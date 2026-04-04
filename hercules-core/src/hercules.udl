@@ -1,4 +1,5 @@
 namespace hercules {
+    [Throws=HerculesError]
     BlockInfo parse_block_header(string hex_header);
     string hercules_version();
 };
@@ -12,4 +13,35 @@ dictionary BlockInfo {
     string timestamp_human;
     u32 bits;
     u32 nonce;
+};
+
+dictionary SyncStatus {
+    u32 synced_headers;
+    u32 peer_height;
+    string peer_addr;
+    string peer_user_agent;
+    boolean is_syncing;
+    string? error;
+};
+
+callback interface SyncCallback {
+    void on_progress(SyncStatus status);
+};
+
+interface HerculesNode {
+    [Throws=HerculesError]
+    constructor(string db_path);
+
+    [Throws=HerculesError]
+    SyncStatus get_status();
+
+    [Throws=HerculesError]
+    void start_header_sync(SyncCallback callback);
+};
+
+[Error]
+interface HerculesError {
+    SyncFailed(string msg);
+    StorageError(string msg);
+    NetworkError(string msg);
 };

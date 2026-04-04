@@ -1,0 +1,270 @@
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+use bitcoin::consensus::{Decodable, Encodable};
+use bitcoin::p2p::address::Address;
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin::BlockHash;
+
+use log::{debug, info, warn};
+
+const PROTOCOL_VERSION: u32 = 70016;
+const USER_AGENT: &str = "/Hercules:0.1.0/";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// DNS seeds for discovering Bitcoin mainnet peers.
+const DNS_SEEDS: &[&str] = &[
+    "seed.bitcoin.sipa.be",
+    "dnsseed.bluematt.me",
+    "seed.bitcoinstats.com",
+    "seed.bitcoin.jonasschnelli.ch",
+    "seed.btc.petertodd.net",
+    "seed.bitcoin.sprovoost.nl",
+    "dnsseed.emzy.de",
+    "seed.bitcoin.wiz.biz",
+];
+
+/// A connection to a single Bitcoin peer.
+pub struct Peer {
+    stream: TcpStream,
+    addr: SocketAddr,
+    their_version: Option<VersionMessage>,
+}
+
+impl Peer {
+    /// Discover peer addresses from DNS seeds.
+    pub fn discover_peers() -> Vec<SocketAddr> {
+        let mut addrs = Vec::new();
+        for seed in DNS_SEEDS {
+            let seed_with_port = format!("{}:8333", seed);
+            match seed_with_port.to_socket_addrs() {
+                Ok(resolved) => {
+                    let new_addrs: Vec<SocketAddr> = resolved.collect();
+                    info!("DNS seed {} returned {} peers", seed, new_addrs.len());
+                    addrs.extend(new_addrs);
+                }
+                Err(e) => {
+                    warn!("Failed to resolve DNS seed {}: {}", seed, e);
+                }
+            }
+        }
+        info!("Discovered {} total peer addresses", addrs.len());
+        addrs
+    }
+
+    /// Connect to a peer and complete the version handshake.
+    pub fn connect(addr: SocketAddr, our_height: i32) -> Result<Peer, PeerError> {
+        info!("Connecting to peer {}", addr);
+
+        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+            .map_err(|e| PeerError::Connection(format!("{}: {}", addr, e)))?;
+
+        stream
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+
+        let mut peer = Peer {
+            stream,
+            addr,
+            their_version: None,
+        };
+
+        peer.handshake(our_height)?;
+        info!("Handshake complete with {}", addr);
+        Ok(peer)
+    }
+
+    /// Perform the version/verack handshake.
+    fn handshake(&mut self, our_height: i32) -> Result<(), PeerError> {
+        // Send our version
+        let our_version = VersionMessage {
+            version: PROTOCOL_VERSION,
+            services: ServiceFlags::NONE,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            receiver: Address::new(&self.addr, ServiceFlags::NETWORK),
+            sender: Address::new(
+                &SocketAddr::from(([0, 0, 0, 0], 0)),
+                ServiceFlags::NONE,
+            ),
+            nonce: rand_nonce(),
+            user_agent: USER_AGENT.to_string(),
+            start_height: our_height,
+            relay: false,
+        };
+
+        self.send(NetworkMessage::Version(our_version))?;
+        debug!("Sent version to {}", self.addr);
+
+        // Receive their version and verack (order can vary)
+        let mut got_version = false;
+        let mut got_verack = false;
+
+        for _ in 0..10 {
+            let msg = self.receive()?;
+            match msg {
+                NetworkMessage::Version(v) => {
+                    info!(
+                        "Peer {} running {} at height {}",
+                        self.addr, v.user_agent, v.start_height
+                    );
+                    self.their_version = Some(v);
+                    got_version = true;
+                    // Send verack in response
+                    self.send(NetworkMessage::Verack)?;
+                    debug!("Sent verack to {}", self.addr);
+                }
+                NetworkMessage::Verack => {
+                    got_verack = true;
+                    debug!("Received verack from {}", self.addr);
+                }
+                NetworkMessage::SendHeaders => {
+                    debug!("Peer {} requested SendHeaders mode", self.addr);
+                }
+                NetworkMessage::SendAddrV2 => {
+                    debug!("Peer {} requested SendAddrV2", self.addr);
+                }
+                NetworkMessage::WtxidRelay => {
+                    debug!("Peer {} requested WtxidRelay", self.addr);
+                }
+                other => {
+                    debug!(
+                        "Ignoring {} message during handshake from {}",
+                        msg_name(&other),
+                        self.addr
+                    );
+                }
+            }
+            if got_version && got_verack {
+                return Ok(());
+            }
+        }
+
+        if !got_version {
+            return Err(PeerError::Handshake("never received version".into()));
+        }
+        // Some peers don't send verack immediately, but we can proceed
+        Ok(())
+    }
+
+    /// Send a Bitcoin P2P message.
+    pub fn send(&mut self, msg: NetworkMessage) -> Result<(), PeerError> {
+        let raw = RawNetworkMessage::new(Magic::BITCOIN, msg);
+        raw.consensus_encode(&mut self.stream)
+            .map_err(|e| PeerError::Send(format!("{}", e)))?;
+        self.stream
+            .flush()
+            .map_err(|e| PeerError::Send(format!("flush: {}", e)))?;
+        Ok(())
+    }
+
+    /// Receive a Bitcoin P2P message.
+    pub fn receive(&mut self) -> Result<NetworkMessage, PeerError> {
+        let raw = RawNetworkMessage::consensus_decode(&mut self.stream)
+            .map_err(|e| PeerError::Receive(format!("{}", e)))?;
+        Ok(raw.payload().clone())
+    }
+
+    /// Request block headers starting from the given locator hashes.
+    /// Returns the headers received from the peer.
+    pub fn get_headers(
+        &mut self,
+        locator_hashes: Vec<BlockHash>,
+        stop_hash: BlockHash,
+    ) -> Result<Vec<bitcoin::block::Header>, PeerError> {
+        let get_headers = GetHeadersMessage {
+            version: PROTOCOL_VERSION,
+            locator_hashes,
+            stop_hash,
+        };
+
+        self.send(NetworkMessage::GetHeaders(get_headers))?;
+
+        // Read messages until we get Headers
+        for _ in 0..10 {
+            let msg = self.receive()?;
+            match msg {
+                NetworkMessage::Headers(headers) => {
+                    return Ok(headers);
+                }
+                NetworkMessage::Ping(nonce) => {
+                    self.send(NetworkMessage::Pong(nonce))?;
+                }
+                other => {
+                    debug!(
+                        "Ignoring {} message while waiting for headers",
+                        msg_name(&other)
+                    );
+                }
+            }
+        }
+
+        Err(PeerError::Receive(
+            "did not receive headers response".into(),
+        ))
+    }
+
+    pub fn peer_height(&self) -> Option<i32> {
+        self.their_version.as_ref().map(|v| v.start_height)
+    }
+
+    pub fn peer_user_agent(&self) -> Option<String> {
+        self.their_version.as_ref().map(|v| v.user_agent.clone())
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+fn msg_name(msg: &NetworkMessage) -> &'static str {
+    match msg {
+        NetworkMessage::Version(_) => "version",
+        NetworkMessage::Verack => "verack",
+        NetworkMessage::Ping(_) => "ping",
+        NetworkMessage::Pong(_) => "pong",
+        NetworkMessage::SendHeaders => "sendheaders",
+        NetworkMessage::GetHeaders(_) => "getheaders",
+        NetworkMessage::Headers(_) => "headers",
+        NetworkMessage::Inv(_) => "inv",
+        NetworkMessage::GetData(_) => "getdata",
+        NetworkMessage::Addr(_) => "addr",
+        NetworkMessage::Alert(_) => "alert",
+        NetworkMessage::FeeFilter(_) => "feefilter",
+        _ => "unknown",
+    }
+}
+
+#[derive(Debug)]
+pub enum PeerError {
+    Connection(String),
+    Handshake(String),
+    Send(String),
+    Receive(String),
+}
+
+impl std::fmt::Display for PeerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerError::Connection(s) => write!(f, "connection error: {}", s),
+            PeerError::Handshake(s) => write!(f, "handshake error: {}", s),
+            PeerError::Send(s) => write!(f, "send error: {}", s),
+            PeerError::Receive(s) => write!(f, "receive error: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for PeerError {}
+
+fn rand_nonce() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish()
+}
