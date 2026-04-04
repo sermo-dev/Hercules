@@ -222,6 +222,38 @@ impl Peer {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+
+    /// Wait for a duration while responding to pings to keep the connection alive.
+    /// Returns Ok on timeout (normal), Err if the peer disconnects.
+    pub fn idle_wait(&mut self, duration: std::time::Duration) -> Result<(), PeerError> {
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < duration {
+            let remaining = duration.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+
+            match self.receive() {
+                Ok(NetworkMessage::Ping(nonce)) => {
+                    self.send(NetworkMessage::Pong(nonce))?;
+                }
+                Ok(_) => {} // ignore other messages during idle
+                Err(_) => break, // timeout or disconnect
+            }
+        }
+
+        // Restore standard read timeout
+        self.stream
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 fn msg_name(msg: &NetworkMessage) -> &'static str {

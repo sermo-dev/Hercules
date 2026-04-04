@@ -21,13 +21,15 @@ struct Theme {
 class NodeViewModel: ObservableObject {
     @Published var syncStatus: SyncStatus?
     @Published var isConnecting = false
+    @Published var isSyncRunning = false
     @Published var errorMessage: String?
 
     private var node: HerculesNode?
 
     func startSync() {
-        guard !isConnecting else { return }
+        guard !isSyncRunning else { return }
         isConnecting = true
+        isSyncRunning = true
         errorMessage = nil
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -45,31 +47,18 @@ class NodeViewModel: ObservableObject {
                     DispatchQueue.main.async {
                         self?.syncStatus = status
                         self?.isConnecting = false
+                        self?.errorMessage = status.error
                     }
                 }
 
+                // This runs continuously — only returns on unrecoverable error
                 try node.startHeaderSync(callback: callback)
-
-                DispatchQueue.main.async {
-                    self?.isConnecting = false
-                }
 
             } catch {
                 DispatchQueue.main.async {
-                    // If we already synced most headers, don't show error
-                    if let s = self?.syncStatus, s.peerHeight > 0, s.syncedHeaders + 10 >= s.peerHeight {
-                        self?.syncStatus = SyncStatus(
-                            syncedHeaders: s.syncedHeaders,
-                            peerHeight: s.syncedHeaders,
-                            peerAddr: s.peerAddr,
-                            peerUserAgent: s.peerUserAgent,
-                            isSyncing: false,
-                            error: nil
-                        )
-                    } else {
-                        self?.errorMessage = "\(error)"
-                    }
+                    self?.errorMessage = "\(error)"
                     self?.isConnecting = false
+                    self?.isSyncRunning = false
                 }
             }
         }
@@ -390,7 +379,8 @@ struct SyncButton: View {
     var label: String {
         if viewModel.isConnecting { return "Connecting to Network..." }
         if isSyncing { return "Syncing Headers..." }
-        if isSynced { return "Node Synced" }
+        if isSynced { return "Node Active" }
+        if viewModel.isSyncRunning { return "Monitoring Network..." }
         if viewModel.syncStatus != nil { return "Resume Sync" }
         return "Connect to Bitcoin Network"
     }
@@ -441,7 +431,7 @@ struct SyncButton: View {
             )
             .shadow(color: isSynced ? Color.clear : (isSyncing ? Theme.warning : Theme.accent).opacity(0.3), radius: 12, y: 6)
         }
-        .disabled(isSyncing)
+        .disabled(viewModel.isSyncRunning)
     }
 }
 
