@@ -275,22 +275,71 @@ This is the core of the project and the largest phase, broken into four sub-phas
 
 **Milestone: TBD — depends on LDK mobile maturity and Phase 2-5 stability**
 
+## Security Model — Progressive Trust Reduction
+
+Hercules progressively reduces trust assumptions as each phase ships. At every stage, the node is useful — later phases add resilience, not core functionality.
+
+### Phase 2: Sovereign Validation (app open)
+
+While the app is foregrounded, Hercules is a fully-validating pruned Bitcoin node:
+
+- Validates every new block: transaction scripts (via libbitcoinconsensus), UTXO spends, merkle roots, proof of work, coinbase rewards
+- Verifies your own transactions against your own UTXO set — zero reliance on third parties
+- Relays mempool transactions according to your chosen policy
+- Prunes old block data, keeping storage at ~10-12GB
+
+**Trust assumption:** The AssumeUTXO snapshot hash, hardcoded in open-source code and cross-verifiable against Bitcoin Core v26+ source. This is the same trust model every Bitcoin Core user operates under by default.
+
+**Limitation:** App must be open. If backgrounded or killed, validation pauses until reopened.
+
+### Phase 4: Always-On Validation (push notifications)
+
+Silent push notifications wake the app every ~10 minutes when a new block is mined. Hercules validates the block in 2-5 seconds within the 30-second iOS push window, then goes back to sleep.
+
+Your phone validates every block 24/7, whether you're using the app or not — matching a dedicated home node for the function that matters most (consensus enforcement).
+
+**Limitation:** Mempool relay only runs while foregrounded. Push windows are too short for sustained relay.
+
+### Phase 5: Cooperative Verification
+
+Two cooperative features eliminate remaining limitations:
+
+**Mempool relay shifts:** Phones take scheduled turns relaying mempool transactions. With 60 users, each contributes 1 minute per hour for 24/7 continuous coverage. Solves the "relay only while foregrounded" constraint.
+
+**Historical spot-checking:** The cooperative randomly audits historical blocks across the full chain, verifying merkle roots, coinbase rewards, and transaction structure. Reduces reliance on the AssumeUTXO trust assumption through distributed probabilistic verification.
+
+### Future: Utreexo
+
+Replace the ~8GB UTXO database with a ~1KB cryptographic accumulator (see Ticket 002). This:
+
+- Drops storage from ~10-12GB to ~2-3GB
+- Enables full cooperative historical validation — phones validate assigned 2,016-block epoch ranges with compact proofs, proving correct validation via accumulator hash agreement
+- The endgame: every historical block fully validated by the cooperative, every new block validated by your phone, ~2GB footprint, zero trust assumptions beyond the open-source code
+
+### Risk Summary
+
+| Stage | Trust assumption | Practical risk |
+|---|---|---|
+| Phase 2 | AssumeUTXO hash (in open-source code, matches Bitcoin Core) | Same as default Bitcoin Core |
+| Phase 4 | Same, but no validation gaps from app closure | Full real-time node |
+| Phase 5 spot-checking | Cooperative audits reduce snapshot reliance | Lower than Bitcoin Core default |
+| Utreexo cooperative | Full chain verified, zero trust assumptions | Equivalent to full archival node |
+
 ## Resource Requirements (On-Device)
 
 | Resource | Steady State | During Initial Sync |
 |---|---|---|
-| Storage | ~2-4 GB | ~4-8 GB (UTXO set + working space) |
-| RAM | ~50-100 MB | ~100-200 MB |
-| CPU | Negligible (burst every ~10 min) | Moderate (throttled, background only) |
-| Network | ~150-300 MB/day | ~1-5 GB (AssumeUTXO snapshot + recent blocks) |
-| Battery | Comparable to a chat app | Noticeable during sync (mitigated by scheduling sync while charging) |
+| Storage | ~10-12 GB (UTXO set + pruned blocks) | ~5 GB download (compressed AssumeUTXO snapshot) |
+| RAM | ~100-200 MB | ~200-300 MB |
+| CPU | Burst every ~10 min (block validation) | Moderate (snapshot loading + catch-up) |
+| Network | ~150-300 MB/day | ~5 GB (AssumeUTXO snapshot over WiFi) |
+| Battery | Comparable to a messaging app | Noticeable during initial setup |
 
 ## What Hercules Is Not
 
-- **Not a wallet.** It is the trust layer underneath your wallet.
+- **Not a wallet.** It is the trust layer underneath your wallet. In Phase 6, existing wallets (BlueWallet, Sparrow, any Electrum-compatible wallet) can point at Hercules to verify transactions against your own node, on your own device.
 - **Not a mining node.** It validates, it does not produce blocks.
 - **Not a 24/7 server replacement.** Individual phones are intermittent. The cooperative protocol provides collective continuity, but a single Hercules node does not replace a dedicated always-on node for network infrastructure purposes.
-- **Not a replacement for running Bitcoin Core.** Power users and businesses should still run full archival nodes. Hercules serves the other 99% of Bitcoin users who currently validate nothing.
 
 ## Why "Hercules"
 
