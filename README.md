@@ -143,49 +143,68 @@ Consensus validation is the one place where "don't reinvent it" is an absolute r
 
 ## Implementation Phases
 
-### Phase 0: Toolchain & Proof of Life
+### Phase 0: Toolchain & Proof of Life ✅
 **Goal:** Rust code running on an iPhone, parsing real Bitcoin data.
 
 - Set up Xcode project with Rust integration via UniFFI
 - Cross-compile rust-bitcoin for `aarch64-apple-ios`
 - Build a minimal app that fetches a block, deserializes it, and displays header information in SwiftUI
-- Establish CI pipeline for building and testing the Rust + Swift stack
 
-**Deliverable:** An app that displays "Block #840000 — 3,500 transactions — hash: 0000...abc"
+**Deliverable:** An app that displays block header information parsed by Rust on iOS.
 
-**Milestone: 2-3 weeks**
-
-### Phase 1: Header Sync & P2P Networking
+### Phase 1: Header Sync & P2P Networking ✅
 **Goal:** Connect to the real Bitcoin network and sync the full header chain.
 
-- Implement Bitcoin P2P protocol handshake (version/verack)
-- Implement `getheaders` message and header chain download
-- Validate header chain: proof of work, difficulty adjustments, timestamps
-- Store headers in SQLite on device
-- Peer discovery and connection management
-- Display sync progress in the UI
+- Bitcoin P2P protocol: version/verack handshake, getheaders/headers messages
+- Full header chain download in 2,000-block batches from live peers
+- Header validation: proof of work, difficulty retarget (every 2,016 blocks with U256 arithmetic), median-time-past timestamps, hash chain linkage
+- SQLite header storage with WAL mode
+- DNS seed peer discovery across 8 seeds
+- Dark navy iOS UI with sync progress, peer info, and status cards
+- 35-test suite covering validation, storage, and public API
 
 **Deliverable:** App that syncs and validates all ~860,000+ block headers from live peers.
-
-**Milestone: 3-4 weeks after Phase 0**
 
 ### Phase 2: Pruned Validating Node
 **Goal:** A real, fully-validating pruned Bitcoin node on iPhone.
 
-This is the core of the project and the largest phase.
+This is the core of the project and the largest phase, broken into four sub-phases.
 
-- Integrate `libbitcoinconsensus` for script validation via C FFI
-- Implement UTXO set management with an on-disk database
-- Implement AssumeUTXO: bootstrap from a committed UTXO snapshot for immediate chain-tip validation
-- Full block download and validation from peers
-- Pruning engine: discard validated blocks, retain configurable recent window
-- Background historical validation via `BGProcessingTask` (runs while device is charging and idle)
-- Catch-up logic: rapidly validate missed blocks when app returns to foreground
-- Mempool: receive, validate, and store unconfirmed transactions
+**Phase 2a — Block Download & Structural Validation (3-4 weeks)**
+- Add `getdata`/`block` messages to P2P layer
+- Download full blocks from peers
+- Validate block structure: merkle root, coinbase, block weight/size, witness commitments
+- Transaction format validation
+
+**Phase 2b — Script Validation via libbitcoinconsensus (2-3 weeks)**
+- Integrate `bitcoinconsensus` crate (bundles the C library from Bitcoin Core)
+- Validate transaction scripts for all input types (P2SH, SegWit, Taproot)
+- Handle BIP activation heights (BIP 16, 34, 65, 66, 68/112/113, 141/143, 341/342)
+- Test against Bitcoin Core's script test vectors
+
+**Phase 2c — UTXO Set Management (4-6 weeks)**
+- UTXO database using LMDB (~8GB, ~100M entries) — benchmark vs SQLite first
+- Apply/rollback blocks against UTXO set (spend inputs, create outputs)
+- Full validation: verify inputs exist, no double-spends, no inflation, correct fees
+- Memory-conscious design for iOS (LMDB memory-mapping, no full set in RAM)
+
+**Phase 2d — AssumeUTXO & Pruning (3-4 weeks)**
+- Bootstrap from a committed UTXO snapshot (~8GB download, WiFi only)
+- Verify snapshot hash against hardcoded value, load into LMDB
+- Validate new blocks forward from snapshot height
+- Pruning engine: retain last 288 blocks (~2 days), delete older block data
+- Catch-up logic when app returns to foreground after being offline
+
+**Design decisions:**
+- ~10-12GB storage (UTXO set + pruned blocks) — accepted, target users are power users
+- AssumeUTXO for onboarding — no full historical sync required on device
+- Foreground validation only in Phase 2 — background/push deferred to Phase 4
+- Historical validation handled cooperatively (see Phase 5)
+- UTXO set must be complete (consensus requires it — relay policy is separate from validation)
 
 **Deliverable:** iPhone app that validates every new block in real-time and maintains a complete, verified UTXO set.
 
-**Milestone: 3-4 months after Phase 1**
+**Milestone: 12-17 weeks after Phase 1**
 
 ### Phase 3: Tor Integration
 **Goal:** All network traffic routed through Tor. Can begin in parallel with Phase 2.
@@ -213,19 +232,24 @@ This is the core of the project and the largest phase.
 
 **Milestone: 3-4 weeks after Phase 2**
 
-### Phase 5: Cooperative Mempool Relay Protocol
-**Goal:** The novel contribution — phones collectively provide continuous mempool relay.
+### Phase 5: Cooperative Mempool Relay & Historical Validation
+**Goal:** The novel contribution — phones collectively provide continuous mempool relay and distributed chain verification.
 
+**Cooperative Mempool Relay:**
 - Design and implement the cooperative relay protocol
 - Policy profile system: define, distribute, and enforce named mempool policies
 - Deterministic slot scheduling algorithm
 - Push notification integration for relay shift wake-ups
 - Peer connection warm-up optimization (minimize time from wake to active relay)
 - Shift overlap and handoff protocol for continuity
-- Monitoring: cooperative health dashboard showing coverage and participation
 - Protocol specification document (potential BIP candidate)
 
-**Deliverable:** A network of phones that collectively relays mempool transactions 24/7 according to shared, explicit policy rules.
+**Cooperative Historical Validation:**
+- Structural spot-checking: cooperative randomly audits historical blocks (merkle roots, coinbase rewards, transaction format) — works immediately, no utreexo required
+- Full cooperative validation (future): with utreexo, phones validate assigned epoch ranges (~2,016 blocks each) and produce accumulator hashes that prove correct validation
+- Multiple phones independently validate the same range — agreement proves correctness
+
+**Deliverable:** A network of phones that collectively relays mempool transactions 24/7 and cooperatively verifies the full historical chain.
 
 **Milestone: 2-3 months after Phase 4**
 
