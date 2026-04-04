@@ -1,0 +1,18 @@
+# Rust build artifacts
+hercules-core/target/
+
+# iOS build artifacts
+build/
+HerculesApp/HerculesApp.xcodeproj/xcuserdata/
+HerculesApp/HerculesApp.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# Screenshots
+screenshot.png
+
+# macOS
+.DS_Store

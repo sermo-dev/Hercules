@@ -1,0 +1,27 @@
+name: HerculesApp
+options:
+  bundleIdPrefix: dev.sermo.hercules
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+
+targets:
+  HerculesApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: HerculesApp
+      - path: ../build/hercules.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.sermo.hercules.app
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_GENERATION_MODE: GeneratedByXcode
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        SWIFT_VERSION: "5.0"
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGNING_ALLOWED: "NO"
+    dependencies:
+      - framework: ../build/herculesFFI.xcframework
+        embed: false
