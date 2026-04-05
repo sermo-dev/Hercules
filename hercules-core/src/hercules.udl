@@ -37,6 +37,17 @@ dictionary SnapshotInfo {
     string utxo_hash;
 };
 
+dictionary BlockNotification {
+    u32 height;
+    string block_hash;
+    string prev_block_hash;
+    u32 timestamp;
+    string timestamp_human;
+    boolean validated;
+    boolean header_validated;
+    string? validation_error;
+};
+
 dictionary TorStatus {
     boolean is_bootstrapped;
     u8 bootstrap_progress;
@@ -66,6 +77,9 @@ interface HerculesNode {
 
     [Throws=HerculesError]
     SnapshotInfo load_snapshot(string snapshot_path, SnapshotCallback callback);
+
+    [Throws=HerculesError]
+    BlockNotification validate_latest_block(u32 timeout_secs);
 
     void stop_sync();
     void set_validation_paused(boolean paused);

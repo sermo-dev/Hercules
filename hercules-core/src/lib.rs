@@ -121,6 +121,35 @@ impl From<tor::TorStatus> for TorStatus {
     }
 }
 
+// ── Phase 4 types (push notifications) ─────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct BlockNotification {
+    pub height: u32,
+    pub block_hash: String,
+    pub prev_block_hash: String,
+    pub timestamp: u32,
+    pub timestamp_human: String,
+    pub validated: bool,
+    pub header_validated: bool,
+    pub validation_error: Option<String>,
+}
+
+impl From<sync::BlockNotification> for BlockNotification {
+    fn from(n: sync::BlockNotification) -> Self {
+        BlockNotification {
+            height: n.height,
+            block_hash: n.block_hash,
+            prev_block_hash: n.prev_block_hash,
+            timestamp: n.timestamp,
+            timestamp_human: n.timestamp_human,
+            validated: n.validated,
+            header_validated: n.header_validated,
+            validation_error: n.validation_error,
+        }
+    }
+}
+
 // ── Errors ─────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -233,6 +262,25 @@ impl HerculesNode {
     /// Get the current Tor status. Returns None if Tor is not enabled.
     pub fn get_tor_status(&self) -> Option<TorStatus> {
         self.tor.as_ref().map(|t| t.status().into())
+    }
+
+    /// One-shot block validation for push notification background wake.
+    /// Connects to a peer, checks for new headers/blocks within the timeout.
+    pub fn validate_latest_block(
+        &self,
+        timeout_secs: u32,
+    ) -> Result<BlockNotification, HerculesError> {
+        self.syncer
+            .validate_latest_block(timeout_secs)
+            .map(|n| n.into())
+            .map_err(|e| match e {
+                sync::SyncError::NoPeers => HerculesError::NetworkError {
+                    msg: "no peers found".into(),
+                },
+                sync::SyncError::Peer(s) => HerculesError::NetworkError { msg: s },
+                sync::SyncError::Validation(s) => HerculesError::SyncFailed { msg: s },
+                sync::SyncError::Store(s) => HerculesError::StorageError { msg: s },
+            })
     }
 
     /// Pause or resume block validation. Header sync continues regardless.

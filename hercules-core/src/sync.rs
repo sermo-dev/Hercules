@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
@@ -43,6 +43,35 @@ pub struct SyncStatus {
     pub is_syncing: bool,
     pub validated_blocks: u32,
     pub error: Option<String>,
+}
+
+/// Result of a one-shot block validation (for push notification background wake).
+#[derive(Debug, Clone)]
+pub struct BlockNotification {
+    pub height: u32,
+    pub block_hash: String,
+    pub prev_block_hash: String,
+    pub timestamp: u32,
+    pub timestamp_human: String,
+    pub validated: bool,
+    pub header_validated: bool,
+    pub validation_error: Option<String>,
+}
+
+impl BlockNotification {
+    /// Create a "no update" notification when we're already at the tip.
+    fn no_update(height: u32, header: &Header) -> Self {
+        BlockNotification {
+            height,
+            block_hash: header.block_hash().to_string(),
+            prev_block_hash: header.prev_blockhash.to_string(),
+            timestamp: header.time,
+            timestamp_human: crate::chrono_format(header.time),
+            validated: false,
+            header_validated: false,
+            validation_error: None,
+        }
+    }
 }
 
 /// Sync block headers and validate full blocks from the Bitcoin P2P network.
@@ -778,6 +807,199 @@ impl HeaderSync {
                 None,
             ));
         }
+    }
+
+    /// One-shot block validation for background push notifications.
+    /// Connects to a single peer, checks for new headers, and optionally
+    /// downloads and validates the latest block — all within `timeout_secs`.
+    ///
+    /// Returns a `BlockNotification` with whatever validation was achieved
+    /// before the deadline. This is designed for iOS's ~30-second background
+    /// execution window (call with timeout_secs=25 to leave margin).
+    pub fn validate_latest_block(
+        &self,
+        timeout_secs: u32,
+    ) -> Result<BlockNotification, SyncError> {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+
+        // Get our current tip
+        let (tip_height, tip_hash, tip_header) = self
+            .store
+            .tip()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .ok_or_else(|| SyncError::Store("store has no headers".into()))?;
+
+        let our_height = self
+            .store
+            .count()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .saturating_sub(1);
+
+        info!(
+            "validate_latest_block: tip at {}, timeout {}s",
+            tip_height, timeout_secs
+        );
+
+        // Connect to one peer
+        if Instant::now() >= deadline {
+            return Ok(BlockNotification::no_update(tip_height, &tip_header));
+        }
+
+        let mut pool = PeerPool::new(our_height, self.tor.clone()).map_err(|e| {
+            if format!("{}", e).contains("no peers discovered") {
+                SyncError::NoPeers
+            } else {
+                SyncError::Peer(format!("{}", e))
+            }
+        })?;
+
+        // Get headers from best peer
+        if Instant::now() >= deadline {
+            return Ok(BlockNotification::no_update(tip_height, &tip_header));
+        }
+
+        let peer = pool.best_peer();
+        if peer.is_none() {
+            return Err(SyncError::Peer("no peers available".into()));
+        }
+        let mut peer = peer.unwrap();
+        let peer_addr = peer.addr().to_string();
+
+        let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
+            Ok(h) => {
+                pool.return_peer(peer);
+                h
+            }
+            Err(e) => {
+                return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
+            }
+        };
+
+        if headers.is_empty() {
+            info!("validate_latest_block: no new headers, chain is current");
+            return Ok(BlockNotification::no_update(tip_height, &tip_header));
+        }
+
+        // Validate and store new headers
+        let timestamps = self
+            .store
+            .last_timestamps(11)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        let store = &self.store;
+        let epoch_lookup = |height: u32| -> Result<u32, String> {
+            store
+                .get_timestamp_at(height)
+                .map_err(|e| format!("{}", e))?
+                .ok_or_else(|| format!("no header at height {}", height))
+        };
+
+        validate_headers(
+            &headers,
+            tip_hash,
+            tip_height,
+            &timestamps,
+            tip_header.bits,
+            &epoch_lookup,
+        )
+        .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+
+        let new_start = tip_height + 1;
+        self.store
+            .store_headers(&headers, new_start)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        let new_tip = tip_height + headers.len() as u32;
+        let new_header = &headers[headers.len() - 1];
+
+        info!(
+            "validate_latest_block: synced headers {}-{} (PoW validated)",
+            new_start, new_tip
+        );
+
+        let mut notification = BlockNotification {
+            height: new_tip,
+            block_hash: new_header.block_hash().to_string(),
+            prev_block_hash: new_header.prev_blockhash.to_string(),
+            timestamp: new_header.time,
+            timestamp_human: crate::chrono_format(new_header.time),
+            validated: false,
+            header_validated: true,
+            validation_error: None,
+        };
+
+        // If time remains, try full block validation
+        if Instant::now() >= deadline {
+            info!("validate_latest_block: deadline reached after header sync");
+            return Ok(notification);
+        }
+
+        let validated_height = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        // Only attempt full validation for the tip block if we're caught up
+        if validated_height + 1 != new_tip {
+            info!(
+                "validate_latest_block: validated_height {} too far from tip {}, skipping block validation",
+                validated_height, new_tip
+            );
+            return Ok(notification);
+        }
+
+        let block_hash = new_header.block_hash();
+        let block_peer = pool.any_peer();
+        if block_peer.is_none() {
+            return Ok(notification);
+        }
+        let mut block_peer = block_peer.unwrap();
+
+        match block_peer.get_block(block_hash) {
+            Ok(block) => {
+                pool.return_peer(block_peer);
+
+                if Instant::now() >= deadline {
+                    return Ok(notification);
+                }
+
+                // Structural validation
+                if let Err(e) = validate_block(&block, new_tip) {
+                    notification.validation_error =
+                        Some(format!("structural: {}", e));
+                    return Ok(notification);
+                }
+
+                // Script validation
+                if let Err(e) = validate_block_scripts(&block, new_tip, &self.utxo) {
+                    notification.validation_error =
+                        Some(format!("scripts: {}", e));
+                    return Ok(notification);
+                }
+
+                // Apply to UTXO set
+                if let Err(e) = self.utxo.apply_block(&block, new_tip) {
+                    notification.validation_error =
+                        Some(format!("utxo: {}", e));
+                    return Ok(notification);
+                }
+
+                self.store
+                    .set_validated_height(new_tip)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                notification.validated = true;
+                info!("validate_latest_block: block {} fully validated", new_tip);
+            }
+            Err(e) => {
+                info!(
+                    "validate_latest_block: block download failed: {}, returning header-only result",
+                    e
+                );
+            }
+        }
+
+        Ok(notification)
     }
 
     /// Get current sync status without syncing.

@@ -22,9 +22,15 @@ targets:
         SWIFT_VERSION: "5.0"
         DEVELOPMENT_TEAM: ""
         CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGN_ENTITLEMENTS: HerculesApp/HerculesApp.entitlements
         OTHER_LDFLAGS: ["-lc++"]
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+    info:
+      path: HerculesApp/Info.plist
+      properties:
+        UIBackgroundModes:
+          - remote-notification
     dependencies:
       - framework: ../build/herculesFFI.xcframework
         embed: false
