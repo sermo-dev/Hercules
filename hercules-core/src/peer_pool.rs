@@ -27,8 +27,11 @@ struct PeerSlot {
     addr: String,
     user_agent: String,
     height: u32,
-    connected_at: Instant,
     misbehavior: u32,
+    /// When the peer was last checked out (taken from the slot). Used to
+    /// detect leaked slots where the caller dropped the Peer without
+    /// calling return_peer().
+    checked_out_at: Option<Instant>,
 }
 
 /// Minimum interval between DNS re-discovery attempts.
@@ -39,6 +42,12 @@ const BAN_DURATION: Duration = Duration::from_secs(24 * 3600);
 
 /// Misbehavior score threshold for automatic banning (matches Bitcoin Core's 100).
 const BAN_THRESHOLD: u32 = 100;
+
+/// Maximum ban entries to prevent unbounded memory growth from address rotation.
+const MAX_BANS: usize = 1024;
+
+/// Timeout for checked-out peer slots before they are reclaimed (prevents slot leaks).
+const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Thread-safe pool of Bitcoin peer connections.
 pub struct PeerPool {
@@ -93,9 +102,36 @@ impl PeerPool {
 
     /// Try to fill the pool up to `MAX_OUTBOUND` connections.
     pub fn maintain(&mut self) {
-        // Expire old bans
+        // Expire old bans and enforce max size
         let now = Instant::now();
         self.bans.retain(|_, expiry| *expiry > now);
+        if self.bans.len() > MAX_BANS {
+            // Evict oldest bans (earliest expiry) to stay bounded
+            let mut entries: Vec<_> = self.bans.drain().collect();
+            entries.sort_by_key(|(_, expiry)| *expiry);
+            let skip = entries.len() - MAX_BANS;
+            self.bans = entries.into_iter().skip(skip).collect();
+        }
+
+        // Reclaim slots where a peer was checked out but never returned
+        // (prevents permanent slot loss from dropped Peer handles)
+        {
+            let mut slots = self.slots.lock().unwrap();
+            let before = slots.len();
+            slots.retain(|s| {
+                if s.peer.is_some() {
+                    return true; // peer present, slot is fine
+                }
+                match s.checked_out_at {
+                    Some(t) => t.elapsed() < CHECKOUT_TIMEOUT,
+                    None => true, // shouldn't happen, keep it
+                }
+            });
+            let removed = before - slots.len();
+            if removed > 0 {
+                warn!("PeerPool: reclaimed {} orphaned peer slots", removed);
+            }
+        }
 
         let current = self.slots.lock().unwrap().len();
         if current >= MAX_OUTBOUND {
@@ -165,8 +201,8 @@ impl PeerPool {
                         addr,
                         user_agent,
                         height,
-                        connected_at: Instant::now(),
                         misbehavior: 0,
+                        checked_out_at: None,
                     };
 
                     self.slots.lock().unwrap().push(slot);
@@ -200,6 +236,7 @@ impl PeerPool {
             .max_by_key(|(_, s)| s.height)
             .map(|(i, _)| i)?;
 
+        slots[best_idx].checked_out_at = Some(Instant::now());
         slots[best_idx].peer.take()
     }
 
@@ -209,6 +246,7 @@ impl PeerPool {
         let mut slots = self.slots.lock().unwrap();
         for slot in slots.iter_mut() {
             if slot.peer.is_some() {
+                slot.checked_out_at = Some(Instant::now());
                 return slot.peer.take();
             }
         }
@@ -222,6 +260,7 @@ impl PeerPool {
         for slot in slots.iter_mut() {
             if slot.addr == addr && slot.peer.is_none() {
                 slot.peer = Some(peer);
+                slot.checked_out_at = None;
                 return;
             }
         }

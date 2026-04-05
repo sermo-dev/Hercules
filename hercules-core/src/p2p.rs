@@ -235,6 +235,15 @@ impl Peer {
             let msg = self.receive()?;
             match msg {
                 NetworkMessage::Version(v) => {
+                    // Reject peers running protocol versions too old to
+                    // support compact blocks and segwit (min 70015, same
+                    // as Bitcoin Core's MIN_PEER_PROTO_VERSION).
+                    if v.version < 70015 {
+                        return Err(PeerError::Handshake(format!(
+                            "peer {} version {} too old (min 70015)",
+                            self.addr, v.version
+                        )));
+                    }
                     info!(
                         "Peer {} running {} at height {}",
                         self.addr, v.user_agent, v.start_height

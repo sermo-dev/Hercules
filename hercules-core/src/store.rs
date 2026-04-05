@@ -18,6 +18,11 @@ impl HeaderStore {
     pub fn open(path: &str) -> Result<HeaderStore, StoreError> {
         let conn = Connection::open(path).map_err(|e| StoreError(format!("open: {}", e)))?;
 
+        // Set WAL journal mode before any writes so that table creation
+        // also benefits from WAL's crash-recovery semantics.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| StoreError(format!("set WAL: {}", e)))?;
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS headers (
@@ -34,9 +39,6 @@ impl HeaderStore {
 ",
         )
         .map_err(|e| StoreError(format!("create tables: {}", e)))?;
-
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| StoreError(format!("set WAL: {}", e)))?;
 
         let store = HeaderStore {
             conn: Mutex::new(conn),

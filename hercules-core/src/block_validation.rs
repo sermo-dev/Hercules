@@ -34,18 +34,24 @@ const WITNESS_SCALE_FACTOR: u64 = 4;
 /// Count legacy signature operations in a script.
 /// Uses conservative counting: 20 for each CHECKMULTISIG (MAX_PUBKEYS_PER_MULTISIG).
 /// This matches Bitcoin Core's `GetLegacySigOpCount` with fAccurate=false.
+/// Continues counting through parse errors (malformed opcodes are skipped,
+/// not silently dropped) to avoid sigops undercount on crafted scripts.
 fn count_script_sigops(script: &bitcoin::Script) -> u64 {
     use bitcoin::opcodes::all::{
         OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
     };
     let mut count = 0u64;
-    for instruction in script.instructions().flatten() {
-        if let Instruction::Op(op) = instruction {
-            if op == OP_CHECKSIG || op == OP_CHECKSIGVERIFY {
-                count += 1;
-            } else if op == OP_CHECKMULTISIG || op == OP_CHECKMULTISIGVERIFY {
-                count += 20;
+    for result in script.instructions() {
+        match result {
+            Ok(Instruction::Op(op)) => {
+                if op == OP_CHECKSIG || op == OP_CHECKSIGVERIFY {
+                    count += 1;
+                } else if op == OP_CHECKMULTISIG || op == OP_CHECKMULTISIGVERIFY {
+                    count += 20;
+                }
             }
+            Ok(_) => {} // PushBytes — not a sigop
+            Err(_) => {} // Malformed opcode — skip, keep counting
         }
     }
     count

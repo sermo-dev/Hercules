@@ -440,6 +440,13 @@ impl UtxoSet {
                 .map_err(|e| UtxoError(format!("write entry height: {}", e)))?;
             w.write_all(&[is_cb as u8])
                 .map_err(|e| UtxoError(format!("write is_coinbase: {}", e)))?;
+            if script.len() > u16::MAX as usize {
+                return Err(UtxoError(format!(
+                    "script too long for snapshot format: {} bytes (max {})",
+                    script.len(),
+                    u16::MAX
+                )));
+            }
             let script_len = script.len() as u16;
             w.write_all(&script_len.to_le_bytes())
                 .map_err(|e| UtxoError(format!("write script_len: {}", e)))?;

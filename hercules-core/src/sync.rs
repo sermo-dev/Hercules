@@ -552,7 +552,9 @@ impl HeaderSync {
             }
 
             // We have new headers — validate and store them
-            // Bitcoin P2P protocol allows max 2000 headers per message
+            // Bitcoin P2P protocol allows max 2000 headers per message.
+            // This check must come BEFORE fork detection to prevent
+            // oversized batches from entering the reorg path.
             if headers.len() > 2000 {
                 warn!(
                     "Peer sent {} headers (max 2000), disconnecting",
@@ -845,7 +847,7 @@ impl HeaderSync {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
-        let mut pool = PeerPool::new(our_height, self.tor.clone()).map_err(|e| {
+        let pool = PeerPool::new(our_height, self.tor.clone()).map_err(|e| {
             if format!("{}", e).contains("no peers discovered") {
                 SyncError::NoPeers
             } else {

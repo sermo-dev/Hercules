@@ -168,6 +168,10 @@ fn u256_mul_u64(bytes: [u8; 32], scalar: u64) -> [u8; 32] {
 
 /// Divide a 256-bit little-endian value by a u64 scalar.
 fn u256_div_u64(bytes: [u8; 32], divisor: u64) -> [u8; 32] {
+    if divisor == 0 {
+        return [0xFF; 32]; // saturate to max, same as u256_div_u256
+    }
+
     let mut limbs = [0u64; 4];
     for i in 0..4 {
         limbs[i] = u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
