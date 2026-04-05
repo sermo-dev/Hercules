@@ -12,6 +12,7 @@ use log::{info, warn};
 use crate::block_validation::{validate_block, validate_block_scripts};
 use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
+use crate::tor::TorManager;
 use crate::utxo::{SnapshotMeta, UtxoSet};
 use crate::validation::{chainwork_for_headers, u256_gt, validate_headers};
 
@@ -50,10 +51,11 @@ pub struct HeaderSync {
     utxo: UtxoSet,
     validation_paused: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    tor: Option<Arc<TorManager>>,
 }
 
 impl HeaderSync {
-    pub fn new(db_path: &str) -> Result<HeaderSync, SyncError> {
+    pub fn new(db_path: &str, tor: Option<Arc<TorManager>>) -> Result<HeaderSync, SyncError> {
         let store =
             HeaderStore::open(db_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
@@ -93,11 +95,16 @@ impl HeaderSync {
             );
         }
 
+        if tor.is_some() {
+            info!("HeaderSync: Tor enabled — all connections routed through Tor");
+        }
+
         Ok(HeaderSync {
             store,
             utxo,
             validation_paused: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            tor,
         })
     }
 
@@ -203,7 +210,7 @@ impl HeaderSync {
             .saturating_sub(1);
 
         // Create the peer pool
-        let mut pool = PeerPool::new(our_height).map_err(|e| {
+        let mut pool = PeerPool::new(our_height, self.tor.clone()).map_err(|e| {
             if format!("{}", e).contains("no peers discovered") {
                 SyncError::NoPeers
             } else {
@@ -274,8 +281,7 @@ impl HeaderSync {
                 continue;
             }
             let mut peer = best_peer.unwrap();
-            let active_sock = peer.addr();
-            let active_addr = active_sock.to_string();
+            let active_addr = peer.addr().to_string();
 
             // Build block locator (tip + exponentially spaced hashes)
             let locator = self
@@ -318,7 +324,7 @@ impl HeaderSync {
                             "Peer {} claims height {} but has no headers above {}, banning",
                             active_addr, claimed, tip_height
                         );
-                        pool.misbehaving(active_sock, 100);
+                        pool.misbehaving(&active_addr, 100);
                         pool.maintain();
                         continue;
                     }
@@ -523,7 +529,7 @@ impl HeaderSync {
                     "Peer sent {} headers (max 2000), disconnecting",
                     headers.len()
                 );
-                pool.misbehaving(active_sock, 100);
+                pool.misbehaving(&active_addr, 100);
                 pool.maintain();
                 continue;
             }
@@ -552,7 +558,7 @@ impl HeaderSync {
                     None => {
                         // Headers don't connect to any known block
                         warn!("Peer {} sent unconnectable headers", active_addr);
-                        pool.misbehaving(active_sock, 20);
+                        pool.misbehaving(&active_addr, 20);
                         continue;
                     }
                     Some(base_height) => {
@@ -594,7 +600,7 @@ impl HeaderSync {
                                 "Peer {} suggests reorg depth {} (max {}), ignoring",
                                 active_addr, reorg_depth, MAX_REORG_DEPTH
                             );
-                            pool.misbehaving(active_sock, 20);
+                            pool.misbehaving(&active_addr, 20);
                             continue;
                         }
 
@@ -656,7 +662,7 @@ impl HeaderSync {
                                 "Reorg rejected: new chain failed validation: {}",
                                 e
                             );
-                            pool.misbehaving(active_sock, 50);
+                            pool.misbehaving(&active_addr, 50);
                             continue;
                         }
 

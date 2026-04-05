@@ -1,0 +1,372 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		207BCB9D380A6282E1252A39 /* HerculesApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */; };
+		30FE03463F60EE0268673195 /* hercules.swift in Sources */ = {isa = PBXBuildFile; fileRef = D447B442663275E674A34B07 /* hercules.swift */; };
+		5EDE5A815A9EBFDB673C9944 /* herculesFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 23538480402D68A26C4B93B3 /* herculesFFI.xcframework */; };
+		6E11490B9C8FBFC3B743B3B1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 314CE09F95D9CE2AEFB5822D /* ContentView.swift */; };
+		CB293751781200CE7EC2D89D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 422A25EDC51BDB37202B75C3 /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		23538480402D68A26C4B93B3 /* herculesFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = herculesFFI.xcframework; path = ../build/herculesFFI.xcframework; sourceTree = "<group>"; };
+		314CE09F95D9CE2AEFB5822D /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		3EEC499055C8047EC500166F /* HerculesApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = HerculesApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		422A25EDC51BDB37202B75C3 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		4CB3647C90E7FDE042B14BD4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerculesApp.swift; sourceTree = "<group>"; };
+		D447B442663275E674A34B07 /* hercules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = hercules.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		3302A470D109C55EA7FB05DF /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5EDE5A815A9EBFDB673C9944 /* herculesFFI.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		300DDEC89BDEA68EDF7F8B2A = {
+			isa = PBXGroup;
+			children = (
+				7407BCD6247DDF5D0BFE8FF4 /* build */,
+				957038D4FC38FBCACED7B86B /* HerculesApp */,
+				A6D5CF95C1D6155B155BD61C /* Frameworks */,
+				64BBDBCFC4B340FF730B3C7B /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		64BBDBCFC4B340FF730B3C7B /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				3EEC499055C8047EC500166F /* HerculesApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		7407BCD6247DDF5D0BFE8FF4 /* build */ = {
+			isa = PBXGroup;
+			children = (
+				D447B442663275E674A34B07 /* hercules.swift */,
+			);
+			name = build;
+			path = ../build;
+			sourceTree = "<group>";
+		};
+		957038D4FC38FBCACED7B86B /* HerculesApp */ = {
+			isa = PBXGroup;
+			children = (
+				422A25EDC51BDB37202B75C3 /* Assets.xcassets */,
+				314CE09F95D9CE2AEFB5822D /* ContentView.swift */,
+				8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */,
+				4CB3647C90E7FDE042B14BD4 /* Info.plist */,
+			);
+			path = HerculesApp;
+			sourceTree = "<group>";
+		};
+		A6D5CF95C1D6155B155BD61C /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				23538480402D68A26C4B93B3 /* herculesFFI.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		202667254CED1A6DA7DF1DD0 /* HerculesApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A91481FCAB97B0249426782D /* Build configuration list for PBXNativeTarget "HerculesApp" */;
+			buildPhases = (
+				E47A64F2088A179CB1DA0E33 /* Sources */,
+				353F20D0E1E47C8110F1C82F /* Resources */,
+				3302A470D109C55EA7FB05DF /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = HerculesApp;
+			packageProductDependencies = (
+			);
+			productName = HerculesApp;
+			productReference = 3EEC499055C8047EC500166F /* HerculesApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		14260B5476144A74F91FD0E4 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					202667254CED1A6DA7DF1DD0 = {
+						DevelopmentTeam = "";
+					};
+				};
+			};
+			buildConfigurationList = 2077C3FF3BC861D9048B488D /* Build configuration list for PBXProject "HerculesApp" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 300DDEC89BDEA68EDF7F8B2A;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 64BBDBCFC4B340FF730B3C7B /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				202667254CED1A6DA7DF1DD0 /* HerculesApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		353F20D0E1E47C8110F1C82F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CB293751781200CE7EC2D89D /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		E47A64F2088A179CB1DA0E33 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6E11490B9C8FBFC3B743B3B1 /* ContentView.swift in Sources */,
+				207BCB9D380A6282E1252A39 /* HerculesApp.swift in Sources */,
+				30FE03463F60EE0268673195 /* hercules.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		0E4E226DAE57CAC97BF69B45 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		425B932F52FEFE82D2157C16 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"../build\"",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = HerculesApp/Info.plist;
+				INFOPLIST_GENERATION_MODE = GeneratedByXcode;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.sermo.hercules.app;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		4EA1794502F1BF0AFC80AE05 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		5EE86D108B1F15F9AF715C60 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"../build\"",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = HerculesApp/Info.plist;
+				INFOPLIST_GENERATION_MODE = GeneratedByXcode;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.sermo.hercules.app;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		2077C3FF3BC861D9048B488D /* Build configuration list for PBXProject "HerculesApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4EA1794502F1BF0AFC80AE05 /* Debug */,
+				0E4E226DAE57CAC97BF69B45 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		A91481FCAB97B0249426782D /* Build configuration list for PBXNativeTarget "HerculesApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				425B932F52FEFE82D2157C16 /* Debug */,
+				5EE86D108B1F15F9AF715C60 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 14260B5476144A74F91FD0E4 /* Project object */;
+}
