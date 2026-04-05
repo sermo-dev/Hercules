@@ -25,6 +25,10 @@ const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const TOR_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const TOR_BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Maximum P2P message payload size (4 MB, matches Bitcoin Core's MAX_SIZE).
+/// Prevents OOM from malicious peers sending crafted headers claiming huge payloads.
+const MAX_P2P_PAYLOAD: u32 = 4_000_000;
+
 /// DNS seeds for discovering Bitcoin mainnet peers.
 const DNS_SEEDS: &[&str] = &[
     "seed.bitcoin.sipa.be",
@@ -260,15 +264,23 @@ impl Peer {
         peer.send(NetworkMessage::Verack)?;
 
         // Wait for their verack
+        let mut got_verack = false;
         for _ in 0..10 {
             let msg = peer.receive()?;
             match msg {
-                NetworkMessage::Verack => break,
+                NetworkMessage::Verack => {
+                    got_verack = true;
+                    break;
+                }
                 NetworkMessage::Ping(nonce) => {
                     peer.send(NetworkMessage::Pong(nonce))?;
                 }
                 _ => {}
             }
+        }
+
+        if !got_verack {
+            return Err(PeerError::Handshake("inbound peer did not send verack".into()));
         }
 
         let user_agent = peer.peer_user_agent().unwrap_or_default();
@@ -366,7 +378,9 @@ impl Peer {
         if !got_version {
             return Err(PeerError::Handshake("never received version".into()));
         }
-        // Some peers don't send verack immediately, but we can proceed
+        if !got_verack {
+            return Err(PeerError::Handshake("never received verack".into()));
+        }
         Ok(())
     }
 
@@ -393,14 +407,51 @@ impl Peer {
     }
 
     /// Receive a Bitcoin P2P message.
+    ///
+    /// Reads the 24-byte P2P header first to validate payload size before
+    /// allocation, preventing OOM from crafted headers (MAX_SIZE = 4 MB,
+    /// matching Bitcoin Core). Returns `PeerError::Timeout` on read timeout
+    /// for reliable detection by `poll_message()`.
     pub fn receive(&mut self) -> Result<NetworkMessage, PeerError> {
-        let raw = match &mut self.stream {
-            PeerStream::Direct(tcp) => RawNetworkMessage::consensus_decode(tcp),
-            PeerStream::Tor(tor) => {
-                RawNetworkMessage::consensus_decode(&mut bitcoin::io::FromStd::new(tor))
+        // Read the 24-byte P2P message header
+        let mut header = [0u8; 24];
+        self.stream.read_exact(&mut header).map_err(|e| {
+            if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+                PeerError::Timeout
+            } else {
+                PeerError::Receive(format!("{}", e))
             }
+        })?;
+
+        // Payload length is at bytes 16..20 (little-endian u32)
+        let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        if payload_len > MAX_P2P_PAYLOAD {
+            return Err(PeerError::Receive(format!(
+                "message payload {} bytes exceeds limit {}",
+                payload_len, MAX_P2P_PAYLOAD
+            )));
         }
-        .map_err(|e| PeerError::Receive(format!("{}", e)))?;
+
+        // Read the payload
+        let mut payload = vec![0u8; payload_len as usize];
+        if payload_len > 0 {
+            self.stream.read_exact(&mut payload).map_err(|e| {
+                if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
+                    PeerError::Timeout
+                } else {
+                    PeerError::Receive(format!("{}", e))
+                }
+            })?;
+        }
+
+        // Decode from the complete message buffer
+        let mut buf = Vec::with_capacity(24 + payload_len as usize);
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&payload);
+
+        let mut slice = buf.as_slice();
+        let raw = RawNetworkMessage::consensus_decode(&mut slice)
+            .map_err(|e| PeerError::Receive(format!("{}", e)))?;
         Ok(raw.payload().clone())
     }
 
@@ -532,13 +583,7 @@ impl Peer {
 
         match result {
             Ok(msg) => Ok(Some(msg)),
-            Err(PeerError::Receive(ref e))
-                if e.contains("timed out")
-                    || e.contains("WouldBlock")
-                    || e.contains("Resource temporarily unavailable") =>
-            {
-                Ok(None) // timeout — no message available
-            }
+            Err(PeerError::Timeout) => Ok(None), // no message available
             Err(e) => Err(e),
         }
     }
@@ -638,6 +683,9 @@ pub enum PeerError {
     Handshake(String),
     Send(String),
     Receive(String),
+    /// Read timed out (no data available within the timeout period).
+    /// Distinct from `Receive` to allow reliable detection without string matching.
+    Timeout,
 }
 
 impl std::fmt::Display for PeerError {
@@ -647,6 +695,7 @@ impl std::fmt::Display for PeerError {
             PeerError::Handshake(s) => write!(f, "handshake error: {}", s),
             PeerError::Send(s) => write!(f, "send error: {}", s),
             PeerError::Receive(s) => write!(f, "receive error: {}", s),
+            PeerError::Timeout => write!(f, "read timed out"),
         }
     }
 }
