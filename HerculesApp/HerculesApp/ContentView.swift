@@ -112,6 +112,17 @@ class NodeViewModel: ObservableObject {
         }
     }
 
+    func stopSync() {
+        guard let node = node else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            node.stopSync()
+            DispatchQueue.main.async {
+                self?.isSyncRunning = false
+                self?.isConnecting = false
+            }
+        }
+    }
+
     func toggleValidationPaused() {
         guard let node = node else { return }
         let newState = !isValidationPaused
@@ -612,24 +623,29 @@ struct SyncButton: View {
         return false
     }
 
+    var canStop: Bool {
+        viewModel.isSyncRunning && !viewModel.isConnecting && !viewModel.isLoadingSnapshot
+    }
+
     var label: String {
         if viewModel.isLoadingSnapshot { return "Loading UTXO Snapshot..." }
         if viewModel.isConnecting { return "Connecting to Network..." }
-        if isSyncing { return "Syncing Headers..." }
-        if isSynced { return "Node Active" }
-        if viewModel.isSyncRunning { return "Monitoring Network..." }
+        if canStop && isSyncing { return "Stop Sync" }
+        if canStop && isSynced { return "Stop Node" }
+        if canStop { return "Stop Node" }
         if viewModel.syncStatus != nil { return "Resume Sync" }
         return "Connect to Bitcoin Network"
     }
 
     var icon: String {
-        if viewModel.isConnecting || isSyncing { return "arrow.triangle.2.circlepath" }
+        if viewModel.isConnecting { return "arrow.triangle.2.circlepath" }
+        if canStop { return "stop.fill" }
         if isSynced { return "checkmark.shield.fill" }
         return "bolt.fill"
     }
 
     var body: some View {
-        Button(action: { viewModel.startSync() }) {
+        Button(action: { canStop ? viewModel.stopSync() : viewModel.startSync() }) {
             HStack(spacing: 10) {
                 if viewModel.isConnecting || isSyncing {
                     ProgressView()
@@ -645,10 +661,10 @@ struct SyncButton: View {
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 16)
-            .foregroundStyle(isSynced ? Theme.accent : .white)
+            .foregroundStyle(canStop ? Theme.error : (isSynced ? Theme.accent : .white))
             .background(
                 Group {
-                    if isSynced {
+                    if canStop {
                         Color.clear
                     } else if isSyncing {
                         Theme.warning
@@ -664,11 +680,11 @@ struct SyncButton: View {
             .clipShape(RoundedRectangle(cornerRadius: 14))
             .overlay(
                 RoundedRectangle(cornerRadius: 14)
-                    .stroke(isSynced ? Theme.accent : Color.clear, lineWidth: 1.5)
+                    .stroke(canStop ? Theme.error : (isSynced ? Theme.accent : Color.clear), lineWidth: 1.5)
             )
-            .shadow(color: isSynced ? Color.clear : (isSyncing ? Theme.warning : Theme.accent).opacity(0.3), radius: 12, y: 6)
+            .shadow(color: canStop ? Color.clear : (isSyncing ? Theme.warning : Theme.accent).opacity(0.3), radius: 12, y: 6)
         }
-        .disabled(viewModel.isSyncRunning)
+        .disabled(viewModel.isConnecting || viewModel.isLoadingSnapshot)
     }
 }
 

@@ -179,6 +179,12 @@ impl HerculesNode {
         })
     }
 
+    /// Request the sync loop to stop cleanly. The blocking `start_header_sync`
+    /// call will return on the next loop iteration.
+    pub fn stop_sync(&self) {
+        self.syncer.stop_sync();
+    }
+
     /// Pause or resume block validation. Header sync continues regardless.
     pub fn set_validation_paused(&self, paused: bool) {
         self.syncer.set_validation_paused(paused);

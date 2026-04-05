@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,6 +34,9 @@ struct PeerSlot {
 const DNS_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Thread-safe pool of Bitcoin peer connections.
+/// Maximum number of banned addresses to track (bounded to prevent growth).
+const MAX_BANNED: usize = 256;
+
 pub struct PeerPool {
     slots: Arc<Mutex<Vec<PeerSlot>>>,
     known_addrs: Vec<SocketAddr>,
@@ -41,6 +45,8 @@ pub struct PeerPool {
     our_height: u32,
     /// Last time DNS seeds were queried (for backoff).
     last_dns_query: Instant,
+    /// Peers banned for misbehavior (height lying, invalid data).
+    banned_addrs: HashSet<SocketAddr>,
 }
 
 impl PeerPool {
@@ -60,6 +66,7 @@ impl PeerPool {
             next_addr: 0,
             our_height,
             last_dns_query: Instant::now(),
+            banned_addrs: HashSet::new(),
         };
 
         pool.maintain();
@@ -111,7 +118,10 @@ impl PeerPool {
             self.next_addr += 1;
             attempts += 1;
 
-            // Skip if already connected to this address
+            // Skip if already connected or banned
+            if self.banned_addrs.contains(&addr) {
+                continue;
+            }
             {
                 let slots = self.slots.lock().unwrap();
                 if slots.iter().any(|s| s.addr == addr) {
@@ -215,6 +225,26 @@ impl PeerPool {
                 height: s.height,
             })
             .collect()
+    }
+
+    /// Ban a peer address. Removes it from the pool and prevents reconnection.
+    pub fn ban_peer(&mut self, addr: SocketAddr) {
+        // Keep ban list bounded
+        if self.banned_addrs.len() >= MAX_BANNED {
+            self.banned_addrs.clear();
+        }
+        self.banned_addrs.insert(addr);
+        self.remove_peer(&addr.to_string());
+        info!("PeerPool: banned peer {}", addr);
+    }
+
+    /// Get the claimed height of a connected peer by address string.
+    pub fn get_peer_height(&self, addr: &str) -> Option<u32> {
+        let slots = self.slots.lock().unwrap();
+        slots
+            .iter()
+            .find(|s| s.addr.to_string() == addr)
+            .map(|s| s.height)
     }
 
     /// Update our reported height (used when connecting to new peers).

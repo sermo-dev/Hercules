@@ -46,6 +46,7 @@ pub struct HeaderSync {
     store: HeaderStore,
     utxo: UtxoSet,
     validation_paused: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
 }
 
 impl HeaderSync {
@@ -93,6 +94,7 @@ impl HeaderSync {
             store,
             utxo,
             validation_paused: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -151,6 +153,13 @@ impl HeaderSync {
         self.validation_paused.load(Ordering::Relaxed)
     }
 
+    /// Request the sync loop to stop. The loop will exit cleanly on its
+    /// next iteration, returning Ok(()) from `sync()`.
+    pub fn stop_sync(&self) {
+        self.shutdown_requested.store(true, Ordering::Relaxed);
+        info!("Sync stop requested");
+    }
+
     /// Build a SyncStatus snapshot from the pool and current state.
     fn make_status(
         &self,
@@ -180,6 +189,9 @@ impl HeaderSync {
     where
         F: Fn(SyncStatus),
     {
+        // Reset shutdown flag so sync can be restarted after a stop
+        self.shutdown_requested.store(false, Ordering::Relaxed);
+
         // Get our current height to report to peers
         let our_height = self
             .store
@@ -230,6 +242,12 @@ impl HeaderSync {
         let mut peer_height = peer_height;
 
         loop {
+            // Check for shutdown request
+            if self.shutdown_requested.load(Ordering::Relaxed) {
+                info!("Sync shutting down cleanly");
+                return Ok(());
+            }
+
             let (tip_height, tip_hash, tip_header) = self
                 .store
                 .tip()
@@ -253,7 +271,8 @@ impl HeaderSync {
                 continue;
             }
             let mut peer = best_peer.unwrap();
-            let active_addr = peer.addr().to_string();
+            let active_sock = peer.addr();
+            let active_addr = active_sock.to_string();
 
             // Request headers from best peer
             let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
@@ -282,6 +301,20 @@ impl HeaderSync {
             };
 
             if headers.is_empty() {
+                // Peer height sanity: if a peer claims height far above our tip
+                // but can't serve any headers beyond it, they're lying. Ban them.
+                if let Some(claimed) = pool.get_peer_height(&active_addr) {
+                    if claimed > tip_height + 2016 {
+                        warn!(
+                            "Peer {} claims height {} but has no headers above {}, banning",
+                            active_addr, claimed, tip_height
+                        );
+                        pool.ban_peer(active_sock);
+                        pool.maintain();
+                        continue;
+                    }
+                }
+
                 // Headers caught up — download and validate blocks
                 peer_height = std::cmp::max(peer_height, tip_height);
 
@@ -459,6 +492,9 @@ impl HeaderSync {
                 // service pings periodically
                 let monitor_start = std::time::Instant::now();
                 while monitor_start.elapsed() < MONITOR_INTERVAL {
+                    if self.shutdown_requested.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let remaining = MONITOR_INTERVAL.saturating_sub(monitor_start.elapsed());
                     let wait = std::cmp::min(remaining, Duration::from_secs(5));
                     if wait.is_zero() {
