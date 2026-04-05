@@ -115,11 +115,12 @@ class NodeViewModel: ObservableObject {
     func toggleValidationPaused() {
         guard let node = node else { return }
         let newState = !isValidationPaused
-        isValidationPaused = newState
-        // Dispatch FFI call off main thread (setValidationPaused sets an AtomicBool
-        // so it's fast, but avoid blocking the main thread for any FFI call)
-        DispatchQueue.global(qos: .userInitiated).async {
+        // Dispatch FFI call off main thread, update UI state only after it succeeds
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             node.setValidationPaused(paused: newState)
+            DispatchQueue.main.async {
+                self?.isValidationPaused = newState
+            }
         }
     }
 

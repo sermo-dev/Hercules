@@ -29,6 +29,9 @@ struct PeerSlot {
     connected_at: Instant,
 }
 
+/// Minimum interval between DNS re-discovery attempts.
+const DNS_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Thread-safe pool of Bitcoin peer connections.
 pub struct PeerPool {
     slots: Arc<Mutex<Vec<PeerSlot>>>,
@@ -36,6 +39,8 @@ pub struct PeerPool {
     /// Index into known_addrs for round-robin connection attempts.
     next_addr: usize,
     our_height: u32,
+    /// Last time DNS seeds were queried (for backoff).
+    last_dns_query: Instant,
 }
 
 impl PeerPool {
@@ -54,6 +59,7 @@ impl PeerPool {
             known_addrs: addrs,
             next_addr: 0,
             our_height,
+            last_dns_query: Instant::now(),
         };
 
         pool.maintain();
@@ -75,7 +81,11 @@ impl PeerPool {
         }
 
         // Re-discover peers from DNS if we've exhausted the address list
-        if self.next_addr >= self.known_addrs.len() {
+        // (with backoff to avoid spamming DNS seeds)
+        if self.next_addr >= self.known_addrs.len()
+            && self.last_dns_query.elapsed() >= DNS_REDISCOVERY_INTERVAL
+        {
+            self.last_dns_query = Instant::now();
             let fresh = Peer::discover_peers();
             if !fresh.is_empty() {
                 info!(

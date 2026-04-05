@@ -323,6 +323,14 @@ pub fn validate_block_scripts(
                     tx_index: tx_idx,
                 })?;
 
+            // Total output value per transaction must not exceed MAX_MONEY
+            if output_sum > MAX_MONEY {
+                return Err(BlockValidationError::ValueOverflow {
+                    height,
+                    tx_index: tx_idx,
+                });
+            }
+
             if input_sum < output_sum {
                 return Err(BlockValidationError::InsufficientInputValue {
                     height,

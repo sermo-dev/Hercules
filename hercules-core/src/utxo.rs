@@ -273,10 +273,11 @@ impl UtxoSet {
             .execute("DELETE FROM utxos WHERE height = ?1", params![height])
             .map_err(|e| UtxoError(format!("delete created: {}", e)))?;
 
-        // Restore spent outputs from undo data
+        // Restore spent outputs from undo data (OR IGNORE in case of
+        // PK conflict from an interrupted previous rollback)
         db_tx
             .execute(
-                "INSERT INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
+                "INSERT OR IGNORE INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
                  SELECT txid, vout, amount, script_pubkey, orig_height, is_coinbase \
                  FROM undo WHERE block_height = ?1",
                 params![height],
@@ -351,6 +352,12 @@ impl UtxoSet {
         for row in rows {
             let (txid, vout, amount, script, height, is_cb) =
                 row.map_err(|e| UtxoError(format!("hash row: {}", e)))?;
+            if script.len() > u16::MAX as usize {
+                return Err(UtxoError(format!(
+                    "script too long for hash: {} bytes",
+                    script.len()
+                )));
+            }
             hasher.update(&txid);
             hasher.update(&vout.to_le_bytes());
             hasher.update(&amount.to_le_bytes());
@@ -473,13 +480,6 @@ impl UtxoSet {
     where
         F: Fn(u64, u64),
     {
-        let current = self.count()?;
-        if current > 0 {
-            return Err(UtxoError(
-                "UTXO set must be empty before loading snapshot".into(),
-            ));
-        }
-
         let mut r = BufReader::new(reader);
 
         // Read header
@@ -543,6 +543,16 @@ impl UtxoSet {
             .conn
             .lock()
             .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+
+        // Emptiness check inside the lock to prevent TOCTOU race with apply_block
+        let current: i64 = conn
+            .query_row("SELECT COUNT(*) FROM utxos", [], |row| row.get(0))
+            .map_err(|e| UtxoError(format!("count for snapshot check: {}", e)))?;
+        if current > 0 {
+            return Err(UtxoError(
+                "UTXO set must be empty before loading snapshot".into(),
+            ));
+        }
 
         let db_tx = conn
             .transaction()

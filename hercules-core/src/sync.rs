@@ -472,6 +472,16 @@ impl HeaderSync {
             }
 
             // We have new headers — validate and store them
+            // Bitcoin P2P protocol allows max 2000 headers per message
+            if headers.len() > 2000 {
+                warn!(
+                    "Peer sent {} headers (max 2000), disconnecting",
+                    headers.len()
+                );
+                pool.remove_peer(&active_addr);
+                pool.maintain();
+                continue;
+            }
             let batch_size = headers.len() as u32;
 
             let timestamps = self
