@@ -137,9 +137,18 @@ impl TorManager {
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| TorError::Bootstrap(format!("create cache dir: {}", e)))?;
 
-        let config = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
-            .build()
-            .map_err(|e| TorError::Bootstrap(format!("config: {}", e)))?;
+        let config = {
+            let mut builder = TorClientConfigBuilder::from_directories(state_dir, cache_dir);
+            // iOS sandbox already provides filesystem isolation, so disable
+            // Arti's Unix permission checks which fail in app containers.
+            builder
+                .storage()
+                .permissions()
+                .dangerously_trust_everyone();
+            builder
+                .build()
+                .map_err(|e| TorError::Bootstrap(format!("config: {}", e)))?
+        };
 
         let bootstrap_progress = Arc::new(AtomicU8::new(0));
 

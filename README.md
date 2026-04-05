@@ -199,7 +199,7 @@ This is the core of the project and the largest phase, broken into four sub-phas
 - ~10-12GB storage (UTXO set + pruned blocks) — accepted, target users are power users
 - AssumeUTXO for onboarding — no full historical sync required on device
 - Foreground validation only in Phase 2 — background/push deferred to Phase 4
-- Historical validation handled cooperatively (see Phase 5)
+- Historical validation handled cooperatively (see Phase 6)
 - UTXO set must be complete (consensus requires it — relay policy is separate from validation)
 
 **Deliverable:** iPhone app that validates every new block in real-time and maintains a complete, verified UTXO set.
@@ -232,7 +232,51 @@ This is the core of the project and the largest phase, broken into four sub-phas
 
 **Milestone: 3-4 weeks after Phase 2**
 
-### Phase 5: Cooperative Mempool Relay & Historical Validation
+### Phase 5: Fully Participating Node
+**Goal:** Transform Hercules from a validating observer into a full network participant — relay blocks, relay transactions, serve peers, accept inbound connections.
+
+Through Phase 4, Hercules downloads and validates but never gives anything back to the network. A real pruned node (Bitcoin Core with `-prune`) still relays blocks and transactions, responds to peer requests, and accepts inbound connections. Phase 5 closes this gap.
+
+**Phase 5a — AssumeUTXO Download & Bootstrap**
+- Automatic download of an AssumeUTXO snapshot over WiFi (~7GB compressed)
+- Hardcoded snapshot hash (matches Bitcoin Core v26+ `chainparams.cpp`) — download source is untrusted, hash commitment is trusted
+- One-tap onboarding: download, verify, load into UTXO set, begin validating forward
+- Temporary: host Hercules-format snapshot on CDN; long-term: BitTorrent/IPFS distribution
+
+**Phase 5b — Mempool**
+- In-memory transaction pool (50MB cap, appropriate for mobile)
+- Full transaction validation against UTXO set (inputs exist, scripts valid, no double-spends)
+- Standard relay policy: dust threshold, max weight, min fee rate, BIP 125 RBF
+- Fee-rate-based eviction when pool is full
+- Conflict removal when new blocks confirm transactions
+
+**Phase 5c — Outbound Relay & Peer Serving**
+- Relay validated block announcements (`inv`/`headers`) to all connected peers
+- Relay validated mempool transactions (`inv`/`tx`) with privacy delay (Poisson, ~2s avg)
+- Respond to `getheaders` — serve our header chain to syncing peers
+- Respond to `getdata` — serve recent blocks (last 288, within pruning window) and mempool transactions
+- Respect `feefilter` (BIP 133) — don't send transactions below peer's minimum fee rate
+- Advertise `NODE_NETWORK_LIMITED` (BIP 159) service flag
+- Bidirectional P2P message handling in `p2p.rs` (currently send-only)
+
+**Phase 5d — Inbound Connections**
+- Activate the .onion hidden service (groundwork exists in `tor.rs`)
+- Accept inbound peer connections via onion address
+- Handle inbound version/verack handshake and service requests
+- Inbound peer limit: 4 (conservative for mobile battery)
+- Inbound peers participate in reputation scoring (Ticket 007)
+
+**Design decisions:**
+- Persist last 288 full blocks for serving (~430MB) — required for `NODE_NETWORK_LIMITED`
+- Mempool size 50MB (vs Core's 300MB) — configurable, balances utility vs mobile constraints
+- Block relay is immediate; transaction relay uses random delay for privacy
+- AssumeUTXO snapshot hash is the same trust model as Bitcoin Core — open-source, cross-verifiable
+
+**Deliverable:** Hercules is a real, fully-participating pruned Bitcoin node — validates, relays, serves peers, and accepts inbound connections over Tor.
+
+**Milestone: 8-12 weeks after Phase 4**
+
+### Phase 6: Cooperative Mempool Relay & Historical Validation
 **Goal:** The novel contribution — phones collectively provide continuous mempool relay and distributed chain verification.
 
 **Cooperative Mempool Relay:**
@@ -251,9 +295,9 @@ This is the core of the project and the largest phase, broken into four sub-phas
 
 **Deliverable:** A network of phones that collectively relays mempool transactions 24/7 and cooperatively verifies the full historical chain.
 
-**Milestone: 2-3 months after Phase 4**
+**Milestone: 2-3 months after Phase 5**
 
-### Phase 6: Wallet Integration API
+### Phase 7: Wallet Integration API
 **Goal:** Let any wallet verify transactions against the local Hercules node.
 
 - Implement local Electrum Personal Server protocol (so existing wallets can connect)
@@ -263,9 +307,9 @@ This is the core of the project and the largest phase, broken into four sub-phas
 
 **Deliverable:** Any Electrum-compatible or BIP 157/158 wallet on the same device can use Hercules as its backend.
 
-**Milestone: 4-6 weeks after Phase 4**
+**Milestone: 4-6 weeks after Phase 5**
 
-### Phase 7: Lightning (Future)
+### Phase 8: Lightning (Future)
 **Goal:** Full Lightning Network node backed by the on-device validating node.
 
 - Integrate LDK (Lightning Dev Kit)
@@ -273,7 +317,7 @@ This is the core of the project and the largest phase, broken into four sub-phas
 - On-chain ↔ Lightning submarine swaps
 - Cooperative channel monitoring (extension of the relay cooperative concept — phones watch each other's channels for fraud while owners are offline)
 
-**Milestone: TBD — depends on LDK mobile maturity and Phase 2-5 stability**
+**Milestone: TBD — depends on LDK mobile maturity and Phase 2-7 stability**
 
 ## Security Model — Progressive Trust Reduction
 
@@ -281,16 +325,11 @@ Hercules progressively reduces trust assumptions as each phase ships. At every s
 
 ### Phase 2: Sovereign Validation (app open)
 
-While the app is foregrounded, Hercules is a fully-validating pruned Bitcoin node:
-
-- Validates every new block: transaction scripts (via libbitcoinconsensus), UTXO spends, merkle roots, proof of work, coinbase rewards
-- Verifies your own transactions against your own UTXO set — zero reliance on third parties
-- Relays mempool transactions according to your chosen policy
-- Prunes old block data, keeping storage at ~10-12GB
+While the app is foregrounded, Hercules validates every new block: transaction scripts (via libbitcoinconsensus), UTXO spends, merkle roots, proof of work, coinbase rewards. Verifies your own transactions against your own UTXO set — zero reliance on third parties. Prunes old block data, keeping storage at ~10-12GB.
 
 **Trust assumption:** The AssumeUTXO snapshot hash, hardcoded in open-source code and cross-verifiable against Bitcoin Core v26+ source. This is the same trust model every Bitcoin Core user operates under by default.
 
-**Limitation:** App must be open. If backgrounded or killed, validation pauses until reopened.
+**Limitation:** App must be open. If backgrounded or killed, validation pauses until reopened. Does not relay or serve peers.
 
 ### Phase 4: Always-On Validation (push notifications)
 
@@ -298,13 +337,19 @@ Silent push notifications wake the app every ~10 minutes when a new block is min
 
 Your phone validates every block 24/7, whether you're using the app or not — matching a dedicated home node for the function that matters most (consensus enforcement).
 
-**Limitation:** Mempool relay only runs while foregrounded. Push windows are too short for sustained relay.
+**Limitation:** Validates but does not yet relay blocks, serve peers, or maintain a mempool.
 
-### Phase 5: Cooperative Verification
+### Phase 5: Full Network Participation
+
+Hercules becomes a real network participant: relays blocks and transactions, responds to peer requests, accepts inbound connections via Tor, and maintains a mempool. Advertises `NODE_NETWORK_LIMITED` (BIP 159). Functionally equivalent to Bitcoin Core in pruned mode.
+
+**Limitation:** Individual phone mempool relay is intermittent (only while app is active or during push windows).
+
+### Phase 6: Cooperative Verification
 
 Two cooperative features eliminate remaining limitations:
 
-**Mempool relay shifts:** Phones take scheduled turns relaying mempool transactions. With 60 users, each contributes 1 minute per hour for 24/7 continuous coverage. Solves the "relay only while foregrounded" constraint.
+**Mempool relay shifts:** Phones take scheduled turns relaying mempool transactions. With 60 users, each contributes 1 minute per hour for 24/7 continuous coverage. Solves the intermittent relay constraint.
 
 **Historical spot-checking:** The cooperative randomly audits historical blocks across the full chain, verifying merkle roots, coinbase rewards, and transaction structure. Reduces reliance on the AssumeUTXO trust assumption through distributed probabilistic verification.
 
@@ -321,8 +366,9 @@ Replace the ~8GB UTXO database with a ~1KB cryptographic accumulator (see Ticket
 | Stage | Trust assumption | Practical risk |
 |---|---|---|
 | Phase 2 | AssumeUTXO hash (in open-source code, matches Bitcoin Core) | Same as default Bitcoin Core |
-| Phase 4 | Same, but no validation gaps from app closure | Full real-time node |
-| Phase 5 spot-checking | Cooperative audits reduce snapshot reliance | Lower than Bitcoin Core default |
+| Phase 4 | Same, but no validation gaps from app closure | Full real-time validation |
+| Phase 5 | Same, but now a full network participant (relay + serve) | Equivalent to pruned Bitcoin Core |
+| Phase 6 spot-checking | Cooperative audits reduce snapshot reliance | Lower than Bitcoin Core default |
 | Utreexo cooperative | Full chain verified, zero trust assumptions | Equivalent to full archival node |
 
 ## Resource Requirements (On-Device)
@@ -337,7 +383,7 @@ Replace the ~8GB UTXO database with a ~1KB cryptographic accumulator (see Ticket
 
 ## What Hercules Is Not
 
-- **Not a wallet.** It is the trust layer underneath your wallet. In Phase 6, existing wallets (BlueWallet, Sparrow, any Electrum-compatible wallet) can point at Hercules to verify transactions against your own node, on your own device.
+- **Not a wallet.** It is the trust layer underneath your wallet. In Phase 7, existing wallets (BlueWallet, Sparrow, any Electrum-compatible wallet) can point at Hercules to verify transactions against your own node, on your own device.
 - **Not a mining node.** It validates, it does not produce blocks.
 - **Not a 24/7 server replacement.** Individual phones are intermittent. The cooperative protocol provides collective continuity, but a single Hercules node does not replace a dedicated always-on node for network infrastructure purposes.
 
