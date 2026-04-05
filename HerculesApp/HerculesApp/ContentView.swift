@@ -196,6 +196,7 @@ class SnapshotProgressCallback: SnapshotCallback {
 struct ContentView: View {
     @StateObject private var viewModel = NodeViewModel()
     @State private var showSettings = false
+    @State private var showAbout = false
 
     var body: some View {
         ZStack {
@@ -205,7 +206,7 @@ struct ContentView: View {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 20) {
                         // Logo / header area
-                        ZStack(alignment: .topTrailing) {
+                        ZStack {
                             VStack(spacing: 8) {
                                 Text("HERCULES")
                                     .font(.system(size: 34, weight: .heavy, design: .default))
@@ -222,15 +223,29 @@ struct ContentView: View {
                             }
                             .frame(maxWidth: .infinity)
 
-                            Button(action: { showSettings = true }) {
-                                Image(systemName: "gearshape.fill")
-                                    .font(.system(size: 16))
-                                    .foregroundStyle(Theme.textSecondary)
-                                    .padding(8)
+                            HStack {
+                                Button(action: { showAbout = true }) {
+                                    Image(systemName: "questionmark.circle")
+                                        .font(.system(size: 16))
+                                        .foregroundStyle(Theme.textSecondary)
+                                        .padding(8)
+                                }
+
+                                Spacer()
+
+                                Button(action: { showSettings = true }) {
+                                    Image(systemName: "gearshape.fill")
+                                        .font(.system(size: 16))
+                                        .foregroundStyle(Theme.textSecondary)
+                                        .padding(8)
+                                }
                             }
                         }
                         .padding(.top, 16)
                         .padding(.bottom, 4)
+                        .sheet(isPresented: $showAbout) {
+                            AboutView()
+                        }
                         .sheet(isPresented: $showSettings) {
                             SettingsView()
                         }
