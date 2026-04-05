@@ -661,6 +661,11 @@ impl HeaderSync {
                     // Process one message from each connected peer (round-robin)
                     self.service_peer_messages(&mut pool);
 
+                    // Avoid busy-spinning when no peers are connected
+                    if pool.count() == 0 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+
                     // If a peer announced a new block, break immediately to fetch it
                     if self.new_block_announced.swap(false, Ordering::Relaxed) {
                         info!("Breaking monitor loop early — new block announced");
@@ -692,9 +697,15 @@ impl HeaderSync {
                         pool.maintain();
                         self.mempool.lock().unwrap().expire_old();
                         self.update_peer_counts(&pool);
-                        // Cap per-peer known_txids to prevent unbounded growth
+                        // Clean up relay_state: remove entries for disconnected peers
+                        // and cap per-peer known_txids to prevent unbounded growth
                         {
+                            let connected: HashSet<String> = pool.peer_info()
+                                .iter()
+                                .map(|p| p.addr.clone())
+                                .collect();
                             let mut state = self.relay_state.lock().unwrap();
+                            state.retain(|addr, _| connected.contains(addr));
                             for rs in state.values_mut() {
                                 if rs.known_txids.len() > 10_000 {
                                     rs.known_txids.clear();
@@ -1049,6 +1060,8 @@ impl HeaderSync {
             }
 
             NetworkMessage::FeeFilter(rate) => {
+                // BIP 133: rate is i64 sat/kvB. Clamp negative values to 0.
+                let clamped = rate.max(0) as u64;
                 let mut state = self.relay_state.lock().unwrap();
                 state
                     .entry(addr.to_string())
@@ -1057,7 +1070,7 @@ impl HeaderSync {
                         feefilter_rate: 0,
                         known_txids: HashSet::new(),
                     })
-                    .feefilter_rate = rate as u64;
+                    .feefilter_rate = clamped;
             }
 
             NetworkMessage::MemPool => {
@@ -1106,7 +1119,15 @@ impl HeaderSync {
 
         let from = start_height.unwrap_or(0);
         let tip_height = self.store.count().unwrap_or(0).saturating_sub(1) as u32;
-        let to = std::cmp::min(from + 1999, tip_height);
+        let mut to = std::cmp::min(from + 1999, tip_height);
+
+        // Respect stop_hash: stop sending headers once we hit it
+        let stop_hash = get_hdrs.stop_hash;
+        if stop_hash != BlockHash::all_zeros() {
+            if let Ok(Some(stop_height)) = self.store.find_height_of_hash(stop_hash) {
+                to = std::cmp::min(to, stop_height);
+            }
+        }
 
         if from > to {
             // Nothing to send
@@ -1152,7 +1173,7 @@ impl HeaderSync {
                         }
                     }
                 }
-                Inventory::Transaction(txid) => {
+                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     let mempool = self.mempool.lock().unwrap();
                     if let Some(tx) = mempool.get(txid) {
                         let tx_clone = tx.clone();
@@ -1491,6 +1512,12 @@ impl HeaderSync {
                         Some(format!("utxo: {}", e));
                     return Ok(notification);
                 }
+
+                // Store block for NODE_NETWORK_LIMITED serving
+                let _ = self.block_store.store_block(&block, new_tip);
+
+                // Remove confirmed transactions from mempool
+                self.mempool.lock().unwrap().remove_confirmed(&block);
 
                 self.store
                     .set_validated_height(new_tip)

@@ -198,7 +198,7 @@ impl PeerPool {
             match result {
                 Ok(peer) => {
                     let user_agent = peer.peer_user_agent().unwrap_or_default();
-                    let height = peer.peer_height().unwrap_or(0) as u32;
+                    let height = peer.peer_height().unwrap_or(0).max(0) as u32;
                     info!("PeerPool: connected to {} ({}) at height {}", addr, user_agent, height);
 
                     let slot = PeerSlot {
@@ -357,20 +357,22 @@ impl PeerPool {
     }
 
     /// Add an inbound peer to the pool. Returns false if at inbound capacity.
+    /// Uses a single lock acquisition for check+insert to avoid TOCTOU races.
     pub fn add_inbound_peer(&self, peer: Peer) -> bool {
-        let inbound = self.inbound_count();
+        let addr = peer.addr().to_string();
+        let user_agent = peer.peer_user_agent().unwrap_or_default();
+        let height = peer.peer_height().unwrap_or(0).max(0) as u32;
+
+        let mut slots = self.slots.lock().unwrap();
+        let inbound = slots.iter().filter(|s| s.inbound).count();
         if inbound >= MAX_INBOUND {
             info!("PeerPool: rejecting inbound peer (at capacity {}/{})", inbound, MAX_INBOUND);
             return false;
         }
 
-        let addr = peer.addr().to_string();
-        let user_agent = peer.peer_user_agent().unwrap_or_default();
-        let height = peer.peer_height().unwrap_or(0) as u32;
-
         info!("PeerPool: accepted inbound peer {} ({}) at height {}", addr, user_agent, height);
 
-        let slot = PeerSlot {
+        slots.push(PeerSlot {
             peer: Some(peer),
             addr,
             user_agent,
@@ -378,9 +380,7 @@ impl PeerPool {
             misbehavior: 0,
             inbound: true,
             checked_out_at: None,
-        };
-
-        self.slots.lock().unwrap().push(slot);
+        });
         true
     }
 

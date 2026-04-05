@@ -206,11 +206,10 @@ impl HerculesNode {
 
             // Start the onion hidden service so we can accept inbound connections.
             // Must be called before wrapping in Arc (requires &mut self).
+            // The handle is stored internally on TorManager to keep the service alive.
             match manager.start_onion_service(8333) {
-                Ok(handle) => {
-                    // Keep the handle alive — dropping it would stop the service.
-                    // The TorManager stores the inbound_rx internally.
-                    std::mem::forget(handle);
+                Ok(addr) => {
+                    log::info!("Onion service running at {}", addr);
                 }
                 Err(e) => {
                     log::warn!("Onion service failed to start (non-fatal): {}", e);

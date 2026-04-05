@@ -94,6 +94,11 @@ impl Mempool {
     ) -> Result<Txid, MempoolError> {
         let txid = tx.compute_txid();
 
+        // 0. Reject coinbase transactions (only valid in blocks)
+        if tx.is_coinbase() {
+            return Err(MempoolError::CoinbaseTx);
+        }
+
         // 1. Already in mempool?
         if self.txs.contains_key(&txid) {
             return Err(MempoolError::AlreadyInMempool);
@@ -357,17 +362,20 @@ impl Mempool {
 
     /// Minimum fee rate in the mempool (sat/vB), or 0.0 if empty.
     pub fn min_fee_rate(&self) -> f64 {
+        if self.txs.is_empty() {
+            return 0.0;
+        }
         self.txs
             .values()
             .map(|e| e.fee_rate)
             .fold(f64::INFINITY, f64::min)
-            .min(f64::INFINITY)
     }
 }
 
 /// Errors from mempool transaction validation.
 #[derive(Debug)]
 pub enum MempoolError {
+    CoinbaseTx,
     AlreadyInMempool,
     ConflictsWith(Txid),
     MissingInput { txid: Txid, vout: u32 },
@@ -384,6 +392,7 @@ pub enum MempoolError {
 impl std::fmt::Display for MempoolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            MempoolError::CoinbaseTx => write!(f, "coinbase transactions are not allowed in mempool"),
             MempoolError::AlreadyInMempool => write!(f, "transaction already in mempool"),
             MempoolError::ConflictsWith(txid) => {
                 write!(f, "conflicts with mempool tx {}", txid)
@@ -471,8 +480,8 @@ mod tests {
     #[test]
     fn min_fee_rate_empty() {
         let pool = Mempool::new();
-        // Empty pool should return infinity
-        assert!(pool.min_fee_rate().is_infinite());
+        // Empty pool should return 0.0
+        assert_eq!(pool.min_fee_rate(), 0.0);
     }
 
     #[test]

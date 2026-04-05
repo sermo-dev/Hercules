@@ -120,6 +120,8 @@ pub struct TorManager {
     onion_address: Option<String>,
     /// Channel receiving inbound connections from the onion service.
     inbound_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<TorStream>>>,
+    /// Handle to the running onion service. Dropping this stops the service.
+    _onion_handle: Option<OnionServiceHandle>,
 }
 
 impl TorManager {
@@ -173,6 +175,7 @@ impl TorManager {
             bootstrap_progress,
             onion_address: None,
             inbound_rx: None,
+            _onion_handle: None,
         })
     }
 
@@ -257,7 +260,7 @@ pub struct OnionServiceHandle {
     pub address: String,
     // The onion service stays alive as long as this handle exists.
     // Arti manages the service internally via the TorClient.
-    _service: Box<dyn std::any::Any + Send>,
+    _service: Box<dyn std::any::Any + Send + Sync>,
 }
 
 impl TorManager {
@@ -266,7 +269,7 @@ impl TorManager {
     ///
     /// The persistent keypair is stored in the Tor data directory,
     /// giving the node a stable .onion address across restarts.
-    pub fn start_onion_service(&mut self, port: u16) -> Result<OnionServiceHandle, TorError> {
+    pub fn start_onion_service(&mut self, port: u16) -> Result<String, TorError> {
         info!("Tor: starting onion service on port {}", port);
 
         let handle = self.runtime.handle().clone();
@@ -328,7 +331,9 @@ impl TorManager {
                                     Ok(data_stream) => {
                                         let tor_stream = TorStream::new(h.clone(), data_stream);
                                         if tx.try_send(tor_stream).is_err() {
-                                            break; // channel full/disconnected
+                                            // Channel full — drop this connection but keep
+                                            // accepting future ones on this circuit.
+                                            continue;
                                         }
                                     }
                                     Err(e) => {
@@ -347,10 +352,12 @@ impl TorManager {
 
         self.inbound_rx = Some(std::sync::Mutex::new(rx));
 
-        Ok(OnionServiceHandle {
-            address: onion_addr,
+        self._onion_handle = Some(OnionServiceHandle {
+            address: onion_addr.clone(),
             _service: Box::new(service),
-        })
+        });
+
+        Ok(onion_addr)
     }
 
     /// Try to accept a pending inbound connection from the onion service.
