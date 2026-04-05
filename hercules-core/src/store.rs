@@ -213,6 +213,177 @@ impl HeaderStore {
         Ok(())
     }
 
+    /// Find the height of a block by its hash. Returns None if not found.
+    pub fn find_height_of_hash(&self, hash: BlockHash) -> Result<Option<u32>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let result = conn.query_row(
+            "SELECT height FROM headers WHERE hash = ?1",
+            params![hash.to_byte_array().as_slice()],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(height) => Ok(Some(height)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StoreError(format!("find hash: {}", e))),
+        }
+    }
+
+    /// Delete all headers above the given height (for reorg rollback).
+    pub fn delete_headers_above(&self, height: u32) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let deleted = conn
+            .execute("DELETE FROM headers WHERE height > ?1", params![height])
+            .map_err(|e| StoreError(format!("delete headers above {}: {}", height, e)))?;
+        info!("Deleted {} headers above height {}", deleted, height);
+        Ok(())
+    }
+
+    /// Build a block locator for the getheaders P2P message.
+    /// Returns hashes from the tip backwards: first 10 are consecutive,
+    /// then exponentially spaced, always ending with genesis.
+    pub fn get_locator_hashes(&self) -> Result<Vec<BlockHash>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+
+        let tip_height: Option<u32> = conn
+            .query_row("SELECT MAX(height) FROM headers", [], |row| row.get(0))
+            .map_err(|e| StoreError(format!("max height: {}", e)))?;
+
+        let tip_height = match tip_height {
+            Some(h) => h,
+            None => return Ok(Vec::new()),
+        };
+
+        // Build height list: first 10 consecutive, then exponentially spaced
+        let mut heights = Vec::new();
+        let mut h = tip_height as i64;
+        let mut step: i64 = 1;
+        while h >= 0 {
+            heights.push(h as u32);
+            if heights.len() >= 10 {
+                step *= 2;
+            }
+            h -= step;
+        }
+        // Always include genesis
+        if *heights.last().unwrap_or(&0) != 0 {
+            heights.push(0);
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT hash FROM headers WHERE height = ?1")
+            .map_err(|e| StoreError(format!("prepare locator: {}", e)))?;
+
+        let mut hashes = Vec::new();
+        for height in heights {
+            let hash_bytes: Vec<u8> = stmt
+                .query_row(params![height], |row| row.get(0))
+                .map_err(|e| StoreError(format!("locator at {}: {}", height, e)))?;
+            let hash_array: [u8; 32] = hash_bytes
+                .try_into()
+                .map_err(|_| StoreError("invalid hash length in locator".into()))?;
+            hashes.push(BlockHash::from_byte_array(hash_array));
+        }
+
+        Ok(hashes)
+    }
+
+    /// Get the last N timestamps ending at or below the given height.
+    /// Used for median time validation during reorgs (where the chain tip
+    /// may not be the height we need timestamps for).
+    pub fn timestamps_up_to(&self, height: u32, count: u32) -> Result<Vec<u32>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp FROM headers WHERE height <= ?1 ORDER BY height DESC LIMIT ?2",
+            )
+            .map_err(|e| StoreError(format!("prepare timestamps_up_to: {}", e)))?;
+
+        let mut timestamps: Vec<u32> = stmt
+            .query_map(params![height, count], |row| row.get(0))
+            .map_err(|e| StoreError(format!("query timestamps_up_to: {}", e)))?
+            .collect::<Result<Vec<u32>, _>>()
+            .map_err(|e| StoreError(format!("read timestamp: {}", e)))?;
+
+        timestamps.reverse(); // ascending height order
+        Ok(timestamps)
+    }
+
+    /// Get a single header at a given height (hash + deserialized header).
+    pub fn get_header_at_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<(BlockHash, Header)>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let result = conn
+            .query_row(
+                "SELECT hash, header FROM headers WHERE height = ?1",
+                params![height],
+                |row| {
+                    let hash_bytes: Vec<u8> = row.get(0)?;
+                    let header_bytes: Vec<u8> = row.get(1)?;
+                    Ok((hash_bytes, header_bytes))
+                },
+            );
+        match result {
+            Ok((hash_bytes, header_bytes)) => {
+                let hash_array: [u8; 32] = hash_bytes
+                    .try_into()
+                    .map_err(|_| StoreError("invalid hash length".into()))?;
+                let hash = BlockHash::from_byte_array(hash_array);
+                let header: Header = deserialize(&header_bytes)
+                    .map_err(|e| StoreError(format!("parse header at {}: {}", height, e)))?;
+                Ok(Some((hash, header)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StoreError(format!("get header at {}: {}", height, e))),
+        }
+    }
+
+    /// Get headers in a height range [from, to] inclusive. For chainwork comparison.
+    pub fn get_headers_in_range(
+        &self,
+        from: u32,
+        to: u32,
+    ) -> Result<Vec<Header>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT header FROM headers WHERE height >= ?1 AND height <= ?2 ORDER BY height",
+            )
+            .map_err(|e| StoreError(format!("prepare range query: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![from, to], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| StoreError(format!("range query: {}", e)))?
+            .collect::<Result<Vec<Vec<u8>>, _>>()
+            .map_err(|e| StoreError(format!("range row: {}", e)))?;
+
+        rows.iter()
+            .map(|bytes| {
+                deserialize(bytes)
+                    .map_err(|e| StoreError(format!("parse header in range: {}", e)))
+            })
+            .collect()
+    }
+
     /// Get the total number of stored headers.
     pub fn count(&self) -> Result<u32, StoreError> {
         let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
@@ -420,5 +591,98 @@ mod tests {
         // Update it
         store.set_validated_height(100).unwrap();
         assert_eq!(store.validated_height().unwrap(), 100);
+    }
+
+    #[test]
+    fn find_height_of_hash_returns_correct_height() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+        store.store_headers(&[genesis], 0).unwrap();
+        let height = store.find_height_of_hash(genesis.block_hash()).unwrap();
+        assert_eq!(height, Some(0));
+    }
+
+    #[test]
+    fn find_height_of_missing_hash_returns_none() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let hash = BlockHash::from_byte_array([0xFF; 32]);
+        assert_eq!(store.find_height_of_hash(hash).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_headers_above_removes_correct_headers() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+        let block1 = block1_header();
+        store.store_headers(&[genesis, block1], 0).unwrap();
+        assert_eq!(store.count().unwrap(), 2);
+
+        store.delete_headers_above(0).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        assert!(store.get_hash_at_height(0).unwrap().is_some());
+        assert!(store.get_hash_at_height(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_locator_hashes_includes_tip_and_genesis() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+        let block1 = block1_header();
+        store.store_headers(&[genesis, block1], 0).unwrap();
+
+        let locator = store.get_locator_hashes().unwrap();
+        assert!(!locator.is_empty());
+        assert_eq!(locator[0], block1.block_hash());
+        assert_eq!(*locator.last().unwrap(), genesis.block_hash());
+    }
+
+    #[test]
+    fn get_headers_in_range_returns_correct_headers() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+        let block1 = block1_header();
+        store.store_headers(&[genesis, block1], 0).unwrap();
+
+        let headers = store.get_headers_in_range(0, 1).unwrap();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].block_hash(), genesis.block_hash());
+        assert_eq!(headers[1].block_hash(), block1.block_hash());
+    }
+
+    #[test]
+    fn timestamps_up_to_returns_ascending_order() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+        let block1 = block1_header();
+        store.store_headers(&[genesis, block1], 0).unwrap();
+
+        // Ask for timestamps up to height 1
+        let ts = store.timestamps_up_to(1, 11).unwrap();
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0], genesis.time);
+        assert_eq!(ts[1], block1.time);
+
+        // Ask for timestamps up to height 0 only
+        let ts0 = store.timestamps_up_to(0, 11).unwrap();
+        assert_eq!(ts0.len(), 1);
+        assert_eq!(ts0[0], genesis.time);
+    }
+
+    #[test]
+    fn get_header_at_height_returns_correct_header() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+        let block1 = block1_header();
+        store.store_headers(&[genesis, block1], 0).unwrap();
+
+        let (hash, header) = store.get_header_at_height(0).unwrap().unwrap();
+        assert_eq!(hash, genesis.block_hash());
+        assert_eq!(header.time, genesis.time);
+
+        let (hash1, header1) = store.get_header_at_height(1).unwrap().unwrap();
+        assert_eq!(hash1, block1.block_hash());
+        assert_eq!(header1.time, block1.time);
+
+        assert!(store.get_header_at_height(999).unwrap().is_none());
     }
 }

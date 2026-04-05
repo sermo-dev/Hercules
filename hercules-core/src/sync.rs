@@ -14,10 +14,13 @@ use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
 use crate::tor::TorManager;
 use crate::utxo::{SnapshotMeta, UtxoSet};
-use crate::validation::validate_headers;
+use crate::validation::{chainwork_for_headers, u256_gt, validate_headers};
 
 /// How often to poll for new blocks after initial sync (seconds).
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Maximum reorg depth we'll accept (bounded by undo data retention window).
+const MAX_REORG_DEPTH: u32 = 288;
 
 /// Genesis block header (block 0).
 fn genesis_header() -> Header {
@@ -280,8 +283,14 @@ impl HeaderSync {
             let mut peer = best_peer.unwrap();
             let active_addr = peer.addr().to_string();
 
+            // Build block locator (tip + exponentially spaced hashes)
+            let locator = self
+                .store
+                .get_locator_hashes()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
             // Request headers from best peer
-            let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
+            let headers = match peer.get_headers(locator, BlockHash::all_zeros()) {
                 Ok(h) => {
                     pool.return_peer(peer);
                     h
@@ -315,7 +324,7 @@ impl HeaderSync {
                             "Peer {} claims height {} but has no headers above {}, banning",
                             active_addr, claimed, tip_height
                         );
-                        pool.ban_peer(&active_addr);
+                        pool.misbehaving(&active_addr, 100);
                         pool.maintain();
                         continue;
                     }
@@ -520,17 +529,12 @@ impl HeaderSync {
                     "Peer sent {} headers (max 2000), disconnecting",
                     headers.len()
                 );
-                pool.remove_peer(&active_addr);
+                pool.misbehaving(&active_addr, 100);
                 pool.maintain();
                 continue;
             }
-            let batch_size = headers.len() as u32;
 
-            let timestamps = self
-                .store
-                .last_timestamps(11)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
+            // Epoch lookup for header validation (used in both fork and normal paths)
             let store = &self.store;
             let epoch_lookup = |height: u32| -> Result<u32, String> {
                 store
@@ -538,6 +542,202 @@ impl HeaderSync {
                     .map_err(|e| format!("{}", e))?
                     .ok_or_else(|| format!("no header at height {}", height))
             };
+
+            // ── Fork detection ──────────────────────────────────────
+            // If the first header's prev_hash doesn't match our tip,
+            // the peer's chain diverges from ours.
+            if headers[0].prev_blockhash != tip_hash {
+                let first_prev = headers[0].prev_blockhash;
+
+                let fork_base = self
+                    .store
+                    .find_height_of_hash(first_prev)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                match fork_base {
+                    None => {
+                        // Headers don't connect to any known block
+                        warn!("Peer {} sent unconnectable headers", active_addr);
+                        pool.misbehaving(&active_addr, 20);
+                        continue;
+                    }
+                    Some(base_height) => {
+                        // Walk forward to find the exact divergence point
+                        let mut fork_at = base_height;
+                        for i in 0..headers.len() {
+                            let h = base_height + 1 + i as u32;
+                            if h > tip_height {
+                                break;
+                            }
+                            match self
+                                .store
+                                .get_hash_at_height(h)
+                                .map_err(|e| SyncError::Store(format!("{}", e)))?
+                            {
+                                Some(our_hash)
+                                    if our_hash == headers[i].block_hash() =>
+                                {
+                                    fork_at = h;
+                                }
+                                _ => break,
+                            }
+                        }
+
+                        let reorg_depth = tip_height - fork_at;
+
+                        if reorg_depth == 0 {
+                            // Headers match our chain — peer responded from a lower
+                            // locator point. This shouldn't happen normally; just retry.
+                            warn!(
+                                "Locator matched at {} but no fork (depth 0), skipping",
+                                base_height
+                            );
+                            continue;
+                        }
+
+                        if reorg_depth > MAX_REORG_DEPTH {
+                            warn!(
+                                "Peer {} suggests reorg depth {} (max {}), ignoring",
+                                active_addr, reorg_depth, MAX_REORG_DEPTH
+                            );
+                            pool.misbehaving(&active_addr, 20);
+                            continue;
+                        }
+
+                        // Compare chainwork: our chain vs the fork
+                        let our_headers = self
+                            .store
+                            .get_headers_in_range(fork_at + 1, tip_height)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                        let our_work = chainwork_for_headers(&our_headers);
+
+                        let new_chain_offset = (fork_at - base_height) as usize;
+                        let new_work =
+                            chainwork_for_headers(&headers[new_chain_offset..]);
+
+                        if !u256_gt(&new_work, &our_work) {
+                            info!(
+                                "Fork at height {} has equal or less work, ignoring",
+                                fork_at
+                            );
+                            continue;
+                        }
+
+                        // ── Execute reorg ────────────────────────────
+                        info!(
+                            "Reorg detected: depth {}, rolling back from {} to {}",
+                            reorg_depth, tip_height, fork_at
+                        );
+
+                        // Step 1: Gather fork-point context BEFORE any
+                        // destructive operations (validate-before-destroy).
+                        let (fork_hash, fork_header) = self
+                            .store
+                            .get_header_at_height(fork_at)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?
+                            .ok_or_else(|| {
+                                SyncError::Store(format!(
+                                    "no header at fork height {}",
+                                    fork_at
+                                ))
+                            })?;
+                        let fork_timestamps = self
+                            .store
+                            .timestamps_up_to(fork_at, 11)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                        // Step 2: Validate new chain headers against the
+                        // fork point. If this fails, our existing chain is
+                        // untouched — just penalize the peer.
+                        let new_headers = &headers[new_chain_offset..];
+                        if let Err(e) = validate_headers(
+                            new_headers,
+                            fork_hash,
+                            fork_at,
+                            &fork_timestamps,
+                            fork_header.bits,
+                            &epoch_lookup,
+                        ) {
+                            warn!(
+                                "Reorg rejected: new chain failed validation: {}",
+                                e
+                            );
+                            pool.misbehaving(&active_addr, 50);
+                            continue;
+                        }
+
+                        // Step 3: Validation passed — now perform the
+                        // destructive rollback.
+                        let current_validated = self
+                            .store
+                            .validated_height()
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                        // Roll back UTXO set for validated blocks above fork point
+                        if current_validated > fork_at {
+                            for h in (fork_at + 1..=current_validated).rev() {
+                                self.utxo
+                                    .rollback_block(h)
+                                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                            }
+                            info!(
+                                "Rolled back UTXO set from {} to {}",
+                                current_validated, fork_at
+                            );
+                        }
+
+                        // Delete headers above fork point
+                        self.store
+                            .delete_headers_above(fork_at)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                        // Reset validated height
+                        let new_validated =
+                            std::cmp::min(current_validated, fork_at);
+                        self.store
+                            .set_validated_height(new_validated)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                        // Step 4: Store the validated new chain headers.
+                        self.store
+                            .store_headers(new_headers, fork_at + 1)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                        let new_tip = fork_at + new_headers.len() as u32;
+                        peer_height = std::cmp::max(peer_height, new_tip);
+
+                        info!(
+                            "Reorg complete: new tip at height {} ({} new headers)",
+                            new_tip,
+                            new_headers.len()
+                        );
+
+                        let best = pool.best_peer_addr().unwrap_or_default();
+                        on_progress(self.make_status(
+                            new_tip,
+                            peer_height,
+                            &pool,
+                            &best,
+                            true,
+                            new_validated,
+                            Some(format!(
+                                "Reorg: rolled back {} blocks to height {}",
+                                reorg_depth, fork_at
+                            )),
+                        ));
+
+                        continue;
+                    }
+                }
+            }
+
+            // ── Normal extension: headers build on our tip ──────────
+            let batch_size = headers.len() as u32;
+
+            let timestamps = self
+                .store
+                .last_timestamps(11)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
             validate_headers(
                 &headers,

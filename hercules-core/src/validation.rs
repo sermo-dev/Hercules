@@ -252,6 +252,137 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+// ── U256 helpers for chainwork computation ──────────────────────────
+
+/// Add two 256-bit little-endian values.
+fn u256_add(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut carry: u16 = 0;
+    for i in 0..32 {
+        let sum = a[i] as u16 + b[i] as u16 + carry;
+        result[i] = sum as u8;
+        carry = sum >> 8;
+    }
+    result
+}
+
+/// Subtract b from a (256-bit little-endian). Assumes a >= b.
+fn u256_sub(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut borrow: i16 = 0;
+    for i in 0..32 {
+        let diff = a[i] as i16 - b[i] as i16 - borrow;
+        if diff < 0 {
+            result[i] = (diff + 256) as u8;
+            borrow = 1;
+        } else {
+            result[i] = diff as u8;
+            borrow = 0;
+        }
+    }
+    result
+}
+
+/// Bitwise NOT of a 256-bit little-endian value.
+fn u256_not(a: [u8; 32]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    for i in 0..32 {
+        result[i] = !a[i];
+    }
+    result
+}
+
+/// Check if a >= b (256-bit little-endian).
+fn u256_gte(a: [u8; 32], b: [u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] > b[i] {
+            return true;
+        }
+        if a[i] < b[i] {
+            return false;
+        }
+    }
+    true // equal
+}
+
+/// Divide a by b (256-bit little-endian), returning the quotient.
+/// Uses binary long division.
+fn u256_div_u256(numerator: [u8; 32], denominator: [u8; 32]) -> [u8; 32] {
+    if denominator == [0u8; 32] {
+        return [0xFF; 32];
+    }
+
+    let mut quotient = [0u8; 32];
+    let mut remainder = [0u8; 32];
+
+    for i in (0..256usize).rev() {
+        // Shift remainder left by 1 bit
+        let mut carry = 0u8;
+        for byte in remainder.iter_mut() {
+            let new_carry = *byte >> 7;
+            *byte = (*byte << 1) | carry;
+            carry = new_carry;
+        }
+
+        // Bring down next bit from numerator
+        let byte_idx = i / 8;
+        let bit_idx = i % 8;
+        remainder[0] |= (numerator[byte_idx] >> bit_idx) & 1;
+
+        if u256_gte(remainder, denominator) {
+            remainder = u256_sub(remainder, denominator);
+            quotient[byte_idx] |= 1 << bit_idx;
+        }
+    }
+
+    quotient
+}
+
+/// Compare a > b (256-bit little-endian).
+pub fn u256_gt(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if a[i] > b[i] {
+            return true;
+        }
+        if a[i] < b[i] {
+            return false;
+        }
+    }
+    false // equal means not greater
+}
+
+/// Compute work for a compact target value.
+/// Uses Bitcoin Core's formula: (~target / (target + 1)) + 1
+fn work_for_compact_target(bits: CompactTarget) -> [u8; 32] {
+    let target = Target::from_compact(bits);
+    let t = target.to_le_bytes();
+
+    if t == [0u8; 32] {
+        return [0u8; 32];
+    }
+
+    let one = {
+        let mut b = [0u8; 32];
+        b[0] = 1;
+        b
+    };
+    let not_t = u256_not(t);
+    let t_plus_1 = u256_add(t, one);
+    let q = u256_div_u256(not_t, t_plus_1);
+    u256_add(q, one)
+}
+
+/// Compute cumulative proof-of-work for a sequence of headers.
+/// Returns a 256-bit little-endian value representing total chainwork.
+pub fn chainwork_for_headers(headers: &[Header]) -> [u8; 32] {
+    let mut total = [0u8; 32];
+    for header in headers {
+        let work = work_for_compact_target(header.bits);
+        total = u256_add(total, work);
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +621,61 @@ mod tests {
             "tampered nonce should fail PoW: {:?}",
             result
         );
+    }
+
+    // ── Chainwork ────────────────────────────────────────────────────
+
+    #[test]
+    fn work_for_genesis_difficulty() {
+        let bits = CompactTarget::from_consensus(0x1d00ffff);
+        let work = super::work_for_compact_target(bits);
+        assert!(work != [0u8; 32]);
+        // At genesis difficulty, work ≈ 2^32
+        let work_u64 = u64::from_le_bytes(work[0..8].try_into().unwrap());
+        assert!(work_u64 > 0);
+        assert!(work_u64 < 1 << 33);
+    }
+
+    #[test]
+    fn chainwork_sums_correctly() {
+        let genesis = genesis_header();
+        let block1 = block1_header();
+        let single = super::chainwork_for_headers(&[genesis]);
+        let double = super::chainwork_for_headers(&[genesis, block1]);
+        assert!(super::u256_gt(&double, &single));
+    }
+
+    #[test]
+    fn u256_add_basic() {
+        let mut a = [0u8; 32];
+        a[0] = 200;
+        let mut b = [0u8; 32];
+        b[0] = 100;
+        let result = super::u256_add(a, b);
+        assert_eq!(result[0], 0x2C);
+        assert_eq!(result[1], 0x01);
+    }
+
+    #[test]
+    fn u256_div_u256_basic() {
+        let mut a = [0u8; 32];
+        a[0] = 100;
+        let mut b = [0u8; 32];
+        b[0] = 10;
+        let result = super::u256_div_u256(a, b);
+        assert_eq!(result[0], 10);
+        assert!(result[1..].iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn u256_gt_works() {
+        let mut a = [0u8; 32];
+        a[0] = 5;
+        let mut b = [0u8; 32];
+        b[0] = 3;
+        assert!(super::u256_gt(&a, &b));
+        assert!(!super::u256_gt(&b, &a));
+        assert!(!super::u256_gt(&a, &a));
     }
 
     #[test]

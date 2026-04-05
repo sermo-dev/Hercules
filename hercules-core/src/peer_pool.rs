@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,15 +28,19 @@ struct PeerSlot {
     user_agent: String,
     height: u32,
     connected_at: Instant,
+    misbehavior: u32,
 }
 
 /// Minimum interval between DNS re-discovery attempts.
 const DNS_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Thread-safe pool of Bitcoin peer connections.
-/// Maximum number of banned addresses to track (bounded to prevent growth).
-const MAX_BANNED: usize = 256;
+/// Duration of a peer ban (24 hours, matches Bitcoin Core default).
+const BAN_DURATION: Duration = Duration::from_secs(24 * 3600);
 
+/// Misbehavior score threshold for automatic banning (matches Bitcoin Core's 100).
+const BAN_THRESHOLD: u32 = 100;
+
+/// Thread-safe pool of Bitcoin peer connections.
 pub struct PeerPool {
     slots: Arc<Mutex<Vec<PeerSlot>>>,
     known_addrs: Vec<String>,
@@ -45,8 +49,8 @@ pub struct PeerPool {
     our_height: u32,
     /// Last time DNS seeds were queried (for backoff).
     last_dns_query: Instant,
-    /// Peers banned for misbehavior (height lying, invalid data).
-    banned_addrs: HashSet<String>,
+    /// Peers banned for misbehavior, with ban expiry time.
+    bans: HashMap<String, Instant>,
     tor: Option<Arc<TorManager>>,
 }
 
@@ -72,7 +76,7 @@ impl PeerPool {
             next_addr: 0,
             our_height,
             last_dns_query: Instant::now(),
-            banned_addrs: HashSet::new(),
+            bans: HashMap::new(),
             tor,
         };
 
@@ -89,6 +93,10 @@ impl PeerPool {
 
     /// Try to fill the pool up to `MAX_OUTBOUND` connections.
     pub fn maintain(&mut self) {
+        // Expire old bans
+        let now = Instant::now();
+        self.bans.retain(|_, expiry| *expiry > now);
+
         let current = self.slots.lock().unwrap().len();
         if current >= MAX_OUTBOUND {
             return;
@@ -130,7 +138,7 @@ impl PeerPool {
             attempts += 1;
 
             // Skip if already connected or banned
-            if self.banned_addrs.contains(&addr) {
+            if self.bans.contains_key(&addr) {
                 continue;
             }
             {
@@ -158,6 +166,7 @@ impl PeerPool {
                         user_agent,
                         height,
                         connected_at: Instant::now(),
+                        misbehavior: 0,
                     };
 
                     self.slots.lock().unwrap().push(slot);
@@ -246,13 +255,32 @@ impl PeerPool {
 
     /// Ban a peer address. Removes it from the pool and prevents reconnection.
     pub fn ban_peer(&mut self, addr: &str) {
-        // Keep ban list bounded
-        if self.banned_addrs.len() >= MAX_BANNED {
-            self.banned_addrs.clear();
-        }
-        self.banned_addrs.insert(addr.to_string());
+        let expiry = Instant::now() + BAN_DURATION;
+        self.bans.insert(addr.to_string(), expiry);
         self.remove_peer(addr);
-        info!("PeerPool: banned peer {}", addr);
+        info!("PeerPool: banned peer {} for 24h", addr);
+    }
+
+    /// Record misbehavior for a peer. If the score reaches BAN_THRESHOLD (100),
+    /// the peer is automatically banned (following Bitcoin Core's Misbehaving() pattern).
+    pub fn misbehaving(&mut self, addr: &str, howmuch: u32) {
+        let mut should_ban = false;
+        {
+            let mut slots = self.slots.lock().unwrap();
+            if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+                slot.misbehavior = slot.misbehavior.saturating_add(howmuch);
+                warn!(
+                    "PeerPool: peer {} misbehaving (+{}), score now {}",
+                    addr, howmuch, slot.misbehavior
+                );
+                if slot.misbehavior >= BAN_THRESHOLD {
+                    should_ban = true;
+                }
+            }
+        }
+        if should_ban {
+            self.ban_peer(addr);
+        }
     }
 
     /// Get the claimed height of a connected peer by address string.
@@ -260,7 +288,7 @@ impl PeerPool {
         let slots = self.slots.lock().unwrap();
         slots
             .iter()
-            .find(|s| s.addr.to_string() == addr)
+            .find(|s| s.addr == addr)
             .map(|s| s.height)
     }
 
