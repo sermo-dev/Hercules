@@ -60,6 +60,9 @@ interface HerculesNode {
 
     [Throws=HerculesError]
     SnapshotInfo load_snapshot(string snapshot_path, SnapshotCallback callback);
+
+    void set_validation_paused(boolean paused);
+    boolean is_validation_paused();
 };
 
 [Error]

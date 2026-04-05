@@ -178,6 +178,16 @@ impl HerculesNode {
             utxo_hash: hex::encode(meta.utxo_hash),
         })
     }
+
+    /// Pause or resume block validation. Header sync continues regardless.
+    pub fn set_validation_paused(&self, paused: bool) {
+        self.syncer.set_validation_paused(paused);
+    }
+
+    /// Check if block validation is currently paused.
+    pub fn is_validation_paused(&self) -> bool {
+        self.syncer.is_validation_paused()
+    }
 }
 
 /// Callback for snapshot loading progress.

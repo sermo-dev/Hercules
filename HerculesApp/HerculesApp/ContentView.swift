@@ -25,6 +25,7 @@ class NodeViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var isLoadingSnapshot = false
     @Published var snapshotProgress: Double = 0
+    @Published var isValidationPaused = false
 
     private var node: HerculesNode?
 
@@ -103,6 +104,13 @@ class NodeViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func toggleValidationPaused() {
+        guard let node = node else { return }
+        let newState = !isValidationPaused
+        node.setValidationPaused(paused: newState)
+        isValidationPaused = newState
     }
 
     static func dbPath() -> String {
@@ -186,7 +194,7 @@ struct ContentView: View {
 
                         // Block validation progress card
                         if let status = viewModel.syncStatus, status.validatedBlocks > 0 {
-                            BlockValidationCard(status: status)
+                            BlockValidationCard(status: status, viewModel: viewModel)
                         }
 
                         // Peers card
@@ -351,6 +359,7 @@ struct SyncProgressCard: View {
 
 struct BlockValidationCard: View {
     let status: SyncStatus
+    @ObservedObject var viewModel: NodeViewModel
 
     var progress: Double {
         guard status.syncedHeaders > 0 else { return 0 }
@@ -365,8 +374,14 @@ struct BlockValidationCard: View {
         status.validatedBlocks >= status.syncedHeaders && status.syncedHeaders > 0
     }
 
-    var isValidating: Bool {
-        status.validatedBlocks > 0 && status.validatedBlocks < status.syncedHeaders
+    var isPaused: Bool {
+        viewModel.isValidationPaused
+    }
+
+    var statusColor: Color {
+        if isComplete { return Theme.success }
+        if isPaused { return Theme.textTertiary }
+        return Theme.warning
     }
 
     var body: some View {
@@ -375,14 +390,14 @@ struct BlockValidationCard: View {
                 HStack {
                     Image(systemName: "cube.fill")
                         .font(.system(size: 12))
-                        .foregroundStyle(isComplete ? Theme.success : Theme.warning)
-                    Text("Block Validation")
+                        .foregroundStyle(statusColor)
+                    Text(isPaused ? "Block Validation (Paused)" : "Block Validation")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(Theme.textSecondary)
                     Spacer()
                     Text(percentText)
                         .font(.system(size: 13, weight: .bold, design: .monospaced))
-                        .foregroundStyle(isComplete ? Theme.success : Theme.warning)
+                        .foregroundStyle(statusColor)
                 }
 
                 // Progress bar
@@ -397,13 +412,15 @@ struct BlockValidationCard: View {
                                 LinearGradient(
                                     colors: isComplete
                                         ? [Theme.success, Theme.success]
-                                        : [Theme.warning, Theme.warning.opacity(0.7)],
+                                        : isPaused
+                                            ? [Theme.textTertiary, Theme.textTertiary.opacity(0.7)]
+                                            : [Theme.warning, Theme.warning.opacity(0.7)],
                                     startPoint: .leading,
                                     endPoint: .trailing
                                 )
                             )
                             .frame(width: geo.size.width * progress, height: 8)
-                            .shadow(color: (isComplete ? Theme.success : Theme.warning).opacity(0.4), radius: 6, y: 2)
+                            .shadow(color: statusColor.opacity(0.4), radius: 6, y: 2)
                     }
                 }
                 .frame(height: 8)
@@ -413,6 +430,23 @@ struct BlockValidationCard: View {
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
                         .foregroundStyle(Theme.textSecondary)
                     Spacer()
+
+                    if !isComplete {
+                        Button(action: { viewModel.toggleValidationPaused() }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: isPaused ? "play.fill" : "pause.fill")
+                                    .font(.system(size: 10))
+                                Text(isPaused ? "Resume" : "Pause")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .foregroundStyle(isPaused ? Theme.accent : Theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(isPaused ? Theme.accent.opacity(0.15) : Color.white.opacity(0.06))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                    }
+
                     Label(formatNumber(status.syncedHeaders), systemImage: "target")
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
                         .foregroundStyle(Theme.textTertiary)

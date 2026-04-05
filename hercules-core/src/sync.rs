@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::block::Header;
@@ -43,6 +45,7 @@ pub struct SyncStatus {
 pub struct HeaderSync {
     store: HeaderStore,
     utxo: UtxoSet,
+    validation_paused: Arc<AtomicBool>,
 }
 
 impl HeaderSync {
@@ -86,7 +89,11 @@ impl HeaderSync {
             );
         }
 
-        Ok(HeaderSync { store, utxo })
+        Ok(HeaderSync {
+            store,
+            utxo,
+            validation_paused: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Load a UTXO snapshot from a file path. Sets validated_height to the
@@ -131,6 +138,17 @@ impl HeaderSync {
             .validated_height()
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
         Ok(count == 0 && validated == 0)
+    }
+
+    /// Pause block validation. Header sync continues.
+    pub fn set_validation_paused(&self, paused: bool) {
+        self.validation_paused.store(paused, Ordering::Relaxed);
+        info!("Block validation {}", if paused { "paused" } else { "resumed" });
+    }
+
+    /// Check if block validation is currently paused.
+    pub fn is_validation_paused(&self) -> bool {
+        self.validation_paused.load(Ordering::Relaxed)
     }
 
     /// Build a SyncStatus snapshot from the pool and current state.
@@ -283,7 +301,9 @@ impl HeaderSync {
                     validated = tip_height;
                 }
 
-                if validated < tip_height {
+                if validated < tip_height
+                    && !self.validation_paused.load(Ordering::Relaxed)
+                {
                     // Download and validate next block
                     let next_height = validated + 1;
                     let block_hash = self
