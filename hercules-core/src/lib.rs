@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 
@@ -6,8 +9,11 @@ mod p2p;
 mod peer_pool;
 mod store;
 mod sync;
+mod tor;
 mod utxo;
 mod validation;
+
+use tor::TorManager;
 
 uniffi::include_scaffolding!("hercules");
 
@@ -96,6 +102,27 @@ impl From<sync::SyncStatus> for SyncStatus {
     }
 }
 
+// ── Phase 3 types (Tor integration) ────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TorStatus {
+    pub is_bootstrapped: bool,
+    pub bootstrap_progress: u8,
+    pub onion_address: Option<String>,
+}
+
+impl From<tor::TorStatus> for TorStatus {
+    fn from(s: tor::TorStatus) -> Self {
+        TorStatus {
+            is_bootstrapped: s.is_bootstrapped,
+            bootstrap_progress: s.bootstrap_progress,
+            onion_address: s.onion_address,
+        }
+    }
+}
+
+// ── Errors ─────────────────────────────────────────────────────────
+
 #[derive(Debug, thiserror::Error)]
 pub enum HerculesError {
     #[error("Sync failed: {msg}")]
@@ -104,6 +131,8 @@ pub enum HerculesError {
     StorageError { msg: String },
     #[error("Network error: {msg}")]
     NetworkError { msg: String },
+    #[error("Tor error: {msg}")]
+    TorError { msg: String },
 }
 
 pub trait SyncCallback: Send + Sync {
@@ -112,14 +141,30 @@ pub trait SyncCallback: Send + Sync {
 
 pub struct HerculesNode {
     syncer: sync::HeaderSync,
+    tor: Option<Arc<TorManager>>,
 }
 
 impl HerculesNode {
-    pub fn new(db_path: String) -> Result<Self, HerculesError> {
-        let syncer = sync::HeaderSync::new(&db_path).map_err(|e| HerculesError::StorageError {
-            msg: format!("{}", e),
-        })?;
-        Ok(HerculesNode { syncer })
+    /// Create a new Hercules node.
+    ///
+    /// If `tor_data_dir` is provided, all network connections will be routed
+    /// through Tor. This blocks during Tor bootstrap (~5-15 seconds).
+    pub fn new(db_path: String, tor_data_dir: Option<String>) -> Result<Self, HerculesError> {
+        let tor = if let Some(ref dir) = tor_data_dir {
+            let path = PathBuf::from(dir);
+            let manager = TorManager::bootstrap(&path).map_err(|e| HerculesError::TorError {
+                msg: format!("{}", e),
+            })?;
+            Some(Arc::new(manager))
+        } else {
+            None
+        };
+
+        let syncer =
+            sync::HeaderSync::new(&db_path, tor.clone()).map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })?;
+        Ok(HerculesNode { syncer, tor })
     }
 
     pub fn get_status(&self) -> Result<SyncStatus, HerculesError> {
@@ -183,6 +228,11 @@ impl HerculesNode {
     /// call will return on the next loop iteration.
     pub fn stop_sync(&self) {
         self.syncer.stop_sync();
+    }
+
+    /// Get the current Tor status. Returns None if Tor is not enabled.
+    pub fn get_tor_status(&self) -> Option<TorStatus> {
+        self.tor.as_ref().map(|t| t.status().into())
     }
 
     /// Pause or resume block validation. Header sync continues regardless.
@@ -298,7 +348,7 @@ mod tests {
 
     #[test]
     fn node_new_and_status() {
-        let node = HerculesNode::new(":memory:".into()).unwrap();
+        let node = HerculesNode::new(":memory:".into(), None).unwrap();
         let status = node.get_status().unwrap();
 
         // Fresh node has genesis stored, so synced_headers = 0 (count 1 minus 1)

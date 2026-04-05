@@ -13,9 +13,15 @@ bitcoin = { version = "0.32", features = ["serde", "bitcoinconsensus"] }
 bitcoinconsensus = "0.105"
 hex = "0.4"
 sha2 = "0.10"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.36", features = ["bundled"] }
 log = "0.4"
 thiserror = "1.0"
+arti-client = { version = "0.41", default-features = false, features = [
+    "tokio", "rustls", "onion-service-client", "onion-service-service", "compression"
+] }
+tor-rtcompat = { version = "0.41", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "io-util"] }
+safelog = "0.8"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

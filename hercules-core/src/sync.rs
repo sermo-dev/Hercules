@@ -12,6 +12,7 @@ use log::{info, warn};
 use crate::block_validation::{validate_block, validate_block_scripts};
 use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
+use crate::tor::TorManager;
 use crate::utxo::{SnapshotMeta, UtxoSet};
 use crate::validation::validate_headers;
 
@@ -47,10 +48,11 @@ pub struct HeaderSync {
     utxo: UtxoSet,
     validation_paused: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    tor: Option<Arc<TorManager>>,
 }
 
 impl HeaderSync {
-    pub fn new(db_path: &str) -> Result<HeaderSync, SyncError> {
+    pub fn new(db_path: &str, tor: Option<Arc<TorManager>>) -> Result<HeaderSync, SyncError> {
         let store =
             HeaderStore::open(db_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
@@ -90,11 +92,16 @@ impl HeaderSync {
             );
         }
 
+        if tor.is_some() {
+            info!("HeaderSync: Tor enabled — all connections routed through Tor");
+        }
+
         Ok(HeaderSync {
             store,
             utxo,
             validation_paused: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            tor,
         })
     }
 
@@ -200,7 +207,7 @@ impl HeaderSync {
             .saturating_sub(1);
 
         // Create the peer pool
-        let mut pool = PeerPool::new(our_height).map_err(|e| {
+        let mut pool = PeerPool::new(our_height, self.tor.clone()).map_err(|e| {
             if format!("{}", e).contains("no peers discovered") {
                 SyncError::NoPeers
             } else {
@@ -271,8 +278,7 @@ impl HeaderSync {
                 continue;
             }
             let mut peer = best_peer.unwrap();
-            let active_sock = peer.addr();
-            let active_addr = active_sock.to_string();
+            let active_addr = peer.addr().to_string();
 
             // Request headers from best peer
             let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
@@ -309,7 +315,7 @@ impl HeaderSync {
                             "Peer {} claims height {} but has no headers above {}, banning",
                             active_addr, claimed, tip_height
                         );
-                        pool.ban_peer(active_sock);
+                        pool.ban_peer(&active_addr);
                         pool.maintain();
                         continue;
                     }

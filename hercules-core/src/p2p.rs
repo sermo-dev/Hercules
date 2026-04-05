@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -13,11 +13,17 @@ use bitcoin::BlockHash;
 
 use log::{debug, info, warn};
 
+use crate::tor::{TorManager, TorStream};
+
 const PROTOCOL_VERSION: u32 = 70016;
 const USER_AGENT: &str = "/Hercules:0.1.0/";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Timeouts used when connecting through Tor (higher latency).
+const TOR_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const TOR_BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// DNS seeds for discovering Bitcoin mainnet peers.
 const DNS_SEEDS: &[&str] = &[
@@ -31,22 +37,79 @@ const DNS_SEEDS: &[&str] = &[
     "seed.bitcoin.wiz.biz",
 ];
 
+/// Well-known Bitcoin v3 .onion seed nodes.
+/// These are 56-character base32-encoded v3 onion addresses.
+/// TODO: verify these against Bitcoin Core's current seed list.
+const ONION_SEEDS: &[&str] = &[
+    "bsqbtcparrfihlwolt4xgjbf4cgqckvrvsfyvy6etgfnhongzoqxziad.onion:8333",
+    "bnpczgbhoyoeg5nai4e4aw2kkxbda47gx2jrlansi6xxne5jrwxfauad.onion:8333",
+    "wizbit5555bsslwv4cqlcc7zsahelqeyaa5kauwcy2b4fhbzab5pwdqd.onion:8333",
+    "2dayzh7uruqtfflmhlt3r2pj2xygkdmcpbezfbml4nbnwrae7zn6eqd.onion:8333",
+];
+
+// ── PeerStream ────────────────────────────────────────────────────────
+
+/// Abstraction over TCP and Tor streams for Bitcoin P2P connections.
+pub enum PeerStream {
+    Direct(TcpStream),
+    Tor(TorStream),
+}
+
+impl PeerStream {
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            PeerStream::Direct(tcp) => tcp.set_read_timeout(timeout),
+            PeerStream::Tor(tor) => {
+                tor.set_read_timeout(timeout);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Read for PeerStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            PeerStream::Direct(tcp) => tcp.read(buf),
+            PeerStream::Tor(tor) => tor.read(buf),
+        }
+    }
+}
+
+impl Write for PeerStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            PeerStream::Direct(tcp) => tcp.write(buf),
+            PeerStream::Tor(tor) => tor.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            PeerStream::Direct(tcp) => tcp.flush(),
+            PeerStream::Tor(tor) => tor.flush(),
+        }
+    }
+}
+
+// ── Peer ──────────────────────────────────────────────────────────────
+
 /// A connection to a single Bitcoin peer.
 pub struct Peer {
-    stream: TcpStream,
-    addr: SocketAddr,
+    stream: PeerStream,
+    addr: String,
     their_version: Option<VersionMessage>,
 }
 
 impl Peer {
-    /// Discover peer addresses from DNS seeds.
-    pub fn discover_peers() -> Vec<SocketAddr> {
+    /// Discover peer addresses from DNS seeds (clearnet).
+    pub fn discover_peers() -> Vec<String> {
         let mut addrs = Vec::new();
         for seed in DNS_SEEDS {
             let seed_with_port = format!("{}:8333", seed);
             match seed_with_port.to_socket_addrs() {
                 Ok(resolved) => {
-                    let new_addrs: Vec<SocketAddr> = resolved.collect();
+                    let new_addrs: Vec<String> = resolved.map(|a| a.to_string()).collect();
                     info!("DNS seed {} returned {} peers", seed, new_addrs.len());
                     addrs.extend(new_addrs);
                 }
@@ -59,11 +122,43 @@ impl Peer {
         addrs
     }
 
-    /// Connect to a peer and complete the version handshake.
-    pub fn connect(addr: SocketAddr, our_height: i32) -> Result<Peer, PeerError> {
+    /// Discover peer addresses through Tor (no clearnet DNS leak).
+    /// Resolves DNS seeds via Tor and adds well-known .onion seed nodes.
+    pub fn discover_peers_tor(tor: &TorManager) -> Vec<String> {
+        let mut addrs = Vec::new();
+
+        // Resolve DNS seeds through Tor
+        for seed in DNS_SEEDS {
+            match tor.resolve(seed) {
+                Ok(resolved) => {
+                    let new_addrs: Vec<String> = resolved.iter().map(|a| a.to_string()).collect();
+                    info!("DNS seed {} (via Tor) returned {} peers", seed, new_addrs.len());
+                    addrs.extend(new_addrs);
+                }
+                Err(e) => {
+                    warn!("Failed to resolve DNS seed {} via Tor: {}", seed, e);
+                }
+            }
+        }
+
+        // Add well-known .onion seed nodes
+        for onion in ONION_SEEDS {
+            addrs.push(onion.to_string());
+        }
+        info!("Discovered {} total peer addresses via Tor ({} onion seeds)", addrs.len(), ONION_SEEDS.len());
+
+        addrs
+    }
+
+    /// Connect to a peer over direct TCP and complete the version handshake.
+    pub fn connect(addr: &str, our_height: i32) -> Result<Peer, PeerError> {
         info!("Connecting to peer {}", addr);
 
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        let sock_addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| PeerError::Connection(format!("invalid address {}: {}", addr, e)))?;
+
+        let stream = TcpStream::connect_timeout(&sock_addr, CONNECT_TIMEOUT)
             .map_err(|e| PeerError::Connection(format!("{}: {}", addr, e)))?;
 
         stream
@@ -71,8 +166,8 @@ impl Peer {
             .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
 
         let mut peer = Peer {
-            stream,
-            addr,
+            stream: PeerStream::Direct(stream),
+            addr: addr.to_string(),
             their_version: None,
         };
 
@@ -81,8 +176,35 @@ impl Peer {
         Ok(peer)
     }
 
+    /// Connect to a peer through Tor and complete the version handshake.
+    /// The address can be an IP:port, hostname:port, or .onion:port.
+    pub fn connect_tor(tor: &TorManager, addr: &str, our_height: i32) -> Result<Peer, PeerError> {
+        info!("Connecting to peer {} via Tor", addr);
+
+        let tor_stream = tor
+            .connect(addr)
+            .map_err(|e| PeerError::Connection(format!("{}: {}", addr, e)))?;
+
+        let mut peer = Peer {
+            stream: PeerStream::Tor(tor_stream),
+            addr: addr.to_string(),
+            their_version: None,
+        };
+
+        peer.handshake(our_height)?;
+        info!("Handshake complete with {} via Tor", addr);
+        Ok(peer)
+    }
+
     /// Perform the version/verack handshake.
     fn handshake(&mut self, our_height: i32) -> Result<(), PeerError> {
+        // For the version message, use a dummy address if we can't parse
+        // (e.g., .onion addresses don't map to SocketAddr).
+        let receiver_addr = self
+            .addr
+            .parse::<SocketAddr>()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8333)));
+
         // Send our version
         let our_version = VersionMessage {
             version: PROTOCOL_VERSION,
@@ -91,7 +213,7 @@ impl Peer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
                 .as_secs() as i64,
-            receiver: Address::new(&self.addr, ServiceFlags::NETWORK),
+            receiver: Address::new(&receiver_addr, ServiceFlags::NETWORK),
             sender: Address::new(
                 &SocketAddr::from(([0, 0, 0, 0], 0)),
                 ServiceFlags::NONE,
@@ -159,18 +281,34 @@ impl Peer {
     /// Send a Bitcoin P2P message.
     pub fn send(&mut self, msg: NetworkMessage) -> Result<(), PeerError> {
         let raw = RawNetworkMessage::new(Magic::BITCOIN, msg);
-        raw.consensus_encode(&mut self.stream)
-            .map_err(|e| PeerError::Send(format!("{}", e)))?;
-        self.stream
-            .flush()
-            .map_err(|e| PeerError::Send(format!("flush: {}", e)))?;
+        // bitcoin's consensus_encode requires bitcoin::io::Write, not std::io::Write.
+        // We match on the variant to get the concrete type which bitcoin_io knows about.
+        match &mut self.stream {
+            PeerStream::Direct(tcp) => {
+                raw.consensus_encode(tcp)
+                    .map_err(|e| PeerError::Send(format!("{}", e)))?;
+                tcp.flush()
+                    .map_err(|e| PeerError::Send(format!("flush: {}", e)))?;
+            }
+            PeerStream::Tor(tor) => {
+                raw.consensus_encode(&mut bitcoin::io::FromStd::new(&mut *tor))
+                    .map_err(|e| PeerError::Send(format!("{}", e)))?;
+                tor.flush()
+                    .map_err(|e| PeerError::Send(format!("flush: {}", e)))?;
+            }
+        }
         Ok(())
     }
 
     /// Receive a Bitcoin P2P message.
     pub fn receive(&mut self) -> Result<NetworkMessage, PeerError> {
-        let raw = RawNetworkMessage::consensus_decode(&mut self.stream)
-            .map_err(|e| PeerError::Receive(format!("{}", e)))?;
+        let raw = match &mut self.stream {
+            PeerStream::Direct(tcp) => RawNetworkMessage::consensus_decode(tcp),
+            PeerStream::Tor(tor) => {
+                RawNetworkMessage::consensus_decode(&mut bitcoin::io::FromStd::new(tor))
+            }
+        }
+        .map_err(|e| PeerError::Receive(format!("{}", e)))?;
         Ok(raw.payload().clone())
     }
 
@@ -217,8 +355,17 @@ impl Peer {
     /// to ensure segwit witness data is included.
     pub fn get_block(&mut self, block_hash: BlockHash) -> Result<Block, PeerError> {
         // Use longer timeout for block downloads (blocks can be up to ~4MB)
+        let download_timeout = match &self.stream {
+            PeerStream::Direct(_) => BLOCK_DOWNLOAD_TIMEOUT,
+            PeerStream::Tor(_) => TOR_BLOCK_DOWNLOAD_TIMEOUT,
+        };
+        let normal_timeout = match &self.stream {
+            PeerStream::Direct(_) => READ_TIMEOUT,
+            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
+        };
+
         self.stream
-            .set_read_timeout(Some(BLOCK_DOWNLOAD_TIMEOUT))
+            .set_read_timeout(Some(download_timeout))
             .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
 
         let inv = vec![Inventory::WitnessBlock(block_hash)];
@@ -228,7 +375,7 @@ impl Peer {
 
         // Restore normal read timeout
         self.stream
-            .set_read_timeout(Some(READ_TIMEOUT))
+            .set_read_timeout(Some(normal_timeout))
             .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
 
         result
@@ -268,14 +415,18 @@ impl Peer {
         self.their_version.as_ref().map(|v| v.user_agent.clone())
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+    pub fn addr(&self) -> &str {
+        &self.addr
     }
 
     /// Wait for a duration while responding to pings to keep the connection alive.
     /// Returns Ok on timeout (normal), Err if the peer disconnects.
     pub fn idle_wait(&mut self, duration: std::time::Duration) -> Result<(), PeerError> {
         let start = std::time::Instant::now();
+        let normal_timeout = match &self.stream {
+            PeerStream::Direct(_) => READ_TIMEOUT,
+            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
+        };
 
         while start.elapsed() < duration {
             let remaining = duration.saturating_sub(start.elapsed());
@@ -298,7 +449,7 @@ impl Peer {
 
         // Restore standard read timeout
         self.stream
-            .set_read_timeout(Some(READ_TIMEOUT))
+            .set_read_timeout(Some(normal_timeout))
             .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
 
         Ok(())

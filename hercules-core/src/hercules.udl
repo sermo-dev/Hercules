@@ -37,6 +37,12 @@ dictionary SnapshotInfo {
     string utxo_hash;
 };
 
+dictionary TorStatus {
+    boolean is_bootstrapped;
+    u8 bootstrap_progress;
+    string? onion_address;
+};
+
 callback interface SyncCallback {
     void on_progress(SyncStatus status);
 };
@@ -47,7 +53,7 @@ callback interface SnapshotCallback {
 
 interface HerculesNode {
     [Throws=HerculesError]
-    constructor(string db_path);
+    constructor(string db_path, string? tor_data_dir);
 
     [Throws=HerculesError]
     SyncStatus get_status();
@@ -64,6 +70,7 @@ interface HerculesNode {
     void stop_sync();
     void set_validation_paused(boolean paused);
     boolean is_validation_paused();
+    TorStatus? get_tor_status();
 };
 
 [Error]
@@ -71,4 +78,5 @@ interface HerculesError {
     SyncFailed(string msg);
     StorageError(string msg);
     NetworkError(string msg);
+    TorError(string msg);
 };

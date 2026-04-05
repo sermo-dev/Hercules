@@ -1,11 +1,11 @@
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
 use crate::p2p::{Peer, PeerError};
+use crate::tor::TorManager;
 
 /// Maximum number of outbound connections (matches Bitcoin Core default).
 const MAX_OUTBOUND: usize = 8;
@@ -24,7 +24,7 @@ pub struct PeerInfo {
 /// A slot holding a live peer connection.
 struct PeerSlot {
     peer: Option<Peer>,
-    addr: SocketAddr,
+    addr: String,
     user_agent: String,
     height: u32,
     connected_at: Instant,
@@ -39,21 +39,27 @@ const MAX_BANNED: usize = 256;
 
 pub struct PeerPool {
     slots: Arc<Mutex<Vec<PeerSlot>>>,
-    known_addrs: Vec<SocketAddr>,
+    known_addrs: Vec<String>,
     /// Index into known_addrs for round-robin connection attempts.
     next_addr: usize,
     our_height: u32,
     /// Last time DNS seeds were queried (for backoff).
     last_dns_query: Instant,
     /// Peers banned for misbehavior (height lying, invalid data).
-    banned_addrs: HashSet<SocketAddr>,
+    banned_addrs: HashSet<String>,
+    tor: Option<Arc<TorManager>>,
 }
 
 impl PeerPool {
-    /// Create a new peer pool. Discovers peers via DNS and connects to an
-    /// initial batch of up to `MAX_OUTBOUND` peers.
-    pub fn new(our_height: u32) -> Result<PeerPool, PeerError> {
-        let addrs = Peer::discover_peers();
+    /// Create a new peer pool. Discovers peers via DNS (or Tor if available)
+    /// and connects to an initial batch of up to `MAX_OUTBOUND` peers.
+    pub fn new(our_height: u32, tor: Option<Arc<TorManager>>) -> Result<PeerPool, PeerError> {
+        let addrs = if let Some(ref tor) = tor {
+            Peer::discover_peers_tor(tor)
+        } else {
+            Peer::discover_peers()
+        };
+
         if addrs.is_empty() {
             return Err(PeerError::Connection("no peers discovered via DNS".into()));
         }
@@ -67,6 +73,7 @@ impl PeerPool {
             our_height,
             last_dns_query: Instant::now(),
             banned_addrs: HashSet::new(),
+            tor,
         };
 
         pool.maintain();
@@ -93,7 +100,11 @@ impl PeerPool {
             && self.last_dns_query.elapsed() >= DNS_REDISCOVERY_INTERVAL
         {
             self.last_dns_query = Instant::now();
-            let fresh = Peer::discover_peers();
+            let fresh = if let Some(ref tor) = self.tor {
+                Peer::discover_peers_tor(tor)
+            } else {
+                Peer::discover_peers()
+            };
             if !fresh.is_empty() {
                 info!(
                     "PeerPool: refreshed DNS, got {} addresses",
@@ -114,7 +125,7 @@ impl PeerPool {
                 break; // exhausted address list
             }
 
-            let addr = self.known_addrs[self.next_addr];
+            let addr = self.known_addrs[self.next_addr].clone();
             self.next_addr += 1;
             attempts += 1;
 
@@ -129,7 +140,13 @@ impl PeerPool {
                 }
             }
 
-            match Peer::connect(addr, self.our_height as i32) {
+            let result = if let Some(ref tor) = self.tor {
+                Peer::connect_tor(tor, &addr, self.our_height as i32)
+            } else {
+                Peer::connect(&addr, self.our_height as i32)
+            };
+
+            match result {
                 Ok(peer) => {
                     let user_agent = peer.peer_user_agent().unwrap_or_default();
                     let height = peer.peer_height().unwrap_or(0) as u32;
@@ -191,7 +208,7 @@ impl PeerPool {
 
     /// Return a peer back to the pool after use.
     pub fn return_peer(&self, peer: Peer) {
-        let addr = peer.addr();
+        let addr = peer.addr().to_string();
         let mut slots = self.slots.lock().unwrap();
         for slot in slots.iter_mut() {
             if slot.addr == addr && slot.peer.is_none() {
@@ -207,7 +224,7 @@ impl PeerPool {
     pub fn remove_peer(&self, addr: &str) {
         let mut slots = self.slots.lock().unwrap();
         let before = slots.len();
-        slots.retain(|s| s.addr.to_string() != addr);
+        slots.retain(|s| s.addr != addr);
         let after = slots.len();
         if after < before {
             info!("PeerPool: removed peer {}, {} remaining", addr, after);
@@ -220,7 +237,7 @@ impl PeerPool {
         slots
             .iter()
             .map(|s| PeerInfo {
-                addr: s.addr.to_string(),
+                addr: s.addr.clone(),
                 user_agent: s.user_agent.clone(),
                 height: s.height,
             })
@@ -228,13 +245,13 @@ impl PeerPool {
     }
 
     /// Ban a peer address. Removes it from the pool and prevents reconnection.
-    pub fn ban_peer(&mut self, addr: SocketAddr) {
+    pub fn ban_peer(&mut self, addr: &str) {
         // Keep ban list bounded
         if self.banned_addrs.len() >= MAX_BANNED {
             self.banned_addrs.clear();
         }
-        self.banned_addrs.insert(addr);
-        self.remove_peer(&addr.to_string());
+        self.banned_addrs.insert(addr.to_string());
+        self.remove_peer(addr);
         info!("PeerPool: banned peer {}", addr);
     }
 
@@ -263,7 +280,7 @@ impl PeerPool {
         slots
             .iter()
             .max_by_key(|s| s.height)
-            .map(|s| s.addr.to_string())
+            .map(|s| s.addr.clone())
     }
 
     /// Service pings on all peers that are currently in the pool (not checked out).
@@ -271,11 +288,11 @@ impl PeerPool {
     /// Peers are taken out of slots before I/O so the mutex is not held during network operations.
     pub fn service_pings(&self) {
         // Take all idle peers out of their slots (releases lock for I/O)
-        let peers_with_addrs: Vec<(SocketAddr, Peer)> = {
+        let peers_with_addrs: Vec<(String, Peer)> = {
             let mut slots = self.slots.lock().unwrap();
             slots
                 .iter_mut()
-                .filter_map(|slot| slot.peer.take().map(|p| (slot.addr, p)))
+                .filter_map(|slot| slot.peer.take().map(|p| (slot.addr.clone(), p)))
                 .collect()
         };
 

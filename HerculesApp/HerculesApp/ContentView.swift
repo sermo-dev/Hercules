@@ -26,6 +26,8 @@ class NodeViewModel: ObservableObject {
     @Published var isLoadingSnapshot = false
     @Published var snapshotProgress: Double = 0
     @Published var isValidationPaused = false
+    @Published var torStatus: TorStatus?
+    @Published var isBootstrappingTor = false
 
     // Thread-safe access to the node: set from background thread, read from main thread
     private var _node: HerculesNode?
@@ -38,13 +40,27 @@ class NodeViewModel: ObservableObject {
     func startSync() {
         guard !isSyncRunning else { return }
         isConnecting = true
+        isBootstrappingTor = true
         isSyncRunning = true
         errorMessage = nil
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let dbPath = Self.dbPath()
-                let node = try HerculesNode(dbPath: dbPath)
+                let torDir = Self.torDataDir()
+                let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
+
+                // Fetch initial Tor status
+                if let status = node.getTorStatus() {
+                    DispatchQueue.main.async {
+                        self?.torStatus = status
+                        self?.isBootstrappingTor = false
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        self?.isBootstrappingTor = false
+                    }
+                }
                 self?.node = node
 
                 // Check if we need to load a UTXO snapshot
@@ -144,6 +160,11 @@ class NodeViewModel: ObservableObject {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("utxo-snapshot.hutx").path
     }
+
+    static func torDataDir() -> String {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return docs.appendingPathComponent("tor").path
+    }
 }
 
 class SyncProgressCallback: SyncCallback {
@@ -200,6 +221,11 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, 16)
                         .padding(.bottom, 4)
+
+                        // Tor status card
+                        if viewModel.isBootstrappingTor || viewModel.torStatus != nil {
+                            TorStatusCard(viewModel: viewModel)
+                        }
 
                         // Node status card
                         NodeStatusCard(viewModel: viewModel)
@@ -531,6 +557,63 @@ struct SnapshotLoadingCard: View {
     }
 }
 
+// MARK: - Tor Status Card
+
+struct TorStatusCard: View {
+    @ObservedObject var viewModel: NodeViewModel
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(
+                            viewModel.torStatus?.isBootstrapped == true
+                                ? Theme.success : Theme.warning
+                        )
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Tor Network")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Theme.textSecondary)
+                        Text(torStatusText)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Theme.textPrimary)
+                    }
+
+                    Spacer()
+
+                    if viewModel.isBootstrappingTor {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: Theme.warning))
+                            .scaleEffect(0.7)
+                    }
+                }
+
+                // Onion address display
+                if let addr = viewModel.torStatus?.onionAddress {
+                    HStack(spacing: 6) {
+                        Image(systemName: "eye.slash.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textTertiary)
+                        Text(truncateOnion(addr))
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                    .padding(.top, 2)
+                }
+            }
+        }
+    }
+
+    var torStatusText: String {
+        if viewModel.isBootstrappingTor { return "Connecting..." }
+        if viewModel.torStatus?.isBootstrapped == true { return "Connected" }
+        return "Offline"
+    }
+}
+
 // MARK: - Peers Card
 
 struct PeersCard: View {
@@ -556,9 +639,17 @@ struct PeersCard: View {
                                     ? Theme.success : Theme.textTertiary.opacity(0.4))
                                 .frame(width: 6, height: 6)
 
-                            Text(peer.addr)
+                            // Truncate .onion addresses for readability
+                            Text(truncateOnion(peer.addr))
                                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                                 .foregroundStyle(Theme.textPrimary)
+
+                            // Show onion icon for .onion peers
+                            if peer.addr.contains(".onion") {
+                                Image(systemName: "lock.shield.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(Theme.success.opacity(0.6))
+                            }
 
                             Spacer()
 
@@ -629,12 +720,13 @@ struct SyncButton: View {
 
     var label: String {
         if viewModel.isLoadingSnapshot { return "Loading UTXO Snapshot..." }
-        if viewModel.isConnecting { return "Connecting to Network..." }
+        if viewModel.isBootstrappingTor { return "Connecting to Tor..." }
+        if viewModel.isConnecting { return "Finding Peers via Tor..." }
         if canStop && isSyncing { return "Stop Sync" }
         if canStop && isSynced { return "Stop Node" }
         if canStop { return "Stop Node" }
         if viewModel.syncStatus != nil { return "Resume Sync" }
-        return "Connect to Bitcoin Network"
+        return "Connect via Tor"
     }
 
     var icon: String {
@@ -712,6 +804,20 @@ func formatNumber(_ n: UInt32) -> String {
     let formatter = NumberFormatter()
     formatter.numberStyle = .decimal
     return formatter.string(from: NSNumber(value: n)) ?? "\(n)"
+}
+
+/// Truncate long .onion addresses for display: "abcdef...xyz.onion:8333"
+func truncateOnion(_ addr: String) -> String {
+    guard addr.contains(".onion") else { return addr }
+    // Format: <56-char-hash>.onion:port
+    let parts = addr.split(separator: ":")
+    let host = String(parts.first ?? Substring(addr))
+    let port = parts.count > 1 ? ":\(parts[1])" : ""
+    let onionParts = host.split(separator: ".")
+    guard let hash = onionParts.first, hash.count > 16 else { return addr }
+    let prefix = hash.prefix(8)
+    let suffix = hash.suffix(8)
+    return "\(prefix)...\(suffix).onion\(port)"
 }
 
 #Preview {
