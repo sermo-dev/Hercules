@@ -2,10 +2,11 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use bitcoin::block::Block;
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
-use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
 use bitcoin::BlockHash;
@@ -16,6 +17,7 @@ const PROTOCOL_VERSION: u32 = 70016;
 const USER_AGENT: &str = "/Hercules:0.1.0/";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// DNS seeds for discovering Bitcoin mainnet peers.
 const DNS_SEEDS: &[&str] = &[
@@ -87,7 +89,7 @@ impl Peer {
             services: ServiceFlags::NONE,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(Duration::ZERO)
                 .as_secs() as i64,
             receiver: Address::new(&self.addr, ServiceFlags::NETWORK),
             sender: Address::new(
@@ -211,6 +213,53 @@ impl Peer {
         ))
     }
 
+    /// Request a full block by hash. Uses WitnessBlock inventory type
+    /// to ensure segwit witness data is included.
+    pub fn get_block(&mut self, block_hash: BlockHash) -> Result<Block, PeerError> {
+        // Use longer timeout for block downloads (blocks can be up to ~4MB)
+        self.stream
+            .set_read_timeout(Some(BLOCK_DOWNLOAD_TIMEOUT))
+            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+
+        let inv = vec![Inventory::WitnessBlock(block_hash)];
+        self.send(NetworkMessage::GetData(inv))?;
+
+        let result = self.receive_block();
+
+        // Restore normal read timeout
+        self.stream
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+
+        result
+    }
+
+    /// Read messages until we receive a Block response.
+    fn receive_block(&mut self) -> Result<Block, PeerError> {
+        for _ in 0..20 {
+            let msg = self.receive()?;
+            match msg {
+                NetworkMessage::Block(block) => return Ok(block),
+                NetworkMessage::Ping(nonce) => {
+                    self.send(NetworkMessage::Pong(nonce))?;
+                }
+                NetworkMessage::NotFound(_) => {
+                    return Err(PeerError::Receive("block not found by peer".into()));
+                }
+                other => {
+                    debug!(
+                        "Ignoring {} message while waiting for block",
+                        msg_name(&other)
+                    );
+                }
+            }
+        }
+
+        Err(PeerError::Receive(
+            "did not receive block response".into(),
+        ))
+    }
+
     pub fn peer_height(&self) -> Option<i32> {
         self.their_version.as_ref().map(|v| v.start_height)
     }
@@ -267,6 +316,8 @@ fn msg_name(msg: &NetworkMessage) -> &'static str {
         NetworkMessage::Headers(_) => "headers",
         NetworkMessage::Inv(_) => "inv",
         NetworkMessage::GetData(_) => "getdata",
+        NetworkMessage::Block(_) => "block",
+        NetworkMessage::NotFound(_) => "notfound",
         NetworkMessage::Addr(_) => "addr",
         NetworkMessage::Alert(_) => "alert",
         NetworkMessage::FeeFilter(_) => "feefilter",

@@ -59,6 +59,19 @@ class NodeViewModel: ObservableObject {
                     self?.errorMessage = "\(error)"
                     self?.isConnecting = false
                     self?.isSyncRunning = false
+                    // Clear stale peer data so status doesn't show "Synced"
+                    // while disconnected; preserve synced_headers count.
+                    if let s = self?.syncStatus {
+                        self?.syncStatus = SyncStatus(
+                            syncedHeaders: s.syncedHeaders,
+                            peerHeight: 0,
+                            peerAddr: "",
+                            peerUserAgent: "",
+                            isSyncing: false,
+                            validatedBlocks: s.validatedBlocks,
+                            error: "\(error)"
+                        )
+                    }
                 }
             }
         }
@@ -116,9 +129,14 @@ struct ContentView: View {
                         // Node status card
                         NodeStatusCard(viewModel: viewModel)
 
-                        // Sync progress card
+                        // Header sync progress card
                         if let status = viewModel.syncStatus, status.peerHeight > 0 {
                             SyncProgressCard(status: status)
+                        }
+
+                        // Block validation progress card
+                        if let status = viewModel.syncStatus, status.validatedBlocks > 0 {
+                            BlockValidationCard(status: status)
                         }
 
                         // Peer card
@@ -161,6 +179,7 @@ struct NodeStatusCard: View {
             return Theme.success
         }
         if viewModel.isConnecting { return Theme.warning }
+        if viewModel.errorMessage != nil { return Theme.error }
         return Theme.textTertiary
     }
 
@@ -170,6 +189,7 @@ struct NodeStatusCard: View {
         if let s = viewModel.syncStatus, s.peerHeight > 0, s.syncedHeaders >= s.peerHeight {
             return "Synced"
         }
+        if viewModel.errorMessage != nil { return "Disconnected" }
         if viewModel.syncStatus != nil { return "Idle" }
         return "Offline"
     }
@@ -269,6 +289,81 @@ struct SyncProgressCard: View {
                         .foregroundStyle(Theme.textSecondary)
                     Spacer()
                     Label(formatNumber(status.peerHeight), systemImage: "target")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Block Validation Card
+
+struct BlockValidationCard: View {
+    let status: SyncStatus
+
+    var progress: Double {
+        guard status.syncedHeaders > 0 else { return 0 }
+        return min(Double(status.validatedBlocks) / Double(status.syncedHeaders), 1.0)
+    }
+
+    var percentText: String {
+        String(format: "%.1f%%", progress * 100)
+    }
+
+    var isComplete: Bool {
+        status.validatedBlocks >= status.syncedHeaders && status.syncedHeaders > 0
+    }
+
+    var isValidating: Bool {
+        status.validatedBlocks > 0 && status.validatedBlocks < status.syncedHeaders
+    }
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Image(systemName: "cube.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(isComplete ? Theme.success : Theme.warning)
+                    Text("Block Validation")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Text(percentText)
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .foregroundStyle(isComplete ? Theme.success : Theme.warning)
+                }
+
+                // Progress bar
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.white.opacity(0.08))
+                            .frame(height: 8)
+
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(
+                                LinearGradient(
+                                    colors: isComplete
+                                        ? [Theme.success, Theme.success]
+                                        : [Theme.warning, Theme.warning.opacity(0.7)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: geo.size.width * progress, height: 8)
+                            .shadow(color: (isComplete ? Theme.success : Theme.warning).opacity(0.4), radius: 6, y: 2)
+                    }
+                }
+                .frame(height: 8)
+
+                HStack {
+                    Label(formatNumber(status.validatedBlocks), systemImage: "cube.fill")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Label(formatNumber(status.syncedHeaders), systemImage: "target")
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
                         .foregroundStyle(Theme.textTertiary)
                 }

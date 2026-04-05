@@ -21,6 +21,7 @@ dictionary SyncStatus {
     string peer_addr;
     string peer_user_agent;
     boolean is_syncing;
+    u32 validated_blocks;
     string? error;
 };
 

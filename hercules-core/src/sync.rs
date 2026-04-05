@@ -8,8 +8,10 @@ use bitcoin::BlockHash;
 
 use log::{info, warn};
 
+use crate::block_validation::{validate_block, validate_block_scripts};
 use crate::p2p::Peer;
 use crate::store::HeaderStore;
+use crate::utxo::UtxoSet;
 use crate::validation::validate_headers;
 
 /// How often to poll for new blocks after initial sync (seconds).
@@ -37,18 +39,29 @@ pub struct SyncStatus {
     pub peer_addr: String,
     pub peer_user_agent: String,
     pub is_syncing: bool,
+    pub validated_blocks: u32,
     pub error: Option<String>,
 }
 
-/// Sync block headers from the Bitcoin P2P network.
+/// Sync block headers and validate full blocks from the Bitcoin P2P network.
 pub struct HeaderSync {
     store: HeaderStore,
+    utxo: UtxoSet,
 }
 
 impl HeaderSync {
     pub fn new(db_path: &str) -> Result<HeaderSync, SyncError> {
         let store =
             HeaderStore::open(db_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        // Derive UTXO database path from header database path
+        let utxo_path = if db_path == ":memory:" {
+            ":memory:".to_string()
+        } else {
+            db_path.replace("headers", "utxo")
+        };
+        let utxo =
+            UtxoSet::open(&utxo_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
         // Ensure genesis header is stored
         if store.count().map_err(|e| SyncError::Store(format!("{}", e)))? == 0 {
@@ -59,7 +72,25 @@ impl HeaderSync {
             info!("Stored genesis header");
         }
 
-        Ok(HeaderSync { store })
+        // Handle upgrade from Phase 2a: if UTXO set is empty but blocks
+        // were already structurally validated, reset to re-validate with scripts
+        let validated = store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        let utxo_count = utxo
+            .count()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if validated > 0 && utxo_count == 0 {
+            store
+                .set_validated_height(0)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            info!(
+                "UTXO set empty but validated_height was {}, resetting to rebuild",
+                validated
+            );
+        }
+
+        Ok(HeaderSync { store, utxo })
     }
 
     /// Run header sync continuously. Calls `on_progress` with status updates.
@@ -93,6 +124,11 @@ impl HeaderSync {
             peer_addr, peer_user_agent, peer_height
         );
 
+        let validated = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
         // Report initial status
         on_progress(SyncStatus {
             synced_headers: our_height,
@@ -100,6 +136,7 @@ impl HeaderSync {
             peer_addr: peer_addr.clone(),
             peer_user_agent: peer_user_agent.clone(),
             is_syncing: true,
+            validated_blocks: validated,
             error: None,
         });
 
@@ -108,7 +145,12 @@ impl HeaderSync {
                 .store
                 .tip()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?
-                .expect("store should have at least genesis");
+                .ok_or_else(|| SyncError::Store("store has no headers".into()))?;
+
+            let current_validated = self
+                .store
+                .validated_height()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
             // Request headers from peer
             let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
@@ -116,7 +158,7 @@ impl HeaderSync {
                 Err(e) => {
                     warn!("Peer error: {}", e);
                     // Try to reconnect
-                    match self.reconnect(&addrs, tip_height, &on_progress, &peer_addr, &peer_user_agent) {
+                    match self.reconnect(&addrs, tip_height, &on_progress, &peer_addr, &peer_user_agent, current_validated) {
                         Ok(new_peer) => {
                             peer_height = new_peer.peer_height().unwrap_or(0) as u32;
                             peer_user_agent = new_peer.peer_user_agent().unwrap_or_default();
@@ -131,18 +173,118 @@ impl HeaderSync {
             };
 
             if headers.is_empty() {
-                // Fully synced — enter monitor mode
+                // Headers caught up — download and validate blocks
                 peer_height = std::cmp::max(peer_height, tip_height);
+
+                let mut validated = self
+                    .store
+                    .validated_height()
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                // Guard: if validated_height exceeds tip (e.g. after reorg), reset
+                if validated > tip_height {
+                    warn!(
+                        "validated_height {} exceeds tip {}, resetting",
+                        validated, tip_height
+                    );
+                    self.store
+                        .set_validated_height(tip_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                    validated = tip_height;
+                }
+
+                if validated < tip_height {
+                    // Download and validate next block
+                    let next_height = validated + 1;
+                    let block_hash = self
+                        .store
+                        .get_hash_at_height(next_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?
+                        .ok_or_else(|| {
+                            SyncError::Store(format!("no hash at height {}", next_height))
+                        })?;
+
+                    let block = match peer.get_block(block_hash) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("Block download error at height {}: {}", next_height, e);
+                            // Try to reconnect
+                            match self.reconnect(
+                                &addrs,
+                                tip_height,
+                                &on_progress,
+                                &peer_addr,
+                                &peer_user_agent,
+                                validated,
+                            ) {
+                                Ok(new_peer) => {
+                                    peer_height = new_peer.peer_height().unwrap_or(0) as u32;
+                                    peer_user_agent =
+                                        new_peer.peer_user_agent().unwrap_or_default();
+                                    peer_addr = new_peer.addr().to_string();
+                                    peer = new_peer;
+                                    continue;
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    };
+
+                    // Verify block hash matches our header chain
+                    if block.block_hash() != block_hash {
+                        return Err(SyncError::Validation(format!(
+                            "block {} hash mismatch: expected {}, got {}",
+                            next_height,
+                            block_hash,
+                            block.block_hash()
+                        )));
+                    }
+
+                    // Structural validation
+                    validate_block(&block, next_height)
+                        .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+
+                    // Script validation + UTXO verification
+                    validate_block_scripts(&block, next_height, &self.utxo)
+                        .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+
+                    // Update UTXO set with this block's changes
+                    self.utxo
+                        .apply_block(&block, next_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                    self.store
+                        .set_validated_height(next_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                    if next_height % 1000 == 0 {
+                        info!("Validated block {}/{}", next_height, tip_height);
+                    }
+
+                    on_progress(SyncStatus {
+                        synced_headers: tip_height,
+                        peer_height,
+                        peer_addr: peer_addr.clone(),
+                        peer_user_agent: peer_user_agent.clone(),
+                        is_syncing: false,
+                        validated_blocks: next_height,
+                        error: None,
+                    });
+
+                    continue; // Immediately download next block
+                }
+
+                // Fully synced and validated — monitor mode
                 on_progress(SyncStatus {
                     synced_headers: tip_height,
                     peer_height,
                     peer_addr: peer_addr.clone(),
                     peer_user_agent: peer_user_agent.clone(),
                     is_syncing: false,
+                    validated_blocks: validated,
                     error: None,
                 });
 
-                // Wait 30 seconds, responding to pings to keep connection alive
                 let _ = peer.idle_wait(MONITOR_INTERVAL);
                 continue;
             }
@@ -186,12 +328,18 @@ impl HeaderSync {
                 new_start, new_height, new_height
             );
 
+            let validated = self
+                .store
+                .validated_height()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
             on_progress(SyncStatus {
                 synced_headers: new_height,
                 peer_height,
                 peer_addr: peer_addr.clone(),
                 peer_user_agent: peer_user_agent.clone(),
                 is_syncing: new_height < peer_height,
+                validated_blocks: validated,
                 error: None,
             });
         }
@@ -205,6 +353,7 @@ impl HeaderSync {
         on_progress: &F,
         old_addr: &str,
         old_ua: &str,
+        validated: u32,
     ) -> Result<Peer, SyncError>
     where
         F: Fn(SyncStatus),
@@ -216,6 +365,7 @@ impl HeaderSync {
             peer_addr: old_addr.to_string(),
             peer_user_agent: old_ua.to_string(),
             is_syncing: false,
+            validated_blocks: validated,
             error: Some("Peer disconnected, reconnecting...".into()),
         });
 
@@ -251,12 +401,18 @@ impl HeaderSync {
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
         let height = count.saturating_sub(1);
 
+        let validated = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
         Ok(SyncStatus {
             synced_headers: height,
             peer_height: 0,
             peer_addr: String::new(),
             peer_user_agent: String::new(),
             is_syncing: false,
+            validated_blocks: validated,
             error: None,
         })
     }

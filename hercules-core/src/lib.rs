@@ -1,9 +1,11 @@
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 
+mod block_validation;
 mod p2p;
 mod store;
 mod sync;
+mod utxo;
 mod validation;
 
 uniffi::include_scaffolding!("hercules");
@@ -58,6 +60,7 @@ pub struct SyncStatus {
     pub peer_addr: String,
     pub peer_user_agent: String,
     pub is_syncing: bool,
+    pub validated_blocks: u32,
     pub error: Option<String>,
 }
 
@@ -69,6 +72,7 @@ impl From<sync::SyncStatus> for SyncStatus {
             peer_addr: s.peer_addr,
             peer_user_agent: s.peer_user_agent,
             is_syncing: s.is_syncing,
+            validated_blocks: s.validated_blocks,
             error: s.error,
         }
     }
@@ -233,6 +237,7 @@ mod tests {
             peer_addr: "1.2.3.4:8333".into(),
             peer_user_agent: "/Satoshi:27.0.0/".into(),
             is_syncing: true,
+            validated_blocks: 50,
             error: None,
         };
         let external: SyncStatus = internal.into();
@@ -240,5 +245,6 @@ mod tests {
         assert_eq!(external.peer_height, 800000);
         assert_eq!(external.peer_addr, "1.2.3.4:8333");
         assert!(external.is_syncing);
+        assert_eq!(external.validated_blocks, 50);
     }
 }

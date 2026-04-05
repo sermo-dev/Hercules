@@ -27,6 +27,10 @@ impl HeaderStore {
                 timestamp INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_headers_hash ON headers(hash);
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 ",
         )
         .map_err(|e| StoreError(format!("create tables: {}", e)))?;
@@ -47,10 +51,10 @@ impl HeaderStore {
         headers: &[Header],
         start_height: u32,
     ) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let mut conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
 
         let tx = conn
-            .unchecked_transaction()
+            .transaction()
             .map_err(|e| StoreError(format!("begin tx: {}", e)))?;
 
         {
@@ -140,6 +144,73 @@ impl HeaderStore {
         )
         .optional()
         .map_err(|e| StoreError(format!("get timestamp at {}: {}", height, e)))
+    }
+
+    /// Get the block hash at a given height from the header chain.
+    pub fn get_hash_at_height(&self, height: u32) -> Result<Option<BlockHash>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let result = conn
+            .query_row(
+                "SELECT hash FROM headers WHERE height = ?1",
+                params![height],
+                |row| {
+                    let hash_bytes: Vec<u8> = row.get(0)?;
+                    Ok(hash_bytes)
+                },
+            )
+            .optional()
+            .map_err(|e| StoreError(format!("get hash at {}: {}", height, e)))?;
+
+        match result {
+            Some(hash_bytes) => {
+                let hash_array: [u8; 32] = hash_bytes
+                    .try_into()
+                    .map_err(|_| StoreError("invalid hash length".into()))?;
+                Ok(Some(BlockHash::from_byte_array(hash_array)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get the highest block height that has been structurally validated.
+    /// Returns 0 if no blocks have been validated yet (genesis is implicit).
+    pub fn validated_height(&self) -> Result<u32, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let result = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'validated_height'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| StoreError(format!("get validated_height: {}", e)))?;
+
+        match result {
+            Some(s) => s
+                .parse::<u32>()
+                .map_err(|e| StoreError(format!("parse validated_height: {}", e))),
+            None => Ok(0),
+        }
+    }
+
+    /// Update the highest structurally validated block height.
+    pub fn set_validated_height(&self, height: u32) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('validated_height', ?1)",
+            params![height.to_string()],
+        )
+        .map_err(|e| StoreError(format!("set validated_height: {}", e)))?;
+        Ok(())
     }
 
     /// Get the total number of stored headers.
@@ -316,5 +387,38 @@ mod tests {
         let ts1 = store.get_timestamp_at(1).unwrap().unwrap();
         assert_eq!(ts0, genesis.time);
         assert_eq!(ts1, block1.time);
+    }
+
+    #[test]
+    fn get_hash_at_height_returns_correct_hash() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+
+        store.store_headers(&[genesis], 0).unwrap();
+        let hash = store.get_hash_at_height(0).unwrap().unwrap();
+        assert_eq!(hash, genesis.block_hash());
+    }
+
+    #[test]
+    fn get_hash_at_missing_height_returns_none() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        assert!(store.get_hash_at_height(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn validated_height_defaults_to_zero() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        assert_eq!(store.validated_height().unwrap(), 0);
+    }
+
+    #[test]
+    fn set_and_get_validated_height() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        store.set_validated_height(42).unwrap();
+        assert_eq!(store.validated_height().unwrap(), 42);
+
+        // Update it
+        store.set_validated_height(100).unwrap();
+        assert_eq!(store.validated_height().unwrap(), 100);
     }
 }
