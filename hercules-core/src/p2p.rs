@@ -99,6 +99,8 @@ pub struct Peer {
     stream: PeerStream,
     addr: String,
     their_version: Option<VersionMessage>,
+    /// True if this peer connected to us (inbound), false if we connected to them.
+    pub inbound: bool,
 }
 
 impl Peer {
@@ -169,6 +171,7 @@ impl Peer {
             stream: PeerStream::Direct(stream),
             addr: addr.to_string(),
             their_version: None,
+            inbound: false,
         };
 
         peer.handshake(our_height)?;
@@ -189,6 +192,7 @@ impl Peer {
             stream: PeerStream::Tor(tor_stream),
             addr: addr.to_string(),
             their_version: None,
+            inbound: false,
         };
 
         peer.handshake(our_height)?;
@@ -196,7 +200,83 @@ impl Peer {
         Ok(peer)
     }
 
-    /// Perform the version/verack handshake.
+    /// Accept an inbound connection: run the version handshake as responder.
+    /// (Wait for their version first, then send ours + verack.)
+    pub fn accept(stream: PeerStream, our_height: i32) -> Result<Peer, PeerError> {
+        let mut peer = Peer {
+            stream,
+            addr: String::new(), // filled after receiving their version
+            their_version: None,
+            inbound: true,
+        };
+
+        // Receive their version first
+        let mut got_version = false;
+        for _ in 0..10 {
+            let msg = peer.receive()?;
+            match msg {
+                NetworkMessage::Version(v) => {
+                    if v.version < 70015 {
+                        return Err(PeerError::Handshake(format!(
+                            "inbound peer version {} too old (min 70015)", v.version
+                        )));
+                    }
+                    peer.addr = format!("inbound-{}", v.nonce);
+                    peer.their_version = Some(v);
+                    got_version = true;
+                    break;
+                }
+                _ => {} // ignore pre-version messages
+            }
+        }
+
+        if !got_version {
+            return Err(PeerError::Handshake("inbound peer did not send version".into()));
+        }
+
+        // Send our version
+        let our_services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+        let our_version = VersionMessage {
+            version: PROTOCOL_VERSION,
+            services: our_services,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs() as i64,
+            receiver: Address::new(
+                &SocketAddr::from(([0, 0, 0, 0], 8333)),
+                ServiceFlags::NETWORK,
+            ),
+            sender: Address::new(
+                &SocketAddr::from(([0, 0, 0, 0], 0)),
+                our_services,
+            ),
+            nonce: rand_nonce(),
+            user_agent: USER_AGENT.to_string(),
+            start_height: our_height,
+            relay: true,
+        };
+        peer.send(NetworkMessage::Version(our_version))?;
+        peer.send(NetworkMessage::Verack)?;
+
+        // Wait for their verack
+        for _ in 0..10 {
+            let msg = peer.receive()?;
+            match msg {
+                NetworkMessage::Verack => break,
+                NetworkMessage::Ping(nonce) => {
+                    peer.send(NetworkMessage::Pong(nonce))?;
+                }
+                _ => {}
+            }
+        }
+
+        let user_agent = peer.peer_user_agent().unwrap_or_default();
+        info!("Accepted inbound peer: {} ({})", peer.addr, user_agent);
+        Ok(peer)
+    }
+
+    /// Perform the version/verack handshake (outbound/initiator mode).
     fn handshake(&mut self, our_height: i32) -> Result<(), PeerError> {
         // For the version message, use a dummy address if we can't parse
         // (e.g., .onion addresses don't map to SocketAddr).
@@ -206,9 +286,12 @@ impl Peer {
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8333)));
 
         // Send our version
+        // Advertise NODE_NETWORK_LIMITED (BIP 159) + NODE_WITNESS (BIP 144)
+        let our_services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+
         let our_version = VersionMessage {
             version: PROTOCOL_VERSION,
-            services: ServiceFlags::NONE,
+            services: our_services,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or(Duration::ZERO)
@@ -216,12 +299,12 @@ impl Peer {
             receiver: Address::new(&receiver_addr, ServiceFlags::NETWORK),
             sender: Address::new(
                 &SocketAddr::from(([0, 0, 0, 0], 0)),
-                ServiceFlags::NONE,
+                our_services,
             ),
             nonce: rand_nonce(),
             user_agent: USER_AGENT.to_string(),
             start_height: our_height,
-            relay: false,
+            relay: true,
         };
 
         self.send(NetworkMessage::Version(our_version))?;
@@ -428,6 +511,65 @@ impl Peer {
         &self.addr
     }
 
+    /// Poll for a single incoming message with the given timeout.
+    /// Returns `Ok(Some(msg))` if a message was received, `Ok(None)` on timeout,
+    /// or `Err` on connection failure. Unlike `idle_wait`, this returns the
+    /// message to the caller for dispatch rather than handling it internally.
+    pub fn poll_message(&mut self, timeout: Duration) -> Result<Option<NetworkMessage>, PeerError> {
+        let normal_timeout = match &self.stream {
+            PeerStream::Direct(_) => READ_TIMEOUT,
+            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
+        };
+
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+
+        let result = self.receive();
+
+        // Restore normal timeout
+        let _ = self.stream.set_read_timeout(Some(normal_timeout));
+
+        match result {
+            Ok(msg) => Ok(Some(msg)),
+            Err(PeerError::Receive(ref e))
+                if e.contains("timed out")
+                    || e.contains("WouldBlock")
+                    || e.contains("Resource temporarily unavailable") =>
+            {
+                Ok(None) // timeout — no message available
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    // ── Sending helpers for serving and relay ─────────────────────────
+
+    /// Send a batch of headers to the peer (response to getheaders or unsolicited announcement).
+    pub fn send_headers(&mut self, headers: Vec<bitcoin::block::Header>) -> Result<(), PeerError> {
+        self.send(NetworkMessage::Headers(headers))
+    }
+
+    /// Send a full block to the peer (response to getdata).
+    pub fn send_block(&mut self, block: Block) -> Result<(), PeerError> {
+        self.send(NetworkMessage::Block(block))
+    }
+
+    /// Send a transaction to the peer (response to getdata).
+    pub fn send_tx(&mut self, tx: bitcoin::Transaction) -> Result<(), PeerError> {
+        self.send(NetworkMessage::Tx(tx))
+    }
+
+    /// Send inventory announcements to the peer (for relay).
+    pub fn send_inv(&mut self, items: Vec<Inventory>) -> Result<(), PeerError> {
+        self.send(NetworkMessage::Inv(items))
+    }
+
+    /// Send a not-found response for requested items we don't have.
+    pub fn send_not_found(&mut self, items: Vec<Inventory>) -> Result<(), PeerError> {
+        self.send(NetworkMessage::NotFound(items))
+    }
+
     /// Wait for a duration while responding to pings to keep the connection alive.
     /// Returns Ok on timeout (normal), Err if the peer disconnects.
     pub fn idle_wait(&mut self, duration: std::time::Duration) -> Result<(), PeerError> {
@@ -465,7 +607,7 @@ impl Peer {
     }
 }
 
-fn msg_name(msg: &NetworkMessage) -> &'static str {
+pub(crate) fn msg_name(msg: &NetworkMessage) -> &'static str {
     match msg {
         NetworkMessage::Version(_) => "version",
         NetworkMessage::Verack => "verack",
@@ -477,10 +619,15 @@ fn msg_name(msg: &NetworkMessage) -> &'static str {
         NetworkMessage::Inv(_) => "inv",
         NetworkMessage::GetData(_) => "getdata",
         NetworkMessage::Block(_) => "block",
+        NetworkMessage::Tx(_) => "tx",
         NetworkMessage::NotFound(_) => "notfound",
         NetworkMessage::Addr(_) => "addr",
         NetworkMessage::Alert(_) => "alert",
         NetworkMessage::FeeFilter(_) => "feefilter",
+        NetworkMessage::MemPool => "mempool",
+        NetworkMessage::GetAddr => "getaddr",
+        NetworkMessage::SendAddrV2 => "sendaddrv2",
+        NetworkMessage::WtxidRelay => "wtxidrelay",
         _ => "unknown",
     }
 }

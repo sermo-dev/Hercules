@@ -54,6 +54,19 @@ dictionary TorStatus {
     string? onion_address;
 };
 
+dictionary MempoolStatus {
+    u32 tx_count;
+    u64 total_size;
+    u64 max_size;
+};
+
+dictionary NodeStatus {
+    u32 inbound_peers;
+    u32 outbound_peers;
+    u64 blocks_served;
+    u64 txs_relayed;
+};
+
 callback interface SyncCallback {
     void on_progress(SyncStatus status);
 };
@@ -85,6 +98,8 @@ interface HerculesNode {
     void set_validation_paused(boolean paused);
     boolean is_validation_paused();
     TorStatus? get_tor_status();
+    MempoolStatus get_mempool_status();
+    NodeStatus get_node_status();
 };
 
 [Error]

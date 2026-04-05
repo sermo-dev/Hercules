@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bitcoin::block::Header;
@@ -7,9 +7,18 @@ use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
+use std::collections::{HashMap, HashSet};
+
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
+use bitcoin::Txid;
+
+use crate::block_store::BlockStore;
 use crate::block_validation::{validate_block, validate_block_scripts};
+use crate::mempool::Mempool;
+use crate::p2p::msg_name;
 use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
 use crate::tor::TorManager;
@@ -75,12 +84,47 @@ impl BlockNotification {
 }
 
 /// Sync block headers and validate full blocks from the Bitcoin P2P network.
+/// Per-peer relay state tracking.
+struct PeerRelayState {
+    wants_sendheaders: bool,
+    feefilter_rate: u64, // sat/kvB from BIP 133
+    known_txids: HashSet<Txid>,
+}
+
+/// Pending transaction relay with Poisson delay.
+struct RelayQueueEntry {
+    txid: Txid,
+    relay_at: Instant,
+    from_peer: String, // don't relay back to sender
+}
+
+/// Counters for node serving activity.
+pub struct NodeStats {
+    pub blocks_served: u64,
+    pub headers_served: u64,
+    pub txs_relayed: u64,
+}
+
 pub struct HeaderSync {
     store: HeaderStore,
     utxo: UtxoSet,
+    block_store: BlockStore,
+    mempool: Mutex<Mempool>,
     validation_paused: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
     tor: Option<Arc<TorManager>>,
+    /// Per-peer relay metadata (keyed by peer address).
+    relay_state: Mutex<HashMap<String, PeerRelayState>>,
+    /// Queue of transactions waiting to be relayed with Poisson delay.
+    relay_queue: Mutex<Vec<RelayQueueEntry>>,
+    /// Cumulative serving counters.
+    pub stats: Mutex<NodeStats>,
+    /// Last-known peer counts (updated from monitor loop for UI access).
+    inbound_peer_count: AtomicU32,
+    outbound_peer_count: AtomicU32,
+    /// Set by handle_inv when a new block is announced — breaks the monitor
+    /// loop early so we fetch the new block immediately instead of waiting.
+    new_block_announced: AtomicBool,
 }
 
 impl HeaderSync {
@@ -96,6 +140,15 @@ impl HeaderSync {
         };
         let utxo =
             UtxoSet::open(&utxo_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        // Derive block store path for NODE_NETWORK_LIMITED serving
+        let blocks_path = if db_path == ":memory:" {
+            ":memory:".to_string()
+        } else {
+            db_path.replace("headers", "blocks")
+        };
+        let block_store =
+            BlockStore::open(&blocks_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
         // Ensure genesis header is stored
         if store.count().map_err(|e| SyncError::Store(format!("{}", e)))? == 0 {
@@ -131,9 +184,21 @@ impl HeaderSync {
         Ok(HeaderSync {
             store,
             utxo,
+            block_store,
+            mempool: Mutex::new(Mempool::new()),
             validation_paused: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             tor,
+            relay_state: Mutex::new(HashMap::new()),
+            relay_queue: Mutex::new(Vec::new()),
+            stats: Mutex::new(NodeStats {
+                blocks_served: 0,
+                headers_served: 0,
+                txs_relayed: 0,
+            }),
+            inbound_peer_count: AtomicU32::new(0),
+            outbound_peer_count: AtomicU32::new(0),
+            new_block_announced: AtomicBool::new(false),
         })
     }
 
@@ -190,6 +255,35 @@ impl HeaderSync {
     /// Check if block validation is currently paused.
     pub fn is_validation_paused(&self) -> bool {
         self.validation_paused.load(Ordering::Relaxed)
+    }
+
+    /// Get mempool status for the UI.
+    pub fn get_mempool_status(&self) -> crate::MempoolStatus {
+        let pool = self.mempool.lock().unwrap();
+        crate::MempoolStatus {
+            tx_count: pool.count() as u32,
+            total_size: pool.size() as u64,
+            max_size: 50_000_000, // DEFAULT_MAX_SIZE
+        }
+    }
+
+    /// Get node serving/relay statistics for the UI.
+    pub fn get_node_status(&self) -> crate::NodeStatus {
+        let stats = self.stats.lock().unwrap();
+        crate::NodeStatus {
+            inbound_peers: self.inbound_peer_count.load(Ordering::Relaxed),
+            outbound_peers: self.outbound_peer_count.load(Ordering::Relaxed),
+            blocks_served: stats.blocks_served,
+            txs_relayed: stats.txs_relayed,
+        }
+    }
+
+    /// Update cached peer counts from the pool (called from monitor loop).
+    fn update_peer_counts(&self, pool: &PeerPool) {
+        self.inbound_peer_count
+            .store(pool.inbound_count() as u32, Ordering::Relaxed);
+        self.outbound_peer_count
+            .store(pool.outbound_count() as u32, Ordering::Relaxed);
     }
 
     /// Request the sync loop to stop. The loop will exit cleanly on its
@@ -486,14 +580,34 @@ impl HeaderSync {
                         .apply_block(&block, next_height)
                         .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
+                    // Store block for NODE_NETWORK_LIMITED serving (last 288 blocks)
+                    self.block_store
+                        .store_block(&block, next_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                    // Remove confirmed transactions from mempool
+                    self.mempool.lock().unwrap().remove_confirmed(&block);
+
                     self.store
                         .set_validated_height(next_height)
                         .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-                    // Prune undo data for deeply-buried blocks (keep 288 for reorgs)
+                    // Relay new tip block to peers (skip during IBD catchup)
+                    if next_height == tip_height {
+                        let inv = vec![Inventory::Block(block_hash)];
+                        pool.for_each_peer(|_addr, _, peer| {
+                            peer.send_inv(inv.clone())
+                                .map_err(|e| format!("block relay: {}", e))
+                        });
+                    }
+
+                    // Prune old data for deeply-buried blocks (keep 288 for reorgs)
                     if next_height % 1000 == 0 && next_height > 288 {
                         self.utxo
                             .prune_undo_below(next_height - 288)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                        self.block_store
+                            .prune_below(next_height - 288)
                             .map_err(|e| SyncError::Store(format!("{}", e)))?;
                     }
 
@@ -515,7 +629,7 @@ impl HeaderSync {
                     continue; // Immediately download next block
                 }
 
-                // Fully synced and validated — monitor mode
+                // Fully synced and validated — active monitor mode
                 let best = pool.best_peer_addr().unwrap_or_default();
                 on_progress(self.make_status(
                     tip_height,
@@ -527,25 +641,83 @@ impl HeaderSync {
                     None,
                 ));
 
-                // Service pings on all idle peers and maintain the pool
-                pool.service_pings();
-                pool.maintain();
                 pool.update_our_height(tip_height);
 
-                // Sleep for the monitor interval in small chunks so we can
-                // service pings periodically
-                let monitor_start = std::time::Instant::now();
+                // Active message-processing loop (replaces passive 30s sleep).
+                // Polls each peer for messages, handles serving requests,
+                // and periodically checks for new blocks.
+                let monitor_start = Instant::now();
+                let mut last_maintain = Instant::now();
+                let mut last_status = Instant::now();
+
+                // Reset the flag before entering the loop
+                self.new_block_announced.store(false, Ordering::Relaxed);
+
                 while monitor_start.elapsed() < MONITOR_INTERVAL {
                     if self.shutdown_requested.load(Ordering::Relaxed) {
                         break;
                     }
-                    let remaining = MONITOR_INTERVAL.saturating_sub(monitor_start.elapsed());
-                    let wait = std::cmp::min(remaining, Duration::from_secs(5));
-                    if wait.is_zero() {
+
+                    // Process one message from each connected peer (round-robin)
+                    self.service_peer_messages(&mut pool);
+
+                    // If a peer announced a new block, break immediately to fetch it
+                    if self.new_block_announced.swap(false, Ordering::Relaxed) {
+                        info!("Breaking monitor loop early — new block announced");
                         break;
                     }
-                    std::thread::sleep(wait);
-                    pool.service_pings();
+
+                    // Drain the relay queue (send pending tx inv messages)
+                    self.drain_relay_queue(&pool);
+
+                    // Accept pending inbound connections from Tor onion service
+                    if let Some(ref tor) = self.tor {
+                        while let Some(inbound_stream) = tor.accept_inbound() {
+                            let peer_stream = crate::p2p::PeerStream::Tor(inbound_stream);
+                            match crate::p2p::Peer::accept(peer_stream, tip_height as i32) {
+                                Ok(peer) => {
+                                    if !pool.add_inbound_peer(peer) {
+                                        info!("Inbound peer rejected: at capacity");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Inbound handshake failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    // Periodic maintenance
+                    if last_maintain.elapsed() >= Duration::from_secs(30) {
+                        pool.maintain();
+                        self.mempool.lock().unwrap().expire_old();
+                        self.update_peer_counts(&pool);
+                        // Cap per-peer known_txids to prevent unbounded growth
+                        {
+                            let mut state = self.relay_state.lock().unwrap();
+                            for rs in state.values_mut() {
+                                if rs.known_txids.len() > 10_000 {
+                                    rs.known_txids.clear();
+                                }
+                            }
+                        }
+                        last_maintain = Instant::now();
+                    }
+
+                    // Periodic status report
+                    if last_status.elapsed() >= Duration::from_secs(10) {
+                        let best = pool.best_peer_addr().unwrap_or_default();
+                        on_progress(self.make_status(
+                            tip_height,
+                            peer_height,
+                            &pool,
+                            &best,
+                            false,
+                            validated,
+                            None,
+                        ));
+                        last_status = Instant::now();
+                    }
                 }
 
                 continue;
@@ -813,6 +985,340 @@ impl HeaderSync {
 
     /// One-shot block validation for background push notifications.
     /// Connects to a single peer, checks for new headers, and optionally
+    // ── Active message processing (Phase 5) ─────────────────────────
+
+    /// Poll each connected peer for a message and handle it.
+    /// Uses short timeouts to avoid blocking — one round-robin pass
+    /// through all peers typically takes ~100ms * peer_count.
+    fn service_peer_messages(&self, pool: &mut PeerPool) {
+        let poll_timeout = Duration::from_millis(100);
+
+        pool.for_each_peer(|addr, _is_inbound, peer| {
+            match peer.poll_message(poll_timeout) {
+                Ok(Some(msg)) => {
+                    if let Err(e) = self.handle_peer_message(addr, msg, peer) {
+                        warn!("Error handling message from {}: {}", addr, e);
+                    }
+                    Ok(())
+                }
+                Ok(None) => Ok(()), // timeout, no message
+                Err(e) => Err(format!("{}", e)), // connection error — remove peer
+            }
+        });
+    }
+
+    /// Handle a single message received from a peer.
+    fn handle_peer_message(
+        &self,
+        addr: &str,
+        msg: NetworkMessage,
+        peer: &mut crate::p2p::Peer,
+    ) -> Result<(), String> {
+        match msg {
+            NetworkMessage::Ping(nonce) => {
+                peer.send(NetworkMessage::Pong(nonce))
+                    .map_err(|e| format!("pong: {}", e))?;
+            }
+
+            NetworkMessage::GetHeaders(get_hdrs) => {
+                self.handle_getheaders(addr, &get_hdrs, peer)?;
+            }
+
+            NetworkMessage::GetData(inv_list) => {
+                self.handle_getdata(addr, &inv_list, peer)?;
+            }
+
+            NetworkMessage::Inv(inv_list) => {
+                self.handle_inv(addr, &inv_list, peer)?;
+            }
+
+            NetworkMessage::Tx(tx) => {
+                self.handle_tx(addr, tx)?;
+            }
+
+            NetworkMessage::SendHeaders => {
+                let mut state = self.relay_state.lock().unwrap();
+                state
+                    .entry(addr.to_string())
+                    .or_insert_with(|| PeerRelayState {
+                        wants_sendheaders: false,
+                        feefilter_rate: 0,
+                        known_txids: HashSet::new(),
+                    })
+                    .wants_sendheaders = true;
+            }
+
+            NetworkMessage::FeeFilter(rate) => {
+                let mut state = self.relay_state.lock().unwrap();
+                state
+                    .entry(addr.to_string())
+                    .or_insert_with(|| PeerRelayState {
+                        wants_sendheaders: false,
+                        feefilter_rate: 0,
+                        known_txids: HashSet::new(),
+                    })
+                    .feefilter_rate = rate as u64;
+            }
+
+            NetworkMessage::MemPool => {
+                let txids = self.mempool.lock().unwrap().get_all_txids();
+                if !txids.is_empty() {
+                    let inv: Vec<Inventory> = txids
+                        .into_iter()
+                        .map(|txid| Inventory::Transaction(txid))
+                        .collect();
+                    peer.send_inv(inv).map_err(|e| format!("mempool inv: {}", e))?;
+                }
+            }
+
+            NetworkMessage::GetAddr => {
+                // We don't maintain an address book, so respond with an empty
+                // addr message. Bitcoin Core only responds to inbound peers and
+                // only once per connection to prevent address scraping — we
+                // simplify by always sending empty. Proper addrman is future work.
+                peer.send(NetworkMessage::Addr(Vec::new()))
+                    .map_err(|e| format!("addr: {}", e))?;
+            }
+
+            other => {
+                // Log but don't error on unknown/unhandled messages
+                debug!("Ignoring {} from {}", msg_name(&other), addr);
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a getheaders request — respond with up to 2000 headers.
+    fn handle_getheaders(
+        &self,
+        addr: &str,
+        get_hdrs: &GetHeadersMessage,
+        peer: &mut crate::p2p::Peer,
+    ) -> Result<(), String> {
+        // Find the best matching locator hash
+        let mut start_height = None;
+        for locator_hash in &get_hdrs.locator_hashes {
+            if let Ok(Some(h)) = self.store.find_height_of_hash(*locator_hash) {
+                start_height = Some(h + 1); // start from the block AFTER the locator
+                break;
+            }
+        }
+
+        let from = start_height.unwrap_or(0);
+        let tip_height = self.store.count().unwrap_or(0).saturating_sub(1) as u32;
+        let to = std::cmp::min(from + 1999, tip_height);
+
+        if from > to {
+            // Nothing to send
+            peer.send_headers(Vec::new())
+                .map_err(|e| format!("send empty headers: {}", e))?;
+            return Ok(());
+        }
+
+        match self.store.get_headers_in_range(from, to) {
+            Ok(headers) => {
+                let count = headers.len();
+                peer.send_headers(headers)
+                    .map_err(|e| format!("send headers: {}", e))?;
+                self.stats.lock().unwrap().headers_served += count as u64;
+            }
+            Err(e) => {
+                warn!("Failed to get headers for {}: {}", addr, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a getdata request — serve blocks or transactions.
+    fn handle_getdata(
+        &self,
+        _addr: &str,
+        inv_list: &[Inventory],
+        peer: &mut crate::p2p::Peer,
+    ) -> Result<(), String> {
+        let mut not_found = Vec::new();
+
+        for item in inv_list {
+            match item {
+                Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
+                    match self.block_store.get_block_by_hash(hash) {
+                        Ok(Some(block)) => {
+                            peer.send_block(block)
+                                .map_err(|e| format!("send block: {}", e))?;
+                            self.stats.lock().unwrap().blocks_served += 1;
+                        }
+                        _ => {
+                            not_found.push(*item);
+                        }
+                    }
+                }
+                Inventory::Transaction(txid) => {
+                    let mempool = self.mempool.lock().unwrap();
+                    if let Some(tx) = mempool.get(txid) {
+                        let tx_clone = tx.clone();
+                        drop(mempool);
+                        peer.send_tx(tx_clone)
+                            .map_err(|e| format!("send tx: {}", e))?;
+                    } else {
+                        not_found.push(*item);
+                    }
+                }
+                _ => {
+                    not_found.push(*item);
+                }
+            }
+        }
+
+        if !not_found.is_empty() {
+            peer.send_not_found(not_found)
+                .map_err(|e| format!("send notfound: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Handle an inv announcement — request unknown blocks/txs.
+    fn handle_inv(
+        &self,
+        addr: &str,
+        inv_list: &[Inventory],
+        peer: &mut crate::p2p::Peer,
+    ) -> Result<(), String> {
+        let mut request = Vec::new();
+
+        for item in inv_list {
+            match item {
+                Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
+                    // Check if we already have this block header
+                    if self.store.find_height_of_hash(*hash).ok().flatten().is_none() {
+                        info!("New block announced by {}: {}", addr, hash);
+                        // Signal the monitor loop to break early and fetch
+                        self.new_block_announced.store(true, Ordering::Relaxed);
+                    }
+                }
+                Inventory::Transaction(txid) => {
+                    if !self.mempool.lock().unwrap().contains(txid) {
+                        // Record that this peer knows about this tx
+                        let mut state = self.relay_state.lock().unwrap();
+                        state
+                            .entry(addr.to_string())
+                            .or_insert_with(|| PeerRelayState {
+                                wants_sendheaders: false,
+                                feefilter_rate: 0,
+                                known_txids: HashSet::new(),
+                            })
+                            .known_txids
+                            .insert(*txid);
+
+                        request.push(Inventory::Transaction(*txid));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !request.is_empty() {
+            peer.send(NetworkMessage::GetData(request))
+                .map_err(|e| format!("getdata for inv: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Handle an incoming transaction — validate and add to mempool.
+    fn handle_tx(&self, addr: &str, tx: bitcoin::Transaction) -> Result<(), String> {
+        let validated_height = self.store.validated_height().unwrap_or(0);
+
+        let result = {
+            let mut mempool = self.mempool.lock().unwrap();
+            mempool.accept_tx(tx, &self.utxo, validated_height)
+        }; // mempool lock released before acquiring relay_queue lock
+
+        match result {
+            Ok(txid) => {
+                // Schedule relay with Poisson delay
+                let delay = poisson_delay_secs(2.0);
+                self.relay_queue.lock().unwrap().push(RelayQueueEntry {
+                    txid,
+                    relay_at: Instant::now() + Duration::from_secs_f64(delay),
+                    from_peer: addr.to_string(),
+                });
+            }
+            Err(e) => {
+                debug!("Rejected tx from {}: {}", addr, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Send pending relay inv messages for transactions whose delay has elapsed.
+    fn drain_relay_queue(&self, pool: &PeerPool) {
+        let now = Instant::now();
+        let mut queue = self.relay_queue.lock().unwrap();
+
+        // Partition: ready vs not-yet
+        let mut ready = Vec::new();
+        queue.retain(|entry| {
+            if entry.relay_at <= now {
+                ready.push((entry.txid, entry.from_peer.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        drop(queue);
+
+        if ready.is_empty() {
+            return;
+        }
+
+        // Snapshot the state we need, then release locks before I/O
+        let relay_snapshot: HashMap<String, (HashSet<Txid>, u64)> = {
+            let state = self.relay_state.lock().unwrap();
+            state
+                .iter()
+                .map(|(addr, rs)| {
+                    (addr.clone(), (rs.known_txids.clone(), rs.feefilter_rate))
+                })
+                .collect()
+        };
+
+        let fee_rates: Vec<(Txid, u64)> = {
+            let mempool = self.mempool.lock().unwrap();
+            ready
+                .iter()
+                .map(|(txid, _)| {
+                    let rate = mempool.fee_rate(txid).unwrap_or(0.0);
+                    (*txid, (rate * 1000.0) as u64) // convert sat/vB → sat/kvB
+                })
+                .collect()
+        };
+        // All locks released — safe to do network I/O now
+
+        for ((txid, from_peer), (_, fee_rate_satkvb)) in ready.iter().zip(fee_rates.iter()) {
+            let inv = vec![Inventory::Transaction(*txid)];
+
+            pool.for_each_peer(|addr, _, peer| {
+                // Don't relay back to sender
+                if addr == from_peer {
+                    return Ok(());
+                }
+                if let Some((known, feefilter)) = relay_snapshot.get(addr) {
+                    // Skip if peer already knows about this tx
+                    if known.contains(txid) {
+                        return Ok(());
+                    }
+                    // BIP 133: skip if tx fee rate is below peer's feefilter
+                    if *feefilter > 0 && *fee_rate_satkvb < *feefilter {
+                        return Ok(());
+                    }
+                }
+                peer.send_inv(inv.clone()).map_err(|e| format!("relay inv: {}", e))?;
+                Ok(())
+            });
+
+            self.stats.lock().unwrap().txs_relayed += 1;
+        }
+    }
+
     /// downloads and validates the latest block — all within `timeout_secs`.
     ///
     /// Returns a `BlockNotification` with whatever validation was achieved
@@ -1049,3 +1555,12 @@ impl std::fmt::Display for SyncError {
 }
 
 impl std::error::Error for SyncError {}
+
+/// Generate a Poisson-distributed delay in seconds (for transaction relay privacy).
+/// Uses hash-based random number generation (no external rand dependency).
+fn poisson_delay_secs(mean: f64) -> f64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let u: f64 = (RandomState::new().build_hasher().finish() as f64) / (u64::MAX as f64);
+    -mean * u.max(1e-15).ln()
+}

@@ -10,6 +10,9 @@ use crate::tor::TorManager;
 /// Maximum number of outbound connections (matches Bitcoin Core default).
 const MAX_OUTBOUND: usize = 8;
 
+/// Maximum number of inbound connections (conservative for mobile).
+const MAX_INBOUND: usize = 16;
+
 /// Short idle wait per peer when servicing pings.
 const PEER_PING_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -28,6 +31,8 @@ struct PeerSlot {
     user_agent: String,
     height: u32,
     misbehavior: u32,
+    /// True if this peer connected to us (inbound).
+    inbound: bool,
     /// When the peer was last checked out (taken from the slot). Used to
     /// detect leaked slots where the caller dropped the Peer without
     /// calling return_peer().
@@ -133,7 +138,7 @@ impl PeerPool {
             }
         }
 
-        let current = self.slots.lock().unwrap().len();
+        let current = self.outbound_count();
         if current >= MAX_OUTBOUND {
             return;
         }
@@ -202,6 +207,7 @@ impl PeerPool {
                         user_agent,
                         height,
                         misbehavior: 0,
+                        inbound: false,
                         checked_out_at: None,
                     };
 
@@ -350,6 +356,103 @@ impl PeerPool {
             .map(|s| s.addr.clone())
     }
 
+    /// Add an inbound peer to the pool. Returns false if at inbound capacity.
+    pub fn add_inbound_peer(&self, peer: Peer) -> bool {
+        let inbound = self.inbound_count();
+        if inbound >= MAX_INBOUND {
+            info!("PeerPool: rejecting inbound peer (at capacity {}/{})", inbound, MAX_INBOUND);
+            return false;
+        }
+
+        let addr = peer.addr().to_string();
+        let user_agent = peer.peer_user_agent().unwrap_or_default();
+        let height = peer.peer_height().unwrap_or(0) as u32;
+
+        info!("PeerPool: accepted inbound peer {} ({}) at height {}", addr, user_agent, height);
+
+        let slot = PeerSlot {
+            peer: Some(peer),
+            addr,
+            user_agent,
+            height,
+            misbehavior: 0,
+            inbound: true,
+            checked_out_at: None,
+        };
+
+        self.slots.lock().unwrap().push(slot);
+        true
+    }
+
+    /// Number of inbound peers.
+    pub fn inbound_count(&self) -> usize {
+        self.slots.lock().unwrap().iter().filter(|s| s.inbound).count()
+    }
+
+    /// Number of outbound peers.
+    pub fn outbound_count(&self) -> usize {
+        self.slots.lock().unwrap().iter().filter(|s| !s.inbound).count()
+    }
+
+    /// Process each connected peer with a callback. Takes each peer out of its
+    /// slot for the duration of the callback, then returns it. If the callback
+    /// returns an error, the peer is removed from the pool.
+    ///
+    /// The callback receives `(addr, is_inbound, &mut Peer)` and returns
+    /// `Ok(())` to keep the peer or `Err(reason)` to remove it.
+    pub fn for_each_peer<F>(&self, mut f: F)
+    where
+        F: FnMut(&str, bool, &mut Peer) -> Result<(), String>,
+    {
+        // Collect addresses and inbound flags of peers that have a connection
+        let peer_info: Vec<(String, bool)> = {
+            let slots = self.slots.lock().unwrap();
+            slots
+                .iter()
+                .filter(|s| s.peer.is_some())
+                .map(|s| (s.addr.clone(), s.inbound))
+                .collect()
+        };
+
+        let mut dead_addrs = Vec::new();
+
+        for (addr, is_inbound) in peer_info {
+            // Take peer out of slot
+            let peer_opt = {
+                let mut slots = self.slots.lock().unwrap();
+                slots
+                    .iter_mut()
+                    .find(|s| s.addr == addr && s.peer.is_some())
+                    .and_then(|s| {
+                        s.checked_out_at = Some(Instant::now());
+                        s.peer.take()
+                    })
+            };
+
+            let Some(mut peer) = peer_opt else { continue };
+
+            match f(&addr, is_inbound, &mut peer) {
+                Ok(()) => {
+                    // Return peer to slot
+                    let mut slots = self.slots.lock().unwrap();
+                    if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr && s.peer.is_none()) {
+                        slot.peer = Some(peer);
+                        slot.checked_out_at = None;
+                    }
+                }
+                Err(reason) => {
+                    warn!("PeerPool: removing peer {}: {}", addr, reason);
+                    dead_addrs.push(addr);
+                }
+            }
+        }
+
+        if !dead_addrs.is_empty() {
+            let mut slots = self.slots.lock().unwrap();
+            slots.retain(|s| !dead_addrs.contains(&s.addr));
+        }
+    }
+
     /// Check whether an address is currently banned.
     pub fn is_banned(&self, addr: &str) -> bool {
         self.bans.get(addr).map_or(false, |expiry| Instant::now() < *expiry)
@@ -426,12 +529,17 @@ mod tests {
 
     /// Insert a test slot (peer=None, simulating a checked-out peer).
     fn add_slot(pool: &PeerPool, addr: &str, height: u32) {
+        add_slot_with_inbound(pool, addr, height, false);
+    }
+
+    fn add_slot_with_inbound(pool: &PeerPool, addr: &str, height: u32, inbound: bool) {
         pool.slots.lock().unwrap().push(PeerSlot {
             peer: None,
             addr: addr.to_string(),
             user_agent: "/test/".to_string(),
             height,
             misbehavior: 0,
+            inbound,
             checked_out_at: None,
         });
     }
@@ -587,6 +695,7 @@ mod tests {
                 user_agent: "/test/".to_string(),
                 height: 100,
                 misbehavior: 0,
+                inbound: false,
                 checked_out_at: Some(Instant::now() - Duration::from_secs(300)),
             });
             // Also add a healthy slot with no checkout
@@ -596,6 +705,7 @@ mod tests {
                 user_agent: "/test/".to_string(),
                 height: 200,
                 misbehavior: 0,
+                inbound: false,
                 checked_out_at: None,
             });
         }
@@ -621,6 +731,7 @@ mod tests {
                 user_agent: "/test/".to_string(),
                 height: 100,
                 misbehavior: 0,
+                inbound: false,
                 checked_out_at: Some(Instant::now()), // just now
             });
         }
@@ -670,5 +781,48 @@ mod tests {
     fn is_banned_false_for_unknown() {
         let pool = test_pool();
         assert!(!pool.is_banned("unknown:8333"));
+    }
+
+    // ── Inbound peer slot tests ──────────────────────────────────────
+
+    #[test]
+    fn inbound_outbound_counts() {
+        let pool = test_pool();
+        add_slot_with_inbound(&pool, "out1:8333", 100, false);
+        add_slot_with_inbound(&pool, "out2:8333", 200, false);
+        add_slot_with_inbound(&pool, "in1:8333", 300, true);
+
+        assert_eq!(pool.outbound_count(), 2);
+        assert_eq!(pool.inbound_count(), 1);
+        assert_eq!(pool.count(), 3);
+    }
+
+    #[test]
+    fn maintain_only_fills_outbound() {
+        let mut pool = test_pool();
+        // Fill with MAX_OUTBOUND outbound + some inbound slots
+        for i in 0..MAX_OUTBOUND {
+            add_slot_with_inbound(&pool, &format!("out{}:8333", i), 100, false);
+        }
+        add_slot_with_inbound(&pool, "in1:8333", 100, true);
+
+        // maintain() should not try to add more outbound (already at MAX_OUTBOUND)
+        pool.maintain();
+        assert_eq!(pool.outbound_count(), MAX_OUTBOUND);
+    }
+
+    #[test]
+    fn for_each_peer_skips_checked_out() {
+        let pool = test_pool();
+        // All slots have peer=None (simulating checked out), so callback should never fire
+        add_slot(&pool, "peer1:8333", 100);
+        add_slot(&pool, "peer2:8333", 200);
+
+        let mut visited = Vec::new();
+        pool.for_each_peer(|addr, _, _| {
+            visited.push(addr.to_string());
+            Ok(())
+        });
+        assert!(visited.is_empty());
     }
 }

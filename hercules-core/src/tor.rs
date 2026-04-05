@@ -118,6 +118,8 @@ pub struct TorManager {
     client: TorClient<PreferredRuntime>,
     bootstrap_progress: Arc<AtomicU8>,
     onion_address: Option<String>,
+    /// Channel receiving inbound connections from the onion service.
+    inbound_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<TorStream>>>,
 }
 
 impl TorManager {
@@ -170,6 +172,7 @@ impl TorManager {
             client,
             bootstrap_progress,
             onion_address: None,
+            inbound_rx: None,
         })
     }
 
@@ -266,7 +269,9 @@ impl TorManager {
     pub fn start_onion_service(&mut self, port: u16) -> Result<OnionServiceHandle, TorError> {
         info!("Tor: starting onion service on port {}", port);
 
-        let (service, address) = self.runtime.block_on(async {
+        let handle = self.runtime.handle().clone();
+
+        let (service, address, request_stream) = self.runtime.block_on(async {
             use arti_client::config::onion_service::OnionServiceConfigBuilder;
 
             let svc_config = OnionServiceConfigBuilder::default()
@@ -278,7 +283,7 @@ impl TorManager {
                     TorError::OnionService(format!("config: {}", e))
                 })?;
 
-            let (service, _request_stream) = self
+            let (service, request_stream) = self
                 .client
                 .launch_onion_service(svc_config)
                 .map_err(|e| {
@@ -295,17 +300,65 @@ impl TorManager {
             })?;
             let address = format!("{}", hs_id.display_unredacted());
 
-            Ok::<_, TorError>((service, address))
+            Ok::<_, TorError>((service, address, request_stream))
         })?;
 
         let onion_addr = format!("{}:{}", address, port);
         info!("Tor: onion service running at {}", onion_addr);
         self.onion_address = Some(onion_addr.clone());
 
+        // Spawn a background task that accepts inbound connections from the
+        // onion service and sends them as TorStream objects through a channel.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TorStream>(16);
+        let accept_handle = handle.clone();
+        handle.spawn(async move {
+            use tokio_stream::StreamExt;
+            let mut rend_stream = request_stream;
+            // Level 1: Accept rendezvous requests (circuit-level)
+            while let Some(rend_request) = rend_stream.next().await {
+                match rend_request.accept().await {
+                    Ok(mut stream_requests) => {
+                        // Level 2: Accept stream requests on this circuit
+                        let tx = tx.clone();
+                        let h = accept_handle.clone();
+                        tokio::spawn(async move {
+                            while let Some(stream_req) = stream_requests.next().await {
+                                use tor_cell::relaycell::msg::Connected;
+                                match stream_req.accept(Connected::new_empty()).await {
+                                    Ok(data_stream) => {
+                                        let tor_stream = TorStream::new(h.clone(), data_stream);
+                                        if tx.try_send(tor_stream).is_err() {
+                                            break; // channel full/disconnected
+                                        }
+                                    }
+                                    Err(e) => {
+                                        info!("Tor: failed to accept stream request: {}", e);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        info!("Tor: failed to accept rendezvous request: {}", e);
+                    }
+                }
+            }
+        });
+
+        self.inbound_rx = Some(std::sync::Mutex::new(rx));
+
         Ok(OnionServiceHandle {
             address: onion_addr,
             _service: Box::new(service),
         })
+    }
+
+    /// Try to accept a pending inbound connection from the onion service.
+    /// Returns `None` if no connection is waiting (non-blocking).
+    pub fn accept_inbound(&self) -> Option<TorStream> {
+        self.inbound_rx
+            .as_ref()
+            .and_then(|rx| rx.lock().unwrap().try_recv().ok())
     }
 }
 

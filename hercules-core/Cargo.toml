@@ -20,7 +20,9 @@ arti-client = { version = "0.41", default-features = false, features = [
     "tokio", "rustls", "onion-service-client", "onion-service-service", "compression"
 ] }
 tor-rtcompat = { version = "0.41", features = ["tokio"] }
+tor-cell = "0.41"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "io-util"] }
+tokio-stream = "0.1"
 safelog = "0.8"
 
 [build-dependencies]

@@ -4,7 +4,9 @@ use std::sync::Arc;
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 
+mod block_store;
 mod block_validation;
+mod mempool;
 mod p2p;
 mod peer_pool;
 mod store;
@@ -150,6 +152,23 @@ impl From<sync::BlockNotification> for BlockNotification {
     }
 }
 
+// ── Phase 5 types (fully participating node) ──────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MempoolStatus {
+    pub tx_count: u32,
+    pub total_size: u64,
+    pub max_size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeStatus {
+    pub inbound_peers: u32,
+    pub outbound_peers: u32,
+    pub blocks_served: u64,
+    pub txs_relayed: u64,
+}
+
 // ── Errors ─────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -181,9 +200,23 @@ impl HerculesNode {
     pub fn new(db_path: String, tor_data_dir: Option<String>) -> Result<Self, HerculesError> {
         let tor = if let Some(ref dir) = tor_data_dir {
             let path = PathBuf::from(dir);
-            let manager = TorManager::bootstrap(&path).map_err(|e| HerculesError::TorError {
+            let mut manager = TorManager::bootstrap(&path).map_err(|e| HerculesError::TorError {
                 msg: format!("{}", e),
             })?;
+
+            // Start the onion hidden service so we can accept inbound connections.
+            // Must be called before wrapping in Arc (requires &mut self).
+            match manager.start_onion_service(8333) {
+                Ok(handle) => {
+                    // Keep the handle alive — dropping it would stop the service.
+                    // The TorManager stores the inbound_rx internally.
+                    std::mem::forget(handle);
+                }
+                Err(e) => {
+                    log::warn!("Onion service failed to start (non-fatal): {}", e);
+                }
+            }
+
             Some(Arc::new(manager))
         } else {
             None
@@ -291,6 +324,16 @@ impl HerculesNode {
     /// Check if block validation is currently paused.
     pub fn is_validation_paused(&self) -> bool {
         self.syncer.is_validation_paused()
+    }
+
+    /// Get mempool status (transaction count, total size, max size).
+    pub fn get_mempool_status(&self) -> MempoolStatus {
+        self.syncer.get_mempool_status()
+    }
+
+    /// Get node serving/relay statistics.
+    pub fn get_node_status(&self) -> NodeStatus {
+        self.syncer.get_node_status()
     }
 }
 
