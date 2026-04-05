@@ -33,12 +33,11 @@ exports.handler = async (event) => {
 
         // Build APNs JWT
         const apnsKey = Buffer.from(process.env.APNS_KEY_BASE64 || "", "base64").toString("utf8");
-        const token = jwt.sign({}, apnsKey, {
-            algorithm: "ES256",
-            keyid: process.env.APNS_KEY_ID,
-            issuer: process.env.APNS_TEAM_ID,
-            header: { alg: "ES256", kid: process.env.APNS_KEY_ID },
-        });
+        const token = jwt.sign(
+            { iss: process.env.APNS_TEAM_ID, iat: Math.floor(Date.now() / 1000) },
+            apnsKey,
+            { algorithm: "ES256", header: { alg: "ES256", kid: process.env.APNS_KEY_ID } }
+        );
 
         // Build silent push payload
         const payload = JSON.stringify({
@@ -87,6 +86,7 @@ exports.handler = async (event) => {
 function sendAPNs(deviceToken, payload, jwtToken) {
     return new Promise((resolve, reject) => {
         const client = http2.connect(`https://${APNS_HOST}`);
+        client.on("error", (err) => reject(err));
 
         const req = client.request({
             ":method": "POST",
@@ -99,28 +99,26 @@ function sendAPNs(deviceToken, payload, jwtToken) {
 
         req.setEncoding("utf8");
         let data = "";
+        let statusCode;
 
-        req.on("response", (headers) => {
-            const status = headers[":status"];
-            if (status === 200) {
+        req.on("response", (headers) => { statusCode = headers[":status"]; });
+        req.on("data", (chunk) => (data += chunk));
+        req.on("end", () => {
+            client.close();
+            if (statusCode === 200) {
                 resolve();
             } else {
-                req.on("data", (chunk) => (data += chunk));
-                req.on("end", () => {
-                    try {
-                        const body = JSON.parse(data);
-                        reject(body.reason || `HTTP ${status}`);
-                    } catch {
-                        reject(`HTTP ${status}`);
-                    }
-                });
+                try {
+                    const body = JSON.parse(data);
+                    reject(body.reason || `HTTP ${statusCode}`);
+                } catch {
+                    reject(`HTTP ${statusCode}`);
+                }
             }
         });
+        req.on("error", (err) => { client.close(); reject(err); });
 
         req.write(payload);
         req.end();
-
-        req.on("error", reject);
-        req.on("close", () => client.close());
     });
 }

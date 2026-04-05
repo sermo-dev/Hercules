@@ -140,7 +140,7 @@ struct SettingsView: View {
     }
 
     private var statusText: String {
-        if let token = notificationManager.deviceToken {
+        if notificationManager.deviceToken != nil {
             return "Registered"
         }
         if let error = notificationManager.registrationError {

@@ -107,19 +107,7 @@ class NotificationManager: ObservableObject {
 
                 // 25 seconds — leaving 5s margin within the 30s iOS window
                 let result = try node.validateLatestBlock(timeoutSecs: 25)
-
-                let record = BlockNotificationRecord(
-                    id: UUID(),
-                    height: result.height,
-                    blockHash: result.blockHash,
-                    timestamp: result.timestamp,
-                    timestampHuman: result.timestampHuman,
-                    validated: result.validated,
-                    headerValidated: result.headerValidated,
-                    receivedAt: Date(),
-                    source: result.validated ? .fullValidation : (result.headerValidated ? .headerOnly : .pushPayload),
-                    validationError: result.validationError
-                )
+                let record = Self.makeRecord(from: result)
 
                 DispatchQueue.main.async {
                     self.appendRecord(record)
@@ -164,19 +152,7 @@ class NotificationManager: ObservableObject {
                 let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
 
                 let result = try node.validateLatestBlock(timeoutSecs: 25)
-
-                let record = BlockNotificationRecord(
-                    id: UUID(),
-                    height: result.height,
-                    blockHash: result.blockHash,
-                    timestamp: result.timestamp,
-                    timestampHuman: result.timestampHuman,
-                    validated: result.validated,
-                    headerValidated: result.headerValidated,
-                    receivedAt: Date(),
-                    source: result.validated ? .fullValidation : (result.headerValidated ? .headerOnly : .pushPayload),
-                    validationError: result.validationError
-                )
+                let record = Self.makeRecord(from: result)
 
                 DispatchQueue.main.async {
                     self.appendRecord(record)
@@ -189,6 +165,23 @@ class NotificationManager: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Record Creation
+
+    private static func makeRecord(from result: BlockNotification) -> BlockNotificationRecord {
+        BlockNotificationRecord(
+            id: UUID(),
+            height: result.height,
+            blockHash: result.blockHash,
+            timestamp: result.timestamp,
+            timestampHuman: result.timestampHuman,
+            validated: result.validated,
+            headerValidated: result.headerValidated,
+            receivedAt: Date(),
+            source: result.validated ? .fullValidation : (result.headerValidated ? .headerOnly : .pushPayload),
+            validationError: result.validationError
+        )
     }
 
     // MARK: - History
@@ -240,9 +233,9 @@ class NotificationManager: ObservableObject {
 
     private func parsePushPayload(_ userInfo: [AnyHashable: Any]) -> PushBlockInfo? {
         guard let block = userInfo["block"] as? [String: Any],
-              let height = block["height"] as? UInt32,
+              let height = (block["height"] as? NSNumber)?.uint32Value,
               let hash = block["hash"] as? String,
-              let timestamp = block["timestamp"] as? UInt32
+              let timestamp = (block["timestamp"] as? NSNumber)?.uint32Value
         else {
             return nil
         }
