@@ -99,6 +99,11 @@ impl Mempool {
             return Err(MempoolError::CoinbaseTx);
         }
 
+        // 0b. Reject transactions with empty inputs or outputs
+        if tx.input.is_empty() || tx.output.is_empty() {
+            return Err(MempoolError::MalformedTx);
+        }
+
         // 1. Already in mempool?
         if self.txs.contains_key(&txid) {
             return Err(MempoolError::AlreadyInMempool);
@@ -109,6 +114,37 @@ impl Mempool {
             let outpoint_key = (input.previous_output.txid, input.previous_output.vout);
             if let Some(conflicting) = self.spends.get(&outpoint_key) {
                 return Err(MempoolError::ConflictsWith(*conflicting));
+            }
+        }
+
+        // Check transaction finality (nLockTime)
+        // A transaction is final if nLockTime == 0, or all inputs have
+        // nSequence == 0xFFFFFFFF, or the locktime has been reached.
+        let all_final = tx.input.iter().all(|i| i.sequence.0 == 0xFFFFFFFF);
+        if !all_final {
+            let lock_time = tx.lock_time.to_consensus_u32();
+            if lock_time != 0 {
+                if lock_time < 500_000_000 {
+                    // Block height lock: must be <= next block height
+                    if lock_time > current_height + 1 {
+                        return Err(MempoolError::NonFinal {
+                            lock_time,
+                            current_height,
+                        });
+                    }
+                } else {
+                    // Time-based lock: must be <= current time
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as u32;
+                    if lock_time > now {
+                        return Err(MempoolError::NonFinal {
+                            lock_time,
+                            current_height,
+                        });
+                    }
+                }
             }
         }
 
@@ -213,8 +249,22 @@ impl Mempool {
             });
         }
 
-        // All checks passed — insert
+        // Check if pool is full and new tx would be the eviction target
         let size = serialized_tx.len();
+        if self.total_size + size > self.max_size {
+            // Pool is full — reject if this tx has the lowest fee rate
+            let current_min = self.txs.values()
+                .map(|e| e.fee_rate)
+                .fold(f64::INFINITY, f64::min);
+            if fee_rate <= current_min {
+                return Err(MempoolError::InsufficientFee {
+                    fee_rate,
+                    min_rate: current_min,
+                });
+            }
+        }
+
+        // All checks passed — insert
 
         // Update spend index
         for input in &tx.input {
@@ -341,7 +391,7 @@ impl Mempool {
         let worst = self
             .txs
             .iter()
-            .min_by(|a, b| a.1.fee_rate.partial_cmp(&b.1.fee_rate).unwrap())
+            .min_by(|a, b| a.1.fee_rate.total_cmp(&b.1.fee_rate))
             .map(|(txid, _)| *txid);
 
         if let Some(txid) = worst {
@@ -376,6 +426,7 @@ impl Mempool {
 #[derive(Debug)]
 pub enum MempoolError {
     CoinbaseTx,
+    MalformedTx,
     AlreadyInMempool,
     ConflictsWith(Txid),
     MissingInput { txid: Txid, vout: u32 },
@@ -386,6 +437,7 @@ pub enum MempoolError {
     OversizedTx { weight: u64 },
     DustOutput { index: usize, amount: u64 },
     NonStandardScript { index: usize },
+    NonFinal { lock_time: u32, current_height: u32 },
     UtxoLookup(String),
 }
 
@@ -393,6 +445,7 @@ impl std::fmt::Display for MempoolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MempoolError::CoinbaseTx => write!(f, "coinbase transactions are not allowed in mempool"),
+            MempoolError::MalformedTx => write!(f, "transaction has empty inputs or outputs"),
             MempoolError::AlreadyInMempool => write!(f, "transaction already in mempool"),
             MempoolError::ConflictsWith(txid) => {
                 write!(f, "conflicts with mempool tx {}", txid)
@@ -430,6 +483,13 @@ impl std::fmt::Display for MempoolError {
             }
             MempoolError::NonStandardScript { index } => {
                 write!(f, "output {} has non-standard script type", index)
+            }
+            MempoolError::NonFinal { lock_time, current_height } => {
+                write!(
+                    f,
+                    "transaction not final (locktime={}, current_height={})",
+                    lock_time, current_height
+                )
             }
             MempoolError::UtxoLookup(e) => write!(f, "UTXO lookup error: {}", e),
         }

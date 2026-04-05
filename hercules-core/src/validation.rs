@@ -100,6 +100,20 @@ pub fn validate_headers(
             }
         }
 
+        // 5. Reject headers more than 2 hours in the future (MAX_FUTURE_BLOCK_TIME)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        let max_future = now.saturating_add(7200); // 2 hours
+        if header.time > max_future {
+            return Err(ValidationError::FutureTimestamp {
+                height,
+                timestamp: header.time,
+                max_allowed: max_future,
+            });
+        }
+
         current_bits = header.bits;
         timestamps.push(header.time);
         expected_prev = block_hash;
@@ -215,6 +229,11 @@ pub enum ValidationError {
         expected: String,
         got: String,
     },
+    FutureTimestamp {
+        height: u32,
+        timestamp: u32,
+        max_allowed: u32,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -249,6 +268,15 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "block {} has wrong difficulty: expected {}, got {}",
                 height, expected, got
+            ),
+            ValidationError::FutureTimestamp {
+                height,
+                timestamp,
+                max_allowed,
+            } => write!(
+                f,
+                "block {} timestamp {} is more than 2 hours in the future (max {})",
+                height, timestamp, max_allowed
             ),
         }
     }

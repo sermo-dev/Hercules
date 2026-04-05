@@ -356,7 +356,8 @@ impl PeerPool {
             .map(|s| s.addr.clone())
     }
 
-    /// Add an inbound peer to the pool. Returns false if at inbound capacity.
+    /// Add an inbound peer to the pool. Returns false if at inbound capacity,
+    /// if the address is a duplicate, or other rejection criteria.
     /// Uses a single lock acquisition for check+insert to avoid TOCTOU races.
     pub fn add_inbound_peer(&self, peer: Peer) -> bool {
         let addr = peer.addr().to_string();
@@ -364,6 +365,13 @@ impl PeerPool {
         let height = peer.peer_height().unwrap_or(0).max(0) as u32;
 
         let mut slots = self.slots.lock().unwrap();
+
+        // Reject duplicate connections (same address already in pool)
+        if slots.iter().any(|s| s.addr == addr) {
+            info!("PeerPool: rejecting duplicate inbound peer {}", addr);
+            return false;
+        }
+
         let inbound = slots.iter().filter(|s| s.inbound).count();
         if inbound >= MAX_INBOUND {
             info!("PeerPool: rejecting inbound peer (at capacity {}/{})", inbound, MAX_INBOUND);

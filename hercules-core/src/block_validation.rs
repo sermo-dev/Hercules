@@ -124,11 +124,9 @@ pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationE
             block_sigops += count_script_sigops(&output.script_pubkey);
         }
 
-        // Count sigops in input scripts (coinbase scriptSig has no meaningful sigops)
-        if !tx.is_coinbase() {
-            for input in &tx.input {
-                block_sigops += count_script_sigops(&input.script_sig);
-            }
+        // Count sigops in input scripts (including coinbase — matches Bitcoin Core)
+        for input in &tx.input {
+            block_sigops += count_script_sigops(&input.script_sig);
         }
     }
 
@@ -152,30 +150,21 @@ pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationE
         }
     }
 
-    // 8. Coinbase reward sanity check
-    // Without UTXO set, we can't compute exact fees. Use upper bound:
-    // coinbase_outputs <= subsidy + sum(all non-coinbase outputs)
-    // This works because fees = inputs - outputs, so outputs < inputs,
-    // meaning sum(non-coinbase outputs) >= actual fees.
-    let subsidy = block_subsidy(height);
+    // 8. Coinbase total output cannot exceed MAX_MONEY (trivial upper bound).
+    // The exact fee-based check happens in validate_block_scripts where we
+    // know the actual fees. We cannot compute exact fees here without the
+    // UTXO set (fees = sum(inputs) - sum(outputs) requires input values).
     let coinbase_total: u64 = block.txdata[0]
         .output
         .iter()
-        .map(|o| o.value.to_sat())
-        .sum();
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value.to_sat()))
+        .ok_or(BlockValidationError::ValueOverflow { height, tx_index: 0 })?;
 
-    let non_coinbase_output_total: u64 = block.txdata[1..]
-        .iter()
-        .flat_map(|tx| &tx.output)
-        .map(|o| o.value.to_sat())
-        .sum();
-
-    let max_allowed = subsidy.to_sat().saturating_add(non_coinbase_output_total);
-    if coinbase_total > max_allowed {
+    if coinbase_total > MAX_MONEY {
         return Err(BlockValidationError::CoinbaseOverpayment {
             height,
             actual: coinbase_total,
-            max_subsidy: max_allowed,
+            max_subsidy: MAX_MONEY,
         });
     }
 
@@ -256,7 +245,17 @@ pub fn validate_block_scripts(
                 // Resolve the spent output: check in-block first, then persistent UTXO set
                 let (amount, script_pubkey) =
                     if let Some(entry) = block_utxos.remove(&key) {
-                        // In-block spend (output created earlier in this block)
+                        // In-block spend (output created earlier in this block).
+                        // Coinbase outputs cannot be spent in the same block
+                        // (maturity requires 100 confirmations).
+                        if entry.2 {
+                            return Err(BlockValidationError::PrematureCoinbaseSpend {
+                                height,
+                                tx_index: tx_idx,
+                                input_index: input_idx,
+                                coinbase_height: height,
+                            });
+                        }
                         (entry.0, entry.1)
                     } else {
                         // Double-spend check: ensure this persistent UTXO hasn't

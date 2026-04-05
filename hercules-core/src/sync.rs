@@ -920,6 +920,21 @@ impl HeaderSync {
                         let new_tip = fork_at + new_headers.len() as u32;
                         peer_height = std::cmp::max(peer_height, new_tip);
 
+                        // Clear the mempool — transactions may reference UTXOs
+                        // that no longer exist on the new chain.
+                        {
+                            let mut mempool = self.mempool.lock().unwrap();
+                            let count = mempool.count();
+                            if count > 0 {
+                                // Remove all transactions since UTXO state changed
+                                let txids: Vec<_> = mempool.get_all_txids();
+                                for txid in &txids {
+                                    mempool.remove_tx(txid);
+                                }
+                                info!("Reorg: cleared {} transactions from mempool", count);
+                            }
+                        }
+
                         info!(
                             "Reorg complete: new tip at height {} ({} new headers)",
                             new_tip,
@@ -1157,6 +1172,11 @@ impl HeaderSync {
         inv_list: &[Inventory],
         peer: &mut crate::p2p::Peer,
     ) -> Result<(), String> {
+        // Bitcoin protocol limits getdata to 50,000 entries
+        if inv_list.len() > 50_000 {
+            return Err(format!("getdata too large: {} entries (max 50000)", inv_list.len()));
+        }
+
         let mut not_found = Vec::new();
 
         for item in inv_list {
@@ -1204,6 +1224,11 @@ impl HeaderSync {
         inv_list: &[Inventory],
         peer: &mut crate::p2p::Peer,
     ) -> Result<(), String> {
+        // Bitcoin protocol limits inv messages to 50,000 entries
+        if inv_list.len() > 50_000 {
+            return Err(format!("inv too large: {} entries (max 50000)", inv_list.len()));
+        }
+
         let mut request = Vec::new();
 
         for item in inv_list {
@@ -1216,7 +1241,7 @@ impl HeaderSync {
                         self.new_block_announced.store(true, Ordering::Relaxed);
                     }
                 }
-                Inventory::Transaction(txid) => {
+                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     if !self.mempool.lock().unwrap().contains(txid) {
                         // Record that this peer knows about this tx
                         let mut state = self.relay_state.lock().unwrap();
@@ -1230,7 +1255,8 @@ impl HeaderSync {
                             .known_txids
                             .insert(*txid);
 
-                        request.push(Inventory::Transaction(*txid));
+                        // Request with witness data for segwit transactions
+                        request.push(Inventory::WitnessTransaction(*txid));
                     }
                 }
                 _ => {}
@@ -1407,6 +1433,13 @@ impl HeaderSync {
         if headers.is_empty() {
             info!("validate_latest_block: no new headers, chain is current");
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
+        }
+
+        // Enforce 2000-header limit (same as main sync loop)
+        if headers.len() > 2000 {
+            return Err(SyncError::Validation(format!(
+                "peer sent {} headers (max 2000)", headers.len()
+            )));
         }
 
         // Validate and store new headers
