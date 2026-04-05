@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use bitcoin::block::Block;
 use bitcoin::consensus::serialize;
+use bitcoin::script::Instruction;
 use bitcoin::{Amount, Txid};
 
 use crate::utxo::UtxoSet;
@@ -20,6 +21,35 @@ const SUBSIDY_HALVING_INTERVAL: u32 = 210_000;
 
 /// Initial block subsidy in satoshis (50 BTC).
 const INITIAL_SUBSIDY: u64 = 50 * 100_000_000;
+
+/// Maximum value of a single output (21 million BTC in satoshis).
+const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
+/// Maximum sigops cost per block (BIP-141).
+const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+
+/// Sigops cost multiplier for legacy (non-witness) sigops.
+const WITNESS_SCALE_FACTOR: u64 = 4;
+
+/// Count legacy signature operations in a script.
+/// Uses conservative counting: 20 for each CHECKMULTISIG (MAX_PUBKEYS_PER_MULTISIG).
+/// This matches Bitcoin Core's `GetLegacySigOpCount` with fAccurate=false.
+fn count_script_sigops(script: &bitcoin::Script) -> u64 {
+    use bitcoin::opcodes::all::{
+        OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
+    };
+    let mut count = 0u64;
+    for instruction in script.instructions().flatten() {
+        if let Instruction::Op(op) = instruction {
+            if op == OP_CHECKSIG || op == OP_CHECKSIGVERIFY {
+                count += 1;
+            } else if op == OP_CHECKMULTISIG || op == OP_CHECKMULTISIGVERIFY {
+                count += 20;
+            }
+        }
+    }
+    count
+}
 
 /// Validate the structural properties of a full block.
 /// This does NOT validate scripts or UTXO spends (Phase 2b/2c).
@@ -59,7 +89,8 @@ pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationE
         });
     }
 
-    // 6. Transaction format validation
+    // 6. Transaction format validation + output value limits + sigops
+    let mut block_sigops: u64 = 0;
     for (i, tx) in block.txdata.iter().enumerate() {
         if tx.input.is_empty() {
             return Err(BlockValidationError::EmptyInputs {
@@ -73,6 +104,35 @@ pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationE
                 tx_index: i,
             });
         }
+
+        // Output value must not exceed MAX_MONEY
+        for (j, output) in tx.output.iter().enumerate() {
+            if output.value.to_sat() > MAX_MONEY {
+                return Err(BlockValidationError::OutputExceedsMaxMoney {
+                    height,
+                    tx_index: i,
+                    output_index: j,
+                    amount: output.value.to_sat(),
+                });
+            }
+            block_sigops += count_script_sigops(&output.script_pubkey);
+        }
+
+        // Count sigops in input scripts (coinbase scriptSig has no meaningful sigops)
+        if !tx.is_coinbase() {
+            for input in &tx.input {
+                block_sigops += count_script_sigops(&input.script_sig);
+            }
+        }
+    }
+
+    // Block-level legacy sigops check (matches Bitcoin Core's CheckBlock)
+    if block_sigops * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST {
+        return Err(BlockValidationError::ExcessiveSigops {
+            height,
+            sigops: block_sigops,
+            max: MAX_BLOCK_SIGOPS_COST / WITNESS_SCALE_FACTOR,
+        });
     }
 
     // 7. No duplicate transactions (BIP-30)
@@ -173,6 +233,8 @@ pub fn validate_block_scripts(
     // Track outputs created within this block for in-block spend resolution.
     // Maps (txid, vout) -> (amount, script_pubkey_bytes, is_coinbase).
     let mut block_utxos: HashMap<(Txid, u32), (u64, Vec<u8>, bool)> = HashMap::new();
+    // Track persistent UTXOs already spent in this block (double-spend detection).
+    let mut spent_persistent: HashSet<(Txid, u32)> = HashSet::new();
     let mut total_fees: u64 = 0;
 
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
@@ -191,6 +253,16 @@ pub fn validate_block_scripts(
                         // In-block spend (output created earlier in this block)
                         (entry.0, entry.1)
                     } else {
+                        // Double-spend check: ensure this persistent UTXO hasn't
+                        // already been consumed by another input in this block
+                        if !spent_persistent.insert(key) {
+                            return Err(BlockValidationError::DuplicateSpend {
+                                height,
+                                tx_index: tx_idx,
+                                input_index: input_idx,
+                            });
+                        }
+
                         let utxo = utxo_set
                             .get(&prev_txid, prev_vout)
                             .map_err(|e| BlockValidationError::UtxoError {
@@ -204,8 +276,9 @@ pub fn validate_block_scripts(
                             })?;
 
                         // Coinbase maturity: coinbase outputs need 100 confirmations
+                        // Use saturating_sub to prevent overflow with large heights
                         if utxo.is_coinbase
-                            && height < utxo.height + COINBASE_MATURITY
+                            && height.saturating_sub(utxo.height) < COINBASE_MATURITY
                         {
                             return Err(BlockValidationError::PrematureCoinbaseSpend {
                                 height,
@@ -385,6 +458,22 @@ pub enum BlockValidationError {
         height: u32,
         msg: String,
     },
+    OutputExceedsMaxMoney {
+        height: u32,
+        tx_index: usize,
+        output_index: usize,
+        amount: u64,
+    },
+    DuplicateSpend {
+        height: u32,
+        tx_index: usize,
+        input_index: usize,
+    },
+    ExcessiveSigops {
+        height: u32,
+        sigops: u64,
+        max: u64,
+    },
 }
 
 impl std::fmt::Display for BlockValidationError {
@@ -474,6 +563,34 @@ impl std::fmt::Display for BlockValidationError {
             Self::UtxoError { height, msg } => {
                 write!(f, "block {} UTXO error: {}", height, msg)
             }
+            Self::OutputExceedsMaxMoney {
+                height,
+                tx_index,
+                output_index,
+                amount,
+            } => write!(
+                f,
+                "block {} tx {} output {} amount {} sats exceeds MAX_MONEY",
+                height, tx_index, output_index, amount
+            ),
+            Self::DuplicateSpend {
+                height,
+                tx_index,
+                input_index,
+            } => write!(
+                f,
+                "block {} tx {} input {} double-spends a UTXO already consumed in this block",
+                height, tx_index, input_index
+            ),
+            Self::ExcessiveSigops {
+                height,
+                sigops,
+                max,
+            } => write!(
+                f,
+                "block {} has {} legacy sigops, exceeds max {}",
+                height, sigops, max
+            ),
         }
     }
 }

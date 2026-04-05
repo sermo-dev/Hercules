@@ -74,6 +74,19 @@ impl PeerPool {
             return;
         }
 
+        // Re-discover peers from DNS if we've exhausted the address list
+        if self.next_addr >= self.known_addrs.len() {
+            let fresh = Peer::discover_peers();
+            if !fresh.is_empty() {
+                info!(
+                    "PeerPool: refreshed DNS, got {} addresses",
+                    fresh.len()
+                );
+                self.known_addrs = fresh;
+                self.next_addr = 0;
+            }
+        }
+
         let needed = MAX_OUTBOUND - current;
         let mut connected = 0;
         let mut attempts = 0;
@@ -81,8 +94,7 @@ impl PeerPool {
 
         while connected < needed && attempts < max_attempts {
             if self.next_addr >= self.known_addrs.len() {
-                self.next_addr = 0;
-                break; // wrapped around, stop
+                break; // exhausted address list
             }
 
             let addr = self.known_addrs[self.next_addr];
@@ -216,24 +228,52 @@ impl PeerPool {
 
     /// Service pings on all peers that are currently in the pool (not checked out).
     /// This keeps connections alive during idle periods.
+    /// Peers are taken out of slots before I/O so the mutex is not held during network operations.
     pub fn service_pings(&self) {
-        let mut slots = self.slots.lock().unwrap();
-        let mut dead = Vec::new();
+        // Take all idle peers out of their slots (releases lock for I/O)
+        let peers_with_addrs: Vec<(SocketAddr, Peer)> = {
+            let mut slots = self.slots.lock().unwrap();
+            slots
+                .iter_mut()
+                .filter_map(|slot| slot.peer.take().map(|p| (slot.addr, p)))
+                .collect()
+        };
 
-        for slot in slots.iter_mut() {
-            if let Some(ref mut peer) = slot.peer {
-                if let Err(e) = peer.idle_wait(PEER_PING_TIMEOUT) {
-                    warn!("PeerPool: peer {} failed during ping service: {}", slot.addr, e);
-                    dead.push(slot.addr.to_string());
+        let mut live = Vec::new();
+        let mut dead_addrs = Vec::new();
+
+        for (addr, mut peer) in peers_with_addrs {
+            match peer.idle_wait(PEER_PING_TIMEOUT) {
+                Ok(()) => live.push((addr, peer)),
+                Err(e) => {
+                    warn!(
+                        "PeerPool: peer {} failed during ping service: {}",
+                        addr, e
+                    );
+                    dead_addrs.push(addr);
                 }
             }
         }
 
-        drop(slots);
+        // Return live peers and remove dead slots
+        let mut slots = self.slots.lock().unwrap();
+        for (addr, peer) in live {
+            for slot in slots.iter_mut() {
+                if slot.addr == addr && slot.peer.is_none() {
+                    slot.peer = Some(peer);
+                    break;
+                }
+            }
+        }
 
-        // Remove dead peers outside the lock
-        for addr in dead {
-            self.remove_peer(&addr);
+        if !dead_addrs.is_empty() {
+            slots.retain(|s| !dead_addrs.contains(&s.addr));
+            let remaining = slots.len();
+            info!(
+                "PeerPool: removed {} dead peers, {} remaining",
+                dead_addrs.len(),
+                remaining
+            );
         }
     }
 }

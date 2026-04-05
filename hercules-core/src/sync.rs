@@ -249,6 +249,7 @@ impl HeaderSync {
                 if pool.count() == 0 {
                     return Err(SyncError::Peer("all peers disconnected".into()));
                 }
+                std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
             let mut peer = best_peer.unwrap();
@@ -322,6 +323,7 @@ impl HeaderSync {
                         if pool.count() == 0 {
                             return Err(SyncError::Peer("all peers disconnected".into()));
                         }
+                        std::thread::sleep(Duration::from_secs(1));
                         continue;
                     }
                     let mut block_peer = block_peer.unwrap();
@@ -364,6 +366,34 @@ impl HeaderSync {
                             block_hash,
                             block.block_hash()
                         )));
+                    }
+
+                    // Crash recovery: if UTXOs from this block already exist in
+                    // the set, the block was applied but validated_height wasn't
+                    // updated (crash between the two). Just advance the height.
+                    let already_applied = self
+                        .utxo
+                        .has_utxos_at_height(next_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                    if already_applied {
+                        info!(
+                            "Block {} already applied (crash recovery), advancing validated height",
+                            next_height
+                        );
+                        self.store
+                            .set_validated_height(next_height)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                        let best = pool.best_peer_addr().unwrap_or_default();
+                        on_progress(self.make_status(
+                            tip_height,
+                            peer_height,
+                            &pool,
+                            &best,
+                            false,
+                            next_height,
+                            None,
+                        ));
+                        continue;
                     }
 
                     // Structural validation

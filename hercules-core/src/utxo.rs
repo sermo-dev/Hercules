@@ -66,6 +66,7 @@ impl UtxoSet {
                 is_coinbase INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_undo_height ON undo(block_height);
+            CREATE INDEX IF NOT EXISTS idx_utxos_height ON utxos(height);
             ",
         )
         .map_err(|e| UtxoError(format!("create tables: {}", e)))?;
@@ -535,7 +536,9 @@ impl UtxoSet {
             hex::encode(file_hash)
         );
 
-        // Bulk-load entries
+        // Bulk-load entries with incremental hash verification.
+        // Hash is computed during insertion and verified BEFORE commit
+        // so corrupt data never persists.
         let mut conn = self
             .conn
             .lock()
@@ -555,6 +558,8 @@ impl UtxoSet {
 
             let mut txid = [0u8; 32];
             let mut buf2 = [0u8; 2];
+            let mut hasher = Sha256::new();
+            let mut prev_key: Option<([u8; 32], u32)> = None;
 
             for i in 0..utxo_count {
                 r.read_exact(&mut txid)
@@ -562,6 +567,18 @@ impl UtxoSet {
                 r.read_exact(&mut buf4)
                     .map_err(|e| UtxoError(format!("read vout at {}: {}", i, e)))?;
                 let vout = u32::from_le_bytes(buf4);
+
+                // Verify entries are sorted by (txid, vout) — required for
+                // deterministic hash and matches DB ORDER BY
+                let key = (txid, vout);
+                if let Some(ref prev) = prev_key {
+                    if key <= *prev {
+                        return Err(UtxoError(
+                            "snapshot entries not sorted by (txid, vout)".into(),
+                        ));
+                    }
+                }
+                prev_key = Some(key);
 
                 r.read_exact(&mut buf8)
                     .map_err(|e| UtxoError(format!("read amount at {}: {}", i, e)))?;
@@ -584,6 +601,15 @@ impl UtxoSet {
                 r.read_exact(&mut script)
                     .map_err(|e| UtxoError(format!("read script at {}: {}", i, e)))?;
 
+                // Feed to hasher in same format/order as compute_hash()
+                hasher.update(&txid);
+                hasher.update(&vout.to_le_bytes());
+                hasher.update(&amount.to_le_bytes());
+                hasher.update(&(script_len as u16).to_le_bytes());
+                hasher.update(&script);
+                hasher.update(&entry_height.to_le_bytes());
+                hasher.update(&[is_coinbase as u8]);
+
                 stmt.execute(params![
                     txid.as_slice(),
                     vout,
@@ -598,6 +624,17 @@ impl UtxoSet {
                     on_progress(i, utxo_count);
                 }
             }
+
+            // Verify hash BEFORE commit — reject corrupt data without persisting
+            let loaded_hash: [u8; 32] = hasher.finalize().into();
+            if loaded_hash != file_hash {
+                // db_tx is dropped without commit → automatic rollback
+                return Err(UtxoError(format!(
+                    "snapshot verification failed: loaded={}, expected={}",
+                    hex::encode(loaded_hash),
+                    hex::encode(file_hash)
+                )));
+            }
         }
 
         db_tx
@@ -607,16 +644,6 @@ impl UtxoSet {
         drop(conn);
 
         on_progress(utxo_count, utxo_count);
-
-        // Verify the loaded UTXO set hash matches
-        let loaded_hash = self.compute_hash()?;
-        if loaded_hash != file_hash {
-            return Err(UtxoError(format!(
-                "snapshot verification failed: loaded={}, expected={}",
-                hex::encode(loaded_hash),
-                hex::encode(file_hash)
-            )));
-        }
 
         info!(
             "UTXO snapshot loaded and verified: {} utxos at height {}",
@@ -629,6 +656,26 @@ impl UtxoSet {
             utxo_count,
             utxo_hash: file_hash,
         })
+    }
+
+    /// Check if any UTXOs exist at the given block height.
+    /// Used for crash recovery: if UTXOs from a block exist but validated_height
+    /// wasn't updated, the block was already applied.
+    pub fn has_utxos_at_height(&self, height: u32) -> Result<bool, UtxoError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+        let result = conn.query_row(
+            "SELECT 1 FROM utxos WHERE height = ?1 LIMIT 1",
+            params![height],
+            |_| Ok(()),
+        );
+        match result {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(UtxoError(format!("check height {}: {}", height, e))),
+        }
     }
 
     /// Get the number of UTXOs in the set.

@@ -27,7 +27,13 @@ class NodeViewModel: ObservableObject {
     @Published var snapshotProgress: Double = 0
     @Published var isValidationPaused = false
 
-    private var node: HerculesNode?
+    // Thread-safe access to the node: set from background thread, read from main thread
+    private var _node: HerculesNode?
+    private let nodeLock = NSLock()
+    private var node: HerculesNode? {
+        get { nodeLock.lock(); defer { nodeLock.unlock() }; return _node }
+        set { nodeLock.lock(); defer { nodeLock.unlock() }; _node = newValue }
+    }
 
     func startSync() {
         guard !isSyncRunning else { return }
@@ -109,8 +115,12 @@ class NodeViewModel: ObservableObject {
     func toggleValidationPaused() {
         guard let node = node else { return }
         let newState = !isValidationPaused
-        node.setValidationPaused(paused: newState)
         isValidationPaused = newState
+        // Dispatch FFI call off main thread (setValidationPaused sets an AtomicBool
+        // so it's fast, but avoid blocking the main thread for any FFI call)
+        DispatchQueue.global(qos: .userInitiated).async {
+            node.setValidationPaused(paused: newState)
+        }
     }
 
     static func dbPath() -> String {
