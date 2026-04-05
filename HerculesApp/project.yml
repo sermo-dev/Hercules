@@ -27,6 +27,7 @@ targets:
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
     info:
+      path: HerculesApp/Info.plist
       properties:
         UIBackgroundModes:
           - remote-notification
