@@ -3,6 +3,7 @@ use bitcoin::consensus::deserialize;
 
 mod block_validation;
 mod p2p;
+mod peer_pool;
 mod store;
 mod sync;
 mod utxo;
@@ -54,11 +55,28 @@ pub fn hercules_version() -> String {
 // ── Phase 1 types (header sync) ────────────────────────────────────
 
 #[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub addr: String,
+    pub user_agent: String,
+    pub height: u32,
+}
+
+impl From<peer_pool::PeerInfo> for PeerInfo {
+    fn from(p: peer_pool::PeerInfo) -> Self {
+        PeerInfo {
+            addr: p.addr,
+            user_agent: p.user_agent,
+            height: p.height,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SyncStatus {
     pub synced_headers: u32,
     pub peer_height: u32,
-    pub peer_addr: String,
-    pub peer_user_agent: String,
+    pub peers: Vec<PeerInfo>,
+    pub active_peer_addr: String,
     pub is_syncing: bool,
     pub validated_blocks: u32,
     pub error: Option<String>,
@@ -69,8 +87,8 @@ impl From<sync::SyncStatus> for SyncStatus {
         SyncStatus {
             synced_headers: s.synced_headers,
             peer_height: s.peer_height,
-            peer_addr: s.peer_addr,
-            peer_user_agent: s.peer_user_agent,
+            peers: s.peers.into_iter().map(|p| p.into()).collect(),
+            active_peer_addr: s.active_peer_addr,
             is_syncing: s.is_syncing,
             validated_blocks: s.validated_blocks,
             error: s.error,
@@ -234,8 +252,12 @@ mod tests {
         let internal = sync::SyncStatus {
             synced_headers: 100,
             peer_height: 800000,
-            peer_addr: "1.2.3.4:8333".into(),
-            peer_user_agent: "/Satoshi:27.0.0/".into(),
+            peers: vec![peer_pool::PeerInfo {
+                addr: "1.2.3.4:8333".into(),
+                user_agent: "/Satoshi:27.0.0/".into(),
+                height: 800000,
+            }],
+            active_peer_addr: "1.2.3.4:8333".into(),
             is_syncing: true,
             validated_blocks: 50,
             error: None,
@@ -243,7 +265,9 @@ mod tests {
         let external: SyncStatus = internal.into();
         assert_eq!(external.synced_headers, 100);
         assert_eq!(external.peer_height, 800000);
-        assert_eq!(external.peer_addr, "1.2.3.4:8333");
+        assert_eq!(external.peers.len(), 1);
+        assert_eq!(external.peers[0].addr, "1.2.3.4:8333");
+        assert_eq!(external.active_peer_addr, "1.2.3.4:8333");
         assert!(external.is_syncing);
         assert_eq!(external.validated_blocks, 50);
     }

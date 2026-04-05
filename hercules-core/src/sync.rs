@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use bitcoin::block::Header;
@@ -9,16 +8,13 @@ use bitcoin::BlockHash;
 use log::{info, warn};
 
 use crate::block_validation::{validate_block, validate_block_scripts};
-use crate::p2p::Peer;
+use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
 use crate::utxo::UtxoSet;
 use crate::validation::validate_headers;
 
 /// How often to poll for new blocks after initial sync (seconds).
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Delay before retrying peer connection after failure.
-const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 
 /// Genesis block header (block 0).
 fn genesis_header() -> Header {
@@ -36,8 +32,8 @@ fn genesis_header() -> Header {
 pub struct SyncStatus {
     pub synced_headers: u32,
     pub peer_height: u32,
-    pub peer_addr: String,
-    pub peer_user_agent: String,
+    pub peers: Vec<PeerInfo>,
+    pub active_peer_addr: String,
     pub is_syncing: bool,
     pub validated_blocks: u32,
     pub error: Option<String>,
@@ -93,6 +89,28 @@ impl HeaderSync {
         Ok(HeaderSync { store, utxo })
     }
 
+    /// Build a SyncStatus snapshot from the pool and current state.
+    fn make_status(
+        &self,
+        synced_headers: u32,
+        peer_height: u32,
+        pool: &PeerPool,
+        active_peer_addr: &str,
+        is_syncing: bool,
+        validated_blocks: u32,
+        error: Option<String>,
+    ) -> SyncStatus {
+        SyncStatus {
+            synced_headers,
+            peer_height,
+            peers: pool.peer_info(),
+            active_peer_addr: active_peer_addr.to_string(),
+            is_syncing,
+            validated_blocks,
+            error,
+        }
+    }
+
     /// Run header sync continuously. Calls `on_progress` with status updates.
     /// This is a blocking call that syncs to the chain tip and then monitors
     /// for new blocks every 30 seconds. It only returns on unrecoverable errors.
@@ -100,12 +118,6 @@ impl HeaderSync {
     where
         F: Fn(SyncStatus),
     {
-        // Discover peers
-        let addrs = Peer::discover_peers();
-        if addrs.is_empty() {
-            return Err(SyncError::NoPeers);
-        }
-
         // Get our current height to report to peers
         let our_height = self
             .store
@@ -113,15 +125,28 @@ impl HeaderSync {
             .map_err(|e| SyncError::Store(format!("{}", e)))?
             .saturating_sub(1);
 
-        // Connect to a peer
-        let mut peer = self.connect_to_peer(&addrs, our_height)?;
-        let mut peer_height = peer.peer_height().unwrap_or(0) as u32;
-        let mut peer_user_agent = peer.peer_user_agent().unwrap_or_default();
-        let mut peer_addr = peer.addr().to_string();
+        // Create the peer pool
+        let mut pool = PeerPool::new(our_height).map_err(|e| {
+            if format!("{}", e).contains("no peers discovered") {
+                SyncError::NoPeers
+            } else {
+                SyncError::Peer(format!("{}", e))
+            }
+        })?;
+
+        let peer_height = pool
+            .peer_info()
+            .iter()
+            .map(|p| p.height)
+            .max()
+            .unwrap_or(0);
+
+        let active_addr = pool.best_peer_addr().unwrap_or_default();
 
         info!(
-            "Connected to {} ({}) at height {}",
-            peer_addr, peer_user_agent, peer_height
+            "PeerPool ready with {} peers, best height {}",
+            pool.count(),
+            peer_height,
         );
 
         let validated = self
@@ -130,15 +155,17 @@ impl HeaderSync {
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
         // Report initial status
-        on_progress(SyncStatus {
-            synced_headers: our_height,
+        on_progress(self.make_status(
+            our_height,
             peer_height,
-            peer_addr: peer_addr.clone(),
-            peer_user_agent: peer_user_agent.clone(),
-            is_syncing: true,
-            validated_blocks: validated,
-            error: None,
-        });
+            &pool,
+            &active_addr,
+            true,
+            validated,
+            None,
+        ));
+
+        let mut peer_height = peer_height;
 
         loop {
             let (tip_height, tip_hash, tip_header) = self
@@ -152,23 +179,42 @@ impl HeaderSync {
                 .validated_height()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-            // Request headers from peer
+            // Get best peer for headers
+            let best_peer = pool.best_peer();
+            if best_peer.is_none() {
+                warn!("No peers available, trying to refill pool");
+                pool.maintain();
+                if pool.count() == 0 {
+                    return Err(SyncError::Peer("all peers disconnected".into()));
+                }
+                continue;
+            }
+            let mut peer = best_peer.unwrap();
+            let active_addr = peer.addr().to_string();
+
+            // Request headers from best peer
             let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
-                Ok(h) => h,
+                Ok(h) => {
+                    pool.return_peer(peer);
+                    h
+                }
                 Err(e) => {
-                    warn!("Peer error: {}", e);
-                    // Try to reconnect
-                    match self.reconnect(&addrs, tip_height, &on_progress, &peer_addr, &peer_user_agent, current_validated) {
-                        Ok(new_peer) => {
-                            peer_height = new_peer.peer_height().unwrap_or(0) as u32;
-                            peer_user_agent = new_peer.peer_user_agent().unwrap_or_default();
-                            peer_addr = new_peer.addr().to_string();
-                            peer = new_peer;
-                            info!("Reconnected to {} ({})", peer_addr, peer_user_agent);
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                    warn!("Peer {} error during get_headers: {}", active_addr, e);
+                    pool.remove_peer(&active_addr);
+                    pool.maintain();
+                    if pool.count() == 0 {
+                        return Err(SyncError::Peer("all peers disconnected".into()));
                     }
+                    on_progress(self.make_status(
+                        tip_height,
+                        peer_height,
+                        &pool,
+                        "",
+                        true,
+                        current_validated,
+                        Some(format!("Peer {} disconnected, using others", active_addr)),
+                    ));
+                    continue;
                 }
             };
 
@@ -204,29 +250,45 @@ impl HeaderSync {
                             SyncError::Store(format!("no hash at height {}", next_height))
                         })?;
 
-                    let block = match peer.get_block(block_hash) {
-                        Ok(b) => b,
+                    // Use any available peer for block download
+                    let block_peer = pool.any_peer();
+                    if block_peer.is_none() {
+                        warn!("No peers available for block download, refilling pool");
+                        pool.maintain();
+                        if pool.count() == 0 {
+                            return Err(SyncError::Peer("all peers disconnected".into()));
+                        }
+                        continue;
+                    }
+                    let mut block_peer = block_peer.unwrap();
+                    let block_peer_addr = block_peer.addr().to_string();
+
+                    let block = match block_peer.get_block(block_hash) {
+                        Ok(b) => {
+                            pool.return_peer(block_peer);
+                            b
+                        }
                         Err(e) => {
-                            warn!("Block download error at height {}: {}", next_height, e);
-                            // Try to reconnect
-                            match self.reconnect(
-                                &addrs,
-                                tip_height,
-                                &on_progress,
-                                &peer_addr,
-                                &peer_user_agent,
-                                validated,
-                            ) {
-                                Ok(new_peer) => {
-                                    peer_height = new_peer.peer_height().unwrap_or(0) as u32;
-                                    peer_user_agent =
-                                        new_peer.peer_user_agent().unwrap_or_default();
-                                    peer_addr = new_peer.addr().to_string();
-                                    peer = new_peer;
-                                    continue;
-                                }
-                                Err(e) => return Err(e),
+                            warn!(
+                                "Block download error at height {} from {}: {}",
+                                next_height, block_peer_addr, e
+                            );
+                            pool.remove_peer(&block_peer_addr);
+                            pool.maintain();
+                            if pool.count() == 0 {
+                                return Err(SyncError::Peer("all peers disconnected".into()));
                             }
+                            let best = pool.best_peer_addr().unwrap_or_default();
+                            on_progress(self.make_status(
+                                tip_height,
+                                peer_height,
+                                &pool,
+                                &best,
+                                false,
+                                validated,
+                                None,
+                            ));
+                            continue;
                         }
                     };
 
@@ -261,31 +323,50 @@ impl HeaderSync {
                         info!("Validated block {}/{}", next_height, tip_height);
                     }
 
-                    on_progress(SyncStatus {
-                        synced_headers: tip_height,
+                    let best = pool.best_peer_addr().unwrap_or_default();
+                    on_progress(self.make_status(
+                        tip_height,
                         peer_height,
-                        peer_addr: peer_addr.clone(),
-                        peer_user_agent: peer_user_agent.clone(),
-                        is_syncing: false,
-                        validated_blocks: next_height,
-                        error: None,
-                    });
+                        &pool,
+                        &best,
+                        false,
+                        next_height,
+                        None,
+                    ));
 
                     continue; // Immediately download next block
                 }
 
                 // Fully synced and validated — monitor mode
-                on_progress(SyncStatus {
-                    synced_headers: tip_height,
+                let best = pool.best_peer_addr().unwrap_or_default();
+                on_progress(self.make_status(
+                    tip_height,
                     peer_height,
-                    peer_addr: peer_addr.clone(),
-                    peer_user_agent: peer_user_agent.clone(),
-                    is_syncing: false,
-                    validated_blocks: validated,
-                    error: None,
-                });
+                    &pool,
+                    &best,
+                    false,
+                    validated,
+                    None,
+                ));
 
-                let _ = peer.idle_wait(MONITOR_INTERVAL);
+                // Service pings on all idle peers and maintain the pool
+                pool.service_pings();
+                pool.maintain();
+                pool.update_our_height(tip_height);
+
+                // Sleep for the monitor interval in small chunks so we can
+                // service pings periodically
+                let monitor_start = std::time::Instant::now();
+                while monitor_start.elapsed() < MONITOR_INTERVAL {
+                    let remaining = MONITOR_INTERVAL.saturating_sub(monitor_start.elapsed());
+                    let wait = std::cmp::min(remaining, Duration::from_secs(5));
+                    if wait.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(wait);
+                    pool.service_pings();
+                }
+
                 continue;
             }
 
@@ -333,64 +414,17 @@ impl HeaderSync {
                 .validated_height()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-            on_progress(SyncStatus {
-                synced_headers: new_height,
+            let best = pool.best_peer_addr().unwrap_or_default();
+            on_progress(self.make_status(
+                new_height,
                 peer_height,
-                peer_addr: peer_addr.clone(),
-                peer_user_agent: peer_user_agent.clone(),
-                is_syncing: new_height < peer_height,
-                validated_blocks: validated,
-                error: None,
-            });
+                &pool,
+                &best,
+                new_height < peer_height,
+                validated,
+                None,
+            ));
         }
-    }
-
-    /// Attempt to reconnect to a peer after disconnection.
-    fn reconnect<F>(
-        &self,
-        addrs: &[SocketAddr],
-        tip_height: u32,
-        on_progress: &F,
-        old_addr: &str,
-        old_ua: &str,
-        validated: u32,
-    ) -> Result<Peer, SyncError>
-    where
-        F: Fn(SyncStatus),
-    {
-        // Report disconnection but keep showing synced state
-        on_progress(SyncStatus {
-            synced_headers: tip_height,
-            peer_height: tip_height,
-            peer_addr: old_addr.to_string(),
-            peer_user_agent: old_ua.to_string(),
-            is_syncing: false,
-            validated_blocks: validated,
-            error: Some("Peer disconnected, reconnecting...".into()),
-        });
-
-        // Wait before retrying
-        std::thread::sleep(RECONNECT_DELAY);
-
-        self.connect_to_peer(addrs, tip_height)
-    }
-
-    /// Try connecting to peers until one succeeds.
-    fn connect_to_peer(&self, addrs: &[SocketAddr], our_height: u32) -> Result<Peer, SyncError> {
-        let mut last_err = String::new();
-        for addr in addrs.iter().take(10) {
-            match Peer::connect(*addr, our_height as i32) {
-                Ok(peer) => return Ok(peer),
-                Err(e) => {
-                    warn!("Failed to connect to {}: {}", addr, e);
-                    last_err = format!("{}", e);
-                }
-            }
-        }
-        Err(SyncError::Peer(format!(
-            "could not connect to any peer, last error: {}",
-            last_err
-        )))
     }
 
     /// Get current sync status without syncing.
@@ -409,8 +443,8 @@ impl HeaderSync {
         Ok(SyncStatus {
             synced_headers: height,
             peer_height: 0,
-            peer_addr: String::new(),
-            peer_user_agent: String::new(),
+            peers: Vec::new(),
+            active_peer_addr: String::new(),
             is_syncing: false,
             validated_blocks: validated,
             error: None,

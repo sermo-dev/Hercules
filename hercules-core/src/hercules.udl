@@ -15,11 +15,17 @@ dictionary BlockInfo {
     u32 nonce;
 };
 
+dictionary PeerInfo {
+    string addr;
+    string user_agent;
+    u32 height;
+};
+
 dictionary SyncStatus {
     u32 synced_headers;
     u32 peer_height;
-    string peer_addr;
-    string peer_user_agent;
+    sequence<PeerInfo> peers;
+    string active_peer_addr;
     boolean is_syncing;
     u32 validated_blocks;
     string? error;
