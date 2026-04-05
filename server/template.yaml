@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Hercules Push Notification Relay
+
+Parameters:
+  ApnsKeyId:
+    Type: String
+    Description: APNs Key ID from Apple Developer account
+    Default: ""
+  ApnsTeamId:
+    Type: String
+    Description: Apple Developer Team ID
+    Default: ""
+  ApnsKeyBase64:
+    Type: String
+    Description: Base64-encoded APNs .p8 private key
+    NoEcho: true
+    Default: ""
+  ApnsTopic:
+    Type: String
+    Description: App bundle ID
+    Default: dev.sermo.hercules.app
+  ApnsHost:
+    Type: String
+    Description: APNs endpoint (sandbox or production)
+    Default: api.sandbox.push.apple.com
+    AllowedValues:
+      - api.sandbox.push.apple.com
+      - api.push.apple.com
+
+Resources:
+  # DynamoDB table for device tokens
+  DevicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: hercules-devices
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: device_token
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_token
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SQS queue for block notifications (from Bitcoin Core blocknotify)
+  BlockQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: hercules-new-blocks
+      VisibilityTimeout: 60
+
+  # Lambda: device registration endpoint
+  RegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: register/index.handler
+      Runtime: nodejs20.x
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          DEVICES_TABLE: !Ref DevicesTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DevicesTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /register
+            Method: post
+
+  # Lambda: send APNs pushes (triggered by SQS)
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: notify/index.handler
+      Runtime: nodejs20.x
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          DEVICES_TABLE: !Ref DevicesTable
+          APNS_KEY_ID: !Ref ApnsKeyId
+          APNS_TEAM_ID: !Ref ApnsTeamId
+          APNS_KEY_BASE64: !Ref ApnsKeyBase64
+          APNS_TOPIC: !Ref ApnsTopic
+          APNS_HOST: !Ref ApnsHost
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DevicesTable
+      Events:
+        SQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BlockQueue.Arn
+            BatchSize: 1
+
+Outputs:
+  ApiEndpoint:
+    Description: Registration API endpoint
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/register"
+  QueueUrl:
+    Description: SQS queue URL for blocknotify script
+    Value: !Ref BlockQueue
+  QueueArn:
+    Description: SQS queue ARN (for IAM policy on Bitcoin node)
+    Value: !GetAtt BlockQueue.Arn

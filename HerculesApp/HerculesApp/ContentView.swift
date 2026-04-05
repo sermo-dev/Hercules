@@ -195,6 +195,7 @@ class SnapshotProgressCallback: SnapshotCallback {
 
 struct ContentView: View {
     @StateObject private var viewModel = NodeViewModel()
+    @State private var showSettings = false
 
     var body: some View {
         ZStack {
@@ -204,23 +205,35 @@ struct ContentView: View {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 20) {
                         // Logo / header area
-                        VStack(spacing: 8) {
-                            Text("HERCULES")
-                                .font(.system(size: 34, weight: .heavy, design: .default))
-                                .tracking(6)
-                                .foregroundStyle(Theme.textPrimary)
+                        ZStack(alignment: .topTrailing) {
+                            VStack(spacing: 8) {
+                                Text("HERCULES")
+                                    .font(.system(size: 34, weight: .heavy, design: .default))
+                                    .tracking(6)
+                                    .foregroundStyle(Theme.textPrimary)
 
-                            Text("Bitcoin Full Node")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(Theme.textSecondary)
+                                Text("Bitcoin Full Node")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(Theme.textSecondary)
 
-                            Text(herculesVersion())
-                                .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                .foregroundStyle(Theme.textTertiary)
+                                Text(herculesVersion())
+                                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                    .foregroundStyle(Theme.textTertiary)
+                            }
+                            .frame(maxWidth: .infinity)
+
+                            Button(action: { showSettings = true }) {
+                                Image(systemName: "gearshape.fill")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(Theme.textSecondary)
+                                    .padding(8)
+                            }
                         }
-                        .frame(maxWidth: .infinity)
                         .padding(.top, 16)
                         .padding(.bottom, 4)
+                        .sheet(isPresented: $showSettings) {
+                            SettingsView()
+                        }
 
                         // Tor status card
                         if viewModel.isBootstrappingTor || viewModel.torStatus != nil {
