@@ -1,12 +1,29 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::Mutex;
 
 use bitcoin::block::Block;
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 
 use log::info;
+
+/// Snapshot file magic bytes: "HUTX"
+const SNAPSHOT_MAGIC: [u8; 4] = [b'H', b'U', b'T', b'X'];
+
+/// Current snapshot format version.
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// Metadata about a loaded or expected UTXO snapshot.
+#[derive(Debug, Clone)]
+pub struct SnapshotMeta {
+    pub height: u32,
+    pub block_hash: [u8; 32],
+    pub utxo_count: u64,
+    pub utxo_hash: [u8; 32],
+}
 
 /// A single unspent transaction output.
 #[derive(Debug, Clone)]
@@ -298,6 +315,322 @@ impl UtxoSet {
         Ok(())
     }
 
+    // ── Snapshot support ─────────────────────────────────────────────
+
+    /// Compute a deterministic SHA256 hash over the entire UTXO set.
+    /// Iterates all UTXOs in (txid, vout) order and hashes each entry.
+    pub fn compute_hash(&self) -> Result<[u8; 32], UtxoError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT txid, vout, amount, script_pubkey, height, is_coinbase \
+                 FROM utxos ORDER BY txid, vout",
+            )
+            .map_err(|e| UtxoError(format!("prepare hash query: {}", e)))?;
+
+        let mut hasher = Sha256::new();
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, i32>(5)?,
+                ))
+            })
+            .map_err(|e| UtxoError(format!("hash query: {}", e)))?;
+
+        for row in rows {
+            let (txid, vout, amount, script, height, is_cb) =
+                row.map_err(|e| UtxoError(format!("hash row: {}", e)))?;
+            hasher.update(&txid);
+            hasher.update(&vout.to_le_bytes());
+            hasher.update(&amount.to_le_bytes());
+            hasher.update(&(script.len() as u16).to_le_bytes());
+            hasher.update(&script);
+            hasher.update(&height.to_le_bytes());
+            hasher.update(&[is_cb as u8]);
+        }
+
+        Ok(hasher.finalize().into())
+    }
+
+    /// Write the entire UTXO set to a snapshot file.
+    ///
+    /// Format:
+    /// - Header: magic (4) + version (4) + height (4) + block_hash (32) + utxo_count (8) + utxo_hash (32)
+    /// - Entries: txid (32) + vout (4) + amount (8) + height (4) + is_coinbase (1) + script_len (2) + script
+    pub fn write_snapshot<W: Write>(
+        &self,
+        writer: W,
+        height: u32,
+        block_hash: &[u8; 32],
+    ) -> Result<SnapshotMeta, UtxoError> {
+        let utxo_count = self.count()?;
+        let utxo_hash = self.compute_hash()?;
+
+        let mut w = BufWriter::new(writer);
+
+        // Write header
+        w.write_all(&SNAPSHOT_MAGIC)
+            .map_err(|e| UtxoError(format!("write magic: {}", e)))?;
+        w.write_all(&SNAPSHOT_VERSION.to_le_bytes())
+            .map_err(|e| UtxoError(format!("write version: {}", e)))?;
+        w.write_all(&height.to_le_bytes())
+            .map_err(|e| UtxoError(format!("write height: {}", e)))?;
+        w.write_all(block_hash)
+            .map_err(|e| UtxoError(format!("write block_hash: {}", e)))?;
+        w.write_all(&utxo_count.to_le_bytes())
+            .map_err(|e| UtxoError(format!("write count: {}", e)))?;
+        w.write_all(&utxo_hash)
+            .map_err(|e| UtxoError(format!("write hash: {}", e)))?;
+
+        // Write entries
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT txid, vout, amount, script_pubkey, height, is_coinbase \
+                 FROM utxos ORDER BY txid, vout",
+            )
+            .map_err(|e| UtxoError(format!("prepare snapshot query: {}", e)))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, i32>(5)?,
+                ))
+            })
+            .map_err(|e| UtxoError(format!("snapshot query: {}", e)))?;
+
+        for row in rows {
+            let (txid, vout, amount, script, h, is_cb) =
+                row.map_err(|e| UtxoError(format!("snapshot row: {}", e)))?;
+
+            w.write_all(&txid)
+                .map_err(|e| UtxoError(format!("write txid: {}", e)))?;
+            w.write_all(&vout.to_le_bytes())
+                .map_err(|e| UtxoError(format!("write vout: {}", e)))?;
+            w.write_all(&amount.to_le_bytes())
+                .map_err(|e| UtxoError(format!("write amount: {}", e)))?;
+            w.write_all(&h.to_le_bytes())
+                .map_err(|e| UtxoError(format!("write entry height: {}", e)))?;
+            w.write_all(&[is_cb as u8])
+                .map_err(|e| UtxoError(format!("write is_coinbase: {}", e)))?;
+            let script_len = script.len() as u16;
+            w.write_all(&script_len.to_le_bytes())
+                .map_err(|e| UtxoError(format!("write script_len: {}", e)))?;
+            w.write_all(&script)
+                .map_err(|e| UtxoError(format!("write script: {}", e)))?;
+        }
+
+        w.flush()
+            .map_err(|e| UtxoError(format!("flush snapshot: {}", e)))?;
+
+        let meta = SnapshotMeta {
+            height,
+            block_hash: *block_hash,
+            utxo_count,
+            utxo_hash,
+        };
+
+        info!(
+            "Wrote UTXO snapshot: height={}, utxos={}, hash={}",
+            height,
+            utxo_count,
+            hex::encode(utxo_hash)
+        );
+
+        Ok(meta)
+    }
+
+    /// Load a UTXO snapshot from a reader. Verifies the UTXO hash after loading.
+    /// The UTXO set must be empty before calling this.
+    ///
+    /// `on_progress` is called periodically with (loaded_count, total_count).
+    pub fn load_snapshot<R: std::io::Read, F>(
+        &self,
+        reader: R,
+        expected_hash: Option<&[u8; 32]>,
+        on_progress: F,
+    ) -> Result<SnapshotMeta, UtxoError>
+    where
+        F: Fn(u64, u64),
+    {
+        let current = self.count()?;
+        if current > 0 {
+            return Err(UtxoError(
+                "UTXO set must be empty before loading snapshot".into(),
+            ));
+        }
+
+        let mut r = BufReader::new(reader);
+
+        // Read header
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)
+            .map_err(|e| UtxoError(format!("read magic: {}", e)))?;
+        if magic != SNAPSHOT_MAGIC {
+            return Err(UtxoError("invalid snapshot magic".into()));
+        }
+
+        let mut buf4 = [0u8; 4];
+        r.read_exact(&mut buf4)
+            .map_err(|e| UtxoError(format!("read version: {}", e)))?;
+        let version = u32::from_le_bytes(buf4);
+        if version != SNAPSHOT_VERSION {
+            return Err(UtxoError(format!(
+                "unsupported snapshot version {}",
+                version
+            )));
+        }
+
+        r.read_exact(&mut buf4)
+            .map_err(|e| UtxoError(format!("read height: {}", e)))?;
+        let height = u32::from_le_bytes(buf4);
+
+        let mut block_hash = [0u8; 32];
+        r.read_exact(&mut block_hash)
+            .map_err(|e| UtxoError(format!("read block_hash: {}", e)))?;
+
+        let mut buf8 = [0u8; 8];
+        r.read_exact(&mut buf8)
+            .map_err(|e| UtxoError(format!("read count: {}", e)))?;
+        let utxo_count = u64::from_le_bytes(buf8);
+
+        let mut file_hash = [0u8; 32];
+        r.read_exact(&mut file_hash)
+            .map_err(|e| UtxoError(format!("read hash: {}", e)))?;
+
+        // Verify against expected hash if provided
+        if let Some(expected) = expected_hash {
+            if file_hash != *expected {
+                return Err(UtxoError(format!(
+                    "snapshot hash mismatch: file={}, expected={}",
+                    hex::encode(file_hash),
+                    hex::encode(expected)
+                )));
+            }
+        }
+
+        info!(
+            "Loading UTXO snapshot: height={}, utxos={}, hash={}",
+            height,
+            utxo_count,
+            hex::encode(file_hash)
+        );
+
+        // Bulk-load entries
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+
+        let db_tx = conn
+            .transaction()
+            .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
+
+        {
+            let mut stmt = db_tx
+                .prepare_cached(
+                    "INSERT INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| UtxoError(format!("prepare insert: {}", e)))?;
+
+            let mut txid = [0u8; 32];
+            let mut buf2 = [0u8; 2];
+
+            for i in 0..utxo_count {
+                r.read_exact(&mut txid)
+                    .map_err(|e| UtxoError(format!("read txid at {}: {}", i, e)))?;
+                r.read_exact(&mut buf4)
+                    .map_err(|e| UtxoError(format!("read vout at {}: {}", i, e)))?;
+                let vout = u32::from_le_bytes(buf4);
+
+                r.read_exact(&mut buf8)
+                    .map_err(|e| UtxoError(format!("read amount at {}: {}", i, e)))?;
+                let amount = i64::from_le_bytes(buf8);
+
+                r.read_exact(&mut buf4)
+                    .map_err(|e| UtxoError(format!("read entry height at {}: {}", i, e)))?;
+                let entry_height = u32::from_le_bytes(buf4);
+
+                let mut cb_byte = [0u8; 1];
+                r.read_exact(&mut cb_byte)
+                    .map_err(|e| UtxoError(format!("read is_coinbase at {}: {}", i, e)))?;
+                let is_coinbase = cb_byte[0] as i32;
+
+                r.read_exact(&mut buf2)
+                    .map_err(|e| UtxoError(format!("read script_len at {}: {}", i, e)))?;
+                let script_len = u16::from_le_bytes(buf2) as usize;
+
+                let mut script = vec![0u8; script_len];
+                r.read_exact(&mut script)
+                    .map_err(|e| UtxoError(format!("read script at {}: {}", i, e)))?;
+
+                stmt.execute(params![
+                    txid.as_slice(),
+                    vout,
+                    amount,
+                    script,
+                    entry_height,
+                    is_coinbase,
+                ])
+                .map_err(|e| UtxoError(format!("insert snapshot utxo {}: {}", i, e)))?;
+
+                if i % 100_000 == 0 {
+                    on_progress(i, utxo_count);
+                }
+            }
+        }
+
+        db_tx
+            .commit()
+            .map_err(|e| UtxoError(format!("commit snapshot: {}", e)))?;
+
+        drop(conn);
+
+        on_progress(utxo_count, utxo_count);
+
+        // Verify the loaded UTXO set hash matches
+        let loaded_hash = self.compute_hash()?;
+        if loaded_hash != file_hash {
+            return Err(UtxoError(format!(
+                "snapshot verification failed: loaded={}, expected={}",
+                hex::encode(loaded_hash),
+                hex::encode(file_hash)
+            )));
+        }
+
+        info!(
+            "UTXO snapshot loaded and verified: {} utxos at height {}",
+            utxo_count, height
+        );
+
+        Ok(SnapshotMeta {
+            height,
+            block_hash,
+            utxo_count,
+            utxo_hash: file_hash,
+        })
+    }
+
     /// Get the number of UTXOs in the set.
     pub fn count(&self) -> Result<u64, UtxoError> {
         let conn = self
@@ -543,5 +876,91 @@ mod tests {
         let result = utxo.get(&txid, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("negative amount"));
+    }
+
+    #[test]
+    fn compute_hash_deterministic() {
+        let utxo = UtxoSet::open(":memory:").unwrap();
+        let genesis = genesis_block();
+        utxo.apply_block(&genesis, 0).unwrap();
+
+        let hash1 = utxo.compute_hash().unwrap();
+        let hash2 = utxo.compute_hash().unwrap();
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn snapshot_write_and_load_roundtrip() {
+        let utxo1 = UtxoSet::open(":memory:").unwrap();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+        assert_eq!(utxo1.count().unwrap(), 1);
+
+        let block_hash = [0xABu8; 32];
+        let mut buf = Vec::new();
+        let meta = utxo1.write_snapshot(&mut buf, 0, &block_hash).unwrap();
+        assert_eq!(meta.height, 0);
+        assert_eq!(meta.block_hash, block_hash);
+        assert_eq!(meta.utxo_count, 1);
+
+        let utxo2 = UtxoSet::open(":memory:").unwrap();
+        let loaded = utxo2
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .unwrap();
+
+        assert_eq!(loaded.height, 0);
+        assert_eq!(loaded.utxo_count, 1);
+        assert_eq!(utxo2.count().unwrap(), 1);
+
+        let coinbase_txid = genesis.txdata[0].compute_txid();
+        let entry = utxo2.get(&coinbase_txid, 0).unwrap().unwrap();
+        assert_eq!(entry.amount, 50 * 100_000_000);
+        assert!(entry.is_coinbase);
+        assert_eq!(utxo1.compute_hash().unwrap(), utxo2.compute_hash().unwrap());
+    }
+
+    #[test]
+    fn snapshot_rejects_wrong_hash() {
+        let utxo1 = UtxoSet::open(":memory:").unwrap();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+
+        let mut buf = Vec::new();
+        utxo1.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
+
+        let utxo2 = UtxoSet::open(":memory:").unwrap();
+        let result = utxo2.load_snapshot(
+            std::io::Cursor::new(&buf),
+            Some(&[0xFFu8; 32]),
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn snapshot_rejects_nonempty_set() {
+        let utxo = UtxoSet::open(":memory:").unwrap();
+        let genesis = genesis_block();
+        utxo.apply_block(&genesis, 0).unwrap();
+
+        let mut buf = Vec::new();
+        utxo.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
+
+        let result = utxo.load_snapshot(std::io::Cursor::new(&buf), None, |_, _| {});
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be empty"));
+    }
+
+    #[test]
+    fn snapshot_rejects_bad_magic() {
+        let utxo = UtxoSet::open(":memory:").unwrap();
+        let result = utxo.load_snapshot(
+            std::io::Cursor::new(b"BADXsomegarbagedata"),
+            None,
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid snapshot magic"));
     }
 }

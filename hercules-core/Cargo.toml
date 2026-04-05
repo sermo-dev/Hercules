@@ -12,6 +12,7 @@ uniffi = { version = "0.28", features = ["cli"] }
 bitcoin = { version = "0.32", features = ["serde", "bitcoinconsensus"] }
 bitcoinconsensus = "0.105"
 hex = "0.4"
+sha2 = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 log = "0.4"
 thiserror = "1.0"

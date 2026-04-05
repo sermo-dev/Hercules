@@ -146,6 +146,51 @@ impl HerculesNode {
                 sync::SyncError::Store(s) => HerculesError::StorageError { msg: s },
             })
     }
+
+    /// Check if the node needs a UTXO snapshot before it can validate blocks efficiently.
+    pub fn needs_snapshot(&self) -> Result<bool, HerculesError> {
+        self.syncer
+            .needs_snapshot()
+            .map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })
+    }
+
+    /// Load a UTXO snapshot from a file. After loading, block validation resumes
+    /// from the snapshot height.
+    pub fn load_snapshot(
+        &self,
+        snapshot_path: String,
+        callback: Box<dyn SnapshotCallback>,
+    ) -> Result<SnapshotInfo, HerculesError> {
+        let meta = self
+            .syncer
+            .load_snapshot(&snapshot_path, None, |loaded, total| {
+                callback.on_progress(loaded, total);
+            })
+            .map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })?;
+
+        Ok(SnapshotInfo {
+            height: meta.height,
+            utxo_count: meta.utxo_count,
+            utxo_hash: hex::encode(meta.utxo_hash),
+        })
+    }
+}
+
+/// Callback for snapshot loading progress.
+pub trait SnapshotCallback: Send + Sync {
+    fn on_progress(&self, loaded: u64, total: u64);
+}
+
+/// Information about a loaded UTXO snapshot.
+#[derive(Debug, Clone)]
+pub struct SnapshotInfo {
+    pub height: u32,
+    pub utxo_count: u64,
+    pub utxo_hash: String,
 }
 
 // ── Utilities ──────────────────────────────────────────────────────

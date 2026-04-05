@@ -10,7 +10,7 @@ use log::{info, warn};
 use crate::block_validation::{validate_block, validate_block_scripts};
 use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
-use crate::utxo::UtxoSet;
+use crate::utxo::{SnapshotMeta, UtxoSet};
 use crate::validation::validate_headers;
 
 /// How often to poll for new blocks after initial sync (seconds).
@@ -87,6 +87,50 @@ impl HeaderSync {
         }
 
         Ok(HeaderSync { store, utxo })
+    }
+
+    /// Load a UTXO snapshot from a file path. Sets validated_height to the
+    /// snapshot height so sync resumes from there.
+    pub fn load_snapshot<F>(
+        &self,
+        snapshot_path: &str,
+        expected_hash: Option<&[u8; 32]>,
+        on_progress: F,
+    ) -> Result<SnapshotMeta, SyncError>
+    where
+        F: Fn(u64, u64),
+    {
+        let file = std::fs::File::open(snapshot_path)
+            .map_err(|e| SyncError::Store(format!("open snapshot: {}", e)))?;
+
+        let meta = self
+            .utxo
+            .load_snapshot(file, expected_hash, on_progress)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        self.store
+            .set_validated_height(meta.height)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        info!(
+            "Loaded UTXO snapshot at height {}, {} utxos",
+            meta.height, meta.utxo_count
+        );
+
+        Ok(meta)
+    }
+
+    /// Check if the UTXO set is empty (needs snapshot or full sync from genesis).
+    pub fn needs_snapshot(&self) -> Result<bool, SyncError> {
+        let count = self
+            .utxo
+            .count()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        let validated = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        Ok(count == 0 && validated == 0)
     }
 
     /// Build a SyncStatus snapshot from the pool and current state.
@@ -318,6 +362,13 @@ impl HeaderSync {
                     self.store
                         .set_validated_height(next_height)
                         .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                    // Prune undo data for deeply-buried blocks (keep 288 for reorgs)
+                    if next_height % 1000 == 0 && next_height > 288 {
+                        self.utxo
+                            .prune_undo_below(next_height - 288)
+                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                    }
 
                     if next_height % 1000 == 0 {
                         info!("Validated block {}/{}", next_height, tip_height);

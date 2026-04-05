@@ -23,6 +23,8 @@ class NodeViewModel: ObservableObject {
     @Published var isConnecting = false
     @Published var isSyncRunning = false
     @Published var errorMessage: String?
+    @Published var isLoadingSnapshot = false
+    @Published var snapshotProgress: Double = 0
 
     private var node: HerculesNode?
 
@@ -37,6 +39,33 @@ class NodeViewModel: ObservableObject {
                 let dbPath = Self.dbPath()
                 let node = try HerculesNode(dbPath: dbPath)
                 self?.node = node
+
+                // Check if we need to load a UTXO snapshot
+                if try node.needsSnapshot() {
+                    let snapshotPath = Self.snapshotPath()
+                    if FileManager.default.fileExists(atPath: snapshotPath) {
+                        DispatchQueue.main.async {
+                            self?.isLoadingSnapshot = true
+                            self?.isConnecting = false
+                        }
+
+                        let snapCallback = SnapshotProgressCallback { loaded, total in
+                            DispatchQueue.main.async {
+                                self?.snapshotProgress = total > 0
+                                    ? Double(loaded) / Double(total) : 0
+                            }
+                        }
+
+                        let _ = try node.loadSnapshot(
+                            snapshotPath: snapshotPath,
+                            callback: snapCallback
+                        )
+
+                        DispatchQueue.main.async {
+                            self?.isLoadingSnapshot = false
+                        }
+                    }
+                }
 
                 let status = try node.getStatus()
                 DispatchQueue.main.async {
@@ -59,14 +88,13 @@ class NodeViewModel: ObservableObject {
                     self?.errorMessage = "\(error)"
                     self?.isConnecting = false
                     self?.isSyncRunning = false
-                    // Clear stale peer data so status doesn't show "Synced"
-                    // while disconnected; preserve synced_headers count.
+                    self?.isLoadingSnapshot = false
                     if let s = self?.syncStatus {
                         self?.syncStatus = SyncStatus(
                             syncedHeaders: s.syncedHeaders,
                             peerHeight: 0,
-                            peerAddr: "",
-                            peerUserAgent: "",
+                            peers: [],
+                            activePeerAddr: "",
                             isSyncing: false,
                             validatedBlocks: s.validatedBlocks,
                             error: "\(error)"
@@ -81,6 +109,11 @@ class NodeViewModel: ObservableObject {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("hercules-headers.sqlite3").path
     }
+
+    static func snapshotPath() -> String {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return docs.appendingPathComponent("utxo-snapshot.hutx").path
+    }
 }
 
 class SyncProgressCallback: SyncCallback {
@@ -92,6 +125,18 @@ class SyncProgressCallback: SyncCallback {
 
     func onProgress(status: SyncStatus) {
         handler(status)
+    }
+}
+
+class SnapshotProgressCallback: SnapshotCallback {
+    let handler: (UInt64, UInt64) -> Void
+
+    init(handler: @escaping (UInt64, UInt64) -> Void) {
+        self.handler = handler
+    }
+
+    func onProgress(loaded: UInt64, total: UInt64) {
+        handler(loaded, total)
     }
 }
 
@@ -134,14 +179,19 @@ struct ContentView: View {
                             SyncProgressCard(status: status)
                         }
 
+                        // Snapshot loading card
+                        if viewModel.isLoadingSnapshot {
+                            SnapshotLoadingCard(progress: viewModel.snapshotProgress)
+                        }
+
                         // Block validation progress card
                         if let status = viewModel.syncStatus, status.validatedBlocks > 0 {
                             BlockValidationCard(status: status)
                         }
 
-                        // Peer card
-                        if let status = viewModel.syncStatus, !status.peerAddr.isEmpty {
-                            PeerInfoCard(status: status)
+                        // Peers card
+                        if let status = viewModel.syncStatus, !status.peers.isEmpty {
+                            PeersCard(status: status)
                         }
 
                         // Error card
@@ -372,9 +422,62 @@ struct BlockValidationCard: View {
     }
 }
 
-// MARK: - Peer Info Card
+// MARK: - Snapshot Loading Card
 
-struct PeerInfoCard: View {
+struct SnapshotLoadingCard: View {
+    let progress: Double
+
+    var percentText: String {
+        String(format: "%.1f%%", progress * 100)
+    }
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Image(systemName: "arrow.down.doc.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.accent)
+                    Text("Loading UTXO Snapshot")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Text(percentText)
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Theme.accent)
+                }
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.white.opacity(0.08))
+                            .frame(height: 8)
+
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(
+                                LinearGradient(
+                                    colors: [Theme.accent, Theme.accent.opacity(0.7)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: geo.size.width * progress, height: 8)
+                            .shadow(color: Theme.accent.opacity(0.4), radius: 6, y: 2)
+                    }
+                }
+                .frame(height: 8)
+
+                Text("Importing verified UTXO set...")
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(Theme.textTertiary)
+            }
+        }
+    }
+}
+
+// MARK: - Peers Card
+
+struct PeersCard: View {
     let status: SyncStatus
 
     var body: some View {
@@ -384,44 +487,37 @@ struct PeerInfoCard: View {
                     Image(systemName: "network")
                         .font(.system(size: 13))
                         .foregroundStyle(Theme.accent)
-                    Text("Connected Peer")
+                    Text("Connected Peers (\(status.peers.count))")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(Theme.textSecondary)
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Text("IP")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(Theme.textTertiary)
-                            .frame(width: 36, alignment: .leading)
-                        Text(status.peerAddr)
-                            .font(.system(size: 13, weight: .regular, design: .monospaced))
-                            .foregroundStyle(Theme.textPrimary)
-                    }
-
-                    if !status.peerUserAgent.isEmpty {
+                VStack(spacing: 6) {
+                    ForEach(status.peers, id: \.addr) { peer in
                         HStack(spacing: 8) {
-                            Text("UA")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(Theme.textTertiary)
-                                .frame(width: 36, alignment: .leading)
-                            Text(status.peerUserAgent)
-                                .font(.system(size: 13, weight: .regular, design: .monospaced))
-                                .foregroundStyle(Theme.textPrimary)
-                        }
-                    }
+                            Circle()
+                                .fill(peer.addr == status.activePeerAddr
+                                    ? Theme.success : Theme.textTertiary.opacity(0.4))
+                                .frame(width: 6, height: 6)
 
-                    if status.peerHeight > 0 {
-                        HStack(spacing: 8) {
-                            Text("Tip")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(Theme.textTertiary)
-                                .frame(width: 36, alignment: .leading)
-                            Text("Block #\(formatNumber(status.peerHeight))")
-                                .font(.system(size: 13, weight: .regular, design: .monospaced))
+                            Text(peer.addr)
+                                .font(.system(size: 12, weight: .medium, design: .monospaced))
                                 .foregroundStyle(Theme.textPrimary)
+
+                            Spacer()
+
+                            if !peer.userAgent.isEmpty {
+                                Text(peer.userAgent)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(Theme.textTertiary)
+                                    .lineLimit(1)
+                            }
                         }
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 8)
+                        .background(peer.addr == status.activePeerAddr
+                            ? Theme.accent.opacity(0.08) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                     }
                 }
             }
@@ -472,6 +568,7 @@ struct SyncButton: View {
     }
 
     var label: String {
+        if viewModel.isLoadingSnapshot { return "Loading UTXO Snapshot..." }
         if viewModel.isConnecting { return "Connecting to Network..." }
         if isSyncing { return "Syncing Headers..." }
         if isSynced { return "Node Active" }

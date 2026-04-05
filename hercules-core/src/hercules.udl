@@ -31,8 +31,18 @@ dictionary SyncStatus {
     string? error;
 };
 
+dictionary SnapshotInfo {
+    u32 height;
+    u64 utxo_count;
+    string utxo_hash;
+};
+
 callback interface SyncCallback {
     void on_progress(SyncStatus status);
+};
+
+callback interface SnapshotCallback {
+    void on_progress(u64 loaded, u64 total);
 };
 
 interface HerculesNode {
@@ -44,6 +54,12 @@ interface HerculesNode {
 
     [Throws=HerculesError]
     void start_header_sync(SyncCallback callback);
+
+    [Throws=HerculesError]
+    boolean needs_snapshot();
+
+    [Throws=HerculesError]
+    SnapshotInfo load_snapshot(string snapshot_path, SnapshotCallback callback);
 };
 
 [Error]
