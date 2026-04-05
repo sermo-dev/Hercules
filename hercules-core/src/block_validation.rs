@@ -641,4 +641,52 @@ mod tests {
         // After 64 halvings, subsidy is 0
         assert_eq!(block_subsidy(210_000 * 64).to_sat(), 0);
     }
+
+    #[test]
+    fn subsidy_just_before_halving() {
+        // Block 209,999 is still first era
+        assert_eq!(block_subsidy(209_999).to_sat(), 50 * 100_000_000);
+    }
+
+    #[test]
+    fn sigops_counts_checksig() {
+        use bitcoin::script::Builder;
+        use bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGVERIFY};
+
+        let script = Builder::new()
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_CHECKSIGVERIFY)
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+        assert_eq!(count_script_sigops(&script), 3);
+    }
+
+    #[test]
+    fn sigops_counts_checkmultisig_as_20() {
+        use bitcoin::script::Builder;
+        use bitcoin::opcodes::all::OP_CHECKMULTISIG;
+
+        let script = Builder::new()
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(count_script_sigops(&script), 20);
+    }
+
+    #[test]
+    fn sigops_empty_script_is_zero() {
+        use bitcoin::script::Builder;
+        let script = Builder::new().into_script();
+        assert_eq!(count_script_sigops(&script), 0);
+    }
+
+    #[test]
+    fn sigops_pushdata_not_counted() {
+        use bitcoin::script::Builder;
+
+        // A script with only push bytes should have 0 sigops
+        let script = Builder::new()
+            .push_slice(&[0x01, 0x02, 0x03])
+            .into_script();
+        assert_eq!(count_script_sigops(&script), 0);
+    }
 }

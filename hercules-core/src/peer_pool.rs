@@ -350,6 +350,11 @@ impl PeerPool {
             .map(|s| s.addr.clone())
     }
 
+    /// Check whether an address is currently banned.
+    pub fn is_banned(&self, addr: &str) -> bool {
+        self.bans.get(addr).map_or(false, |expiry| Instant::now() < *expiry)
+    }
+
     /// Service pings on all peers that are currently in the pool (not checked out).
     /// This keeps connections alive during idle periods.
     /// Peers are taken out of slots before I/O so the mutex is not held during network operations.
@@ -399,5 +404,271 @@ impl PeerPool {
                 remaining
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a PeerPool without DNS discovery for testing.
+    fn test_pool() -> PeerPool {
+        PeerPool {
+            slots: Arc::new(Mutex::new(Vec::new())),
+            known_addrs: Vec::new(),
+            next_addr: 0,
+            our_height: 0,
+            last_dns_query: Instant::now(),
+            bans: HashMap::new(),
+            tor: None,
+        }
+    }
+
+    /// Insert a test slot (peer=None, simulating a checked-out peer).
+    fn add_slot(pool: &PeerPool, addr: &str, height: u32) {
+        pool.slots.lock().unwrap().push(PeerSlot {
+            peer: None,
+            addr: addr.to_string(),
+            user_agent: "/test/".to_string(),
+            height,
+            misbehavior: 0,
+            checked_out_at: None,
+        });
+    }
+
+    #[test]
+    fn count_reflects_slots() {
+        let pool = test_pool();
+        assert_eq!(pool.count(), 0);
+        add_slot(&pool, "1.2.3.4:8333", 100);
+        assert_eq!(pool.count(), 1);
+        add_slot(&pool, "5.6.7.8:8333", 200);
+        assert_eq!(pool.count(), 2);
+    }
+
+    #[test]
+    fn peer_info_returns_all_slots() {
+        let pool = test_pool();
+        add_slot(&pool, "1.2.3.4:8333", 100);
+        add_slot(&pool, "5.6.7.8:8333", 200);
+        let info = pool.peer_info();
+        assert_eq!(info.len(), 2);
+        assert_eq!(info[0].addr, "1.2.3.4:8333");
+        assert_eq!(info[0].height, 100);
+        assert_eq!(info[1].addr, "5.6.7.8:8333");
+        assert_eq!(info[1].height, 200);
+    }
+
+    #[test]
+    fn get_peer_height_found_and_missing() {
+        let pool = test_pool();
+        add_slot(&pool, "1.2.3.4:8333", 850_000);
+        assert_eq!(pool.get_peer_height("1.2.3.4:8333"), Some(850_000));
+        assert_eq!(pool.get_peer_height("9.9.9.9:8333"), None);
+    }
+
+    #[test]
+    fn best_peer_addr_selects_highest_height() {
+        let pool = test_pool();
+        add_slot(&pool, "low.peer:8333", 100);
+        add_slot(&pool, "high.peer:8333", 900_000);
+        add_slot(&pool, "mid.peer:8333", 500_000);
+        assert_eq!(pool.best_peer_addr(), Some("high.peer:8333".to_string()));
+    }
+
+    #[test]
+    fn best_peer_addr_empty_pool() {
+        let pool = test_pool();
+        assert_eq!(pool.best_peer_addr(), None);
+    }
+
+    #[test]
+    fn remove_peer_drops_slot() {
+        let pool = test_pool();
+        add_slot(&pool, "1.2.3.4:8333", 100);
+        add_slot(&pool, "5.6.7.8:8333", 200);
+        assert_eq!(pool.count(), 2);
+        pool.remove_peer("1.2.3.4:8333");
+        assert_eq!(pool.count(), 1);
+        assert_eq!(pool.get_peer_height("1.2.3.4:8333"), None);
+        assert_eq!(pool.get_peer_height("5.6.7.8:8333"), Some(200));
+    }
+
+    #[test]
+    fn remove_peer_nonexistent_is_noop() {
+        let pool = test_pool();
+        add_slot(&pool, "1.2.3.4:8333", 100);
+        pool.remove_peer("9.9.9.9:8333");
+        assert_eq!(pool.count(), 1);
+    }
+
+    #[test]
+    fn ban_peer_removes_and_records() {
+        let mut pool = test_pool();
+        add_slot(&pool, "bad.peer:8333", 100);
+        pool.ban_peer("bad.peer:8333");
+        assert_eq!(pool.count(), 0);
+        assert!(pool.is_banned("bad.peer:8333"));
+    }
+
+    #[test]
+    fn misbehaving_increments_score() {
+        let mut pool = test_pool();
+        add_slot(&pool, "peer:8333", 100);
+
+        pool.misbehaving("peer:8333", 10);
+        {
+            let slots = pool.slots.lock().unwrap();
+            let slot = slots.iter().find(|s| s.addr == "peer:8333").unwrap();
+            assert_eq!(slot.misbehavior, 10);
+        }
+
+        pool.misbehaving("peer:8333", 20);
+        {
+            let slots = pool.slots.lock().unwrap();
+            let slot = slots.iter().find(|s| s.addr == "peer:8333").unwrap();
+            assert_eq!(slot.misbehavior, 30);
+        }
+    }
+
+    #[test]
+    fn misbehaving_auto_bans_at_threshold() {
+        let mut pool = test_pool();
+        add_slot(&pool, "peer:8333", 100);
+
+        // Below threshold — not banned
+        pool.misbehaving("peer:8333", 99);
+        assert!(!pool.is_banned("peer:8333"));
+        assert_eq!(pool.count(), 1);
+
+        // Exactly at threshold — banned
+        pool.misbehaving("peer:8333", 1);
+        assert!(pool.is_banned("peer:8333"));
+        assert_eq!(pool.count(), 0);
+    }
+
+    #[test]
+    fn misbehaving_score_saturates() {
+        let mut pool = test_pool();
+        add_slot(&pool, "peer:8333", 100);
+
+        pool.misbehaving("peer:8333", u32::MAX);
+        // Should be banned (score >= 100) and not panic from overflow
+        assert!(pool.is_banned("peer:8333"));
+    }
+
+    #[test]
+    fn bans_overflow_eviction_keeps_newest() {
+        let mut pool = test_pool();
+
+        // Fill bans beyond MAX_BANS
+        for i in 0..MAX_BANS + 50 {
+            let addr = format!("peer{}:8333", i);
+            // Stagger expiry times so oldest can be identified
+            pool.bans.insert(addr, Instant::now() + Duration::from_secs(i as u64 + 1));
+        }
+        assert!(pool.bans.len() > MAX_BANS);
+
+        pool.maintain();
+
+        assert!(pool.bans.len() <= MAX_BANS);
+    }
+
+    #[test]
+    fn slot_checkout_timeout_reclaim() {
+        let mut pool = test_pool();
+
+        // Add a slot with checkout time far in the past (simulating a leaked peer)
+        {
+            let mut slots = pool.slots.lock().unwrap();
+            slots.push(PeerSlot {
+                peer: None,
+                addr: "leaked:8333".to_string(),
+                user_agent: "/test/".to_string(),
+                height: 100,
+                misbehavior: 0,
+                checked_out_at: Some(Instant::now() - Duration::from_secs(300)),
+            });
+            // Also add a healthy slot with no checkout
+            slots.push(PeerSlot {
+                peer: None,
+                addr: "healthy:8333".to_string(),
+                user_agent: "/test/".to_string(),
+                height: 200,
+                misbehavior: 0,
+                checked_out_at: None,
+            });
+        }
+        assert_eq!(pool.count(), 2);
+
+        pool.maintain();
+
+        // Leaked slot should be reclaimed, healthy one kept
+        assert_eq!(pool.count(), 1);
+        assert_eq!(pool.get_peer_height("leaked:8333"), None);
+        assert_eq!(pool.get_peer_height("healthy:8333"), Some(200));
+    }
+
+    #[test]
+    fn recent_checkout_not_reclaimed() {
+        let mut pool = test_pool();
+
+        {
+            let mut slots = pool.slots.lock().unwrap();
+            slots.push(PeerSlot {
+                peer: None,
+                addr: "recent:8333".to_string(),
+                user_agent: "/test/".to_string(),
+                height: 100,
+                misbehavior: 0,
+                checked_out_at: Some(Instant::now()), // just now
+            });
+        }
+
+        pool.maintain();
+
+        // Recently checked out slot should NOT be reclaimed
+        assert_eq!(pool.count(), 1);
+    }
+
+    #[test]
+    fn update_our_height() {
+        let mut pool = test_pool();
+        assert_eq!(pool.our_height, 0);
+        pool.update_our_height(850_000);
+        assert_eq!(pool.our_height, 850_000);
+    }
+
+    #[test]
+    fn best_peer_returns_none_when_all_checked_out() {
+        let pool = test_pool();
+        // Slots with peer=None (all checked out)
+        add_slot(&pool, "peer:8333", 100);
+        assert!(pool.best_peer().is_none());
+    }
+
+    #[test]
+    fn any_peer_returns_none_when_all_checked_out() {
+        let pool = test_pool();
+        add_slot(&pool, "peer:8333", 100);
+        assert!(pool.any_peer().is_none());
+    }
+
+    #[test]
+    fn best_peer_skips_checked_out_slots() {
+        let pool = test_pool();
+        // Slots with peer=None are treated as checked-out; best_peer should skip them
+        add_slot(&pool, "peer:8333", 100);
+        assert!(pool.best_peer().is_none());
+
+        // Verify the slot was not modified (no checkout timestamp set)
+        let slots = pool.slots.lock().unwrap();
+        assert!(slots[0].checked_out_at.is_none());
+    }
+
+    #[test]
+    fn is_banned_false_for_unknown() {
+        let pool = test_pool();
+        assert!(!pool.is_banned("unknown:8333"));
     }
 }

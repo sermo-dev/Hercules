@@ -705,4 +705,235 @@ mod tests {
             result
         );
     }
+
+    // ── u256 edge case tests ──────────────────────────────────────
+
+    #[test]
+    fn u256_add_overflow_wraps() {
+        let max = [0xFF; 32];
+        let one = {
+            let mut b = [0u8; 32];
+            b[0] = 1;
+            b
+        };
+        // max + 1 wraps to zero (carry discarded)
+        let result = super::u256_add(max, one);
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn u256_add_zero_identity() {
+        let zero = [0u8; 32];
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 42;
+            b
+        };
+        assert_eq!(super::u256_add(val, zero), val);
+        assert_eq!(super::u256_add(zero, val), val);
+    }
+
+    #[test]
+    fn u256_sub_basic() {
+        let a = {
+            let mut b = [0u8; 32];
+            b[0] = 200;
+            b
+        };
+        let b = {
+            let mut v = [0u8; 32];
+            v[0] = 100;
+            v
+        };
+        let result = super::u256_sub(a, b);
+        assert_eq!(result[0], 100);
+        assert!(result[1..].iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn u256_sub_self_is_zero() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 0xFF;
+            b[7] = 0xAB;
+            b
+        };
+        let result = super::u256_sub(val, val);
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn u256_mul_by_zero() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 42;
+            b
+        };
+        let result = super::u256_mul_u64(val, 0);
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn u256_mul_by_one() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 99;
+            b[8] = 0x12;
+            b
+        };
+        let result = super::u256_mul_u64(val, 1);
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn u256_div_u64_by_one() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 77;
+            b[16] = 0xFF;
+            b
+        };
+        let result = super::u256_div_u64(val, 1);
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn u256_div_u64_by_zero_saturates() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 42;
+            b
+        };
+        let result = super::u256_div_u64(val, 0);
+        assert_eq!(result, [0xFF; 32]);
+    }
+
+    #[test]
+    fn u256_div_u256_equal_is_one() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 100;
+            b[16] = 0xAB;
+            b
+        };
+        let result = super::u256_div_u256(val, val);
+        let mut expected = [0u8; 32];
+        expected[0] = 1;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn u256_div_u256_smaller_numerator_is_zero() {
+        let small = {
+            let mut b = [0u8; 32];
+            b[0] = 5;
+            b
+        };
+        let big = {
+            let mut b = [0u8; 32];
+            b[0] = 10;
+            b
+        };
+        let result = super::u256_div_u256(small, big);
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn u256_div_u256_by_one() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 0xDE;
+            b[1] = 0xAD;
+            b
+        };
+        let one = {
+            let mut b = [0u8; 32];
+            b[0] = 1;
+            b
+        };
+        let result = super::u256_div_u256(val, one);
+        assert_eq!(result, val);
+    }
+
+    #[test]
+    fn u256_div_u256_by_zero_saturates() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 42;
+            b
+        };
+        let result = super::u256_div_u256(val, [0u8; 32]);
+        assert_eq!(result, [0xFF; 32]);
+    }
+
+    #[test]
+    fn u256_gte_equal_values() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 0xFF;
+            b[31] = 0x01;
+            b
+        };
+        assert!(super::u256_gte(val, val));
+    }
+
+    #[test]
+    fn u256_gt_equal_returns_false() {
+        let val = {
+            let mut b = [0u8; 32];
+            b[0] = 42;
+            b
+        };
+        assert!(!super::u256_gt(&val, &val));
+    }
+
+    #[test]
+    fn u256_not_zero_is_max() {
+        let result = super::u256_not([0u8; 32]);
+        assert_eq!(result, [0xFF; 32]);
+    }
+
+    #[test]
+    fn u256_not_max_is_zero() {
+        let result = super::u256_not([0xFF; 32]);
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    // ── chainwork edge cases ───���─────────────────────────��────────
+
+    #[test]
+    fn chainwork_empty_headers_is_zero() {
+        let result = super::chainwork_for_headers(&[]);
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    #[test]
+    fn work_for_zero_target_is_zero() {
+        // A zero target (invalid) should return zero work
+        use bitcoin::CompactTarget;
+        let result = super::work_for_compact_target(CompactTarget::from_consensus(0));
+        assert_eq!(result, [0u8; 32]);
+    }
+
+    // ── validate_headers edge cases ────────��──────────────────────
+
+    #[test]
+    fn validate_skips_mtp_with_few_timestamps() {
+        // With < 11 timestamps, the MTP check should be skipped
+        let genesis = genesis_header();
+        let block1 = block1_header();
+
+        // Only 2 timestamps — MTP check should not activate
+        let timestamps = vec![genesis.time, genesis.time + 1];
+
+        let result = validate_headers(
+            &[block1],
+            genesis.block_hash(),
+            0,
+            &timestamps,
+            genesis.bits,
+            &|_| Err("unused".into()),
+        );
+        assert!(result.is_ok(), "should pass with < 11 timestamps: {:?}", result);
+    }
 }
