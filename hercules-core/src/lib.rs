@@ -63,17 +63,19 @@ pub fn hercules_version() -> String {
 }
 
 /// Wipe all on-disk state for a Hercules node so the next launch starts from a
-/// clean genesis. Deletes the headers DB plus the derived UTXO and block-store
-/// DBs (and their SQLite -wal/-shm sidecars). The caller MUST drop any live
-/// `HerculesNode` for this `db_path` before calling this — open SQLite handles
-/// will silently keep the inodes alive on POSIX, leaving stale state behind.
+/// clean genesis. Deletes the headers DB plus the derived block-store and
+/// peers SQLite files (and their -wal/-shm sidecars), and recursively removes
+/// the LMDB UTXO directory. The caller MUST drop any live `HerculesNode` for
+/// this `db_path` before calling this — open file handles will silently keep
+/// the inodes alive on POSIX, leaving stale state behind.
 pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
-    // Mirror the path-derivation logic in `HeaderSync::new`. Keep these in sync.
-    let utxo_path = db_path.replace("headers", "utxo");
+    // Mirror the path-derivation logic in `HeaderSync::new`. Keep in sync.
+    let utxo_dir = sync::derive_sibling_path(&db_path, "utxo-lmdb");
     let blocks_path = db_path.replace("headers", "blocks");
     let peers_path = db_path.replace("headers", "peers");
 
-    for base in [&db_path, &utxo_path, &blocks_path, &peers_path] {
+    // SQLite files (headers / blocks / peers) — three sidecars each.
+    for base in [&db_path, &blocks_path, &peers_path] {
         for suffix in ["", "-wal", "-shm"] {
             let p = format!("{}{}", base, suffix);
             match std::fs::remove_file(&p) {
@@ -87,6 +89,18 @@ pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
             }
         }
     }
+
+    // LMDB env: a directory of mmapped files. Recursive removal.
+    match std::fs::remove_dir_all(&utxo_dir) {
+        Ok(_) => log::info!("reset_database: removed {}", utxo_dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(HerculesError::StorageError {
+                msg: format!("failed to remove {}: {}", utxo_dir, e),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -476,7 +490,11 @@ mod tests {
 
     #[test]
     fn node_new_and_status() {
-        let node = HerculesNode::new(":memory:".into(), None).unwrap();
+        // LMDB needs a real directory for the UTXO env, so we anchor every
+        // store under a temp dir instead of the old `:memory:` sentinel.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("hercules-headers.sqlite3");
+        let node = HerculesNode::new(db_path.to_string_lossy().into_owned(), None).unwrap();
         let status = node.get_status().unwrap();
 
         // Fresh node has genesis stored, so synced_headers = 0 (count 1 minus 1)

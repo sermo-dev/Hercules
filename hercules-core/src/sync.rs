@@ -153,12 +153,10 @@ impl HeaderSync {
         let store =
             HeaderStore::open(db_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-        // Derive UTXO database path from header database path
-        let utxo_path = if db_path == ":memory:" {
-            ":memory:".to_string()
-        } else {
-            db_path.replace("headers", "utxo")
-        };
+        // Derive UTXO database path from header database path. The UTXO set
+        // is now LMDB (a directory of mmapped files), not SQLite, so the path
+        // is a directory name sitting next to the headers SQLite file.
+        let utxo_path = derive_sibling_path(db_path, "utxo-lmdb");
         let utxo =
             UtxoSet::open(&utxo_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
@@ -1836,4 +1834,20 @@ fn poisson_delay_secs(mean: f64) -> f64 {
     use std::hash::{BuildHasher, Hasher};
     let u: f64 = (RandomState::new().build_hasher().finish() as f64) / (u64::MAX as f64);
     -mean * u.max(1e-15).ln()
+}
+
+/// Build a sibling path next to `db_path`. Used to put auxiliary stores
+/// (UTXO LMDB env, block store, peer store) alongside the headers SQLite file
+/// without coupling their names to the headers filename's substring layout.
+///
+/// Returns `<parent_of_db_path>/<name>`. If `db_path` has no parent (just a
+/// bare filename), the result is `<name>` in the current directory.
+pub(crate) fn derive_sibling_path(db_path: &str, name: &str) -> String {
+    let path = std::path::Path::new(db_path);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    parent.join(name).to_string_lossy().into_owned()
 }

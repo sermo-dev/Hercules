@@ -1,11 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 
 use bitcoin::block::Block;
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
-use rusqlite::{params, Connection};
+use heed::types::{Bytes, Unit};
+use heed::{Database, Env, EnvOpenOptions, PutFlags};
 use sha2::{Digest, Sha256};
 
 use log::info;
@@ -15,6 +16,35 @@ const SNAPSHOT_MAGIC: [u8; 4] = [b'H', b'U', b'T', b'X'];
 
 /// Current snapshot format version.
 const SNAPSHOT_VERSION: u32 = 1;
+
+/// Maximum allowed amount per UTXO (Bitcoin's MAX_MONEY in satoshis).
+/// Used as a sanity bound on read so a corrupt value doesn't propagate
+/// silently into fee math or hash inputs.
+const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
+/// Initial LMDB map size: 64 GB. LMDB's `map_size` is *virtual* address space,
+/// not on-disk reservation — actual file growth is lazy. 64 GB gives plenty of
+/// headroom over Bitcoin's ~12 GB UTXO set plus undo data, and easily fits in
+/// the 64-bit virtual address space available on iOS / macOS.
+const INITIAL_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024;
+
+/// Number of named DBs we open inside the env. heed requires this up-front.
+const MAX_DBS: u32 = 8;
+
+/// LMDB key length for the `utxos` DB: txid (32) + vout (4 BE).
+const UTXO_KEY_LEN: usize = 36;
+
+/// LMDB key length for the `height_index` DB: height (4 BE) + txid (32) + vout (4 BE).
+const HEIGHT_INDEX_KEY_LEN: usize = 40;
+
+/// Header bytes in a serialized utxos value: amount(8) + height(4) + flags(1).
+const UTXO_VALUE_HEADER_LEN: usize = 13;
+
+/// `flags` bit indicating the UTXO came from a coinbase tx.
+const FLAG_COINBASE: u8 = 1 << 0;
+
+/// Header bytes in a serialized undo entry value: txid(32) + vout(4) + amount(8) + orig_height(4) + flags(1).
+const UNDO_VALUE_HEADER_LEN: usize = 49;
 
 /// Metadata about a loaded or expected UTXO snapshot.
 #[derive(Debug, Clone)]
@@ -34,97 +64,101 @@ pub struct UtxoEntry {
     pub is_coinbase: bool,
 }
 
-/// Persistent UTXO set backed by SQLite.
+/// Persistent UTXO set backed by LMDB (via the `heed` crate).
+///
+/// Three named databases live inside one env:
+///
+/// * `utxos` — `key = txid(32) || vout(4 BE)`, value = `amount(8 LE) || height(4 LE) || flags(1) || script`.
+///   Big-endian vout makes the natural lex sort match `(txid, vout)`, so a
+///   single cursor scan reproduces the snapshot iteration order without an
+///   ORDER BY.
+///
+/// * `undo` — `key = block_height(4 BE) || idx(4 BE)`, value = the spent UTXO
+///   we'll need to restore on rollback. Keying by height puts every block's
+///   undo records together, so prune-below and rollback both range-scan a
+///   contiguous chunk.
+///
+/// * `height_index` — `key = block_height(4 BE) || txid(32) || vout(4 BE)`,
+///   value = empty. Lets us answer "which UTXOs were created at this height?"
+///   in O(matches) instead of scanning the full set, which rollback needs.
+///   Also gives `has_utxos_at_height` a single cursor seek.
+///
+/// All schema versioning is implicit in the snapshot format hash check —
+/// loading a snapshot computed under different on-disk semantics will fail
+/// the SHA256 verification before any data lands.
 pub struct UtxoSet {
-    conn: Mutex<Connection>,
+    env: Env,
+    utxos: Database<Bytes, Bytes>,
+    undo: Database<Bytes, Bytes>,
+    height_index: Database<Bytes, Unit>,
 }
 
 impl UtxoSet {
-    /// Open or create a UTXO set database at the given path.
+    /// Open or create a UTXO LMDB env at `path`. `path` is treated as a
+    /// directory — heed creates `data.mdb` and `lock.mdb` inside it.
     pub fn open(path: &str) -> Result<UtxoSet, UtxoError> {
-        let conn =
-            Connection::open(path).map_err(|e| UtxoError(format!("open: {}", e)))?;
+        let path_buf = PathBuf::from(path);
+        fs::create_dir_all(&path_buf)
+            .map_err(|e| UtxoError(format!("create utxo dir {}: {}", path, e)))?;
+        Self::open_at(&path_buf)
+    }
 
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS utxos (
-                txid BLOB NOT NULL,
-                vout INTEGER NOT NULL,
-                amount INTEGER NOT NULL,
-                script_pubkey BLOB NOT NULL,
-                height INTEGER NOT NULL,
-                is_coinbase INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (txid, vout)
-            );
-            CREATE TABLE IF NOT EXISTS undo (
-                block_height INTEGER NOT NULL,
-                txid BLOB NOT NULL,
-                vout INTEGER NOT NULL,
-                amount INTEGER NOT NULL,
-                script_pubkey BLOB NOT NULL,
-                orig_height INTEGER NOT NULL,
-                is_coinbase INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_undo_height ON undo(block_height);
-            CREATE INDEX IF NOT EXISTS idx_utxos_height ON utxos(height);
-            ",
-        )
-        .map_err(|e| UtxoError(format!("create tables: {}", e)))?;
+    fn open_at(path: &Path) -> Result<UtxoSet, UtxoError> {
+        // SAFETY: heed marks `open` unsafe because LMDB requires the same
+        // mmap'd file isn't simultaneously opened with conflicting flags from
+        // another process. We're a single-process iOS app and never share the
+        // env directory across processes, so this contract holds.
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(INITIAL_MAP_SIZE)
+                .max_dbs(MAX_DBS)
+                .open(path)
+        }
+        .map_err(|e| UtxoError(format!("open env at {}: {}", path.display(), e)))?;
 
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| UtxoError(format!("set WAL: {}", e)))?;
+        let mut wtxn = env
+            .write_txn()
+            .map_err(|e| UtxoError(format!("begin create-tx: {}", e)))?;
+        let utxos: Database<Bytes, Bytes> = env
+            .create_database(&mut wtxn, Some("utxos"))
+            .map_err(|e| UtxoError(format!("create utxos db: {}", e)))?;
+        let undo: Database<Bytes, Bytes> = env
+            .create_database(&mut wtxn, Some("undo"))
+            .map_err(|e| UtxoError(format!("create undo db: {}", e)))?;
+        let height_index: Database<Bytes, Unit> = env
+            .create_database(&mut wtxn, Some("height_index"))
+            .map_err(|e| UtxoError(format!("create height_index db: {}", e)))?;
+        wtxn.commit()
+            .map_err(|e| UtxoError(format!("commit create-tx: {}", e)))?;
 
-        // Reduce fsync frequency for write-heavy workload (safe with WAL)
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| UtxoError(format!("set synchronous: {}", e)))?;
+        info!(
+            "UTXO LMDB env opened at {} (map_size={} GB)",
+            path.display(),
+            INITIAL_MAP_SIZE / (1 << 30)
+        );
 
-        // 16MB page cache for random-access UTXO lookups
-        conn.pragma_update(None, "cache_size", "-16000")
-            .map_err(|e| UtxoError(format!("set cache_size: {}", e)))?;
-
-        info!("UTXO set opened at {}", path);
         Ok(UtxoSet {
-            conn: Mutex::new(conn),
+            env,
+            utxos,
+            undo,
+            height_index,
         })
     }
 
     /// Look up an unspent output by txid and output index.
     pub fn get(&self, txid: &Txid, vout: u32) -> Result<Option<UtxoEntry>, UtxoError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
-
-        let result = conn.query_row(
-            "SELECT amount, script_pubkey, height, is_coinbase FROM utxos WHERE txid = ?1 AND vout = ?2",
-            params![txid.to_byte_array().as_slice(), vout],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, u32>(2)?,
-                    row.get::<_, i32>(3)?,
-                ))
-            },
-        );
-
-        match result {
-            Ok((amount_i64, script_pubkey, height, is_coinbase)) => {
-                if amount_i64 < 0 {
-                    return Err(UtxoError(format!(
-                        "corrupt UTXO: negative amount {}",
-                        amount_i64
-                    )));
-                }
-                Ok(Some(UtxoEntry {
-                    amount: amount_i64 as u64,
-                    script_pubkey,
-                    height,
-                    is_coinbase: is_coinbase != 0,
-                }))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(UtxoError(format!("get utxo: {}", e))),
+        let key = utxo_key(&txid.to_byte_array(), vout);
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let val = self
+            .utxos
+            .get(&rtxn, &key)
+            .map_err(|e| UtxoError(format!("get utxo: {}", e)))?;
+        match val {
+            Some(bytes) => Ok(Some(decode_utxo_value(bytes)?)),
+            None => Ok(None),
         }
     }
 
@@ -133,169 +167,205 @@ impl UtxoSet {
     /// Handles in-block spends correctly (outputs created and spent
     /// within the same block never touch the database).
     pub fn apply_block(&self, block: &Block, height: u32) -> Result<(), UtxoError> {
-        // Phase 1: Analyze the block to find in-block spends
-        let mut created: HashMap<(Txid, u32), ()> = HashMap::new();
-        let mut in_block_spent: HashSet<(Txid, u32)> = HashSet::new();
+        // Phase 1: Analyze the block to find in-block spends so we can skip
+        // writing then immediately deleting outputs that are spent in the
+        // same block. (`HashSet` of (txid, vout) since we only need
+        // membership checks.)
+        let mut created: std::collections::HashSet<(Txid, u32)> =
+            std::collections::HashSet::new();
+        let mut in_block_spent: std::collections::HashSet<(Txid, u32)> =
+            std::collections::HashSet::new();
 
         for tx in &block.txdata {
             let txid = tx.compute_txid();
-
-            // Register all non-OP_RETURN outputs as created
             for (vout, output) in tx.output.iter().enumerate() {
                 if !output.script_pubkey.is_op_return() {
-                    created.insert((txid, vout as u32), ());
+                    created.insert((txid, vout as u32));
                 }
             }
-
-            // Check if any input spends an output from this block
             if !tx.is_coinbase() {
                 for input in &tx.input {
                     let key = (input.previous_output.txid, input.previous_output.vout);
-                    if created.contains_key(&key) {
+                    if created.contains(&key) {
                         in_block_spent.insert(key);
                     }
                 }
             }
         }
 
-        // Phase 2: Apply changes in a single database transaction
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
-
-        let db_tx = conn
-            .transaction()
+        let mut wtxn = self
+            .env
+            .write_txn()
             .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
 
-        // Save undo data and delete spent persistent UTXOs
-        {
-            // Copy each spent UTXO to the undo table before deleting
-            let mut undo_stmt = db_tx
-                .prepare_cached(
-                    "INSERT INTO undo (block_height, txid, vout, amount, script_pubkey, orig_height, is_coinbase) \
-                     SELECT ?1, txid, vout, amount, script_pubkey, height, is_coinbase \
-                     FROM utxos WHERE txid = ?2 AND vout = ?3",
-                )
-                .map_err(|e| UtxoError(format!("prepare undo: {}", e)))?;
+        // Index inside the block for the undo key — multiple inputs can be
+        // recorded against the same height, so we tie-break with a counter.
+        let mut undo_idx: u32 = 0;
 
-            let mut del_stmt = db_tx
-                .prepare_cached("DELETE FROM utxos WHERE txid = ?1 AND vout = ?2")
-                .map_err(|e| UtxoError(format!("prepare delete: {}", e)))?;
-
-            for tx in &block.txdata {
-                if tx.is_coinbase() {
+        // Phase 2a: copy each spent UTXO into `undo` then delete it from `utxos`
+        // (and from `height_index`, where it was registered when created).
+        for tx in &block.txdata {
+            if tx.is_coinbase() {
+                continue;
+            }
+            for input in &tx.input {
+                let prev_txid = input.previous_output.txid;
+                let prev_vout = input.previous_output.vout;
+                let okey = (prev_txid, prev_vout);
+                if in_block_spent.contains(&okey) {
                     continue;
                 }
-                for input in &tx.input {
-                    let key = (input.previous_output.txid, input.previous_output.vout);
-                    if !in_block_spent.contains(&key) {
-                        let txid_bytes = input.previous_output.txid.to_byte_array();
+                let prev_txid_bytes = prev_txid.to_byte_array();
+                let utxo_k = utxo_key(&prev_txid_bytes, prev_vout);
+                let val = self
+                    .utxos
+                    .get(&wtxn, &utxo_k)
+                    .map_err(|e| UtxoError(format!("get for spend: {}", e)))?
+                    .ok_or_else(|| {
+                        UtxoError(format!(
+                            "apply_block: missing utxo {}:{}",
+                            hex::encode(prev_txid_bytes),
+                            prev_vout
+                        ))
+                    })?
+                    .to_vec();
+                let entry = decode_utxo_value(&val)?;
 
-                        undo_stmt
-                            .execute(params![
-                                height,
-                                txid_bytes.as_slice(),
-                                input.previous_output.vout,
-                            ])
-                            .map_err(|e| UtxoError(format!("save undo: {}", e)))?;
+                let undo_k = undo_key(height, undo_idx);
+                undo_idx = undo_idx
+                    .checked_add(1)
+                    .ok_or_else(|| UtxoError("undo idx overflow".into()))?;
+                let undo_v = encode_undo_value(&prev_txid_bytes, prev_vout, &entry);
+                self.undo
+                    .put(&mut wtxn, &undo_k, &undo_v)
+                    .map_err(|e| UtxoError(format!("put undo: {}", e)))?;
 
-                        del_stmt
-                            .execute(params![
-                                txid_bytes.as_slice(),
-                                input.previous_output.vout,
-                            ])
-                            .map_err(|e| UtxoError(format!("delete utxo: {}", e)))?;
-                    }
-                }
+                self.utxos
+                    .delete(&mut wtxn, &utxo_k)
+                    .map_err(|e| UtxoError(format!("delete utxo: {}", e)))?;
+
+                let hi_k = height_index_key(entry.height, &prev_txid_bytes, prev_vout);
+                self.height_index
+                    .delete(&mut wtxn, &hi_k)
+                    .map_err(|e| UtxoError(format!("delete height_index: {}", e)))?;
             }
         }
 
-        // Insert new UTXOs (skip in-block-spent outputs and OP_RETURN)
-        {
-            let mut ins_stmt = db_tx
-                .prepare_cached(
-                    "INSERT INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                )
-                .map_err(|e| UtxoError(format!("prepare insert: {}", e)))?;
+        // Phase 2b: write the new outputs (skipping in-block-spent and
+        // OP_RETURN) plus their `height_index` entries.
+        for tx in &block.txdata {
+            let txid = tx.compute_txid();
+            let txid_bytes = txid.to_byte_array();
+            let is_cb = tx.is_coinbase();
 
-            for tx in &block.txdata {
-                let txid = tx.compute_txid();
-                let is_cb = tx.is_coinbase();
-
-                for (vout, output) in tx.output.iter().enumerate() {
-                    if output.script_pubkey.is_op_return() {
-                        continue;
-                    }
-                    let key = (txid, vout as u32);
-                    if in_block_spent.contains(&key) {
-                        continue;
-                    }
-                    ins_stmt
-                        .execute(params![
-                            txid.to_byte_array().as_slice(),
-                            vout as u32,
-                            output.value.to_sat() as i64,
-                            output.script_pubkey.as_bytes(),
-                            height,
-                            is_cb as i32,
-                        ])
-                        .map_err(|e| UtxoError(format!("insert utxo: {}", e)))?;
+            for (vout, output) in tx.output.iter().enumerate() {
+                if output.script_pubkey.is_op_return() {
+                    continue;
                 }
+                let vout = vout as u32;
+                if in_block_spent.contains(&(txid, vout)) {
+                    continue;
+                }
+                let entry = UtxoEntry {
+                    amount: output.value.to_sat(),
+                    script_pubkey: output.script_pubkey.as_bytes().to_vec(),
+                    height,
+                    is_coinbase: is_cb,
+                };
+                let utxo_k = utxo_key(&txid_bytes, vout);
+                let utxo_v = encode_utxo_value(&entry);
+                self.utxos
+                    .put(&mut wtxn, &utxo_k, &utxo_v)
+                    .map_err(|e| UtxoError(format!("put utxo: {}", e)))?;
+
+                let hi_k = height_index_key(height, &txid_bytes, vout);
+                self.height_index
+                    .put(&mut wtxn, &hi_k, &())
+                    .map_err(|e| UtxoError(format!("put height_index: {}", e)))?;
             }
         }
 
-        db_tx
-            .commit()
+        wtxn.commit()
             .map_err(|e| UtxoError(format!("commit: {}", e)))?;
-
         Ok(())
     }
 
     /// Undo a block's UTXO changes. Must be called from the chain tip downward.
     ///
-    /// 1. Removes all outputs created at this height
-    /// 2. Restores all outputs that were spent at this height (from undo data)
-    /// 3. Deletes the undo data for this height
+    /// 1. Removes all outputs created at this height (via `height_index`).
+    /// 2. Restores all outputs that were spent at this height (from `undo`).
+    /// 3. Deletes the undo data for this height.
     pub fn rollback_block(&self, height: u32) -> Result<(), UtxoError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
-
-        let db_tx = conn
-            .transaction()
+        let mut wtxn = self
+            .env
+            .write_txn()
             .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
 
-        // Remove outputs created at this height
-        db_tx
-            .execute("DELETE FROM utxos WHERE height = ?1", params![height])
-            .map_err(|e| UtxoError(format!("delete created: {}", e)))?;
+        // Step 1: collect (txid, vout) pairs created at this height.
+        // We can't delete during iteration in heed, so buffer first.
+        let prefix = height.to_be_bytes();
+        let mut to_delete: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let iter = self
+                .height_index
+                .prefix_iter(&wtxn, &prefix)
+                .map_err(|e| UtxoError(format!("prefix iter: {}", e)))?;
+            for r in iter {
+                let (k, _) =
+                    r.map_err(|e| UtxoError(format!("height_index iter: {}", e)))?;
+                if k.len() != HEIGHT_INDEX_KEY_LEN {
+                    return Err(UtxoError(format!(
+                        "corrupt height_index key len {}",
+                        k.len()
+                    )));
+                }
+                // Extract the (txid, vout) suffix as the utxo key.
+                let utxo_k = k[4..].to_vec();
+                to_delete.push((k.to_vec(), utxo_k));
+            }
+        }
+        for (hi_k, utxo_k) in &to_delete {
+            self.utxos
+                .delete(&mut wtxn, utxo_k.as_slice())
+                .map_err(|e| UtxoError(format!("delete utxo: {}", e)))?;
+            self.height_index
+                .delete(&mut wtxn, hi_k.as_slice())
+                .map_err(|e| UtxoError(format!("delete height_index: {}", e)))?;
+        }
 
-        // Restore spent outputs from undo data (OR IGNORE in case of
-        // PK conflict from an interrupted previous rollback)
-        db_tx
-            .execute(
-                "INSERT OR IGNORE INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
-                 SELECT txid, vout, amount, script_pubkey, orig_height, is_coinbase \
-                 FROM undo WHERE block_height = ?1",
-                params![height],
-            )
-            .map_err(|e| UtxoError(format!("restore undo: {}", e)))?;
+        // Step 2 & 3: walk undo entries for this height, then restore each
+        // spent UTXO into `utxos` + `height_index` and delete the undo
+        // record. heed's iterator borrows the txn immutably for as long as
+        // it's alive, so we collect first then mutate.
+        let mut restorations: Vec<(Vec<u8>, [u8; 32], u32, UtxoEntry)> = Vec::new();
+        {
+            let iter = self
+                .undo
+                .prefix_iter(&wtxn, &prefix)
+                .map_err(|e| UtxoError(format!("undo prefix iter: {}", e)))?;
+            for r in iter {
+                let (k, v) = r.map_err(|e| UtxoError(format!("undo iter: {}", e)))?;
+                let (txid, vout, entry) = decode_undo_value(v)?;
+                restorations.push((k.to_vec(), txid, vout, entry));
+            }
+        }
+        for (undo_k, txid, vout, entry) in restorations {
+            let utxo_k = utxo_key(&txid, vout);
+            let utxo_v = encode_utxo_value(&entry);
+            self.utxos
+                .put(&mut wtxn, &utxo_k, &utxo_v)
+                .map_err(|e| UtxoError(format!("restore utxo: {}", e)))?;
+            let hi_k = height_index_key(entry.height, &txid, vout);
+            self.height_index
+                .put(&mut wtxn, &hi_k, &())
+                .map_err(|e| UtxoError(format!("restore height_index: {}", e)))?;
+            self.undo
+                .delete(&mut wtxn, undo_k.as_slice())
+                .map_err(|e| UtxoError(format!("delete undo: {}", e)))?;
+        }
 
-        // Clean up undo data
-        db_tx
-            .execute(
-                "DELETE FROM undo WHERE block_height = ?1",
-                params![height],
-            )
-            .map_err(|e| UtxoError(format!("delete undo: {}", e)))?;
-
-        db_tx
-            .commit()
+        wtxn.commit()
             .map_err(|e| UtxoError(format!("commit rollback: {}", e)))?;
-
         Ok(())
     }
 
@@ -303,17 +373,23 @@ impl UtxoSet {
     /// Call this to reclaim disk space for deeply-buried blocks
     /// that will never be rolled back.
     pub fn prune_undo_below(&self, height: u32) -> Result<(), UtxoError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
 
-        conn.execute(
-            "DELETE FROM undo WHERE block_height < ?1",
-            params![height],
-        )
-        .map_err(|e| UtxoError(format!("prune undo: {}", e)))?;
-
+        // Range delete: [0..height_be).
+        let upper = height.to_be_bytes();
+        let lower = [0u8; 4];
+        let range = (
+            std::ops::Bound::Included(&lower[..]),
+            std::ops::Bound::Excluded(&upper[..]),
+        );
+        self.undo
+            .delete_range(&mut wtxn, &range)
+            .map_err(|e| UtxoError(format!("prune undo: {}", e)))?;
+        wtxn.commit()
+            .map_err(|e| UtxoError(format!("commit prune: {}", e)))?;
         Ok(())
     }
 
@@ -322,51 +398,40 @@ impl UtxoSet {
     /// Compute a deterministic SHA256 hash over the entire UTXO set.
     /// Iterates all UTXOs in (txid, vout) order and hashes each entry.
     pub fn compute_hash(&self) -> Result<[u8; 32], UtxoError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT txid, vout, amount, script_pubkey, height, is_coinbase \
-                 FROM utxos ORDER BY txid, vout",
-            )
-            .map_err(|e| UtxoError(format!("prepare hash query: {}", e)))?;
-
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
         let mut hasher = Sha256::new();
-
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, u32>(4)?,
-                    row.get::<_, i32>(5)?,
-                ))
-            })
-            .map_err(|e| UtxoError(format!("hash query: {}", e)))?;
-
-        for row in rows {
-            let (txid, vout, amount, script, height, is_cb) =
-                row.map_err(|e| UtxoError(format!("hash row: {}", e)))?;
-            if script.len() > u16::MAX as usize {
+        let iter = self
+            .utxos
+            .iter(&rtxn)
+            .map_err(|e| UtxoError(format!("iter: {}", e)))?;
+        for r in iter {
+            let (k, v) = r.map_err(|e| UtxoError(format!("hash iter: {}", e)))?;
+            if k.len() != UTXO_KEY_LEN {
+                return Err(UtxoError(format!("corrupt utxo key len {}", k.len())));
+            }
+            let entry = decode_utxo_value(v)?;
+            if entry.script_pubkey.len() > u16::MAX as usize {
                 return Err(UtxoError(format!(
                     "script too long for hash: {} bytes",
-                    script.len()
+                    entry.script_pubkey.len()
                 )));
             }
-            hasher.update(&txid);
+            // Same field order as the snapshot file's hash chain — see
+            // `load_snapshot` for the matching feed sequence.
+            let txid = &k[..32];
+            let vout_be = &k[32..36];
+            let vout = u32::from_be_bytes([vout_be[0], vout_be[1], vout_be[2], vout_be[3]]);
+            hasher.update(txid);
             hasher.update(&vout.to_le_bytes());
-            hasher.update(&amount.to_le_bytes());
-            hasher.update(&(script.len() as u16).to_le_bytes());
-            hasher.update(&script);
-            hasher.update(&height.to_le_bytes());
-            hasher.update(&[is_cb as u8]);
+            hasher.update(&entry.amount.to_le_bytes());
+            hasher.update(&(entry.script_pubkey.len() as u16).to_le_bytes());
+            hasher.update(&entry.script_pubkey);
+            hasher.update(&entry.height.to_le_bytes());
+            hasher.update(&[entry.is_coinbase as u8]);
         }
-
         Ok(hasher.finalize().into())
     }
 
@@ -386,7 +451,7 @@ impl UtxoSet {
 
         let mut w = BufWriter::new(writer);
 
-        // Write header
+        // Header
         w.write_all(&SNAPSHOT_MAGIC)
             .map_err(|e| UtxoError(format!("write magic: {}", e)))?;
         w.write_all(&SNAPSHOT_VERSION.to_le_bytes())
@@ -400,57 +465,46 @@ impl UtxoSet {
         w.write_all(&utxo_hash)
             .map_err(|e| UtxoError(format!("write hash: {}", e)))?;
 
-        // Write entries
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+        // Entries — natural cursor order is `(txid, vout)` because vout is BE
+        // in the key.
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let iter = self
+            .utxos
+            .iter(&rtxn)
+            .map_err(|e| UtxoError(format!("snapshot iter: {}", e)))?;
+        for r in iter {
+            let (k, v) = r.map_err(|e| UtxoError(format!("snapshot iter row: {}", e)))?;
+            if k.len() != UTXO_KEY_LEN {
+                return Err(UtxoError(format!("corrupt utxo key len {}", k.len())));
+            }
+            let entry = decode_utxo_value(v)?;
+            let txid = &k[..32];
+            let vout = u32::from_be_bytes([k[32], k[33], k[34], k[35]]);
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT txid, vout, amount, script_pubkey, height, is_coinbase \
-                 FROM utxos ORDER BY txid, vout",
-            )
-            .map_err(|e| UtxoError(format!("prepare snapshot query: {}", e)))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, u32>(4)?,
-                    row.get::<_, i32>(5)?,
-                ))
-            })
-            .map_err(|e| UtxoError(format!("snapshot query: {}", e)))?;
-
-        for row in rows {
-            let (txid, vout, amount, script, h, is_cb) =
-                row.map_err(|e| UtxoError(format!("snapshot row: {}", e)))?;
-
-            w.write_all(&txid)
+            w.write_all(txid)
                 .map_err(|e| UtxoError(format!("write txid: {}", e)))?;
             w.write_all(&vout.to_le_bytes())
                 .map_err(|e| UtxoError(format!("write vout: {}", e)))?;
-            w.write_all(&amount.to_le_bytes())
+            w.write_all(&entry.amount.to_le_bytes())
                 .map_err(|e| UtxoError(format!("write amount: {}", e)))?;
-            w.write_all(&h.to_le_bytes())
+            w.write_all(&entry.height.to_le_bytes())
                 .map_err(|e| UtxoError(format!("write entry height: {}", e)))?;
-            w.write_all(&[is_cb as u8])
+            w.write_all(&[entry.is_coinbase as u8])
                 .map_err(|e| UtxoError(format!("write is_coinbase: {}", e)))?;
-            if script.len() > u16::MAX as usize {
+            if entry.script_pubkey.len() > u16::MAX as usize {
                 return Err(UtxoError(format!(
                     "script too long for snapshot format: {} bytes (max {})",
-                    script.len(),
+                    entry.script_pubkey.len(),
                     u16::MAX
                 )));
             }
-            let script_len = script.len() as u16;
+            let script_len = entry.script_pubkey.len() as u16;
             w.write_all(&script_len.to_le_bytes())
                 .map_err(|e| UtxoError(format!("write script_len: {}", e)))?;
-            w.write_all(&script)
+            w.write_all(&entry.script_pubkey)
                 .map_err(|e| UtxoError(format!("write script: {}", e)))?;
         }
 
@@ -489,7 +543,7 @@ impl UtxoSet {
     {
         let mut r = BufReader::new(reader);
 
-        // Read header
+        // ── Header ─────────────────────────────────────────────────
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)
             .map_err(|e| UtxoError(format!("read magic: {}", e)))?;
@@ -525,7 +579,6 @@ impl UtxoSet {
         r.read_exact(&mut file_hash)
             .map_err(|e| UtxoError(format!("read hash: {}", e)))?;
 
-        // Verify against expected hash if provided
         if let Some(expected) = expected_hash {
             if file_hash != *expected {
                 return Err(UtxoError(format!(
@@ -543,122 +596,131 @@ impl UtxoSet {
             hex::encode(file_hash)
         );
 
-        // Bulk-load entries with incremental hash verification.
-        // Hash is computed during insertion and verified BEFORE commit
-        // so corrupt data never persists.
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
+        // ── Bulk load with PutFlags::APPEND ────────────────────────
+        // The snapshot file is sorted by (txid, vout); our key encoding
+        // (txid || vout BE) preserves that order, so APPEND is safe and
+        // skips B+ tree page-split work entirely. Hash is computed
+        // streaming and verified BEFORE commit so corrupt data never
+        // persists.
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| UtxoError(format!("begin snapshot tx: {}", e)))?;
 
-        // Emptiness check inside the lock to prevent TOCTOU race with apply_block
-        let current: i64 = conn
-            .query_row("SELECT COUNT(*) FROM utxos", [], |row| row.get(0))
-            .map_err(|e| UtxoError(format!("count for snapshot check: {}", e)))?;
-        if current > 0 {
+        // TOCTOU-safe emptiness check inside the write transaction.
+        if !self
+            .utxos
+            .is_empty(&wtxn)
+            .map_err(|e| UtxoError(format!("is_empty check: {}", e)))?
+        {
             return Err(UtxoError(
                 "UTXO set must be empty before loading snapshot".into(),
             ));
         }
 
-        let db_tx = conn
-            .transaction()
-            .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
+        let mut txid = [0u8; 32];
+        let mut buf2 = [0u8; 2];
+        let mut hasher = Sha256::new();
+        let mut prev_key: Option<[u8; UTXO_KEY_LEN]> = None;
+        // Reuse a single allocation for the value buffer across the inner loop.
+        let mut value_buf: Vec<u8> = Vec::with_capacity(UTXO_VALUE_HEADER_LEN + 64);
 
-        {
-            let mut stmt = db_tx
-                .prepare_cached(
-                    "INSERT INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                )
-                .map_err(|e| UtxoError(format!("prepare insert: {}", e)))?;
+        for i in 0..utxo_count {
+            r.read_exact(&mut txid)
+                .map_err(|e| UtxoError(format!("read txid at {}: {}", i, e)))?;
+            r.read_exact(&mut buf4)
+                .map_err(|e| UtxoError(format!("read vout at {}: {}", i, e)))?;
+            let vout = u32::from_le_bytes(buf4);
 
-            let mut txid = [0u8; 32];
-            let mut buf2 = [0u8; 2];
-            let mut hasher = Sha256::new();
-            let mut prev_key: Option<([u8; 32], u32)> = None;
-
-            for i in 0..utxo_count {
-                r.read_exact(&mut txid)
-                    .map_err(|e| UtxoError(format!("read txid at {}: {}", i, e)))?;
-                r.read_exact(&mut buf4)
-                    .map_err(|e| UtxoError(format!("read vout at {}: {}", i, e)))?;
-                let vout = u32::from_le_bytes(buf4);
-
-                // Verify entries are sorted by (txid, vout) — required for
-                // deterministic hash and matches DB ORDER BY
-                let key = (txid, vout);
-                if let Some(ref prev) = prev_key {
-                    if key <= *prev {
-                        return Err(UtxoError(
-                            "snapshot entries not sorted by (txid, vout)".into(),
-                        ));
-                    }
-                }
-                prev_key = Some(key);
-
-                r.read_exact(&mut buf8)
-                    .map_err(|e| UtxoError(format!("read amount at {}: {}", i, e)))?;
-                let amount = i64::from_le_bytes(buf8);
-
-                r.read_exact(&mut buf4)
-                    .map_err(|e| UtxoError(format!("read entry height at {}: {}", i, e)))?;
-                let entry_height = u32::from_le_bytes(buf4);
-
-                let mut cb_byte = [0u8; 1];
-                r.read_exact(&mut cb_byte)
-                    .map_err(|e| UtxoError(format!("read is_coinbase at {}: {}", i, e)))?;
-                let is_coinbase = cb_byte[0] as i32;
-
-                r.read_exact(&mut buf2)
-                    .map_err(|e| UtxoError(format!("read script_len at {}: {}", i, e)))?;
-                let script_len = u16::from_le_bytes(buf2) as usize;
-
-                let mut script = vec![0u8; script_len];
-                r.read_exact(&mut script)
-                    .map_err(|e| UtxoError(format!("read script at {}: {}", i, e)))?;
-
-                // Feed to hasher in same format/order as compute_hash()
-                hasher.update(&txid);
-                hasher.update(&vout.to_le_bytes());
-                hasher.update(&amount.to_le_bytes());
-                hasher.update(&(script_len as u16).to_le_bytes());
-                hasher.update(&script);
-                hasher.update(&entry_height.to_le_bytes());
-                hasher.update(&[is_coinbase as u8]);
-
-                stmt.execute(params![
-                    txid.as_slice(),
-                    vout,
-                    amount,
-                    script,
-                    entry_height,
-                    is_coinbase,
-                ])
-                .map_err(|e| UtxoError(format!("insert snapshot utxo {}: {}", i, e)))?;
-
-                if i % 100_000 == 0 {
-                    on_progress(i, utxo_count);
-                }
+            r.read_exact(&mut buf8)
+                .map_err(|e| UtxoError(format!("read amount at {}: {}", i, e)))?;
+            let amount = u64::from_le_bytes(buf8);
+            if amount > MAX_MONEY {
+                return Err(UtxoError(format!(
+                    "snapshot entry {}: amount {} exceeds MAX_MONEY",
+                    i, amount
+                )));
             }
 
-            // Verify hash BEFORE commit — reject corrupt data without persisting
-            let loaded_hash: [u8; 32] = hasher.finalize().into();
-            if loaded_hash != file_hash {
-                // db_tx is dropped without commit → automatic rollback
-                return Err(UtxoError(format!(
-                    "snapshot verification failed: loaded={}, expected={}",
-                    hex::encode(loaded_hash),
-                    hex::encode(file_hash)
-                )));
+            r.read_exact(&mut buf4)
+                .map_err(|e| UtxoError(format!("read entry height at {}: {}", i, e)))?;
+            let entry_height = u32::from_le_bytes(buf4);
+
+            let mut cb_byte = [0u8; 1];
+            r.read_exact(&mut cb_byte)
+                .map_err(|e| UtxoError(format!("read is_coinbase at {}: {}", i, e)))?;
+            let is_coinbase = cb_byte[0] != 0;
+
+            r.read_exact(&mut buf2)
+                .map_err(|e| UtxoError(format!("read script_len at {}: {}", i, e)))?;
+            let script_len = u16::from_le_bytes(buf2) as usize;
+
+            let mut script = vec![0u8; script_len];
+            r.read_exact(&mut script)
+                .map_err(|e| UtxoError(format!("read script at {}: {}", i, e)))?;
+
+            // Build the LMDB key and assert strictly-ascending order so the
+            // APPEND optimization stays valid. (LMDB's APPEND would error out
+            // anyway, but our message is clearer.)
+            let key = utxo_key(&txid, vout);
+            if let Some(ref prev) = prev_key {
+                if key.as_slice() <= prev.as_slice() {
+                    return Err(UtxoError(
+                        "snapshot entries not sorted by (txid, vout)".into(),
+                    ));
+                }
+            }
+            prev_key = Some(key);
+
+            // Feed the canonical hash format BEFORE writing — corruption
+            // detected on read still aborts before any DB mutation lands
+            // (the wtxn is dropped without commit on early return).
+            hasher.update(&txid);
+            hasher.update(&vout.to_le_bytes());
+            hasher.update(&amount.to_le_bytes());
+            hasher.update(&(script_len as u16).to_le_bytes());
+            hasher.update(&script);
+            hasher.update(&entry_height.to_le_bytes());
+            hasher.update(&[is_coinbase as u8]);
+
+            // Encode the value.
+            value_buf.clear();
+            value_buf.extend_from_slice(&amount.to_le_bytes());
+            value_buf.extend_from_slice(&entry_height.to_le_bytes());
+            value_buf.push(if is_coinbase { FLAG_COINBASE } else { 0 });
+            value_buf.extend_from_slice(&script);
+
+            self.utxos
+                .put_with_flags(&mut wtxn, PutFlags::APPEND, &key, &value_buf)
+                .map_err(|e| UtxoError(format!("append utxo {}: {}", i, e)))?;
+
+            // Snapshot UTXOs are seeded "as if" created at their original
+            // height; populate `height_index` so future rollback past the
+            // snapshot height (which we never actually do) would still find
+            // them. Cheap to maintain and keeps the invariant clean.
+            let hi_k = height_index_key(entry_height, &txid, vout);
+            self.height_index
+                .put(&mut wtxn, &hi_k, &())
+                .map_err(|e| UtxoError(format!("append height_index {}: {}", i, e)))?;
+
+            if i % 100_000 == 0 {
+                on_progress(i, utxo_count);
             }
         }
 
-        db_tx
-            .commit()
-            .map_err(|e| UtxoError(format!("commit snapshot: {}", e)))?;
+        // Verify hash BEFORE commit — reject corrupt data without persisting.
+        let loaded_hash: [u8; 32] = hasher.finalize().into();
+        if loaded_hash != file_hash {
+            // wtxn dropped without commit → automatic rollback.
+            return Err(UtxoError(format!(
+                "snapshot verification failed: loaded={}, expected={}",
+                hex::encode(loaded_hash),
+                hex::encode(file_hash)
+            )));
+        }
 
-        drop(conn);
+        wtxn.commit()
+            .map_err(|e| UtxoError(format!("commit snapshot: {}", e)))?;
 
         on_progress(utxo_count, utxo_count);
 
@@ -679,33 +741,145 @@ impl UtxoSet {
     /// Used for crash recovery: if UTXOs from a block exist but validated_height
     /// wasn't updated, the block was already applied.
     pub fn has_utxos_at_height(&self, height: u32) -> Result<bool, UtxoError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
-        let result = conn.query_row(
-            "SELECT 1 FROM utxos WHERE height = ?1 LIMIT 1",
-            params![height],
-            |_| Ok(()),
-        );
-        match result {
-            Ok(()) => Ok(true),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-            Err(e) => Err(UtxoError(format!("check height {}: {}", height, e))),
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let prefix = height.to_be_bytes();
+        let mut iter = self
+            .height_index
+            .prefix_iter(&rtxn, &prefix)
+            .map_err(|e| UtxoError(format!("prefix iter: {}", e)))?;
+        match iter.next() {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(e)) => Err(UtxoError(format!("prefix iter row: {}", e))),
+            None => Ok(false),
         }
     }
 
     /// Get the number of UTXOs in the set.
     pub fn count(&self) -> Result<u64, UtxoError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| UtxoError(format!("lock: {}", e)))?;
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM utxos", [], |row| row.get(0))
-            .map_err(|e| UtxoError(format!("count: {}", e)))?;
-        Ok(count as u64)
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        self.utxos
+            .len(&rtxn)
+            .map_err(|e| UtxoError(format!("len: {}", e)))
     }
+}
+
+// ── Encoding helpers ────────────────────────────────────────────────
+
+/// `txid(32) || vout(4 BE)` — BE so the natural lex sort matches the
+/// `(txid, vout)` ordering used by snapshots.
+fn utxo_key(txid: &[u8; 32], vout: u32) -> [u8; UTXO_KEY_LEN] {
+    let mut k = [0u8; UTXO_KEY_LEN];
+    k[..32].copy_from_slice(txid);
+    k[32..].copy_from_slice(&vout.to_be_bytes());
+    k
+}
+
+/// `block_height(4 BE) || idx(4 BE)` — BE on both fields so undo entries
+/// scan as a contiguous range per height for prune/rollback.
+fn undo_key(height: u32, idx: u32) -> [u8; 8] {
+    let mut k = [0u8; 8];
+    k[..4].copy_from_slice(&height.to_be_bytes());
+    k[4..].copy_from_slice(&idx.to_be_bytes());
+    k
+}
+
+/// `height(4 BE) || txid(32) || vout(4 BE)` — height-prefixed so a single
+/// `prefix_iter` returns every UTXO created at that block height.
+fn height_index_key(height: u32, txid: &[u8; 32], vout: u32) -> [u8; HEIGHT_INDEX_KEY_LEN] {
+    let mut k = [0u8; HEIGHT_INDEX_KEY_LEN];
+    k[..4].copy_from_slice(&height.to_be_bytes());
+    k[4..36].copy_from_slice(txid);
+    k[36..].copy_from_slice(&vout.to_be_bytes());
+    k
+}
+
+/// `amount(8 LE) || height(4 LE) || flags(1) || script(rest)`
+fn encode_utxo_value(entry: &UtxoEntry) -> Vec<u8> {
+    let mut v = Vec::with_capacity(UTXO_VALUE_HEADER_LEN + entry.script_pubkey.len());
+    v.extend_from_slice(&entry.amount.to_le_bytes());
+    v.extend_from_slice(&entry.height.to_le_bytes());
+    v.push(if entry.is_coinbase { FLAG_COINBASE } else { 0 });
+    v.extend_from_slice(&entry.script_pubkey);
+    v
+}
+
+fn decode_utxo_value(bytes: &[u8]) -> Result<UtxoEntry, UtxoError> {
+    if bytes.len() < UTXO_VALUE_HEADER_LEN {
+        return Err(UtxoError(format!(
+            "corrupt utxo value: len {} < {}",
+            bytes.len(),
+            UTXO_VALUE_HEADER_LEN
+        )));
+    }
+    let amount = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    if amount > MAX_MONEY {
+        return Err(UtxoError(format!(
+            "corrupt UTXO: amount {} exceeds MAX_MONEY",
+            amount
+        )));
+    }
+    let height = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let flags = bytes[12];
+    let is_coinbase = (flags & FLAG_COINBASE) != 0;
+    let script_pubkey = bytes[UTXO_VALUE_HEADER_LEN..].to_vec();
+    Ok(UtxoEntry {
+        amount,
+        script_pubkey,
+        height,
+        is_coinbase,
+    })
+}
+
+/// `txid(32) || vout(4 LE) || amount(8 LE) || orig_height(4 LE) || flags(1) || script`
+fn encode_undo_value(txid: &[u8; 32], vout: u32, entry: &UtxoEntry) -> Vec<u8> {
+    let mut v = Vec::with_capacity(UNDO_VALUE_HEADER_LEN + entry.script_pubkey.len());
+    v.extend_from_slice(txid);
+    v.extend_from_slice(&vout.to_le_bytes());
+    v.extend_from_slice(&entry.amount.to_le_bytes());
+    v.extend_from_slice(&entry.height.to_le_bytes());
+    v.push(if entry.is_coinbase { FLAG_COINBASE } else { 0 });
+    v.extend_from_slice(&entry.script_pubkey);
+    v
+}
+
+fn decode_undo_value(bytes: &[u8]) -> Result<([u8; 32], u32, UtxoEntry), UtxoError> {
+    if bytes.len() < UNDO_VALUE_HEADER_LEN {
+        return Err(UtxoError(format!(
+            "corrupt undo value: len {} < {}",
+            bytes.len(),
+            UNDO_VALUE_HEADER_LEN
+        )));
+    }
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&bytes[0..32]);
+    let vout = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+    let amount = u64::from_le_bytes(bytes[36..44].try_into().unwrap());
+    if amount > MAX_MONEY {
+        return Err(UtxoError(format!(
+            "corrupt undo: amount {} exceeds MAX_MONEY",
+            amount
+        )));
+    }
+    let orig_height = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
+    let flags = bytes[48];
+    let is_coinbase = (flags & FLAG_COINBASE) != 0;
+    let script_pubkey = bytes[UNDO_VALUE_HEADER_LEN..].to_vec();
+    Ok((
+        txid,
+        vout,
+        UtxoEntry {
+            amount,
+            script_pubkey,
+            height: orig_height,
+            is_coinbase,
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -719,11 +893,111 @@ impl std::fmt::Display for UtxoError {
 
 impl std::error::Error for UtxoError {}
 
+// ── Test helpers ────────────────────────────────────────────────────
+//
+// These exist only under `cfg(test)` so we can write surgical state-setup
+// in tests that exercised raw SQL inserts in the SQLite version. Production
+// code goes through `apply_block` / `rollback_block` exclusively.
+
+#[cfg(test)]
+impl UtxoSet {
+    /// Insert a UTXO directly. Bypasses block validation; tests use this to
+    /// simulate "this UTXO existed before the block we're about to roll back".
+    fn test_insert_utxo(
+        &self,
+        txid: [u8; 32],
+        vout: u32,
+        entry: UtxoEntry,
+    ) -> Result<(), UtxoError> {
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| UtxoError(format!("begin: {}", e)))?;
+        let key = utxo_key(&txid, vout);
+        let val = encode_utxo_value(&entry);
+        self.utxos
+            .put(&mut wtxn, &key, &val)
+            .map_err(|e| UtxoError(format!("put: {}", e)))?;
+        let hi_k = height_index_key(entry.height, &txid, vout);
+        self.height_index
+            .put(&mut wtxn, &hi_k, &())
+            .map_err(|e| UtxoError(format!("put hi: {}", e)))?;
+        wtxn.commit()
+            .map_err(|e| UtxoError(format!("commit: {}", e)))?;
+        Ok(())
+    }
+
+    /// Insert raw bytes into the utxos DB. For corruption-detection tests
+    /// that need to plant a value the encoder would reject.
+    fn test_insert_raw_utxo(
+        &self,
+        txid: [u8; 32],
+        vout: u32,
+        raw_value: &[u8],
+    ) -> Result<(), UtxoError> {
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| UtxoError(format!("begin: {}", e)))?;
+        let key = utxo_key(&txid, vout);
+        self.utxos
+            .put(&mut wtxn, &key, raw_value)
+            .map_err(|e| UtxoError(format!("put: {}", e)))?;
+        wtxn.commit()
+            .map_err(|e| UtxoError(format!("commit: {}", e)))?;
+        Ok(())
+    }
+
+    /// Insert an undo entry directly. Used to set up rollback tests without
+    /// going through a real apply_block first.
+    fn test_insert_undo(
+        &self,
+        block_height: u32,
+        idx: u32,
+        txid: [u8; 32],
+        vout: u32,
+        entry: UtxoEntry,
+    ) -> Result<(), UtxoError> {
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| UtxoError(format!("begin: {}", e)))?;
+        let k = undo_key(block_height, idx);
+        let v = encode_undo_value(&txid, vout, &entry);
+        self.undo
+            .put(&mut wtxn, &k, &v)
+            .map_err(|e| UtxoError(format!("put: {}", e)))?;
+        wtxn.commit()
+            .map_err(|e| UtxoError(format!("commit: {}", e)))?;
+        Ok(())
+    }
+
+    /// Count of undo entries currently persisted (across all heights).
+    fn test_count_undo(&self) -> Result<u64, UtxoError> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        self.undo
+            .len(&rtxn)
+            .map_err(|e| UtxoError(format!("len: {}", e)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bitcoin::block::Block;
     use bitcoin::consensus::deserialize;
+    use tempfile::TempDir;
+
+    /// Open a fresh UtxoSet backed by a temp directory. The TempDir is
+    /// returned so the caller keeps it alive (drop = cleanup).
+    fn fresh() -> (UtxoSet, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let utxo = UtxoSet::open(dir.path().to_str().unwrap()).unwrap();
+        (utxo, dir)
+    }
 
     /// The full genesis block (header + coinbase transaction).
     fn genesis_block() -> Block {
@@ -746,26 +1020,25 @@ mod tests {
 
     #[test]
     fn empty_utxo_set_has_zero_count() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         assert_eq!(utxo.count().unwrap(), 0);
     }
 
     #[test]
     fn get_missing_utxo_returns_none() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         let txid = Txid::from_byte_array([0u8; 32]);
         assert!(utxo.get(&txid, 0).unwrap().is_none());
     }
 
     #[test]
     fn apply_genesis_creates_one_utxo() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         let genesis = genesis_block();
 
         utxo.apply_block(&genesis, 0).unwrap();
         assert_eq!(utxo.count().unwrap(), 1);
 
-        // The genesis coinbase output should be 50 BTC
         let coinbase_txid = genesis.txdata[0].compute_txid();
         let entry = utxo.get(&coinbase_txid, 0).unwrap().unwrap();
         assert_eq!(entry.amount, 50 * 100_000_000);
@@ -775,7 +1048,7 @@ mod tests {
 
     #[test]
     fn rollback_genesis_restores_empty_set() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         let genesis = genesis_block();
 
         utxo.apply_block(&genesis, 0).unwrap();
@@ -784,167 +1057,105 @@ mod tests {
         utxo.rollback_block(0).unwrap();
         assert_eq!(utxo.count().unwrap(), 0);
 
-        // The UTXO should be gone
         let coinbase_txid = genesis.txdata[0].compute_txid();
         assert!(utxo.get(&coinbase_txid, 0).unwrap().is_none());
     }
 
     #[test]
     fn apply_and_rollback_roundtrip() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         let genesis = genesis_block();
 
-        // Apply block 0
         utxo.apply_block(&genesis, 0).unwrap();
         assert_eq!(utxo.count().unwrap(), 1);
-
-        // Apply block 0 again at height 1 (reuses genesis block for simplicity)
-        // This adds another UTXO with the same txid but different height tracking
-        // (INSERT would conflict on PK, so this tests the duplicate handling)
-        // Actually, same txid+vout = PK conflict. Let me just test rollback at height 0.
-
-        // Rollback block 0
         utxo.rollback_block(0).unwrap();
         assert_eq!(utxo.count().unwrap(), 0);
     }
 
     #[test]
     fn rollback_restores_spent_utxos() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
 
-        // Manually insert a UTXO (simulating a previous block's output)
-        {
-            let conn = utxo.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    [1u8; 32].as_slice(),
-                    0u32,
-                    1000i64,
-                    vec![0x76u8, 0xa9],
-                    5u32,
-                    0i32,
-                ],
-            )
+        // Plant a UTXO at height 5 (the "previous" output) and an undo entry
+        // at height 10 saying "block 10 spent it". Then plant the new output
+        // block 10 created. Rolling back block 10 should remove the new
+        // output and restore the old one.
+        let old_entry = UtxoEntry {
+            amount: 1000,
+            script_pubkey: vec![0x76, 0xa9],
+            height: 5,
+            is_coinbase: false,
+        };
+        let new_entry = UtxoEntry {
+            amount: 500,
+            script_pubkey: vec![0x76, 0xa9],
+            height: 10,
+            is_coinbase: false,
+        };
+
+        utxo.test_insert_undo(10, 0, [1u8; 32], 0, old_entry.clone())
             .unwrap();
-
-            // Simulate undo data for block 10 having spent this UTXO
-            conn.execute(
-                "INSERT INTO undo (block_height, txid, vout, amount, script_pubkey, orig_height, is_coinbase) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![10u32, [1u8; 32].as_slice(), 0u32, 1000i64, vec![0x76u8, 0xa9], 5u32, 0i32],
-            )
-            .unwrap();
-
-            // Also simulate block 10 having created a new output
-            conn.execute(
-                "INSERT INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    [2u8; 32].as_slice(),
-                    0u32,
-                    500i64,
-                    vec![0x76u8, 0xa9],
-                    10u32,
-                    0i32,
-                ],
-            )
-            .unwrap();
-        }
-
-        // Before rollback: 1 UTXO at height 10 (the old one was spent)
-        // Plus the manually inserted UTXO we're pretending was spent
-        // Actually we have 2 UTXOs: the old one at height 5 is NOT in the table
-        // (it was "spent"), and block 10's output IS in the table.
-        // Wait, I inserted both. Let me reconsider.
-
-        // State: utxos has the height-5 entry AND the height-10 entry = 2 UTXOs
-        // But conceptually, the height-5 entry was spent by block 10 and should not be there.
-        // Let me remove it to simulate the correct state.
-        {
-            let conn = utxo.conn.lock().unwrap();
-            conn.execute(
-                "DELETE FROM utxos WHERE txid = ?1 AND vout = ?2",
-                params![[1u8; 32].as_slice(), 0u32],
-            )
-            .unwrap();
-        }
-
-        // Now: 1 UTXO (height 10), undo data says height-5 UTXO was spent
-        assert_eq!(utxo.count().unwrap(), 1);
+        utxo.test_insert_utxo([2u8; 32], 0, new_entry).unwrap();
 
         let txid_old = Txid::from_byte_array([1u8; 32]);
         let txid_new = Txid::from_byte_array([2u8; 32]);
+        assert_eq!(utxo.count().unwrap(), 1);
         assert!(utxo.get(&txid_old, 0).unwrap().is_none());
         assert!(utxo.get(&txid_new, 0).unwrap().is_some());
 
-        // Rollback block 10
         utxo.rollback_block(10).unwrap();
 
-        // After rollback: height-10 output removed, height-5 output restored
         assert_eq!(utxo.count().unwrap(), 1);
         let restored = utxo.get(&txid_old, 0).unwrap().unwrap();
         assert_eq!(restored.amount, 1000);
         assert_eq!(restored.height, 5);
         assert!(!restored.is_coinbase);
-
         assert!(utxo.get(&txid_new, 0).unwrap().is_none());
     }
 
     #[test]
     fn prune_undo_removes_old_data() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
-
-        // Insert undo data at various heights
-        {
-            let conn = utxo.conn.lock().unwrap();
-            for h in [5u32, 10, 15, 20] {
-                conn.execute(
-                    "INSERT INTO undo (block_height, txid, vout, amount, script_pubkey, orig_height, is_coinbase) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![h, [h as u8; 32].as_slice(), 0u32, 100i64, vec![0xacu8], 0u32, 0i32],
-                )
+        let (utxo, _dir) = fresh();
+        let dummy = UtxoEntry {
+            amount: 100,
+            script_pubkey: vec![0xac],
+            height: 0,
+            is_coinbase: false,
+        };
+        for h in [5u32, 10, 15, 20] {
+            utxo.test_insert_undo(h, 0, [h as u8; 32], 0, dummy.clone())
                 .unwrap();
-            }
         }
 
-        // Prune below height 15 — should remove heights 5 and 10
         utxo.prune_undo_below(15).unwrap();
-
-        // Verify: rollback at 5 and 10 should be no-ops (no undo data)
-        // rollback at 15 and 20 should still work
-        let conn = utxo.conn.lock().unwrap();
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM undo", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(remaining, 2); // heights 15 and 20
+        assert_eq!(utxo.test_count_undo().unwrap(), 2); // heights 15 and 20
     }
 
     #[test]
-    fn negative_amount_detected_on_read() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
-
-        // Manually insert a corrupted UTXO with negative amount
-        {
-            let conn = utxo.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO utxos (txid, vout, amount, script_pubkey, height, is_coinbase) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![[9u8; 32].as_slice(), 0u32, -1i64, vec![0xacu8], 0u32, 0i32],
-            )
-            .unwrap();
-        }
+    fn corrupt_amount_detected_on_read() {
+        let (utxo, _dir) = fresh();
+        // Plant a value with amount = MAX_MONEY + 1, which decode_utxo_value
+        // must reject as a corruption indicator.
+        let bad_amount: u64 = MAX_MONEY + 1;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&bad_amount.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes()); // height
+        raw.push(0); // flags
+                     // No script bytes — header-only is fine for the decoder.
+        utxo.test_insert_raw_utxo([9u8; 32], 0, &raw).unwrap();
 
         let txid = Txid::from_byte_array([9u8; 32]);
         let result = utxo.get(&txid, 0);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("negative amount"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds MAX_MONEY"));
     }
 
     #[test]
     fn compute_hash_deterministic() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         let genesis = genesis_block();
         utxo.apply_block(&genesis, 0).unwrap();
 
@@ -955,7 +1166,7 @@ mod tests {
 
     #[test]
     fn snapshot_write_and_load_roundtrip() {
-        let utxo1 = UtxoSet::open(":memory:").unwrap();
+        let (utxo1, _dir1) = fresh();
         let genesis = genesis_block();
         utxo1.apply_block(&genesis, 0).unwrap();
         assert_eq!(utxo1.count().unwrap(), 1);
@@ -967,11 +1178,10 @@ mod tests {
         assert_eq!(meta.block_hash, block_hash);
         assert_eq!(meta.utxo_count, 1);
 
-        let utxo2 = UtxoSet::open(":memory:").unwrap();
+        let (utxo2, _dir2) = fresh();
         let loaded = utxo2
             .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
             .unwrap();
-
         assert_eq!(loaded.height, 0);
         assert_eq!(loaded.utxo_count, 1);
         assert_eq!(utxo2.count().unwrap(), 1);
@@ -985,14 +1195,14 @@ mod tests {
 
     #[test]
     fn snapshot_rejects_wrong_hash() {
-        let utxo1 = UtxoSet::open(":memory:").unwrap();
+        let (utxo1, _dir1) = fresh();
         let genesis = genesis_block();
         utxo1.apply_block(&genesis, 0).unwrap();
 
         let mut buf = Vec::new();
         utxo1.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
 
-        let utxo2 = UtxoSet::open(":memory:").unwrap();
+        let (utxo2, _dir2) = fresh();
         let result = utxo2.load_snapshot(
             std::io::Cursor::new(&buf),
             Some(&[0xFFu8; 32]),
@@ -1004,7 +1214,7 @@ mod tests {
 
     #[test]
     fn snapshot_rejects_nonempty_set() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         let genesis = genesis_block();
         utxo.apply_block(&genesis, 0).unwrap();
 
@@ -1018,13 +1228,34 @@ mod tests {
 
     #[test]
     fn snapshot_rejects_bad_magic() {
-        let utxo = UtxoSet::open(":memory:").unwrap();
+        let (utxo, _dir) = fresh();
         let result = utxo.load_snapshot(
             std::io::Cursor::new(b"BADXsomegarbagedata"),
             None,
             |_, _| {},
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid snapshot magic"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid snapshot magic"));
+    }
+
+    #[test]
+    fn has_utxos_at_height_after_apply() {
+        let (utxo, _dir) = fresh();
+        let genesis = genesis_block();
+        utxo.apply_block(&genesis, 0).unwrap();
+        assert!(utxo.has_utxos_at_height(0).unwrap());
+        assert!(!utxo.has_utxos_at_height(1).unwrap());
+    }
+
+    #[test]
+    fn has_utxos_at_height_clears_after_rollback() {
+        let (utxo, _dir) = fresh();
+        let genesis = genesis_block();
+        utxo.apply_block(&genesis, 0).unwrap();
+        utxo.rollback_block(0).unwrap();
+        assert!(!utxo.has_utxos_at_height(0).unwrap());
     }
 }
