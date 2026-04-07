@@ -180,6 +180,11 @@ impl Peer {
 
         peer.handshake(our_height)?;
         info!("Handshake complete with {}", addr);
+        // Ask the peer for their address book so we can keep our AddrManager
+        // populated. Non-fatal — peers that ignore us are still usable.
+        if let Err(e) = peer.send_getaddr() {
+            debug!("send_getaddr to {} failed: {}", addr, e);
+        }
         Ok(peer)
     }
 
@@ -201,6 +206,9 @@ impl Peer {
 
         peer.handshake(our_height)?;
         info!("Handshake complete with {} via Tor", addr);
+        if let Err(e) = peer.send_getaddr() {
+            debug!("send_getaddr to {} via Tor failed: {}", addr, e);
+        }
         Ok(peer)
     }
 
@@ -615,6 +623,15 @@ impl Peer {
         self.send(NetworkMessage::NotFound(items))
     }
 
+    /// Ask the peer to send us their address book. Used immediately after
+    /// handshake on outbound connections so we can populate our AddrManager
+    /// with gossip-discovered peers (instead of relying solely on DNS).
+    /// Bitcoin Core sends one getaddr per outbound peer per connection
+    /// lifetime; we follow the same pattern.
+    pub fn send_getaddr(&mut self) -> Result<(), PeerError> {
+        self.send(NetworkMessage::GetAddr)
+    }
+
     /// Wait for a duration while responding to pings to keep the connection alive.
     /// Returns Ok on timeout (normal), Err if the peer disconnects.
     pub fn idle_wait(&mut self, duration: std::time::Duration) -> Result<(), PeerError> {
@@ -667,6 +684,7 @@ pub(crate) fn msg_name(msg: &NetworkMessage) -> &'static str {
         NetworkMessage::Tx(_) => "tx",
         NetworkMessage::NotFound(_) => "notfound",
         NetworkMessage::Addr(_) => "addr",
+        NetworkMessage::AddrV2(_) => "addrv2",
         NetworkMessage::Alert(_) => "alert",
         NetworkMessage::FeeFilter(_) => "feefilter",
         NetworkMessage::MemPool => "mempool",

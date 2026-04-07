@@ -40,12 +40,61 @@ const HEADER_DIVERGENCE_PENALTY: u32 = 50;
 /// opinion — both peers get this since we don't know who's lying.
 const HEADER_DISAGREEMENT_PENALTY: u32 = 10;
 
+/// Cap on how many addresses we'll process from a single addr / addrv2
+/// message. Bitcoin Core's MAX_ADDR_TO_SEND is 1000; we accept the same
+/// limit so a chatty peer can't fill the gossip queue with one message.
+const MAX_GOSSIP_ADDRS_PER_MSG: usize = 1000;
+
 /// Outcome of cross-checking a header batch against independent peers.
 enum HeaderCrossCheck {
     /// Agreement reached (or only one peer available — best-effort accept).
     Accept,
     /// Active peer's headers were contradicted by majority — reject the batch.
     Reject,
+}
+
+/// Format a legacy v1 `Address` from `addr` gossip into the `host:port`
+/// string our AddrManager keys on. Returns `None` for unroutable entries
+/// (Tor addresses encoded in the legacy form, port 0, etc.).
+fn format_v1_address(addr: &bitcoin::p2p::Address) -> Option<String> {
+    if addr.port == 0 {
+        return None;
+    }
+    // socket_addr() rejects Tor addresses (returns AddrNotAvailable),
+    // which is exactly what we want — we can't reach a v2 onion via TCP.
+    let sock = addr.socket_addr().ok()?;
+    if !is_routable(&sock) {
+        return None;
+    }
+    Some(sock.to_string())
+}
+
+/// Format a BIP 155 `AddrV2Message` into a `host:port` string. Only the
+/// IPv4/IPv6 variants are emitted; Tor v3 / I2P / Cjdns are skipped.
+fn format_v2_address(msg: &bitcoin::p2p::address::AddrV2Message) -> Option<String> {
+    if msg.port == 0 {
+        return None;
+    }
+    let sock = msg.socket_addr().ok()?;
+    if !is_routable(&sock) {
+        return None;
+    }
+    Some(sock.to_string())
+}
+
+/// Reject obvious junk before we put an address into the AddrManager:
+/// loopback, link-local, multicast, unspecified. We deliberately do NOT
+/// filter RFC1918 here — a node operator with a self-hosted peer on the
+/// LAN should still be able to talk to it.
+fn is_routable(sock: &std::net::SocketAddr) -> bool {
+    let ip = sock.ip();
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_link_local() && !v4.is_broadcast(),
+        std::net::IpAddr::V6(_) => true,
+    }
 }
 
 /// Genesis block header (block 0).
@@ -138,6 +187,12 @@ pub struct HeaderSync {
     relay_state: Mutex<HashMap<String, PeerRelayState>>,
     /// Queue of transactions waiting to be relayed with Poisson delay.
     relay_queue: Mutex<Vec<RelayQueueEntry>>,
+    /// Addresses queued by `handle_peer_message` from inbound `addr` /
+    /// `addrv2` gossip. Drained into the PeerPool's AddrManager after
+    /// `service_peer_messages` returns, since the message handlers run
+    /// inside `for_each_peer` (which already holds the slot Mutex) and
+    /// can't safely take a `&mut PeerPool`.
+    pending_gossip_addrs: Mutex<Vec<String>>,
     /// Cumulative serving counters.
     pub stats: Mutex<NodeStats>,
     /// Last-known peer counts (updated from monitor loop for UI access).
@@ -219,6 +274,7 @@ impl HeaderSync {
             tor,
             relay_state: Mutex::new(HashMap::new()),
             relay_queue: Mutex::new(Vec::new()),
+            pending_gossip_addrs: Mutex::new(Vec::new()),
             stats: Mutex::new(NodeStats {
                 blocks_served: 0,
                 headers_served: 0,
@@ -842,6 +898,29 @@ impl HeaderSync {
                     // Process one message from each connected peer (round-robin)
                     self.service_peer_messages(&mut pool);
 
+                    // Drain any addresses that the message handlers queued
+                    // from `addr` / `addrv2` gossip into the PeerPool's
+                    // AddrManager. This needs to happen outside the
+                    // for_each_peer call because that path holds the slot
+                    // mutex and can't take a `&mut PeerPool`.
+                    let gossip = std::mem::take(
+                        &mut *self.pending_gossip_addrs.lock().unwrap(),
+                    );
+                    if !gossip.is_empty() {
+                        pool.ingest_gossip_addrs(gossip);
+                    }
+
+                    // Opportunistic refill: if the outbound pool has shrunk
+                    // (peers dropped, banned, or removed by service_peer_messages
+                    // for protocol errors), top it back up immediately rather
+                    // than waiting for the next 30s `last_maintain` tick. This
+                    // is the fix for "connected peers drop below 8 and don't
+                    // recover" — by the time we noticed the drop on the
+                    // periodic timer, anywhere from 0–30s of sync was wasted.
+                    if pool.outbound_count() < pool.outbound_target() {
+                        pool.maintain();
+                    }
+
                     // Avoid busy-spinning when no peers are connected
                     if pool.count() == 0 {
                         std::thread::sleep(Duration::from_millis(100));
@@ -1312,6 +1391,41 @@ impl HeaderSync {
                 // simplify by always sending empty. Proper addrman is future work.
                 peer.send(NetworkMessage::Addr(Vec::new()))
                     .map_err(|e| format!("addr: {}", e))?;
+            }
+
+            NetworkMessage::Addr(entries) => {
+                // Legacy v1 addr gossip. Each entry is `(timestamp, Address)`
+                // where Address is the IPv4-mapped-in-IPv6 form. We queue every
+                // routable entry into pending_gossip_addrs for the monitor
+                // loop to fold into the PeerPool's AddrManager.
+                let mut queued = 0;
+                for (_ts, a) in entries.iter().take(MAX_GOSSIP_ADDRS_PER_MSG) {
+                    if let Some(s) = format_v1_address(a) {
+                        self.pending_gossip_addrs.lock().unwrap().push(s);
+                        queued += 1;
+                    }
+                }
+                if queued > 0 {
+                    debug!("Queued {} v1 gossip addresses from {}", queued, addr);
+                }
+            }
+
+            NetworkMessage::AddrV2(entries) => {
+                // BIP 155 addrv2 — supports Tor v3, I2P, etc. We only ingest
+                // IPv4/IPv6 variants here; reconstructing a Tor v3 hostname
+                // from its 32-byte pubkey would require SHA-3 (not in our dep
+                // tree) and we already bootstrap Tor via bundled onion seeds.
+                // I2P/Cjdns are not relevant on mobile.
+                let mut queued = 0;
+                for entry in entries.iter().take(MAX_GOSSIP_ADDRS_PER_MSG) {
+                    if let Some(s) = format_v2_address(entry) {
+                        self.pending_gossip_addrs.lock().unwrap().push(s);
+                        queued += 1;
+                    }
+                }
+                if queued > 0 {
+                    debug!("Queued {} v2 gossip addresses from {}", queued, addr);
+                }
             }
 
             other => {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,256 @@ struct PeerSlot {
 
 /// Minimum interval between DNS re-discovery attempts.
 const DNS_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum number of known addresses to retain in memory. The real Bitcoin
+/// Core addrman keeps tens of thousands; we cap small for an iPhone budget.
+/// When the manager fills up, the oldest never-tried entries are evicted
+/// first so we don't keep stale gossip indefinitely.
+const MAX_KNOWN_ADDRS: usize = 10_000;
+
+/// Wall-clock budget for a single `maintain()` connection-refill pass. We
+/// blow through addresses in priority order until either we hit the slot
+/// target or this budget is exhausted, whichever comes first. The cap exists
+/// because `maintain()` runs on the synchronous monitor loop — we can't let
+/// it stall the loop for tens of seconds chasing a long tail of dead peers.
+const REFILL_BUDGET: Duration = Duration::from_secs(2);
+
+/// Minimum number of viable candidates before we'll re-query DNS seeds. The
+/// AddrManager is the primary source of peer addresses; DNS is only consulted
+/// as a fallback when the manager has been depleted (initial bootstrap or
+/// after a long offline period).
+const DNS_FALLBACK_THRESHOLD: usize = 50;
+
+/// Base delay between connection retries for an address that has failed.
+/// Failures double this up to ADDR_RETRY_MAX, so a flapping peer naturally
+/// drops to the back of the candidate queue without us needing an explicit
+/// blacklist.
+const ADDR_RETRY_BASE: Duration = Duration::from_secs(60);
+
+/// Cap on the exponential backoff for failed addresses. After ~6 failures
+/// the backoff plateaus here so an address eventually becomes eligible again
+/// rather than being shadow-banned forever.
+const ADDR_RETRY_MAX: Duration = Duration::from_secs(3600);
+
+/// Per-address bookkeeping for the in-memory address manager. Tracks when
+/// we first heard about an address, when we last tried it, the last time
+/// we successfully connected to it, and how many failures we've seen. This
+/// is the minimum state needed to schedule retries with backoff and to rank
+/// candidates by reliability without dragging in a full Bitcoin Core
+/// new/tried addrman implementation.
+#[derive(Debug, Clone)]
+struct AddrMeta {
+    first_seen: Instant,
+    last_tried: Option<Instant>,
+    last_success: Option<Instant>,
+    failure_count: u32,
+}
+
+impl AddrMeta {
+    fn new() -> AddrMeta {
+        AddrMeta {
+            first_seen: Instant::now(),
+            last_tried: None,
+            last_success: None,
+            failure_count: 0,
+        }
+    }
+
+    /// Compute the per-address backoff based on consecutive failures.
+    /// Doubles per failure, capped at ADDR_RETRY_MAX. A never-tried address
+    /// has zero backoff.
+    fn current_backoff(&self) -> Duration {
+        if self.failure_count == 0 {
+            return Duration::ZERO;
+        }
+        let exp = self.failure_count.saturating_sub(1).min(20);
+        let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
+        let secs = ADDR_RETRY_BASE
+            .as_secs()
+            .saturating_mul(multiplier)
+            .min(ADDR_RETRY_MAX.as_secs());
+        Duration::from_secs(secs)
+    }
+
+    /// Is this address eligible for a connection attempt right now? An
+    /// address is eligible if we've never tried it, or enough time has
+    /// elapsed since the last attempt to satisfy its current backoff.
+    fn is_eligible(&self, now: Instant) -> bool {
+        match self.last_tried {
+            None => true,
+            Some(t) => now.duration_since(t) >= self.current_backoff(),
+        }
+    }
+
+    /// Ranking tier for candidate selection — lower is better.
+    /// 0: known-good (last_success set, currently eligible)
+    /// 1: never-tried (no attempts yet)
+    /// 2: previously-tried, currently eligible
+    /// 3: in backoff (only used if all higher tiers are empty)
+    fn tier(&self, now: Instant) -> u8 {
+        if !self.is_eligible(now) {
+            return 3;
+        }
+        if self.last_success.is_some() {
+            return 0;
+        }
+        if self.last_tried.is_none() {
+            return 1;
+        }
+        2
+    }
+}
+
+/// In-memory address manager. Replaces the old forward-only `known_addrs`
+/// vector with a HashMap that tracks per-address state, supports gossip
+/// ingestion (so peers feed us new candidates), and ranks candidates by
+/// reliability when refilling the outbound pool.
+///
+/// This is intentionally much simpler than Bitcoin Core's `CAddrMan`: no
+/// new/tried tables, no bucket-based eclipse hardening, no peers.dat
+/// persistence. The goal is to fix the immediate symptom (outbound pool
+/// shrinks below MAX_OUTBOUND when DNS-discovered peers fall over) without
+/// committing to the full addrman complexity. Persistence can be added
+/// later if iPhone restart-churn proves it necessary.
+struct AddrManager {
+    addrs: HashMap<String, AddrMeta>,
+    max_size: usize,
+}
+
+impl AddrManager {
+    fn new(max_size: usize) -> AddrManager {
+        AddrManager {
+            addrs: HashMap::new(),
+            max_size,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.addrs.len()
+    }
+
+    /// Insert a single address. New addresses get a fresh AddrMeta; existing
+    /// addresses are left alone (we don't want gossip to wipe out a peer's
+    /// established success/failure history). Returns true if a new entry
+    /// was actually added.
+    fn insert(&mut self, addr: String) -> bool {
+        if self.addrs.contains_key(&addr) {
+            return false;
+        }
+        self.evict_if_full();
+        self.addrs.insert(addr, AddrMeta::new());
+        true
+    }
+
+    /// Bulk insert. Returns the number of brand-new entries added.
+    fn insert_many<I: IntoIterator<Item = String>>(&mut self, addrs: I) -> usize {
+        let mut added = 0;
+        for addr in addrs {
+            if self.insert(addr) {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// Evict to make room when at capacity. Strategy: drop the oldest
+    /// never-tried entry first; if all entries have been tried, drop the
+    /// one with the most failures. We never evict an address with a
+    /// successful past connection — those are the most valuable.
+    fn evict_if_full(&mut self) {
+        if self.addrs.len() < self.max_size {
+            return;
+        }
+
+        // Prefer to evict an address with no successes — never-tried first,
+        // then most-failed.
+        let victim: Option<String> = self
+            .addrs
+            .iter()
+            .filter(|(_, m)| m.last_success.is_none())
+            .max_by_key(|(_, m)| (m.failure_count, m.first_seen.elapsed().as_secs()))
+            .map(|(addr, _)| addr.clone());
+
+        if let Some(addr) = victim {
+            self.addrs.remove(&addr);
+            return;
+        }
+
+        // Last resort: every address has succeeded at least once. Drop the
+        // oldest one. Should be exceedingly rare given MAX_KNOWN_ADDRS.
+        if let Some(addr) = self
+            .addrs
+            .iter()
+            .max_by_key(|(_, m)| m.first_seen.elapsed().as_secs())
+            .map(|(addr, _)| addr.clone())
+        {
+            self.addrs.remove(&addr);
+        }
+    }
+
+    /// Mark an address as successfully connected. Resets failure count and
+    /// stamps last_success/last_tried so the entry is treated as known-good.
+    fn record_success(&mut self, addr: &str) {
+        let now = Instant::now();
+        let entry = self
+            .addrs
+            .entry(addr.to_string())
+            .or_insert_with(AddrMeta::new);
+        entry.last_tried = Some(now);
+        entry.last_success = Some(now);
+        entry.failure_count = 0;
+    }
+
+    /// Mark an address as having failed to connect. Increments failure_count
+    /// (driving the exponential backoff) and stamps last_tried.
+    fn record_failure(&mut self, addr: &str) {
+        let now = Instant::now();
+        let entry = self
+            .addrs
+            .entry(addr.to_string())
+            .or_insert_with(AddrMeta::new);
+        entry.last_tried = Some(now);
+        entry.failure_count = entry.failure_count.saturating_add(1);
+    }
+
+    /// Number of addresses currently eligible for a connection attempt
+    /// (i.e., not still in backoff). Used to decide whether DNS fallback
+    /// should kick in.
+    fn candidate_count(&self) -> usize {
+        let now = Instant::now();
+        self.addrs.values().filter(|m| m.is_eligible(now)).count()
+    }
+
+    /// Pick up to `limit` candidate addresses, ranked best first. Excludes
+    /// addresses for which `exclude` returns true (used to skip already-
+    /// connected or banned peers, or to enforce subnet diversity).
+    ///
+    /// Ranking: known-good first, then never-tried, then retry tier. Within
+    /// a tier, oldest first_seen wins so we don't starve older entries when
+    /// new gossip floods in.
+    fn pick_candidates(&self, limit: usize, exclude: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let now = Instant::now();
+        let mut entries: Vec<(&String, &AddrMeta)> = self
+            .addrs
+            .iter()
+            .filter(|(addr, _)| !exclude(addr.as_str()))
+            .collect();
+
+        entries.sort_by(|(_, a), (_, b)| {
+            let ta = a.tier(now);
+            let tb = b.tier(now);
+            ta.cmp(&tb)
+                .then(a.failure_count.cmp(&b.failure_count))
+                .then(a.first_seen.cmp(&b.first_seen))
+        });
+
+        entries
+            .into_iter()
+            .take(limit)
+            .map(|(addr, _)| addr.clone())
+            .collect()
+    }
+}
 
 /// Duration of a peer ban (24 hours, matches Bitcoin Core default).
 const BAN_DURATION: Duration = Duration::from_secs(24 * 3600);
@@ -117,9 +367,10 @@ fn subnet_bucket(addr: &str) -> Option<String> {
 /// Thread-safe pool of Bitcoin peer connections.
 pub struct PeerPool {
     slots: Arc<Mutex<Vec<PeerSlot>>>,
-    known_addrs: Vec<String>,
-    /// Index into known_addrs for round-robin connection attempts.
-    next_addr: usize,
+    /// In-memory address manager. Sources include DNS seeds (bootstrap),
+    /// `addr` / `addrv2` gossip from connected peers, and inbound peers'
+    /// self-reported addresses.
+    addrs: AddrManager,
     our_height: u32,
     /// Last time DNS seeds were queried (for backoff).
     last_dns_query: Instant,
@@ -145,17 +396,21 @@ impl PeerPool {
         tor: Option<Arc<TorManager>>,
         peers_db_path: Option<&str>,
     ) -> Result<PeerPool, PeerError> {
-        let addrs = if let Some(ref tor) = tor {
+        let seeds = if let Some(ref tor) = tor {
             Peer::discover_peers_tor(tor)
         } else {
             Peer::discover_peers()
         };
 
-        if addrs.is_empty() {
+        if seeds.is_empty() {
             return Err(PeerError::Connection("no peers discovered via DNS".into()));
         }
 
-        info!("PeerPool: discovered {} addresses, connecting up to {}", addrs.len(), MAX_OUTBOUND);
+        info!(
+            "PeerPool: bootstrap from DNS produced {} addresses, connecting up to {}",
+            seeds.len(),
+            MAX_OUTBOUND
+        );
 
         // Open the persistence store and hydrate any existing bans. Failures
         // are logged but non-fatal — the pool still works without persistence.
@@ -179,10 +434,12 @@ impl PeerPool {
             None => (None, HashMap::new()),
         };
 
+        let mut addrs = AddrManager::new(MAX_KNOWN_ADDRS);
+        addrs.insert_many(seeds);
+
         let mut pool = PeerPool {
             slots: Arc::new(Mutex::new(Vec::new())),
-            known_addrs: addrs,
-            next_addr: 0,
+            addrs,
             our_height,
             last_dns_query: Instant::now(),
             bans,
@@ -267,9 +524,11 @@ impl PeerPool {
             return;
         }
 
-        // Re-discover peers from DNS if we've exhausted the address list
-        // (with backoff to avoid spamming DNS seeds)
-        if self.next_addr >= self.known_addrs.len()
+        // DNS is now a fallback, not the primary source. We only re-query
+        // when the AddrManager is depleted enough that we'd otherwise stall
+        // — the steady-state expectation is that gossip from connected peers
+        // keeps the manager well above DNS_FALLBACK_THRESHOLD.
+        if self.addrs.candidate_count() < DNS_FALLBACK_THRESHOLD
             && self.last_dns_query.elapsed() >= DNS_REDISCOVERY_INTERVAL
         {
             self.last_dns_query = Instant::now();
@@ -279,49 +538,85 @@ impl PeerPool {
                 Peer::discover_peers()
             };
             if !fresh.is_empty() {
+                let added = self.addrs.insert_many(fresh);
                 info!(
-                    "PeerPool: refreshed DNS, got {} addresses",
-                    fresh.len()
+                    "PeerPool: DNS fallback added {} new addresses (total known: {})",
+                    added,
+                    self.addrs.len()
                 );
-                self.known_addrs = fresh;
-                self.next_addr = 0;
             }
         }
 
         let needed = MAX_OUTBOUND - current;
-        let mut connected = 0;
-        let mut attempts = 0;
-        let max_attempts = needed * 3; // try up to 3x the slots we need
+        let refill_started = Instant::now();
 
-        while connected < needed && attempts < max_attempts {
-            if self.next_addr >= self.known_addrs.len() {
-                break; // exhausted address list
+        // Snapshot the current outbound buckets and connected addresses so
+        // we can filter candidates without holding the slots lock for the
+        // duration of the connection attempt.
+        let (already_connected, used_buckets): (HashSet<String>, HashSet<String>) = {
+            let slots = self.slots.lock().unwrap();
+            let connected = slots.iter().map(|s| s.addr.clone()).collect();
+            let buckets = slots
+                .iter()
+                .filter(|s| !s.inbound)
+                .filter_map(|s| subnet_bucket(&s.addr))
+                .collect();
+            (connected, buckets)
+        };
+
+        let bans = &self.bans;
+        let exclude = |addr: &str| -> bool {
+            if bans.contains_key(addr) {
+                return true;
             }
-
-            let addr = self.known_addrs[self.next_addr].clone();
-            self.next_addr += 1;
-            attempts += 1;
-
-            // Skip if already connected or banned
-            if self.bans.contains_key(&addr) {
-                continue;
+            if already_connected.contains(addr) {
+                return true;
             }
-            {
-                let slots = self.slots.lock().unwrap();
-                if slots.iter().any(|s| s.addr == addr) {
-                    continue;
+            if let Some(bucket) = subnet_bucket(addr) {
+                if used_buckets.contains(&bucket) {
+                    return true;
                 }
-                // Subnet diversity: don't fill outbound slots with multiple
-                // peers from the same /16. .onion addresses skip this check
-                // (they return None from subnet_bucket).
-                if let Some(ref bucket) = subnet_bucket(&addr) {
-                    let already_present = slots.iter().any(|s| {
-                        !s.inbound
-                            && subnet_bucket(&s.addr).as_ref() == Some(bucket)
-                    });
-                    if already_present {
-                        continue;
-                    }
+            }
+            false
+        };
+
+        // Pick a healthy multiple of `needed` candidates so we have a buffer
+        // when several attempts in a row fail. The wall-clock budget is the
+        // real cap; this just keeps us from sorting the entire address book
+        // for every refill pass.
+        let candidates = self.addrs.pick_candidates(needed.saturating_mul(4), &exclude);
+
+        if candidates.is_empty() {
+            warn!(
+                "PeerPool: no eligible candidates to refill outbound (have {}, need {})",
+                current, MAX_OUTBOUND
+            );
+            return;
+        }
+
+        let mut connected = 0;
+        // Track buckets we've claimed during this pass so we don't let two
+        // back-to-back successful connects both come from the same /16.
+        let mut claimed_buckets: HashSet<String> = HashSet::new();
+
+        for addr in candidates {
+            if connected >= needed {
+                break;
+            }
+            if refill_started.elapsed() >= REFILL_BUDGET {
+                info!(
+                    "PeerPool: refill budget ({}s) exhausted after {} new connections",
+                    REFILL_BUDGET.as_secs(),
+                    connected
+                );
+                break;
+            }
+
+            // Re-check the bucket against this pass's claims (the snapshot
+            // above only reflects buckets occupied at the start of refill).
+            if let Some(bucket) = subnet_bucket(&addr) {
+                if claimed_buckets.contains(&bucket) {
+                    continue;
                 }
             }
 
@@ -335,7 +630,11 @@ impl PeerPool {
                 Ok(peer) => {
                     let user_agent = peer.peer_user_agent().unwrap_or_default();
                     let height = peer.peer_height().unwrap_or(0).max(0) as u32;
-                    info!("PeerPool: connected to {} ({}) at height {}", addr, user_agent, height);
+                    info!(
+                        "PeerPool: connected to {} ({}) at height {}",
+                        addr, user_agent, height
+                    );
+                    self.addrs.record_success(&addr);
 
                     // Restore any persisted score so a known-good peer comes
                     // back at its earned reputation, not as a stranger.
@@ -344,6 +643,10 @@ impl PeerPool {
                         .as_ref()
                         .and_then(|s| s.load_score(&addr).ok().flatten())
                         .unwrap_or(SCORE_DEFAULT);
+
+                    if let Some(bucket) = subnet_bucket(&addr) {
+                        claimed_buckets.insert(bucket);
+                    }
 
                     let slot = PeerSlot {
                         peer: Some(peer),
@@ -360,14 +663,45 @@ impl PeerPool {
                 }
                 Err(e) => {
                     warn!("PeerPool: failed to connect to {}: {}", addr, e);
+                    self.addrs.record_failure(&addr);
                 }
             }
         }
 
         if connected > 0 {
             let total = self.slots.lock().unwrap().len();
-            info!("PeerPool: added {} peers, total now {}/{}", connected, total, MAX_OUTBOUND);
+            info!(
+                "PeerPool: added {} peers, total now {}/{} (known addrs: {})",
+                connected,
+                total,
+                MAX_OUTBOUND,
+                self.addrs.len()
+            );
         }
+    }
+
+    /// Public entry point for ingesting addresses learned via `addr` /
+    /// `addrv2` gossip from connected peers. Called by the sync loop after
+    /// it drains queued gossip from message handlers. Returns the number of
+    /// brand-new addresses added (existing entries are left untouched so
+    /// gossip can't reset earned reputation).
+    pub fn ingest_gossip_addrs(&mut self, addrs: Vec<String>) -> usize {
+        let added = self.addrs.insert_many(addrs);
+        if added > 0 {
+            info!(
+                "PeerPool: ingested {} new gossip addresses (total known: {})",
+                added,
+                self.addrs.len()
+            );
+        }
+        added
+    }
+
+    /// Number of addresses currently held in the address manager. Exposed
+    /// for diagnostics and tests; the sync loop can also use it to decide
+    /// whether to issue a fresh `getaddr` to top up.
+    pub fn known_addr_count(&self) -> usize {
+        self.addrs.len()
     }
 
     /// Return the "best" peer for header sync, temporarily taking it out of
@@ -669,6 +1003,13 @@ impl PeerPool {
         self.slots.lock().unwrap().iter().filter(|s| !s.inbound).count()
     }
 
+    /// Target number of outbound peers. The monitor loop checks
+    /// `outbound_count() < outbound_target()` after every message-processing
+    /// pass and triggers an opportunistic refill if peers have been lost.
+    pub fn outbound_target(&self) -> usize {
+        MAX_OUTBOUND
+    }
+
     /// Process each connected peer with a callback. Takes each peer out of its
     /// slot for the duration of the callback, then returns it. If the callback
     /// returns an error, the peer is removed from the pool.
@@ -803,8 +1144,7 @@ mod tests {
     fn test_pool() -> PeerPool {
         PeerPool {
             slots: Arc::new(Mutex::new(Vec::new())),
-            known_addrs: Vec::new(),
-            next_addr: 0,
+            addrs: AddrManager::new(MAX_KNOWN_ADDRS),
             our_height: 0,
             last_dns_query: Instant::now(),
             bans: HashMap::new(),
@@ -819,8 +1159,7 @@ mod tests {
     fn test_pool_with_store() -> PeerPool {
         PeerPool {
             slots: Arc::new(Mutex::new(Vec::new())),
-            known_addrs: Vec::new(),
-            next_addr: 0,
+            addrs: AddrManager::new(MAX_KNOWN_ADDRS),
             our_height: 0,
             last_dns_query: Instant::now(),
             bans: HashMap::new(),
@@ -1290,5 +1629,192 @@ mod tests {
             Ok(())
         });
         assert!(visited.is_empty());
+    }
+
+    // ── AddrManager tests ────────────────────────────────────────────
+
+    #[test]
+    fn addrman_insert_dedupes() {
+        let mut m = AddrManager::new(100);
+        assert!(m.insert("1.2.3.4:8333".to_string()));
+        assert!(!m.insert("1.2.3.4:8333".to_string()));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn addrman_insert_many_counts_only_new() {
+        let mut m = AddrManager::new(100);
+        let added = m.insert_many(vec![
+            "1.2.3.4:8333".to_string(),
+            "5.6.7.8:8333".to_string(),
+            "1.2.3.4:8333".to_string(), // duplicate
+        ]);
+        assert_eq!(added, 2);
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn addrman_record_success_marks_known_good() {
+        let mut m = AddrManager::new(100);
+        m.insert("1.2.3.4:8333".to_string());
+        m.record_success("1.2.3.4:8333");
+        let meta = m.addrs.get("1.2.3.4:8333").unwrap();
+        assert!(meta.last_success.is_some());
+        assert_eq!(meta.failure_count, 0);
+        assert_eq!(meta.tier(Instant::now()), 0); // tier 0 = known-good
+    }
+
+    #[test]
+    fn addrman_record_failure_increments_count() {
+        let mut m = AddrManager::new(100);
+        m.insert("1.2.3.4:8333".to_string());
+        m.record_failure("1.2.3.4:8333");
+        m.record_failure("1.2.3.4:8333");
+        let meta = m.addrs.get("1.2.3.4:8333").unwrap();
+        assert_eq!(meta.failure_count, 2);
+        assert!(meta.last_success.is_none());
+    }
+
+    #[test]
+    fn addrman_record_success_after_failures_resets() {
+        let mut m = AddrManager::new(100);
+        m.insert("1.2.3.4:8333".to_string());
+        m.record_failure("1.2.3.4:8333");
+        m.record_failure("1.2.3.4:8333");
+        m.record_success("1.2.3.4:8333");
+        let meta = m.addrs.get("1.2.3.4:8333").unwrap();
+        assert_eq!(meta.failure_count, 0);
+        assert_eq!(meta.tier(Instant::now()), 0);
+    }
+
+    #[test]
+    fn addrman_backoff_grows_with_failures() {
+        // Backoff doubles per failure, starting from ADDR_RETRY_BASE.
+        let mut meta = AddrMeta::new();
+        meta.last_tried = Some(Instant::now());
+
+        meta.failure_count = 1;
+        assert_eq!(meta.current_backoff(), ADDR_RETRY_BASE);
+
+        meta.failure_count = 2;
+        assert_eq!(meta.current_backoff(), ADDR_RETRY_BASE * 2);
+
+        meta.failure_count = 3;
+        assert_eq!(meta.current_backoff(), ADDR_RETRY_BASE * 4);
+    }
+
+    #[test]
+    fn addrman_backoff_caps_at_max() {
+        // After enough failures the backoff plateaus at ADDR_RETRY_MAX
+        // instead of growing without bound.
+        let mut meta = AddrMeta::new();
+        meta.last_tried = Some(Instant::now());
+        meta.failure_count = 50;
+        assert_eq!(meta.current_backoff(), ADDR_RETRY_MAX);
+    }
+
+    #[test]
+    fn addrman_eligible_for_never_tried() {
+        let meta = AddrMeta::new();
+        assert!(meta.is_eligible(Instant::now()));
+    }
+
+    #[test]
+    fn addrman_eligible_after_backoff_elapsed() {
+        // Synthesise an entry whose last_tried was long ago, so even with
+        // failures the backoff has elapsed.
+        let mut meta = AddrMeta::new();
+        meta.failure_count = 1;
+        meta.last_tried = Some(Instant::now() - (ADDR_RETRY_BASE * 2));
+        assert!(meta.is_eligible(Instant::now()));
+    }
+
+    #[test]
+    fn addrman_pick_candidates_orders_known_good_first() {
+        let mut m = AddrManager::new(100);
+        m.insert("never:8333".to_string());
+        m.insert("good:8333".to_string());
+        m.record_success("good:8333");
+
+        let picked = m.pick_candidates(10, &|_| false);
+        assert_eq!(picked[0], "good:8333");
+        assert_eq!(picked[1], "never:8333");
+    }
+
+    #[test]
+    fn addrman_pick_candidates_respects_exclude() {
+        let mut m = AddrManager::new(100);
+        m.insert("a:8333".to_string());
+        m.insert("b:8333".to_string());
+        m.insert("c:8333".to_string());
+
+        let picked = m.pick_candidates(10, &|addr| addr == "b:8333");
+        assert_eq!(picked.len(), 2);
+        assert!(!picked.contains(&"b:8333".to_string()));
+    }
+
+    #[test]
+    fn addrman_pick_candidates_respects_limit() {
+        let mut m = AddrManager::new(100);
+        for i in 0..10 {
+            m.insert(format!("peer{}:8333", i));
+        }
+        let picked = m.pick_candidates(3, &|_| false);
+        assert_eq!(picked.len(), 3);
+    }
+
+    #[test]
+    fn addrman_eviction_drops_never_tried_first() {
+        // With a tiny capacity, inserting a new address should evict an
+        // existing never-tried entry, never the known-good one.
+        let mut m = AddrManager::new(2);
+        m.insert("good:8333".to_string());
+        m.record_success("good:8333");
+        m.insert("never:8333".to_string());
+        assert_eq!(m.len(), 2);
+
+        // Inserting a third should evict "never", not "good".
+        m.insert("new:8333".to_string());
+        assert_eq!(m.len(), 2);
+        assert!(m.addrs.contains_key("good:8333"));
+        assert!(m.addrs.contains_key("new:8333"));
+        assert!(!m.addrs.contains_key("never:8333"));
+    }
+
+    #[test]
+    fn addrman_candidate_count_excludes_in_backoff() {
+        let mut m = AddrManager::new(100);
+        m.insert("eligible:8333".to_string());
+        m.insert("backoff:8333".to_string());
+        m.record_failure("backoff:8333");
+        // backoff:8333 just failed → not eligible until ADDR_RETRY_BASE elapses
+        assert_eq!(m.candidate_count(), 1);
+    }
+
+    #[test]
+    fn addrman_record_on_unknown_address_creates_entry() {
+        // Defensive: record_success / record_failure on a never-seen address
+        // should still work (e.g., a peer we connect to that we never put
+        // through `insert` ourselves).
+        let mut m = AddrManager::new(100);
+        m.record_success("surprise:8333");
+        assert!(m.addrs.contains_key("surprise:8333"));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn ingest_gossip_addrs_returns_count_added() {
+        let mut pool = test_pool();
+        let added = pool.ingest_gossip_addrs(vec![
+            "1.2.3.4:8333".to_string(),
+            "5.6.7.8:8333".to_string(),
+        ]);
+        assert_eq!(added, 2);
+        assert_eq!(pool.known_addr_count(), 2);
+
+        // Re-ingesting the same addresses adds zero new entries.
+        let added2 = pool.ingest_gossip_addrs(vec!["1.2.3.4:8333".to_string()]);
+        assert_eq!(added2, 0);
+        assert_eq!(pool.known_addr_count(), 2);
     }
 }
