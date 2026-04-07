@@ -204,6 +204,10 @@ impl HeaderSync {
 
     /// Load a UTXO snapshot from a file path. Sets validated_height to the
     /// snapshot height so sync resumes from there.
+    ///
+    /// Accepts either a raw `.hutx` file or a `.hutx.gz` gzipped file.
+    /// The `.gz` form is decompressed on the fly so we never need to write
+    /// the (much larger) decompressed file to disk on mobile.
     pub fn load_snapshot<F>(
         &self,
         snapshot_path: &str,
@@ -216,10 +220,16 @@ impl HeaderSync {
         let file = std::fs::File::open(snapshot_path)
             .map_err(|e| SyncError::Store(format!("open snapshot: {}", e)))?;
 
-        let meta = self
-            .utxo
-            .load_snapshot(file, expected_hash, on_progress)
-            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        let meta = if snapshot_path.ends_with(".gz") {
+            let decoder = flate2::read::GzDecoder::new(file);
+            self.utxo
+                .load_snapshot(decoder, expected_hash, on_progress)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?
+        } else {
+            self.utxo
+                .load_snapshot(file, expected_hash, on_progress)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?
+        };
 
         self.store
             .set_validated_height(meta.height)

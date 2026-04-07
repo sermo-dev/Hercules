@@ -1715,6 +1715,7 @@ dependencies = [
  "arti-client",
  "bitcoin",
  "bitcoinconsensus",
+ "flate2",
  "hex",
  "log",
  "rusqlite",

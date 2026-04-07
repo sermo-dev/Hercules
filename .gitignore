@@ -16,3 +16,8 @@ screenshot.png
 
 # macOS
 .DS_Store
+
+# Bitcoin Core dumps and Hercules UTXO snapshots (multi-GB binary blobs)
+*.hutx
+*.hutx.gz
+*_utxo.dat

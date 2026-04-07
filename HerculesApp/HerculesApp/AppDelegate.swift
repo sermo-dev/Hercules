@@ -41,6 +41,18 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         )
     }
 
+    // MARK: - Background URLSession (snapshot download)
+
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        // Stash the handler; SnapshotDownloader will invoke it once the
+        // session has finished delivering all pending events.
+        SnapshotDownloader.shared.backgroundCompletionHandler = completionHandler
+    }
+
     // MARK: - Foreground Notification Display
 
     func userNotificationCenter(

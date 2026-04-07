@@ -13,6 +13,7 @@ bitcoin = { version = "0.32", features = ["serde", "bitcoinconsensus"] }
 bitcoinconsensus = "0.105"
 hex = "0.4"
 sha2 = "0.10"
+flate2 = "1.0"
 rusqlite = { version = "0.36", features = ["bundled"] }
 log = "0.4"
 thiserror = "1.0"
@@ -31,3 +32,7 @@ uniffi = { version = "0.28", features = ["build"] }
 [[bin]]
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
+
+[[bin]]
+name = "convert_snapshot"
+path = "src/bin/convert_snapshot.rs"

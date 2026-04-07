@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 // MARK: - Theme
@@ -28,6 +29,10 @@ class NodeViewModel: ObservableObject {
     @Published var isValidationPaused = false
     @Published var torStatus: TorStatus?
     @Published var isBootstrappingTor = false
+    @Published var isDownloadingSnapshot = false
+    @Published var snapshotDownloadProgress: Double = 0
+    @Published var snapshotBytesDownloaded: Int64 = 0
+    @Published var snapshotBytesTotal: Int64 = SnapshotDownloader.expectedBytes
 
     // Thread-safe access to the node: set from background thread, read from main thread
     private var _node: HerculesNode?
@@ -35,6 +40,88 @@ class NodeViewModel: ObservableObject {
     private var node: HerculesNode? {
         get { nodeLock.lock(); defer { nodeLock.unlock() }; return _node }
         set { nodeLock.lock(); defer { nodeLock.unlock() }; _node = newValue }
+    }
+
+    // Subscriptions to SnapshotDownloader's @Published state.
+    private var downloadCancellables = Set<AnyCancellable>()
+    // Continuation that the download flow awaits while the download runs.
+    private var downloadWaiter: ((Result<URL, Error>) -> Void)?
+
+    init() {
+        // Mirror SnapshotDownloader's @Published state into ours so the UI
+        // observing NodeViewModel sees download progress without depending on
+        // the singleton directly.
+        let dl = SnapshotDownloader.shared
+        dl.$progress
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] p in self?.snapshotDownloadProgress = p }
+            .store(in: &downloadCancellables)
+        dl.$bytesDownloaded
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] b in self?.snapshotBytesDownloaded = b }
+            .store(in: &downloadCancellables)
+        dl.$bytesTotal
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] b in self?.snapshotBytesTotal = b }
+            .store(in: &downloadCancellables)
+        dl.$status
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in self?.handleDownloadStatus(status) }
+            .store(in: &downloadCancellables)
+    }
+
+    private func handleDownloadStatus(_ status: SnapshotDownloader.Status) {
+        switch status {
+        case .idle:
+            isDownloadingSnapshot = false
+        case .downloading:
+            isDownloadingSnapshot = true
+        case .completed(let url):
+            isDownloadingSnapshot = false
+            // Hand off to the waiting sync flow, if any.
+            if let waiter = downloadWaiter {
+                downloadWaiter = nil
+                waiter(.success(url))
+            }
+        case .failed(let msg):
+            isDownloadingSnapshot = false
+            if let waiter = downloadWaiter {
+                downloadWaiter = nil
+                waiter(.failure(NSError(
+                    domain: "Hercules", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: msg]
+                )))
+            } else {
+                errorMessage = msg
+            }
+        }
+    }
+
+    /// Block the calling background thread until the snapshot download
+    /// completes (or fails). Returns the local file URL on success.
+    private func awaitSnapshotDownload() throws -> URL {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<URL, Error> = .failure(NSError(
+            domain: "Hercules", code: -1,
+            userInfo: [NSLocalizedDescriptionKey: "Download did not complete"]
+        ))
+        DispatchQueue.main.async {
+            self.downloadWaiter = { r in
+                result = r
+                semaphore.signal()
+            }
+            SnapshotDownloader.shared.start()
+        }
+        semaphore.wait()
+        switch result {
+        case .success(let url): return url
+        case .failure(let err): throw err
+        }
+    }
+
+    /// Cancel an in-flight snapshot download. Safe to call from any thread.
+    func cancelSnapshotDownload() {
+        SnapshotDownloader.shared.cancel()
     }
 
     func startSync() {
@@ -63,30 +150,53 @@ class NodeViewModel: ObservableObject {
                 }
                 self?.node = node
 
-                // Check if we need to load a UTXO snapshot
+                // Check if we need to load a UTXO snapshot. If so, download
+                // the .hutx.gz from R2 (background URLSession, OS-resumable),
+                // import it, and delete the cached file.
                 if try node.needsSnapshot() {
-                    let snapshotPath = Self.snapshotPath()
-                    if FileManager.default.fileExists(atPath: snapshotPath) {
+                    DispatchQueue.main.async {
+                        self?.isConnecting = false
+                    }
+
+                    // Block until the file is on disk. Surfaces progress to
+                    // the UI via the SnapshotDownloader subscriptions set up
+                    // in init().
+                    let downloadedURL = try self?.awaitSnapshotDownload()
+                    guard let snapshotURL = downloadedURL else {
+                        throw NSError(
+                            domain: "Hercules", code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "Snapshot download cancelled"]
+                        )
+                    }
+
+                    DispatchQueue.main.async {
+                        self?.isLoadingSnapshot = true
+                    }
+
+                    let snapCallback = SnapshotProgressCallback { loaded, total in
                         DispatchQueue.main.async {
-                            self?.isLoadingSnapshot = true
-                            self?.isConnecting = false
+                            self?.snapshotProgress = total > 0
+                                ? Double(loaded) / Double(total) : 0
                         }
+                    }
 
-                        let snapCallback = SnapshotProgressCallback { loaded, total in
-                            DispatchQueue.main.async {
-                                self?.snapshotProgress = total > 0
-                                    ? Double(loaded) / Double(total) : 0
-                            }
-                        }
-
+                    // Always delete the cached .gz after the import attempt:
+                    // on success it's redundant (UTXOs are now in SQLite); on
+                    // failure it prevents an infinite hash-mismatch retry loop
+                    // against the same bad bytes.
+                    do {
                         let _ = try node.loadSnapshot(
-                            snapshotPath: snapshotPath,
+                            snapshotPath: snapshotURL.path,
                             callback: snapCallback
                         )
+                        SnapshotDownloader.deleteDownloadedFile()
+                    } catch {
+                        SnapshotDownloader.deleteDownloadedFile()
+                        throw error
+                    }
 
-                        DispatchQueue.main.async {
-                            self?.isLoadingSnapshot = false
-                        }
+                    DispatchQueue.main.async {
+                        self?.isLoadingSnapshot = false
                     }
                 }
 
@@ -112,6 +222,7 @@ class NodeViewModel: ObservableObject {
                     self?.isConnecting = false
                     self?.isSyncRunning = false
                     self?.isLoadingSnapshot = false
+                    self?.isDownloadingSnapshot = false
                     if let s = self?.syncStatus {
                         self?.syncStatus = SyncStatus(
                             syncedHeaders: s.syncedHeaders,
@@ -154,11 +265,6 @@ class NodeViewModel: ObservableObject {
     static func dbPath() -> String {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("hercules-headers.sqlite3").path
-    }
-
-    static func snapshotPath() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("utxo-snapshot.hutx").path
     }
 
     static func torDataDir() -> String {
@@ -263,7 +369,12 @@ struct ContentView: View {
                             SyncProgressCard(status: status)
                         }
 
-                        // Snapshot loading card
+                        // Snapshot download card (Phase 5a — pre-import)
+                        if viewModel.isDownloadingSnapshot {
+                            SnapshotDownloadCard(viewModel: viewModel)
+                        }
+
+                        // Snapshot loading card (UTXO import after download)
                         if viewModel.isLoadingSnapshot {
                             SnapshotLoadingCard(progress: viewModel.snapshotProgress)
                         }
@@ -532,6 +643,92 @@ struct BlockValidationCard: View {
     }
 }
 
+// MARK: - Snapshot Download Card
+
+struct SnapshotDownloadCard: View {
+    @ObservedObject var viewModel: NodeViewModel
+
+    var percentText: String {
+        String(format: "%.1f%%", viewModel.snapshotDownloadProgress * 100)
+    }
+
+    var byteText: String {
+        let downloaded = ByteCountFormatter.string(
+            fromByteCount: viewModel.snapshotBytesDownloaded,
+            countStyle: .file
+        )
+        let total = ByteCountFormatter.string(
+            fromByteCount: viewModel.snapshotBytesTotal,
+            countStyle: .file
+        )
+        return "\(downloaded) / \(total)"
+    }
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Image(systemName: "icloud.and.arrow.down.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.accent)
+                    Text("Downloading UTXO Snapshot")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Text(percentText)
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Theme.accent)
+                }
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.white.opacity(0.08))
+                            .frame(height: 8)
+
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(
+                                LinearGradient(
+                                    colors: [Theme.accent, Theme.accent.opacity(0.7)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: geo.size.width * viewModel.snapshotDownloadProgress, height: 8)
+                            .shadow(color: Theme.accent.opacity(0.4), radius: 6, y: 2)
+                    }
+                }
+                .frame(height: 8)
+
+                HStack {
+                    Text(byteText)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Text("Wi-Fi only • one-time")
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+
+                Button(action: { viewModel.cancelSnapshotDownload() }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                        Text("Cancel Download")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundStyle(Theme.error)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Theme.error.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+    }
+}
+
 // MARK: - Snapshot Loading Card
 
 struct SnapshotLoadingCard: View {
@@ -743,10 +940,14 @@ struct SyncButton: View {
     }
 
     var canStop: Bool {
-        viewModel.isSyncRunning && !viewModel.isConnecting && !viewModel.isLoadingSnapshot
+        viewModel.isSyncRunning
+            && !viewModel.isConnecting
+            && !viewModel.isLoadingSnapshot
+            && !viewModel.isDownloadingSnapshot
     }
 
     var label: String {
+        if viewModel.isDownloadingSnapshot { return "Downloading UTXO Snapshot..." }
         if viewModel.isLoadingSnapshot { return "Loading UTXO Snapshot..." }
         if viewModel.isBootstrappingTor { return "Connecting to Tor..." }
         if viewModel.isConnecting { return "Finding Peers via Tor..." }
@@ -804,7 +1005,7 @@ struct SyncButton: View {
             )
             .shadow(color: canStop ? Color.clear : (isSyncing ? Theme.warning : Theme.accent).opacity(0.3), radius: 12, y: 6)
         }
-        .disabled(viewModel.isConnecting || viewModel.isLoadingSnapshot)
+        .disabled(viewModel.isConnecting || viewModel.isLoadingSnapshot || viewModel.isDownloadingSnapshot)
     }
 }
 
