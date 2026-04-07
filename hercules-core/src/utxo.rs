@@ -1147,7 +1147,9 @@ impl std::error::Error for UtxoError {}
 impl UtxoSet {
     /// Insert a UTXO directly. Bypasses block validation; tests use this to
     /// simulate "this UTXO existed before the block we're about to roll back".
-    fn test_insert_utxo(
+    /// `pub(crate)` so the mempool test suite can build a populated UTXO set
+    /// without going through `apply_block`.
+    pub(crate) fn test_insert_utxo(
         &self,
         txid: [u8; 32],
         vout: u32,
