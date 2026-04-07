@@ -46,10 +46,21 @@ class SnapshotDownloader: NSObject, ObservableObject {
     var backgroundCompletionHandler: (() -> Void)?
 
     private lazy var session: URLSession = {
+        // Background URLSessions are backed by `nsurlsessiond`, a system
+        // daemon that does not exist in the iOS Simulator — attempting to
+        // create a background download task there fails with an opaque
+        // "unknown error" (NSCocoaErrorDomain 4097). Fall back to a default
+        // session in simulator builds. Real devices keep the background
+        // session so the download continues across app suspension.
+        #if targetEnvironment(simulator)
+        let config = URLSessionConfiguration.default
+        config.allowsCellularAccess = false
+        #else
         let config = URLSessionConfiguration.background(withIdentifier: Self.backgroundSessionId)
         config.isDiscretionary = false       // user-initiated, run promptly
         config.sessionSendsLaunchEvents = true
         config.allowsCellularAccess = false  // 8.2 GB — Wi-Fi only by default
+        #endif
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
 
