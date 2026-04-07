@@ -17,6 +17,37 @@ struct Theme {
     static let textTertiary = Color.white.opacity(0.35)
 }
 
+// MARK: - Validation Mode
+
+/// How the node builds its UTXO set on first run.
+///
+/// `assumeUtxo` downloads a hash-anchored snapshot — fast but anchored to a
+/// constant baked into the app. `fromGenesis` validates every block from
+/// height 0 — slower (weeks on a phone) but trusts only Bitcoin's consensus
+/// rules. The choice is part of the node's identity for a given DB; switching
+/// is destructive and goes through `NodeViewModel.resetAndRestart`.
+enum ValidationMode: String {
+    case assumeUtxo
+    case fromGenesis
+}
+
+enum ValidationModePreference {
+    static let key = "validationMode"
+
+    static var current: ValidationMode? {
+        get {
+            UserDefaults.standard.string(forKey: key).flatMap(ValidationMode.init(rawValue:))
+        }
+        set {
+            if let m = newValue {
+                UserDefaults.standard.set(m.rawValue, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+    }
+}
+
 // MARK: - View Model
 
 class NodeViewModel: ObservableObject {
@@ -34,6 +65,19 @@ class NodeViewModel: ObservableObject {
     @Published var snapshotBytesDownloaded: Int64 = 0
     @Published var snapshotBytesTotal: Int64 = SnapshotDownloader.expectedBytes
 
+    /// User-selected validation mode. `nil` means the user hasn't picked yet
+    /// — the main view shows the picker card and the SyncButton is disabled.
+    @Published var validationMode: ValidationMode? = ValidationModePreference.current
+
+    /// True while `resetAndRestart` is wiping DB files. UI shows a transient
+    /// "Resetting…" state and blocks the SyncButton.
+    @Published var isResetting = false
+
+    // Phase 5 participation stats — populated by the 5s polling timer once
+    // the node has reached tip and the monitor loop is running.
+    @Published var mempoolStatus: MempoolStatus?
+    @Published var nodeStatus: NodeStatus?
+
     // Thread-safe access to the node: set from background thread, read from main thread
     private var _node: HerculesNode?
     private let nodeLock = NSLock()
@@ -42,7 +86,8 @@ class NodeViewModel: ObservableObject {
         set { nodeLock.lock(); defer { nodeLock.unlock() }; _node = newValue }
     }
 
-    // Subscriptions to SnapshotDownloader's @Published state.
+    // Subscriptions to SnapshotDownloader's @Published state and the
+    // participation-stats polling timer.
     private var downloadCancellables = Set<AnyCancellable>()
     // Continuation that the download flow awaits while the download runs.
     private var downloadWaiter: ((Result<URL, Error>) -> Void)?
@@ -68,6 +113,36 @@ class NodeViewModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] status in self?.handleDownloadStatus(status) }
             .store(in: &downloadCancellables)
+
+        // Poll mempool + node-status stats every 5s. The Rust calls are cheap
+        // (uncontended locks + a few u32/u64 reads) so the cost is negligible
+        // even when we're not yet a full participant.
+        Timer.publish(every: 5, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in self?.pollParticipationStats() }
+            .store(in: &downloadCancellables)
+    }
+
+    /// Read mempool + node-status from the live HerculesNode. Off main thread
+    /// because the FFI calls hop into Rust and we don't want to block UI even
+    /// for a few milliseconds. Silently no-ops if the node isn't running.
+    private func pollParticipationStats() {
+        guard let node = node, isSyncRunning else {
+            // Clear stale stats so the card doesn't show ghost data after stop.
+            if mempoolStatus != nil || nodeStatus != nil {
+                mempoolStatus = nil
+                nodeStatus = nil
+            }
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let mp = node.getMempoolStatus()
+            let ns = node.getNodeStatus()
+            DispatchQueue.main.async {
+                self?.mempoolStatus = mp
+                self?.nodeStatus = ns
+            }
+        }
     }
 
     private func handleDownloadStatus(_ status: SnapshotDownloader.Status) {
@@ -124,6 +199,90 @@ class NodeViewModel: ObservableObject {
         SnapshotDownloader.shared.cancel()
     }
 
+    /// Persist the user's validation-mode choice. Idempotent — only writes
+    /// when the value actually changes.
+    func setValidationMode(_ mode: ValidationMode) {
+        guard validationMode != mode else { return }
+        validationMode = mode
+        ValidationModePreference.current = mode
+    }
+
+    /// Wipe all on-disk state and restart sync with a new validation mode.
+    /// This is the destructive "Switch validation mode" path: it stops the
+    /// running node, drops the open SQLite handles, deletes the headers /
+    /// utxo / blocks DB files via Rust's `reset_database`, persists the new
+    /// mode, then re-runs `startSync`. Any in-progress snapshot download is
+    /// also cancelled and its cached file removed.
+    ///
+    /// `completion` is invoked on the main queue after the wipe finishes
+    /// (success) or with the error that aborted it (failure). It runs
+    /// *before* `startSync` is re-invoked so the caller can dismiss any
+    /// confirmation sheet first.
+    func resetAndRestart(mode: ValidationMode, completion: @escaping (Error?) -> Void) {
+        DispatchQueue.main.async { self.isResetting = true }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            // 1. Cancel any in-flight download (clears resume data + .gz file).
+            SnapshotDownloader.shared.cancel()
+            SnapshotDownloader.deleteDownloadedFile()
+
+            // 2. Ask the running sync loop to stop. This sets a flag the loop
+            // checks on its next iteration — it does NOT block.
+            if let node = self.node {
+                node.stopSync()
+            }
+
+            // 3. Spin until the sync loop has actually returned (isSyncRunning
+            // flips to false in the catch/finally of startSync's background
+            // task). Cap the wait so a wedged loop can't deadlock the user.
+            let deadline = Date().addingTimeInterval(15)
+            while Date() < deadline {
+                var stillRunning = true
+                DispatchQueue.main.sync { stillRunning = self.isSyncRunning }
+                if !stillRunning { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+
+            // 4. Drop the HerculesNode reference so its open SQLite handles
+            // are released BEFORE we try to delete the files. On POSIX an
+            // open inode survives unlink, which would leave stale state.
+            self.node = nil
+
+            // 5. Wipe the on-disk DBs via Rust.
+            do {
+                try resetDatabase(dbPath: Self.dbPath())
+            } catch {
+                DispatchQueue.main.async {
+                    self.isResetting = false
+                    completion(error)
+                }
+                return
+            }
+
+            // 6. Persist the new mode and reset transient UI state.
+            DispatchQueue.main.async {
+                ValidationModePreference.current = mode
+                self.validationMode = mode
+                self.syncStatus = nil
+                self.errorMessage = nil
+                self.isLoadingSnapshot = false
+                self.isDownloadingSnapshot = false
+                self.snapshotProgress = 0
+                self.snapshotDownloadProgress = 0
+                self.mempoolStatus = nil
+                self.nodeStatus = nil
+                self.isResetting = false
+
+                completion(nil)
+
+                // 7. Kick off a fresh sync with the new mode.
+                self.startSync()
+            }
+        }
+    }
+
     func startSync() {
         guard !isSyncRunning else { return }
         isConnecting = true
@@ -150,10 +309,12 @@ class NodeViewModel: ObservableObject {
                 }
                 self?.node = node
 
-                // Check if we need to load a UTXO snapshot. If so, download
-                // the .hutx.gz from R2 (background URLSession, OS-resumable),
-                // import it, and delete the cached file.
-                if try node.needsSnapshot() {
+                // Honor the user's explicit validation-mode choice. AssumeUTXO
+                // runs the download/import path on a fresh DB; Genesis skips
+                // it entirely (block-by-block validation will start from
+                // wherever validated_height is — 0 on a clean wipe).
+                let mode = self?.validationMode ?? .assumeUtxo
+                if mode == .assumeUtxo, try node.needsSnapshot() {
                     DispatchQueue.main.async {
                         self?.isConnecting = false
                     }
@@ -353,7 +514,21 @@ struct ContentView: View {
                             AboutView()
                         }
                         .sheet(isPresented: $showSettings) {
-                            SettingsView()
+                            SettingsView(viewModel: viewModel)
+                        }
+
+                        // High-level state pill (always visible — its job is
+                        // to answer "what is my node doing right now").
+                        HStack {
+                            Spacer()
+                            NodeStatePill(viewModel: viewModel)
+                            Spacer()
+                        }
+
+                        // Validation mode picker — only on first run, before
+                        // the user has committed to AssumeUTXO vs Genesis.
+                        if viewModel.validationMode == nil && !viewModel.isSyncRunning {
+                            ValidationModePickerCard(viewModel: viewModel)
                         }
 
                         // Tor status card
@@ -384,6 +559,15 @@ struct ContentView: View {
                             BlockValidationCard(status: status, viewModel: viewModel)
                         }
 
+                        // Network participation card — only meaningful once
+                        // the monitor loop is running. We show it as soon as
+                        // either stat dictionary has been populated, but the
+                        // pill above is the canonical "are we participating?"
+                        // signal.
+                        if viewModel.mempoolStatus != nil || viewModel.nodeStatus != nil {
+                            NetworkParticipationCard(viewModel: viewModel)
+                        }
+
                         // Peers card
                         if let status = viewModel.syncStatus, !status.peers.isEmpty {
                             PeersCard(status: status)
@@ -410,6 +594,341 @@ struct ContentView: View {
         }
         .toolbarBackground(Theme.bg, for: .navigationBar)
         .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Node State Pill
+
+/// The four user-visible states a Hercules node moves through, derived in
+/// Swift from existing SyncStatus / TorStatus / view-model flags. This is the
+/// "what is my node doing right now" answer at a glance — drill-down detail
+/// lives in the cards below it.
+enum NodeState {
+    case offline            // not started yet
+    case connecting         // tor bootstrap or no peers
+    case downloadingSnapshot // AssumeUTXO download in flight
+    case importingSnapshot  // .hutx.gz being decoded into the UTXO DB
+    case headerSync         // pulling 80-byte headers from genesis to tip
+    case validating         // walking blocks, building UTXO toward tip
+    case participant        // at tip, mempool + relay + serving + inbound
+
+    var label: String {
+        switch self {
+        case .offline:             return "Offline"
+        case .connecting:          return "Connecting"
+        case .downloadingSnapshot: return "Downloading Snapshot"
+        case .importingSnapshot:   return "Importing Snapshot"
+        case .headerSync:          return "Header Sync"
+        case .validating:          return "Validating"
+        case .participant:         return "Participant"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .offline:             return Theme.textTertiary
+        case .connecting:          return Theme.warning
+        case .downloadingSnapshot: return Theme.accent
+        case .importingSnapshot:   return Theme.accent
+        case .headerSync:          return Theme.warning
+        case .validating:          return Theme.warning
+        case .participant:         return Theme.success
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .offline:             return "moon.zzz.fill"
+        case .connecting:          return "network"
+        case .downloadingSnapshot: return "icloud.and.arrow.down.fill"
+        case .importingSnapshot:   return "arrow.down.doc.fill"
+        case .headerSync:          return "list.bullet.rectangle"
+        case .validating:          return "cube.fill"
+        case .participant:         return "checkmark.shield.fill"
+        }
+    }
+}
+
+extension NodeViewModel {
+    /// Compute the visible state from the existing flags + the most recent
+    /// sync status. The transitions are sharp: there's no in-between, so we
+    /// can match on a few simple conditions.
+    var nodeState: NodeState {
+        if !isSyncRunning && syncStatus == nil { return .offline }
+        if isDownloadingSnapshot { return .downloadingSnapshot }
+        if isLoadingSnapshot { return .importingSnapshot }
+        if isBootstrappingTor { return .connecting }
+        guard let s = syncStatus else { return .connecting }
+        if s.peers.isEmpty && !s.isSyncing { return .connecting }
+
+        // Header sync running and we haven't validated anything yet.
+        if s.validatedBlocks == 0 && (s.peerHeight == 0 || s.syncedHeaders < s.peerHeight) {
+            return .headerSync
+        }
+
+        // Validating: we have headers ahead of validated blocks. The monitor
+        // loop only fires once validated catches all the way up to the local
+        // header tip — until then we're a validator-in-progress.
+        if s.peerHeight > 0 && s.validatedBlocks >= s.peerHeight {
+            return .participant
+        }
+        if s.validatedBlocks > 0 || s.syncedHeaders > s.validatedBlocks {
+            return .validating
+        }
+        return .headerSync
+    }
+
+    /// Sub-progress hint shown under the pill (e.g. "612,403 / 880,210").
+    var nodeStateDetail: String? {
+        switch nodeState {
+        case .offline, .connecting:
+            return nil
+        case .downloadingSnapshot:
+            return String(format: "%.1f%%", snapshotDownloadProgress * 100)
+        case .importingSnapshot:
+            return String(format: "%.1f%%", snapshotProgress * 100)
+        case .headerSync:
+            guard let s = syncStatus, s.peerHeight > 0 else { return nil }
+            return "\(formatNumber(s.syncedHeaders)) / \(formatNumber(s.peerHeight))"
+        case .validating:
+            guard let s = syncStatus, s.syncedHeaders > 0 else { return nil }
+            return "\(formatNumber(s.validatedBlocks)) / \(formatNumber(s.syncedHeaders))"
+        case .participant:
+            guard let s = syncStatus else { return nil }
+            return "tip \(formatNumber(s.validatedBlocks))"
+        }
+    }
+}
+
+struct NodeStatePill: View {
+    @ObservedObject var viewModel: NodeViewModel
+
+    var body: some View {
+        let state = viewModel.nodeState
+        HStack(spacing: 8) {
+            Image(systemName: state.icon)
+                .font(.system(size: 11, weight: .semibold))
+            Text(state.label)
+                .font(.system(size: 12, weight: .semibold))
+                .tracking(0.5)
+            if let detail = viewModel.nodeStateDetail {
+                Text("·")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(state.color.opacity(0.5))
+                Text(detail)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(state.color.opacity(0.85))
+            }
+        }
+        .foregroundStyle(state.color)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(state.color.opacity(0.12))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule().stroke(state.color.opacity(0.35), lineWidth: 1)
+        )
+    }
+}
+
+// MARK: - Validation Mode Picker Card
+
+/// Shown on the main view when no validation mode is set yet. Two big tap
+/// targets so first-run users have to make a deliberate choice — there is no
+/// silent default. Once a mode is picked the card disappears and the
+/// SyncButton becomes enabled.
+struct ValidationModePickerCard: View {
+    @ObservedObject var viewModel: NodeViewModel
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 8) {
+                    Image(systemName: "shield.lefthalf.filled")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.accent)
+                    Text("Choose Validation Mode")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+
+                Text("How should this node build its UTXO set? You can switch later from Settings, but switching wipes all validation progress.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textTertiary)
+
+                modeButton(
+                    mode: .assumeUtxo,
+                    title: "AssumeUTXO",
+                    badge: "Recommended",
+                    subtitle: "Trusts a hash baked into the app. ~8 GB download, hours to tip.",
+                    icon: "bolt.shield.fill"
+                )
+
+                modeButton(
+                    mode: .fromGenesis,
+                    title: "Validate from Genesis",
+                    badge: nil,
+                    subtitle: "Trusts only Bitcoin's consensus rules. ~600 GB, weeks to tip on a phone.",
+                    icon: "cube.transparent.fill"
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func modeButton(
+        mode: ValidationMode,
+        title: String,
+        badge: String?,
+        subtitle: String,
+        icon: String
+    ) -> some View {
+        Button(action: { viewModel.setValidationMode(mode) }) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 18))
+                    .foregroundStyle(Theme.accent)
+                    .frame(width: 24)
+                    .padding(.top, 2)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Theme.textPrimary)
+                        if let badge = badge {
+                            Text(badge)
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(Theme.accent)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Theme.accent.opacity(0.15))
+                                .clipShape(Capsule())
+                        }
+                    }
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(12)
+            .background(Color.white.opacity(0.04))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Theme.cardBorder, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Network Participation Card
+
+/// Phase 5 stats: only meaningful once the node has reached tip and the
+/// monitor loop is running. Shows mempool size, peer counts, and lifetime
+/// served/relayed totals. Hidden until at least one poll has populated data.
+struct NetworkParticipationCard: View {
+    @ObservedObject var viewModel: NodeViewModel
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.success)
+                    Text("Network Participation")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    if viewModel.nodeState == .participant {
+                        Text("LIVE")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(Theme.success)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Theme.success.opacity(0.15))
+                            .clipShape(Capsule())
+                    }
+                }
+
+                if let ns = viewModel.nodeStatus {
+                    HStack(spacing: 16) {
+                        statBlock(
+                            label: "Inbound",
+                            value: "\(ns.inboundPeers)",
+                            sub: "via .onion",
+                            color: Theme.accent
+                        )
+                        statBlock(
+                            label: "Outbound",
+                            value: "\(ns.outboundPeers)",
+                            sub: "Tor circuits",
+                            color: Theme.textSecondary
+                        )
+                    }
+                }
+
+                if let mp = viewModel.mempoolStatus {
+                    Divider().background(Theme.cardBorder)
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Mempool")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Theme.textTertiary)
+                            Text("\(formatNumber(mp.txCount)) txs")
+                                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(Theme.textPrimary)
+                        }
+                        Spacer()
+                        Text(byteSize(mp.totalSize) + " / " + byteSize(mp.maxSize))
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                }
+
+                if let ns = viewModel.nodeStatus {
+                    Divider().background(Theme.cardBorder)
+                    HStack(spacing: 16) {
+                        statBlock(
+                            label: "Blocks Served",
+                            value: formatNumber(UInt32(min(ns.blocksServed, UInt64(UInt32.max)))),
+                            sub: "to peers",
+                            color: Theme.success
+                        )
+                        statBlock(
+                            label: "Txs Relayed",
+                            value: formatNumber(UInt32(min(ns.txsRelayed, UInt64(UInt32.max)))),
+                            sub: "lifetime",
+                            color: Theme.success
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func statBlock(label: String, value: String, sub: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.textTertiary)
+            Text(value)
+                .font(.system(size: 18, weight: .semibold, design: .monospaced))
+                .foregroundStyle(color)
+            Text(sub)
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.textTertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func byteSize(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 }
 
@@ -947,6 +1466,8 @@ struct SyncButton: View {
     }
 
     var label: String {
+        if viewModel.isResetting { return "Resetting..." }
+        if viewModel.validationMode == nil { return "Choose Validation Mode" }
         if viewModel.isDownloadingSnapshot { return "Downloading UTXO Snapshot..." }
         if viewModel.isLoadingSnapshot { return "Loading UTXO Snapshot..." }
         if viewModel.isBootstrappingTor { return "Connecting to Tor..." }
@@ -1005,7 +1526,13 @@ struct SyncButton: View {
             )
             .shadow(color: canStop ? Color.clear : (isSyncing ? Theme.warning : Theme.accent).opacity(0.3), radius: 12, y: 6)
         }
-        .disabled(viewModel.isConnecting || viewModel.isLoadingSnapshot || viewModel.isDownloadingSnapshot)
+        .disabled(
+            viewModel.isConnecting
+            || viewModel.isLoadingSnapshot
+            || viewModel.isDownloadingSnapshot
+            || viewModel.isResetting
+            || viewModel.validationMode == nil
+        )
     }
 }
 

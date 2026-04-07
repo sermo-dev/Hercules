@@ -61,6 +61,33 @@ pub fn hercules_version() -> String {
     "Hercules v0.1.0".to_string()
 }
 
+/// Wipe all on-disk state for a Hercules node so the next launch starts from a
+/// clean genesis. Deletes the headers DB plus the derived UTXO and block-store
+/// DBs (and their SQLite -wal/-shm sidecars). The caller MUST drop any live
+/// `HerculesNode` for this `db_path` before calling this — open SQLite handles
+/// will silently keep the inodes alive on POSIX, leaving stale state behind.
+pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
+    // Mirror the path-derivation logic in `HeaderSync::new`. Keep these in sync.
+    let utxo_path = db_path.replace("headers", "utxo");
+    let blocks_path = db_path.replace("headers", "blocks");
+
+    for base in [&db_path, &utxo_path, &blocks_path] {
+        for suffix in ["", "-wal", "-shm"] {
+            let p = format!("{}{}", base, suffix);
+            match std::fs::remove_file(&p) {
+                Ok(_) => log::info!("reset_database: removed {}", p),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(HerculesError::StorageError {
+                        msg: format!("failed to remove {}: {}", p, e),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── Phase 1 types (header sync) ────────────────────────────────────
 
 #[derive(Debug, Clone)]

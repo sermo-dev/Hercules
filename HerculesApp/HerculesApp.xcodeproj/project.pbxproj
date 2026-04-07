@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		207BCB9D380A6282E1252A39 /* HerculesApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */; };
 		30FE03463F60EE0268673195 /* hercules.swift in Sources */ = {isa = PBXBuildFile; fileRef = D447B442663275E674A34B07 /* hercules.swift */; };
+		57F102B1AEC3AAFB708A1D34 /* SnapshotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */; };
 		5EDE5A815A9EBFDB673C9944 /* herculesFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 23538480402D68A26C4B93B3 /* herculesFFI.xcframework */; };
 		6E11490B9C8FBFC3B743B3B1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 314CE09F95D9CE2AEFB5822D /* ContentView.swift */; };
 		A128B0A9D11BC0123589A67B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F6A2BE5D8836DC97A10384A /* AppDelegate.swift */; };
@@ -29,6 +30,7 @@
 		4CB3647C90E7FDE042B14BD4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		4F6A2BE5D8836DC97A10384A /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		5DF36E0E80A83078F748A223 /* HerculesApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesApp.entitlements; sourceTree = "<group>"; };
+		73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotDownloader.swift; sourceTree = "<group>"; };
 		8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerculesApp.swift; sourceTree = "<group>"; };
 		91B6627F64A7DEA672DD126A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		D447B442663275E674A34B07 /* hercules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = hercules.swift; sourceTree = "<group>"; };
@@ -87,6 +89,7 @@
 				F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */,
 				369D4212C2AB889A298C77F9 /* NotificationManager.swift */,
 				91B6627F64A7DEA672DD126A /* SettingsView.swift */,
+				73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */,
 			);
 			path = HerculesApp;
 			sourceTree = "<group>";
@@ -177,6 +180,7 @@
 				B3EF5D8882B4179A23DF8B64 /* NotificationHistory.swift in Sources */,
 				FEA13ADA8F49AAA14C5EB73F /* NotificationManager.swift in Sources */,
 				BC2233A312C88F1BCD98652D /* SettingsView.swift in Sources */,
+				57F102B1AEC3AAFB708A1D34 /* SnapshotDownloader.swift in Sources */,
 				30FE03463F60EE0268673195 /* hercules.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

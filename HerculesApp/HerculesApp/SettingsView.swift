@@ -1,10 +1,14 @@
 import SwiftUI
 
 struct SettingsView: View {
+    @ObservedObject var viewModel: NodeViewModel
     @ObservedObject var notificationManager = NotificationManager.shared
     @State private var relayURL: String = NotificationManager.shared.relayServerURL
     @State private var isTestingNotification = false
     @State private var testResult: String?
+    @State private var showSwitchModeConfirm = false
+    @State private var pendingSwitchMode: ValidationMode?
+    @State private var switchModeError: String?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -14,6 +18,7 @@ struct SettingsView: View {
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 20) {
                     header
+                    validationModeCard
                     notificationToggleCard
                     relayServerCard
                     registrationStatusCard
@@ -26,6 +31,85 @@ struct SettingsView: View {
                 .padding(.bottom, 40)
             }
         }
+        .alert("Switch validation mode?", isPresented: $showSwitchModeConfirm, presenting: pendingSwitchMode) { mode in
+            Button("Cancel", role: .cancel) {
+                pendingSwitchMode = nil
+            }
+            Button("Switch & Wipe", role: .destructive) {
+                viewModel.resetAndRestart(mode: mode) { error in
+                    if let error = error {
+                        switchModeError = "\(error)"
+                    }
+                    pendingSwitchMode = nil
+                }
+            }
+        } message: { mode in
+            let validated = viewModel.syncStatus?.validatedBlocks ?? 0
+            let target = mode == .assumeUtxo ? "AssumeUTXO" : "Validate from Genesis"
+            Text("This will discard \(formatNumber(validated)) validated blocks and the current UTXO set, then restart in \(target) mode. This cannot be undone.")
+        }
+    }
+
+    // MARK: - Validation Mode
+
+    private var validationModeCard: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: "shield.lefthalf.filled")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.accent)
+                    Text("Validation Mode")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+
+                let current = viewModel.validationMode
+                Text(current == .assumeUtxo
+                     ? "AssumeUTXO — trusts a hash baked into the app."
+                     : current == .fromGenesis
+                        ? "Validate from Genesis — trusts only consensus rules."
+                        : "Not yet selected.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textPrimary)
+
+                Text("Switching modes wipes all on-disk state (headers, UTXO, blocks) and starts fresh. The node must restart.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textTertiary)
+
+                HStack(spacing: 10) {
+                    switchButton(to: .assumeUtxo, label: "Switch to AssumeUTXO")
+                    switchButton(to: .fromGenesis, label: "Switch to Genesis")
+                }
+
+                if let err = switchModeError {
+                    Text(err)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Theme.error)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func switchButton(to mode: ValidationMode, label: String) -> some View {
+        let isCurrent = viewModel.validationMode == mode
+        Button(action: {
+            switchModeError = nil
+            pendingSwitchMode = mode
+            showSwitchModeConfirm = true
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(isCurrent ? Theme.textTertiary : Theme.accent)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity)
+                .background((isCurrent ? Theme.textTertiary : Theme.accent).opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .disabled(isCurrent || viewModel.isResetting)
     }
 
     // MARK: - Header
