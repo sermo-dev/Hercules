@@ -760,7 +760,7 @@ struct ValidationModePickerCard: View {
                     mode: .assumeUtxo,
                     title: "AssumeUTXO",
                     badge: "Recommended",
-                    subtitle: "Trusts a hash baked into the app. ~8 GB download, hours to tip.",
+                    subtitle: "Trusts a hash baked into the app. ~8 GB one-time download, ~10–60 min to tip on Wi-Fi.",
                     icon: "bolt.shield.fill"
                 )
 
@@ -768,7 +768,7 @@ struct ValidationModePickerCard: View {
                     mode: .fromGenesis,
                     title: "Validate from Genesis",
                     badge: nil,
-                    subtitle: "Trusts only Bitcoin's consensus rules. ~600 GB, weeks to tip on a phone.",
+                    subtitle: "Trusts only Bitcoin's consensus rules. Downloads & validates every block (~600 GB), ~1–2 days to tip on a phone over Wi-Fi.",
                     icon: "cube.transparent.fill"
                 )
             }
@@ -1293,7 +1293,7 @@ struct SnapshotLoadingCard: View {
                 }
                 .frame(height: 8)
 
-                Text("Importing verified UTXO set...")
+                Text("Verifying & importing UTXO set…")
                     .font(.system(size: 12, weight: .regular))
                     .foregroundStyle(Theme.textTertiary)
             }
