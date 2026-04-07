@@ -6,10 +6,10 @@ use bitcoin::block::Block;
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
 use heed::types::{Bytes, Unit};
-use heed::{Database, Env, EnvOpenOptions, PutFlags};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, PutFlags};
 use sha2::{Digest, Sha256};
 
-use log::info;
+use log::{info, warn};
 
 /// Snapshot file magic bytes: "HUTX"
 const SNAPSHOT_MAGIC: [u8; 4] = [b'H', b'U', b'T', b'X'];
@@ -45,6 +45,31 @@ const FLAG_COINBASE: u8 = 1 << 0;
 
 /// Header bytes in a serialized undo entry value: txid(32) + vout(4) + amount(8) + orig_height(4) + flags(1).
 const UNDO_VALUE_HEADER_LEN: usize = 49;
+
+/// Bulk-load batch size: commit and reopen the write txn every N entries
+/// during snapshot load. Bounds dirty-page accumulation in LMDB's per-txn
+/// dirty list so it doesn't grow past available RAM and trigger the mmap
+/// eviction death spiral on iOS. APPEND ordering is preserved across
+/// commits since the snapshot stream is monotonically sorted.
+///
+/// Lowered to a tiny value under `cfg(test)` so the test suite actually
+/// exercises the periodic-commit code path with handfuls of entries instead
+/// of needing a million-entry stream.
+#[cfg(not(test))]
+const SNAPSHOT_LOAD_BATCH: u64 = 1_000_000;
+#[cfg(test)]
+const SNAPSHOT_LOAD_BATCH: u64 = 4;
+
+/// Buffered reader capacity for snapshot streams (256 KiB). Larger than the
+/// default 8 KiB to reduce syscall + gzip-decoder overhead during the
+/// hours-long iPhone import.
+const SNAPSHOT_READ_BUF: usize = 256 * 1024;
+
+/// Sentinel filename written next to the LMDB env directory while a
+/// snapshot load is in progress. Its presence on `UtxoSet::open` means a
+/// previous load was interrupted (process killed, OS reboot) and the
+/// on-disk state is partial / unverified — we wipe and start fresh.
+const SNAPSHOT_LOADING_MARKER_SUFFIX: &str = ".loading";
 
 /// Metadata about a loaded or expected UTXO snapshot.
 #[derive(Debug, Clone)]
@@ -96,8 +121,29 @@ pub struct UtxoSet {
 impl UtxoSet {
     /// Open or create a UTXO LMDB env at `path`. `path` is treated as a
     /// directory — heed creates `data.mdb` and `lock.mdb` inside it.
+    ///
+    /// If a `<path>.loading` marker exists, a previous snapshot load was
+    /// interrupted: the env on disk is partial and unverified. We wipe it
+    /// before opening so the caller sees an empty set and can re-import.
     pub fn open(path: &str) -> Result<UtxoSet, UtxoError> {
         let path_buf = PathBuf::from(path);
+        let marker = loading_marker_path(&path_buf);
+
+        if marker.exists() {
+            warn!(
+                "Detected interrupted UTXO snapshot load at {} — wiping partial env",
+                path_buf.display()
+            );
+            if path_buf.exists() {
+                fs::remove_dir_all(&path_buf).map_err(|e| {
+                    UtxoError(format!("wipe partial env {}: {}", path_buf.display(), e))
+                })?;
+            }
+            fs::remove_file(&marker).map_err(|e| {
+                UtxoError(format!("remove loading marker {}: {}", marker.display(), e))
+            })?;
+        }
+
         fs::create_dir_all(&path_buf)
             .map_err(|e| UtxoError(format!("create utxo dir {}: {}", path, e)))?;
         Self::open_at(&path_buf)
@@ -532,6 +578,37 @@ impl UtxoSet {
     /// The UTXO set must be empty before calling this.
     ///
     /// `on_progress` is called periodically with (loaded_count, total_count).
+    ///
+    /// ## Performance and crash safety
+    ///
+    /// The naive "single huge write txn" form of this loop took hours on
+    /// iPhone because (a) every entry triggered a random `height_index.put`
+    /// across an unsorted B+ tree, and (b) the per-txn dirty page list grew
+    /// past available RAM, evicting the mmap and faulting cold pages back
+    /// in on every subsequent put. Three changes fix it:
+    ///
+    /// 1. **Skip `height_index` for snapshot rows.** The index is only used
+    ///    by rollback, and rollback past the snapshot height is forbidden by
+    ///    design (the snapshot is the assume-valid floor). Halves the LMDB
+    ///    write count and eliminates *all* of the random-write work.
+    /// 2. **Periodic mid-stream commits.** Every `SNAPSHOT_LOAD_BATCH`
+    ///    entries we commit and reopen the wtxn so dirty pages flush to the
+    ///    OS page cache instead of accumulating in LMDB's per-txn list.
+    ///    APPEND ordering survives across commits because each new key is
+    ///    still strictly greater than the existing max.
+    /// 3. **`NO_META_SYNC` for the load window.** Defers the meta-page
+    ///    fsync between batches; data pages still fsync at each commit, so
+    ///    a crash loses at most the last batch — never corrupts the env.
+    ///    `NO_SYNC` was *not* used because it can leave LMDB structurally
+    ///    broken on a process kill.
+    ///
+    /// Periodic commits introduce a new failure mode: if the process dies
+    /// after batch N has committed but before verification finishes, the
+    /// env contains unverified partial state. To prevent that from
+    /// masquerading as a complete UTXO set, we write a `<env>.loading`
+    /// marker file before the first batch and delete it only after a
+    /// successful `force_sync`. `UtxoSet::open` checks for the marker on
+    /// startup and wipes the env if found.
     pub fn load_snapshot<R: std::io::Read, F>(
         &self,
         reader: R,
@@ -541,7 +618,7 @@ impl UtxoSet {
     where
         F: Fn(u64, u64),
     {
-        let mut r = BufReader::new(reader);
+        let mut r = BufReader::with_capacity(SNAPSHOT_READ_BUF, reader);
 
         // ── Header ─────────────────────────────────────────────────
         let mut magic = [0u8; 4];
@@ -596,131 +673,208 @@ impl UtxoSet {
             hex::encode(file_hash)
         );
 
-        // ── Bulk load with PutFlags::APPEND ────────────────────────
-        // The snapshot file is sorted by (txid, vout); our key encoding
-        // (txid || vout BE) preserves that order, so APPEND is safe and
-        // skips B+ tree page-split work entirely. Hash is computed
-        // streaming and verified BEFORE commit so corrupt data never
-        // persists.
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| UtxoError(format!("begin snapshot tx: {}", e)))?;
+        // ── NO_META_SYNC for the load window ──────────────────────
+        // SAFETY: NO_META_SYNC is documented as integrity-preserving (a
+        // crash may undo the last committed transaction but cannot corrupt
+        // the env). The FlagGuard's Drop unconditionally restores the
+        // default sync mode for any subsequent operations on this env.
+        //
+        // Done *before* the marker write so a set_flags failure can't
+        // orphan a marker file on an env that was never touched.
+        let _flag_guard = unsafe {
+            self.env
+                .set_flags(EnvFlags::NO_META_SYNC, FlagSetMode::Enable)
+                .map_err(|e| UtxoError(format!("enable NO_META_SYNC: {}", e)))?;
+            FlagGuard {
+                env: &self.env,
+                flags_to_clear: EnvFlags::NO_META_SYNC,
+            }
+        };
 
-        // TOCTOU-safe emptiness check inside the write transaction.
-        if !self
-            .utxos
-            .is_empty(&wtxn)
-            .map_err(|e| UtxoError(format!("is_empty check: {}", e)))?
-        {
-            return Err(UtxoError(
-                "UTXO set must be empty before loading snapshot".into(),
-            ));
-        }
+        // ── Crash-recovery marker ─────────────────────────────────
+        // Write the marker before touching the env so an interrupted load
+        // is always detectable on next open. We won't delete it until the
+        // final force_sync returns.
+        let marker = loading_marker_path(self.env.path());
+        fs::write(&marker, b"snapshot load in progress\n").map_err(|e| {
+            UtxoError(format!(
+                "write loading marker {}: {}",
+                marker.display(),
+                e
+            ))
+        })?;
 
-        let mut txid = [0u8; 32];
-        let mut buf2 = [0u8; 2];
-        let mut hasher = Sha256::new();
-        let mut prev_key: Option<[u8; UTXO_KEY_LEN]> = None;
-        // Reuse a single allocation for the value buffer across the inner loop.
-        let mut value_buf: Vec<u8> = Vec::with_capacity(UTXO_VALUE_HEADER_LEN + 64);
+        // ── Bulk-load loop (in a closure so error paths funnel through
+        //     the cleanup block below) ──────────────────────────────
+        let load_result: Result<(), UtxoError> = (|| {
+            let mut wtxn = self
+                .env
+                .write_txn()
+                .map_err(|e| UtxoError(format!("begin snapshot tx: {}", e)))?;
 
-        for i in 0..utxo_count {
-            r.read_exact(&mut txid)
-                .map_err(|e| UtxoError(format!("read txid at {}: {}", i, e)))?;
-            r.read_exact(&mut buf4)
-                .map_err(|e| UtxoError(format!("read vout at {}: {}", i, e)))?;
-            let vout = u32::from_le_bytes(buf4);
+            // TOCTOU-safe emptiness check inside the (initial) write txn.
+            if !self
+                .utxos
+                .is_empty(&wtxn)
+                .map_err(|e| UtxoError(format!("is_empty check: {}", e)))?
+            {
+                return Err(UtxoError(
+                    "UTXO set must be empty before loading snapshot".into(),
+                ));
+            }
 
-            r.read_exact(&mut buf8)
-                .map_err(|e| UtxoError(format!("read amount at {}: {}", i, e)))?;
-            let amount = u64::from_le_bytes(buf8);
-            if amount > MAX_MONEY {
+            let mut txid = [0u8; 32];
+            let mut buf2 = [0u8; 2];
+            let mut buf4 = [0u8; 4];
+            let mut buf8 = [0u8; 8];
+            let mut hasher = Sha256::new();
+            let mut prev_key: Option<[u8; UTXO_KEY_LEN]> = None;
+            // Reuse a single allocation for the value buffer across the inner loop.
+            let mut value_buf: Vec<u8> = Vec::with_capacity(UTXO_VALUE_HEADER_LEN + 64);
+
+            for i in 0..utxo_count {
+                r.read_exact(&mut txid)
+                    .map_err(|e| UtxoError(format!("read txid at {}: {}", i, e)))?;
+                r.read_exact(&mut buf4)
+                    .map_err(|e| UtxoError(format!("read vout at {}: {}", i, e)))?;
+                let vout = u32::from_le_bytes(buf4);
+
+                r.read_exact(&mut buf8)
+                    .map_err(|e| UtxoError(format!("read amount at {}: {}", i, e)))?;
+                let amount = u64::from_le_bytes(buf8);
+                if amount > MAX_MONEY {
+                    return Err(UtxoError(format!(
+                        "snapshot entry {}: amount {} exceeds MAX_MONEY",
+                        i, amount
+                    )));
+                }
+
+                r.read_exact(&mut buf4)
+                    .map_err(|e| UtxoError(format!("read entry height at {}: {}", i, e)))?;
+                let entry_height = u32::from_le_bytes(buf4);
+
+                let mut cb_byte = [0u8; 1];
+                r.read_exact(&mut cb_byte)
+                    .map_err(|e| UtxoError(format!("read is_coinbase at {}: {}", i, e)))?;
+                let is_coinbase = cb_byte[0] != 0;
+
+                r.read_exact(&mut buf2)
+                    .map_err(|e| UtxoError(format!("read script_len at {}: {}", i, e)))?;
+                let script_len = u16::from_le_bytes(buf2) as usize;
+
+                let mut script = vec![0u8; script_len];
+                r.read_exact(&mut script)
+                    .map_err(|e| UtxoError(format!("read script at {}: {}", i, e)))?;
+
+                // Build the LMDB key and assert strictly-ascending order so the
+                // APPEND optimization stays valid across commits. (LMDB's APPEND
+                // would error out anyway, but our message is clearer.)
+                let key = utxo_key(&txid, vout);
+                if let Some(ref prev) = prev_key {
+                    if key.as_slice() <= prev.as_slice() {
+                        return Err(UtxoError(
+                            "snapshot entries not sorted by (txid, vout)".into(),
+                        ));
+                    }
+                }
+                prev_key = Some(key);
+
+                // Feed the canonical hash format BEFORE writing — a stream
+                // corruption detected on read aborts before the *current*
+                // batch is committed. Earlier already-committed batches are
+                // wiped by the cleanup block on the way out.
+                hasher.update(&txid);
+                hasher.update(&vout.to_le_bytes());
+                hasher.update(&amount.to_le_bytes());
+                hasher.update(&(script_len as u16).to_le_bytes());
+                hasher.update(&script);
+                hasher.update(&entry_height.to_le_bytes());
+                hasher.update(&[is_coinbase as u8]);
+
+                // Encode the value.
+                value_buf.clear();
+                value_buf.extend_from_slice(&amount.to_le_bytes());
+                value_buf.extend_from_slice(&entry_height.to_le_bytes());
+                value_buf.push(if is_coinbase { FLAG_COINBASE } else { 0 });
+                value_buf.extend_from_slice(&script);
+
+                self.utxos
+                    .put_with_flags(&mut wtxn, PutFlags::APPEND, &key, &value_buf)
+                    .map_err(|e| UtxoError(format!("append utxo {}: {}", i, e)))?;
+
+                // Note: `height_index` is intentionally NOT populated for
+                // snapshot rows — see the doc comment on this function.
+
+                // Periodic commit + reopen so LMDB's per-txn dirty list
+                // doesn't pile up. The next key in the stream is still
+                // strictly greater than the new max key in the DB, so
+                // APPEND keeps working in the new txn.
+                let next_i = i + 1;
+                if next_i < utxo_count && next_i % SNAPSHOT_LOAD_BATCH == 0 {
+                    wtxn.commit().map_err(|e| {
+                        UtxoError(format!("commit batch at {}: {}", next_i, e))
+                    })?;
+                    wtxn = self.env.write_txn().map_err(|e| {
+                        UtxoError(format!("reopen tx at {}: {}", next_i, e))
+                    })?;
+                }
+
+                if i % 100_000 == 0 {
+                    on_progress(i, utxo_count);
+                }
+            }
+
+            // Verify hash BEFORE the final commit. If this fails, the
+            // in-flight wtxn rolls back and the cleanup block wipes any
+            // earlier batched commits.
+            let loaded_hash: [u8; 32] = hasher.finalize().into();
+            if loaded_hash != file_hash {
                 return Err(UtxoError(format!(
-                    "snapshot entry {}: amount {} exceeds MAX_MONEY",
-                    i, amount
+                    "snapshot verification failed: loaded={}, expected={}",
+                    hex::encode(loaded_hash),
+                    hex::encode(file_hash)
                 )));
             }
 
-            r.read_exact(&mut buf4)
-                .map_err(|e| UtxoError(format!("read entry height at {}: {}", i, e)))?;
-            let entry_height = u32::from_le_bytes(buf4);
+            wtxn.commit()
+                .map_err(|e| UtxoError(format!("commit snapshot: {}", e)))?;
+            Ok(())
+        })();
 
-            let mut cb_byte = [0u8; 1];
-            r.read_exact(&mut cb_byte)
-                .map_err(|e| UtxoError(format!("read is_coinbase at {}: {}", i, e)))?;
-            let is_coinbase = cb_byte[0] != 0;
-
-            r.read_exact(&mut buf2)
-                .map_err(|e| UtxoError(format!("read script_len at {}: {}", i, e)))?;
-            let script_len = u16::from_le_bytes(buf2) as usize;
-
-            let mut script = vec![0u8; script_len];
-            r.read_exact(&mut script)
-                .map_err(|e| UtxoError(format!("read script at {}: {}", i, e)))?;
-
-            // Build the LMDB key and assert strictly-ascending order so the
-            // APPEND optimization stays valid. (LMDB's APPEND would error out
-            // anyway, but our message is clearer.)
-            let key = utxo_key(&txid, vout);
-            if let Some(ref prev) = prev_key {
-                if key.as_slice() <= prev.as_slice() {
-                    return Err(UtxoError(
-                        "snapshot entries not sorted by (txid, vout)".into(),
-                    ));
+        // ── Cleanup / commit ──────────────────────────────────────
+        match load_result {
+            Ok(()) => {
+                // Force a synchronous flush of all data + meta pages so
+                // the marker file can be removed safely. NO_META_SYNC
+                // doesn't disable explicit force_sync.
+                self.env
+                    .force_sync()
+                    .map_err(|e| UtxoError(format!("force_sync after load: {}", e)))?;
+                // Marker removal proves the load completed end-to-end.
+                fs::remove_file(&marker).map_err(|e| {
+                    UtxoError(format!(
+                        "remove loading marker {}: {}",
+                        marker.display(),
+                        e
+                    ))
+                })?;
+            }
+            Err(e) => {
+                // Wipe any partial state so the next load can start from
+                // empty. The marker is only removed if BOTH the wipe and
+                // the sync succeed — otherwise we leave it on disk so
+                // `open()` will wipe again on next start. Removing the
+                // marker after a failed clear_all would strand partial
+                // data with no recovery signal, which is unrecoverable
+                // without manual intervention.
+                let cleanup_ok =
+                    self.clear_all().is_ok() && self.env.force_sync().is_ok();
+                if cleanup_ok {
+                    let _ = fs::remove_file(&marker);
                 }
-            }
-            prev_key = Some(key);
-
-            // Feed the canonical hash format BEFORE writing — corruption
-            // detected on read still aborts before any DB mutation lands
-            // (the wtxn is dropped without commit on early return).
-            hasher.update(&txid);
-            hasher.update(&vout.to_le_bytes());
-            hasher.update(&amount.to_le_bytes());
-            hasher.update(&(script_len as u16).to_le_bytes());
-            hasher.update(&script);
-            hasher.update(&entry_height.to_le_bytes());
-            hasher.update(&[is_coinbase as u8]);
-
-            // Encode the value.
-            value_buf.clear();
-            value_buf.extend_from_slice(&amount.to_le_bytes());
-            value_buf.extend_from_slice(&entry_height.to_le_bytes());
-            value_buf.push(if is_coinbase { FLAG_COINBASE } else { 0 });
-            value_buf.extend_from_slice(&script);
-
-            self.utxos
-                .put_with_flags(&mut wtxn, PutFlags::APPEND, &key, &value_buf)
-                .map_err(|e| UtxoError(format!("append utxo {}: {}", i, e)))?;
-
-            // Snapshot UTXOs are seeded "as if" created at their original
-            // height; populate `height_index` so future rollback past the
-            // snapshot height (which we never actually do) would still find
-            // them. Cheap to maintain and keeps the invariant clean.
-            let hi_k = height_index_key(entry_height, &txid, vout);
-            self.height_index
-                .put(&mut wtxn, &hi_k, &())
-                .map_err(|e| UtxoError(format!("append height_index {}: {}", i, e)))?;
-
-            if i % 100_000 == 0 {
-                on_progress(i, utxo_count);
+                return Err(e);
             }
         }
-
-        // Verify hash BEFORE commit — reject corrupt data without persisting.
-        let loaded_hash: [u8; 32] = hasher.finalize().into();
-        if loaded_hash != file_hash {
-            // wtxn dropped without commit → automatic rollback.
-            return Err(UtxoError(format!(
-                "snapshot verification failed: loaded={}, expected={}",
-                hex::encode(loaded_hash),
-                hex::encode(file_hash)
-            )));
-        }
-
-        wtxn.commit()
-            .map_err(|e| UtxoError(format!("commit snapshot: {}", e)))?;
 
         on_progress(utxo_count, utxo_count);
 
@@ -735,6 +889,28 @@ impl UtxoSet {
             utxo_count,
             utxo_hash: file_hash,
         })
+    }
+
+    /// Wipe every named DB inside the env in a single transaction. Used by
+    /// the snapshot-load error path to clear partial state from earlier
+    /// batched commits before returning the error to the caller.
+    fn clear_all(&self) -> Result<(), UtxoError> {
+        let mut wtxn = self
+            .env
+            .write_txn()
+            .map_err(|e| UtxoError(format!("clear_all begin tx: {}", e)))?;
+        self.utxos
+            .clear(&mut wtxn)
+            .map_err(|e| UtxoError(format!("clear_all utxos: {}", e)))?;
+        self.undo
+            .clear(&mut wtxn)
+            .map_err(|e| UtxoError(format!("clear_all undo: {}", e)))?;
+        self.height_index
+            .clear(&mut wtxn)
+            .map_err(|e| UtxoError(format!("clear_all height_index: {}", e)))?;
+        wtxn.commit()
+            .map_err(|e| UtxoError(format!("clear_all commit: {}", e)))?;
+        Ok(())
     }
 
     /// Check if any UTXOs exist at the given block height.
@@ -769,7 +945,75 @@ impl UtxoSet {
     }
 }
 
+impl Drop for UtxoSet {
+    /// Force heed to actually close the LMDB env when the last `UtxoSet`
+    /// reference goes away.
+    ///
+    /// Without this, heed's process-global `OPENED_ENV` cache holds an
+    /// extra `Arc<EnvInner>` for every opened path, so the underlying env
+    /// stays mapped for the lifetime of the process — even after every
+    /// user-facing `Env` handle has been dropped. That's harmless for a
+    /// long-running iOS node, but it breaks two important cases:
+    ///
+    /// 1. **Crash-recovery wipe in `open()`** — if a process restart
+    ///    detects a stale `<env>.loading` marker, we `remove_dir_all` the
+    ///    env directory and reopen. With heed's stale cache entry still
+    ///    around, the reopen would return the *old* `Env` (still mmap'd to
+    ///    the now-unlinked file) instead of a fresh empty one.
+    /// 2. **Tests** that simulate restart by dropping a `UtxoSet` and
+    ///    reopening the same path.
+    ///
+    /// `prepare_for_closing` takes the cache's `Arc` out (replacing it with
+    /// `None`) so subsequent opens of the same path are guaranteed cache
+    /// misses. The actual `mdb_env_close` happens once our last `Arc`
+    /// (`self.env`) drops as part of normal field destruction below.
+    fn drop(&mut self) {
+        let _ = self.env.clone().prepare_for_closing();
+    }
+}
+
 // ── Encoding helpers ────────────────────────────────────────────────
+
+/// Path of the "snapshot load in progress" sentinel for an LMDB env at
+/// `env_dir`. Stored as a sibling file (`<env_dir><suffix>`) rather than
+/// inside the env directory so it can't collide with LMDB's own files
+/// and survives a `remove_dir_all(env_dir)` wipe.
+fn loading_marker_path(env_dir: &Path) -> PathBuf {
+    let mut p = env_dir.to_path_buf();
+    let new_name = match env_dir.file_name() {
+        Some(name) => {
+            let mut s = name.to_os_string();
+            s.push(SNAPSHOT_LOADING_MARKER_SUFFIX);
+            s
+        }
+        None => std::ffi::OsString::from(SNAPSHOT_LOADING_MARKER_SUFFIX),
+    };
+    p.set_file_name(new_name);
+    p
+}
+
+/// RAII guard that restores the env's default sync flags when dropped, no
+/// matter how the snapshot-load function exits. Constructed only after the
+/// caller has *enabled* one or more "unsafe" flags (e.g. `NO_META_SYNC`)
+/// and trusts the guard to disable them again.
+struct FlagGuard<'a> {
+    env: &'a Env,
+    flags_to_clear: EnvFlags,
+}
+
+impl Drop for FlagGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: Disabling NO_SYNC / NO_META_SYNC restores conservative
+        // defaults — the unsafety in `set_flags` is on the *enable* side.
+        // Errors here are ignored because Drop has nowhere to report them
+        // and leaving a flag enabled is no worse than the current state.
+        unsafe {
+            let _ = self
+                .env
+                .set_flags(self.flags_to_clear, FlagSetMode::Disable);
+        }
+    }
+}
 
 /// `txid(32) || vout(4 BE)` — BE so the natural lex sort matches the
 /// `(txid, vout)` ordering used by snapshots.
@@ -997,6 +1241,36 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let utxo = UtxoSet::open(dir.path().to_str().unwrap()).unwrap();
         (utxo, dir)
+    }
+
+    /// Build a synthetic snapshot byte stream containing `n` distinct UTXOs
+    /// with strictly increasing txids (`[0;32]`, `[1;32]`, ...). The
+    /// returned `expected_hash` is the snapshot's content hash, suitable
+    /// for passing to `load_snapshot` as `Some(&hash)`.
+    ///
+    /// Used by the periodic-commit and clear_all tests to drive
+    /// `SNAPSHOT_LOAD_BATCH` (which is lowered to 4 under cfg(test))
+    /// across multiple batch boundaries with a small entry count.
+    fn make_snapshot_with_n_utxos(n: u8) -> (Vec<u8>, [u8; 32]) {
+        let (utxo, _dir) = fresh();
+        for i in 0..n {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            utxo.test_insert_utxo(
+                txid,
+                0,
+                UtxoEntry {
+                    amount: 1000 + i as u64,
+                    script_pubkey: vec![0xac],
+                    height: 1,
+                    is_coinbase: false,
+                },
+            )
+            .unwrap();
+        }
+        let mut buf = Vec::new();
+        let meta = utxo.write_snapshot(&mut buf, 1, &[0u8; 32]).unwrap();
+        (buf, meta.utxo_hash)
     }
 
     /// The full genesis block (header + coinbase transaction).
@@ -1239,6 +1513,190 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid snapshot magic"));
+    }
+
+    #[test]
+    fn snapshot_load_does_not_populate_height_index() {
+        // Confirm the optimization: snapshot rows must NOT land in
+        // height_index, since rollback past the snapshot height is
+        // forbidden by design.
+        let (utxo1, _dir1) = fresh();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+
+        let mut buf = Vec::new();
+        let meta = utxo1.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
+
+        let (utxo2, _dir2) = fresh();
+        utxo2
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .unwrap();
+
+        // utxos populated as expected.
+        assert_eq!(utxo2.count().unwrap(), 1);
+        // height_index empty: has_utxos_at_height should report false even
+        // though height 0 has a UTXO in the main table.
+        assert!(!utxo2.has_utxos_at_height(0).unwrap());
+    }
+
+    #[test]
+    fn snapshot_load_removes_marker_on_success() {
+        let (utxo1, _dir1) = fresh();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+        let mut buf = Vec::new();
+        let meta = utxo1.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
+
+        let dir2 = TempDir::new().unwrap();
+        let env_path = dir2.path().join("utxo");
+        let utxo2 = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        utxo2
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .unwrap();
+
+        // Marker must be gone after a clean load.
+        let marker = loading_marker_path(&env_path);
+        assert!(
+            !marker.exists(),
+            "loading marker should be removed on success"
+        );
+    }
+
+    #[test]
+    fn snapshot_load_does_not_write_marker_on_header_hash_failure() {
+        let (utxo1, _dir1) = fresh();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+        let mut buf = Vec::new();
+        utxo1.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
+
+        let dir2 = TempDir::new().unwrap();
+        let env_path = dir2.path().join("utxo");
+        let utxo2 = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        let result = utxo2.load_snapshot(
+            std::io::Cursor::new(&buf),
+            Some(&[0xFFu8; 32]),
+            |_, _| {},
+        );
+        assert!(result.is_err());
+
+        // The expected-hash check in the header runs before any flag/marker
+        // setup, so the marker is never written and the env was never
+        // touched. Both invariants matter: leaving a marker on a no-op
+        // failure would force an unnecessary wipe on next open.
+        let marker = loading_marker_path(&env_path);
+        assert!(!marker.exists());
+        assert_eq!(utxo2.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn open_wipes_env_when_loading_marker_present() {
+        // Set up a populated env, then synthesize an interrupted-load
+        // condition by writing the marker file. Reopening should wipe the
+        // env to empty state and remove the marker.
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join("utxo");
+        {
+            let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+            let genesis = genesis_block();
+            utxo.apply_block(&genesis, 0).unwrap();
+            assert_eq!(utxo.count().unwrap(), 1);
+        } // drop closes the env
+
+        let marker = loading_marker_path(&env_path);
+        std::fs::write(&marker, b"interrupted\n").unwrap();
+        assert!(marker.exists());
+
+        let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            utxo.count().unwrap(),
+            0,
+            "interrupted load marker should trigger a wipe"
+        );
+        assert!(!marker.exists(), "marker should be removed after wipe");
+    }
+
+    #[test]
+    fn loading_marker_path_is_sibling_of_env_dir() {
+        let p = loading_marker_path(Path::new("/tmp/foo/utxo-lmdb"));
+        assert_eq!(p, PathBuf::from("/tmp/foo/utxo-lmdb.loading"));
+    }
+
+    #[test]
+    fn snapshot_load_periodic_commits_persist_all_entries() {
+        // SNAPSHOT_LOAD_BATCH is 4 under cfg(test), so loading 13 entries
+        // forces 3 batch commits at i=4, 8, 12 plus a final commit. The
+        // entire periodic-commit code path is exercised here — the whole
+        // optimization being added — and every entry must round-trip.
+        let (snapshot_bytes, expected_hash) = make_snapshot_with_n_utxos(13);
+
+        let (utxo, _dir) = fresh();
+        let meta = utxo
+            .load_snapshot(
+                std::io::Cursor::new(&snapshot_bytes),
+                Some(&expected_hash),
+                |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(meta.utxo_count, 13);
+        assert_eq!(utxo.count().unwrap(), 13);
+
+        // Spot-check entries on either side of every batch boundary.
+        for i in 0u8..13 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = i;
+            let txid = Txid::from_byte_array(bytes);
+            let entry = utxo.get(&txid, 0).unwrap().unwrap();
+            assert_eq!(entry.amount, 1000 + i as u64);
+            assert_eq!(entry.height, 1);
+            assert!(!entry.is_coinbase);
+            assert_eq!(entry.script_pubkey, vec![0xac]);
+        }
+
+        // The "skip height_index for snapshot rows" optimization holds
+        // even across batched commits — height_index must still be empty.
+        assert!(!utxo.has_utxos_at_height(1).unwrap());
+    }
+
+    #[test]
+    fn snapshot_load_clears_partial_batches_on_post_commit_hash_failure() {
+        // Build a 13-entry snapshot, then flip the last byte (the script
+        // byte of entry 12) so the streaming hash check fails AFTER batch
+        // commits at i=4, 8, 12 have already persisted 12 entries to disk.
+        // The cleanup path must clear_all those persisted entries — leaving
+        // a non-empty env without a marker would be unrecoverable. The
+        // marker must also be removed, since cleanup_ok == true here.
+        let (mut snapshot_bytes, expected_hash) = make_snapshot_with_n_utxos(13);
+        let last = snapshot_bytes.len() - 1;
+        snapshot_bytes[last] ^= 0xFF;
+
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join("utxo");
+        let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+
+        let result = utxo.load_snapshot(
+            std::io::Cursor::new(&snapshot_bytes),
+            Some(&expected_hash),
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("verification failed"));
+
+        // clear_all wiped every previously committed batch.
+        assert_eq!(utxo.count().unwrap(), 0);
+
+        // cleanup_ok was true (clear_all and force_sync both succeeded),
+        // so the marker must be gone — the env is back in a known-empty
+        // state and a fresh load can proceed without going through
+        // open()'s wipe path.
+        let marker = loading_marker_path(&env_path);
+        assert!(
+            !marker.exists(),
+            "marker should be removed when cleanup succeeds"
+        );
     }
 
     #[test]
