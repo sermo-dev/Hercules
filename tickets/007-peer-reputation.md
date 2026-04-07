@@ -1,5 +1,21 @@
 # Ticket 007: Peer Reputation and Scoring System
 
+## Status (as of 2026-04-06): Partially Complete
+
+**Implemented:**
+- Per-peer misbehavior counter — `PeerSlot.misbehavior` in `hercules-core/src/peer_pool.rs`
+- Automatic ban at `BAN_THRESHOLD = 100`, matching Bitcoin Core's `Misbehaving()` pattern
+- `pool.misbehaving(addr, delta)` API used throughout `sync.rs` for header/PoW/oversize violations
+- Saturating-add prevents overflow on adversarial input
+
+**Still required to close this ticket:**
+- **Positive deltas** — scores only increase (toward ban); no rewards for successfully served headers, blocks, or pings. The graduated 0–200 reputation model isn't built.
+- **Timed bans** — bans are a `HashSet<addr>`, not `HashMap<addr, expiry>`. Banned peers cannot recover, and bans don't survive restart.
+- **Reputation-weighted selection** — `best_peer()` picks by height alone; no `height * (score / 100)` weighting that would prefer reliable-but-slightly-behind peers over a sketchy peer at the absolute tip.
+- **Persistence** — neither scores nor bans survive restart.
+
+The current model is "binary banning with a counter" rather than the graduated reputation system this ticket spec describes. Functional for catching obvious bad actors, insufficient for distinguishing reliable peers from merely-slow ones.
+
 ## Summary
 
 Replace the current binary ban/allow peer model with a graduated reputation scoring system that tracks peer behavior over time, penalizes misbehavior proportionally, and rewards reliable peers with preferential selection.

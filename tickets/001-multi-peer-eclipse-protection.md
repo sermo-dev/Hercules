@@ -1,5 +1,21 @@
 # Ticket 001: Multi-Peer Connections with Eclipse Attack Protection
 
+## Status (as of 2026-04-06): Partially Complete
+
+**Implemented:**
+- Multi-peer outbound pool — `MAX_OUTBOUND = 8` in `hercules-core/src/peer_pool.rs:11`
+- Misbehavior scoring with automatic ban at threshold 100 (`PeerSlot.misbehavior`, `pool.misbehaving()`)
+- Multiple DNS seeds for peer discovery
+- UI surfaces connected peer count and per-peer info
+
+**Still required to close this ticket:**
+- **Header cross-validation** — header sync currently runs from a single active peer at a time. No comparison across 2+ independent peers before headers are stored, which is the core eclipse-resistance mechanism this ticket was opened for.
+- **Subnet diversity** — no /16 enforcement when filling outbound slots; an attacker controlling one /16 could in principle dominate the pool.
+- **Parallel range download** — `getheaders` is sequential from one peer, not chunked across peers for faster initial sync.
+- **Persistent ban list** — bans live in-memory only, lost on restart.
+
+The remaining gaps are what would matter most against a sophisticated eclipse attempt; the current pool gives us breadth but not cross-validation.
+
 ## Problem
 
 Hercules currently connects to a single peer for header sync. If that peer is malicious, they could serve a fake header chain (an eclipse attack). While PoW verification makes this extremely expensive, it doesn't protect against a well-funded attacker or a compromised DNS seed returning only attacker-controlled nodes.
