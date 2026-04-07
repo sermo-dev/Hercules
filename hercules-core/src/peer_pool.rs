@@ -49,8 +49,9 @@ const DNS_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Maximum number of known addresses to retain in memory. The real Bitcoin
 /// Core addrman keeps tens of thousands; we cap small for an iPhone budget.
-/// When the manager fills up, the oldest never-tried entries are evicted
-/// first so we don't keep stale gossip indefinitely.
+/// When the manager fills up, eviction prefers the address with the most
+/// connection failures (oldest as tiebreaker) and never evicts an address
+/// that has succeeded at least once. See `AddrManager::evict_if_full`.
 const MAX_KNOWN_ADDRS: usize = 10_000;
 
 /// Wall-clock budget for a single `maintain()` connection-refill pass. We
@@ -198,22 +199,34 @@ impl AddrManager {
         added
     }
 
-    /// Evict to make room when at capacity. Strategy: drop the oldest
-    /// never-tried entry first; if all entries have been tried, drop the
-    /// one with the most failures. We never evict an address with a
-    /// successful past connection — those are the most valuable.
+    /// Evict one entry to make room when at capacity.
+    ///
+    /// Policy, in priority order:
+    /// 1. Among entries that have never successfully connected, drop the one
+    ///    with the highest `failure_count` (oldest `first_seen` as tiebreaker).
+    ///    This pushes addresses we have evidence are bad off the list before
+    ///    addresses we've never tried.
+    /// 2. If every entry has succeeded at least once, drop the oldest one.
+    ///    Should be exceedingly rare at MAX_KNOWN_ADDRS=10_000.
+    ///
+    /// Known-good entries are *never* evicted by step 1 — they're the most
+    /// valuable thing the addrman holds and they survive churn.
     fn evict_if_full(&mut self) {
         if self.addrs.len() < self.max_size {
             return;
         }
 
-        // Prefer to evict an address with no successes — never-tried first,
-        // then most-failed.
+        // Capture `now` once so the comparator inside max_by_key doesn't
+        // re-read the clock for every entry.
+        let now = Instant::now();
+
         let victim: Option<String> = self
             .addrs
             .iter()
             .filter(|(_, m)| m.last_success.is_none())
-            .max_by_key(|(_, m)| (m.failure_count, m.first_seen.elapsed().as_secs()))
+            .max_by_key(|(_, m)| {
+                (m.failure_count, now.duration_since(m.first_seen).as_secs())
+            })
             .map(|(addr, _)| addr.clone());
 
         if let Some(addr) = victim {
@@ -221,12 +234,11 @@ impl AddrManager {
             return;
         }
 
-        // Last resort: every address has succeeded at least once. Drop the
-        // oldest one. Should be exceedingly rare given MAX_KNOWN_ADDRS.
+        // Fallback: every entry has at least one success. Drop the oldest.
         if let Some(addr) = self
             .addrs
             .iter()
-            .max_by_key(|(_, m)| m.first_seen.elapsed().as_secs())
+            .max_by_key(|(_, m)| now.duration_since(m.first_seen).as_secs())
             .map(|(addr, _)| addr.clone())
         {
             self.addrs.remove(&addr);
@@ -1764,9 +1776,11 @@ mod tests {
     }
 
     #[test]
-    fn addrman_eviction_drops_never_tried_first() {
-        // With a tiny capacity, inserting a new address should evict an
-        // existing never-tried entry, never the known-good one.
+    fn addrman_eviction_protects_known_good_entry() {
+        // With a tiny capacity, inserting a new address should evict the
+        // never-tried entry, never the known-good one. (`record_success`
+        // marks the entry as the highest tier, so eviction picks the
+        // remaining lower-tier entry.)
         let mut m = AddrManager::new(2);
         m.insert("good:8333".to_string());
         m.record_success("good:8333");
@@ -1779,6 +1793,28 @@ mod tests {
         assert!(m.addrs.contains_key("good:8333"));
         assert!(m.addrs.contains_key("new:8333"));
         assert!(!m.addrs.contains_key("never:8333"));
+    }
+
+    #[test]
+    fn addrman_eviction_drops_most_failed_entry() {
+        // When the AddrManager is full and no known-good entry exists, the
+        // entry with the highest failure_count should be evicted first
+        // (this is the actual policy implemented by `evict_if_full`).
+        let mut m = AddrManager::new(2);
+        m.insert("flaky:8333".to_string());
+        m.record_failure("flaky:8333");
+        m.record_failure("flaky:8333");
+        m.record_failure("flaky:8333");
+        m.insert("fresh:8333".to_string());
+        assert_eq!(m.len(), 2);
+
+        // A new insertion should evict "flaky" (3 failures) over "fresh"
+        // (0 failures).
+        m.insert("newcomer:8333".to_string());
+        assert_eq!(m.len(), 2);
+        assert!(!m.addrs.contains_key("flaky:8333"));
+        assert!(m.addrs.contains_key("fresh:8333"));
+        assert!(m.addrs.contains_key("newcomer:8333"));
     }
 
     #[test]

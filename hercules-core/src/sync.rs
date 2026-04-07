@@ -1395,17 +1395,21 @@ impl HeaderSync {
 
             NetworkMessage::Addr(entries) => {
                 // Legacy v1 addr gossip. Each entry is `(timestamp, Address)`
-                // where Address is the IPv4-mapped-in-IPv6 form. We queue every
-                // routable entry into pending_gossip_addrs for the monitor
-                // loop to fold into the PeerPool's AddrManager.
-                let mut queued = 0;
-                for (_ts, a) in entries.iter().take(MAX_GOSSIP_ADDRS_PER_MSG) {
-                    if let Some(s) = format_v1_address(a) {
-                        self.pending_gossip_addrs.lock().unwrap().push(s);
-                        queued += 1;
-                    }
-                }
-                if queued > 0 {
+                // where Address is the IPv4-mapped-in-IPv6 form. We collect
+                // routable entries locally, then push them into
+                // pending_gossip_addrs in a single locked extend for the
+                // monitor loop to fold into the PeerPool's AddrManager.
+                let batch: Vec<String> = entries
+                    .iter()
+                    .take(MAX_GOSSIP_ADDRS_PER_MSG)
+                    .filter_map(|(_ts, a)| format_v1_address(a))
+                    .collect();
+                if !batch.is_empty() {
+                    let queued = batch.len();
+                    self.pending_gossip_addrs
+                        .lock()
+                        .unwrap()
+                        .extend(batch);
                     debug!("Queued {} v1 gossip addresses from {}", queued, addr);
                 }
             }
@@ -1416,14 +1420,17 @@ impl HeaderSync {
                 // from its 32-byte pubkey would require SHA-3 (not in our dep
                 // tree) and we already bootstrap Tor via bundled onion seeds.
                 // I2P/Cjdns are not relevant on mobile.
-                let mut queued = 0;
-                for entry in entries.iter().take(MAX_GOSSIP_ADDRS_PER_MSG) {
-                    if let Some(s) = format_v2_address(entry) {
-                        self.pending_gossip_addrs.lock().unwrap().push(s);
-                        queued += 1;
-                    }
-                }
-                if queued > 0 {
+                let batch: Vec<String> = entries
+                    .iter()
+                    .take(MAX_GOSSIP_ADDRS_PER_MSG)
+                    .filter_map(format_v2_address)
+                    .collect();
+                if !batch.is_empty() {
+                    let queued = batch.len();
+                    self.pending_gossip_addrs
+                        .lock()
+                        .unwrap()
+                        .extend(batch);
                     debug!("Queued {} v2 gossip addresses from {}", queued, addr);
                 }
             }
