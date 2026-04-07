@@ -31,6 +31,23 @@ const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 /// Maximum reorg depth we'll accept (bounded by undo data retention window).
 const MAX_REORG_DEPTH: u32 = 288;
 
+/// Penalty applied to a peer that produced a divergent header batch when
+/// cross-checked against the majority. Two strikes ban it (2 * 50 = 100,
+/// score drops to 0).
+const HEADER_DIVERGENCE_PENALTY: u32 = 50;
+
+/// Lighter penalty for a 2-peer disagreement we can't break with a third
+/// opinion — both peers get this since we don't know who's lying.
+const HEADER_DISAGREEMENT_PENALTY: u32 = 10;
+
+/// Outcome of cross-checking a header batch against independent peers.
+enum HeaderCrossCheck {
+    /// Agreement reached (or only one peer available — best-effort accept).
+    Accept,
+    /// Active peer's headers were contradicted by majority — reject the batch.
+    Reject,
+}
+
 /// Genesis block header (block 0).
 fn genesis_header() -> Header {
     let raw = hex::decode(
@@ -109,6 +126,10 @@ pub struct HeaderSync {
     store: HeaderStore,
     utxo: UtxoSet,
     block_store: BlockStore,
+    /// SQLite path for the persistent peer reputation/ban store. Threaded
+    /// through to `PeerPool::new` on each sync session so scores survive a
+    /// process restart. `None` for in-memory test sessions.
+    peers_db_path: Option<String>,
     mempool: Mutex<Mempool>,
     validation_paused: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
@@ -150,6 +171,14 @@ impl HeaderSync {
         let block_store =
             BlockStore::open(&blocks_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
+        // Derive peers DB path for persistent reputation scores and bans.
+        // Skip persistence in :memory: mode (used by tests).
+        let peers_db_path = if db_path == ":memory:" {
+            None
+        } else {
+            Some(db_path.replace("headers", "peers"))
+        };
+
         // Ensure genesis header is stored
         if store.count().map_err(|e| SyncError::Store(format!("{}", e)))? == 0 {
             let genesis = genesis_header();
@@ -185,6 +214,7 @@ impl HeaderSync {
             store,
             utxo,
             block_store,
+            peers_db_path,
             mempool: Mutex::new(Mempool::new()),
             validation_paused: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -303,6 +333,138 @@ impl HeaderSync {
         info!("Sync stop requested");
     }
 
+    /// Cross-check a freshly fetched header batch against one or two
+    /// independent peers before storing it. This is the core eclipse-attack
+    /// defense: even if our active peer is fully attacker-controlled, an
+    /// honest second peer responding to the same locator will return a
+    /// different first header hash, and we can detect the lie.
+    ///
+    /// Strategy:
+    /// 1. Pick a single independent peer (different addr, not banned). Send
+    ///    the same `getheaders` locator. Compare the first hash.
+    /// 2. If they agree → accept. Both peers earn a small reward.
+    /// 3. If they disagree → query a third peer to break the tie.
+    ///    - If 2-of-3 agree, the divergent peer takes
+    ///      `HEADER_DIVERGENCE_PENALTY`. Accept iff active peer is in the
+    ///      majority; reject otherwise.
+    ///    - If we have no third peer, we can't tell who is lying. Apply a
+    ///      lighter `HEADER_DISAGREEMENT_PENALTY` to both and reject the
+    ///      batch — refusing to commit dubious headers is the safer default.
+    /// 4. If only one peer in the pool → best-effort accept (we logged a
+    ///    warning at sync start; this is a degraded mode).
+    fn cross_check_headers(
+        &self,
+        pool: &mut PeerPool,
+        locator: &[BlockHash],
+        active_addr: &str,
+        active_first_hash: BlockHash,
+    ) -> HeaderCrossCheck {
+        // Step 1: pick an independent witness peer.
+        let witness_addr = match pool.peer_addr_other_than(active_addr) {
+            Some(a) => a,
+            None => {
+                debug!(
+                    "cross-check skipped: only active peer {} available",
+                    active_addr
+                );
+                return HeaderCrossCheck::Accept;
+            }
+        };
+
+        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator) {
+            Some(h) => h,
+            None => {
+                // Witness peer failed to respond — we can't conclude anything.
+                // Don't penalize the active peer over a network failure.
+                debug!(
+                    "cross-check witness {} failed; accepting active peer's headers",
+                    witness_addr
+                );
+                return HeaderCrossCheck::Accept;
+            }
+        };
+
+        if witness_first == active_first_hash {
+            // Two independent peers agree on the first header — accept.
+            pool.reward(active_addr, 1);
+            pool.reward(&witness_addr, 1);
+            return HeaderCrossCheck::Accept;
+        }
+
+        warn!(
+            "Header divergence: active {} returned {}, witness {} returned {} — escalating",
+            active_addr, active_first_hash, witness_addr, witness_first
+        );
+
+        // Step 3: try to break the tie with a third peer.
+        let exclude = [active_addr.to_string(), witness_addr.clone()];
+        let tiebreaker_addr = pool.peer_addr_excluding(&exclude);
+
+        if let Some(tb_addr) = tiebreaker_addr {
+            if let Some(tb_first) = self.fetch_first_header_hash(pool, &tb_addr, locator) {
+                if tb_first == active_first_hash {
+                    // Active + tiebreaker agree → witness is the liar.
+                    warn!(
+                        "Header cross-check: penalizing divergent witness {}",
+                        witness_addr
+                    );
+                    pool.misbehaving(&witness_addr, HEADER_DIVERGENCE_PENALTY);
+                    return HeaderCrossCheck::Accept;
+                } else if tb_first == witness_first {
+                    // Witness + tiebreaker agree → active is the liar.
+                    warn!(
+                        "Header cross-check: penalizing divergent active peer {}",
+                        active_addr
+                    );
+                    pool.misbehaving(active_addr, HEADER_DIVERGENCE_PENALTY);
+                    return HeaderCrossCheck::Reject;
+                } else {
+                    // All three peers disagree — pathological case. Penalize
+                    // active (it's our default trust target) and reject.
+                    warn!(
+                        "Header cross-check: 3-way disagreement, rejecting batch from {}",
+                        active_addr
+                    );
+                    pool.misbehaving(active_addr, HEADER_DISAGREEMENT_PENALTY);
+                    return HeaderCrossCheck::Reject;
+                }
+            }
+        }
+
+        // Step 4: only two peers in the pool and they disagree.
+        warn!(
+            "Header cross-check: 2-peer disagreement with no tiebreaker available; rejecting batch"
+        );
+        pool.misbehaving(active_addr, HEADER_DISAGREEMENT_PENALTY);
+        pool.misbehaving(&witness_addr, HEADER_DISAGREEMENT_PENALTY);
+        HeaderCrossCheck::Reject
+    }
+
+    /// Send a `getheaders` to a specific peer and return the first header
+    /// hash from its response, or `None` on any failure (network, empty
+    /// response, peer no longer in pool). This wraps the peer checkout/return
+    /// dance so the cross-check helper stays readable.
+    fn fetch_first_header_hash(
+        &self,
+        pool: &mut PeerPool,
+        addr: &str,
+        locator: &[BlockHash],
+    ) -> Option<BlockHash> {
+        let mut peer = pool.checkout_peer_by_addr(addr)?;
+        let result = peer.get_headers(locator.to_vec(), BlockHash::all_zeros());
+        match result {
+            Ok(headers) => {
+                pool.return_peer(peer);
+                headers.first().map(|h| h.block_hash())
+            }
+            Err(e) => {
+                warn!("cross-check: peer {} failed to respond: {}", addr, e);
+                pool.remove_peer(addr);
+                None
+            }
+        }
+    }
+
     /// Build a SyncStatus snapshot from the pool and current state.
     fn make_status(
         &self,
@@ -343,7 +505,12 @@ impl HeaderSync {
             .saturating_sub(1);
 
         // Create the peer pool
-        let mut pool = PeerPool::new(our_height, self.tor.clone()).map_err(|e| {
+        let mut pool = PeerPool::new(
+            our_height,
+            self.tor.clone(),
+            self.peers_db_path.as_deref(),
+        )
+        .map_err(|e| {
             if format!("{}", e).contains("no peers discovered") {
                 SyncError::NoPeers
             } else {
@@ -426,6 +593,9 @@ impl HeaderSync {
             let headers = match peer.get_headers(locator, BlockHash::all_zeros()) {
                 Ok(h) => {
                     pool.return_peer(peer);
+                    // Reward peers that successfully serve us headers — even an
+                    // empty response counts (it means we're caught up to them).
+                    pool.reward(&active_addr, 1);
                     h
                 }
                 Err(e) => {
@@ -513,6 +683,9 @@ impl HeaderSync {
                     let block = match block_peer.get_block(block_hash) {
                         Ok(b) => {
                             pool.return_peer(block_peer);
+                            // Successfully served a full block — bigger reward
+                            // than headers since blocks are a meatier task.
+                            pool.reward(&block_peer_addr, 2);
                             b
                         }
                         Err(e) => {
@@ -756,6 +929,31 @@ impl HeaderSync {
                 pool.misbehaving(&active_addr, 100);
                 pool.maintain();
                 continue;
+            }
+
+            // ── Eclipse-resistance: cross-check headers against an
+            // independent peer before storing them. We re-fetch the locator
+            // from the store rather than reusing the earlier `locator` since
+            // borrow-checker constraints make threading it through cleaner.
+            let cross_check_locator = self
+                .store
+                .get_locator_hashes()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            let active_first_hash = headers[0].block_hash();
+            match self.cross_check_headers(
+                &mut pool,
+                &cross_check_locator,
+                &active_addr,
+                active_first_hash,
+            ) {
+                HeaderCrossCheck::Accept => {}
+                HeaderCrossCheck::Reject => {
+                    // The cross-check helper has already applied the
+                    // appropriate misbehavior penalty. Drop the batch and
+                    // try again on the next iteration.
+                    pool.maintain();
+                    continue;
+                }
             }
 
             // Epoch lookup for header validation (used in both fork and normal paths)
@@ -1410,7 +1608,12 @@ impl HeaderSync {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
-        let pool = PeerPool::new(our_height, self.tor.clone()).map_err(|e| {
+        let pool = PeerPool::new(
+            our_height,
+            self.tor.clone(),
+            self.peers_db_path.as_deref(),
+        )
+        .map_err(|e| {
             if format!("{}", e).contains("no peers discovered") {
                 SyncError::NoPeers
             } else {

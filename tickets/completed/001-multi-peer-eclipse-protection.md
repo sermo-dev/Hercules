@@ -1,20 +1,19 @@
 # Ticket 001: Multi-Peer Connections with Eclipse Attack Protection
 
-## Status (as of 2026-04-06): Partially Complete
+## Status (as of 2026-04-06): Complete (parallel range download deferred)
 
 **Implemented:**
-- Multi-peer outbound pool — `MAX_OUTBOUND = 8` in `hercules-core/src/peer_pool.rs:11`
-- Misbehavior scoring with automatic ban at threshold 100 (`PeerSlot.misbehavior`, `pool.misbehaving()`)
-- Multiple DNS seeds for peer discovery
-- UI surfaces connected peer count and per-peer info
+- Multi-peer outbound pool — `MAX_OUTBOUND = 8` in `hercules-core/src/peer_pool.rs`.
+- Multiple DNS seeds for peer discovery; UI surfaces connected peer count and per-peer info.
+- Graduated reputation scoring with `pool.misbehaving()` / `pool.reward()` and auto-ban at `BAN_LOW_THRESHOLD = 20`. See ticket 007 for the full reputation model.
+- **Header cross-validation** — `HeaderSync::cross_check_headers` in `sync.rs` re-issues every batch's `getheaders` locator to an independent witness peer and compares the first hash. Disagreement escalates to a third tiebreaker peer; majority wins, and divergent peers take a 50-point misbehavior penalty. 2-peer disagreements with no tiebreaker reject the batch and apply a lighter penalty to both peers — refusing to commit dubious headers is the safer default.
+- **Subnet diversity** — `subnet_bucket()` in `peer_pool.rs` buckets outbound peers into /16 (IPv4) or /32 (IPv6) groups; `maintain()` rejects new candidates whose bucket is already represented. `.onion` addresses are exempt because Tor circuits provide their own diversity.
+- **Persistent ban list** — `peer_store.rs` writes bans through to SQLite immediately on `ban_peer()`, with expiry restored across restarts via `load_active_bans()`.
 
-**Still required to close this ticket:**
-- **Header cross-validation** — header sync currently runs from a single active peer at a time. No comparison across 2+ independent peers before headers are stored, which is the core eclipse-resistance mechanism this ticket was opened for.
-- **Subnet diversity** — no /16 enforcement when filling outbound slots; an attacker controlling one /16 could in principle dominate the pool.
-- **Parallel range download** — `getheaders` is sequential from one peer, not chunked across peers for faster initial sync.
-- **Persistent ban list** — bans live in-memory only, lost on restart.
+**Deferred:**
+- **Parallel range download** — chunking `getheaders` across peers for faster initial sync was dropped from this ticket. AssumeUTXO already collapses initial sync into a 10-minute snapshot import on Wi-Fi, so the marginal benefit doesn't justify the protocol complexity. Can be revisited if a future change makes header sync the dominant cost again.
 
-The remaining gaps are what would matter most against a sophisticated eclipse attempt; the current pool gives us breadth but not cross-validation.
+Eclipse resistance is now the cross-check + subnet diversity combo: an attacker would need to control multiple /16 subnets AND outvote our witness peers in the cross-check on every batch.
 
 ## Problem
 

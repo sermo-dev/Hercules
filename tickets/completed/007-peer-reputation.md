@@ -1,20 +1,17 @@
 # Ticket 007: Peer Reputation and Scoring System
 
-## Status (as of 2026-04-06): Partially Complete
+## Status (as of 2026-04-06): Complete
 
 **Implemented:**
-- Per-peer misbehavior counter — `PeerSlot.misbehavior` in `hercules-core/src/peer_pool.rs`
-- Automatic ban at `BAN_THRESHOLD = 100`, matching Bitcoin Core's `Misbehaving()` pattern
-- `pool.misbehaving(addr, delta)` API used throughout `sync.rs` for header/PoW/oversize violations
-- Saturating-add prevents overflow on adversarial input
+- Graduated bidirectional score on `PeerSlot.score: i32`, range [0, 200], default 100. See `hercules-core/src/peer_pool.rs`.
+- `pool.misbehaving(addr, delta)` subtracts from the score (i64 arithmetic prevents wrap on adversarial `u32::MAX` deltas). Auto-ban triggers at `BAN_LOW_THRESHOLD = 20`.
+- `pool.reward(addr, delta)` adds to the score, capped at `SCORE_MAX = 200`. Wired into `sync.rs` after every successful `get_headers` (+1) and `get_block` (+2) call.
+- Reputation-weighted `best_peer()` and `best_peer_addr()` selection: `weight = height * (score / 100.0)`, so a reliable peer at score 180 sitting one block behind beats a sketchy peer at score 30 at the absolute tip.
+- Timed bans via `HashMap<addr, Instant>` with `BAN_DURATION = 24h`, capped at `MAX_BANS = 1024` with oldest-first eviction.
+- Persistence in `peer_store.rs`: SQLite tables `peer_scores` and `peer_bans`. Bans are write-through; scores are flushed in bulk every 60 seconds from `maintain()` plus a final flush on `Drop`. Bans and scores are restored at `PeerPool::new` time so a peer can't dodge a ban by restarting the app.
+- `reset_database()` in `lib.rs` now also wipes the peers DB so a clean reset clears reputation state.
 
-**Still required to close this ticket:**
-- **Positive deltas** — scores only increase (toward ban); no rewards for successfully served headers, blocks, or pings. The graduated 0–200 reputation model isn't built.
-- **Timed bans** — bans are a `HashSet<addr>`, not `HashMap<addr, expiry>`. Banned peers cannot recover, and bans don't survive restart.
-- **Reputation-weighted selection** — `best_peer()` picks by height alone; no `height * (score / 100)` weighting that would prefer reliable-but-slightly-behind peers over a sketchy peer at the absolute tip.
-- **Persistence** — neither scores nor bans survive restart.
-
-The current model is "binary banning with a counter" rather than the graduated reputation system this ticket spec describes. Functional for catching obvious bad actors, insufficient for distinguishing reliable peers from merely-slow ones.
+The graduated reputation system from the ticket spec is fully built. Reliable peers earn headroom against future penalties, and the cross-validation work in ticket 001 leverages the same reward/penalty plumbing to penalize divergent peers.
 
 ## Summary
 

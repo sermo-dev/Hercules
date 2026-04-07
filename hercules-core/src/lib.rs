@@ -10,6 +10,7 @@ mod block_validation;
 mod mempool;
 mod p2p;
 mod peer_pool;
+mod peer_store;
 mod store;
 mod sync;
 mod tor;
@@ -70,8 +71,9 @@ pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
     // Mirror the path-derivation logic in `HeaderSync::new`. Keep these in sync.
     let utxo_path = db_path.replace("headers", "utxo");
     let blocks_path = db_path.replace("headers", "blocks");
+    let peers_path = db_path.replace("headers", "peers");
 
-    for base in [&db_path, &utxo_path, &blocks_path] {
+    for base in [&db_path, &utxo_path, &blocks_path, &peers_path] {
         for suffix in ["", "-wal", "-shm"] {
             let p = format!("{}{}", base, suffix);
             match std::fs::remove_file(&p) {
