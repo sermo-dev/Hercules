@@ -28,6 +28,12 @@ use crate::validation::{chainwork_for_headers, u256_gt, validate_headers};
 /// How often to poll for new blocks after initial sync (seconds).
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often we re-broadcast our own onion address to all addrv2-capable
+/// peers. Bitcoin Core uses 24h here. Without periodic refresh, peers age
+/// out our address from their addrman after a day or two and inbound
+/// discovery quietly degrades.
+const SELF_AD_REBROADCAST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Maximum reorg depth we'll accept (bounded by undo data retention window).
 const MAX_REORG_DEPTH: u32 = 288;
 
@@ -69,17 +75,98 @@ fn format_v1_address(addr: &bitcoin::p2p::Address) -> Option<String> {
     Some(sock.to_string())
 }
 
-/// Format a BIP 155 `AddrV2Message` into a `host:port` string. Only the
-/// IPv4/IPv6 variants are emitted; Tor v3 / I2P / Cjdns are skipped.
+/// Format a BIP 155 `AddrV2Message` into a `host:port` string. Handles
+/// IPv4, IPv6, and Tor v3 — the latter is reconstructed from its 32-byte
+/// ed25519 pubkey via `tor_v3::pubkey_to_hostname` so we can stash dialable
+/// onion addresses in the AddrManager and feed them straight back to Arti's
+/// `client.connect()`. I2P / Cjdns are still dropped — we don't reach those
+/// networks from a mobile node.
 fn format_v2_address(msg: &bitcoin::p2p::address::AddrV2Message) -> Option<String> {
+    use bitcoin::p2p::address::AddrV2;
     if msg.port == 0 {
         return None;
     }
-    let sock = msg.socket_addr().ok()?;
-    if !is_routable(&sock) {
+    match &msg.addr {
+        AddrV2::Ipv4(_) | AddrV2::Ipv6(_) => {
+            let sock = msg.socket_addr().ok()?;
+            if !is_routable(&sock) {
+                return None;
+            }
+            Some(sock.to_string())
+        }
+        AddrV2::TorV3(pubkey) => {
+            let hostname = crate::tor_v3::pubkey_to_hostname(pubkey);
+            Some(format!("{}:{}", hostname, msg.port))
+        }
+        // I2P, Cjdns, TorV2 (deprecated), Unknown — silently drop. Mobile
+        // nodes don't have I2P or Cjdns transports configured, and TorV2
+        // hasn't been supported by Arti or modern Tor in years.
+        _ => None,
+    }
+}
+
+/// Convert a `(timestamp, host:port)` entry sampled from the AddrManager into
+/// the legacy v1 `(u32, Address)` shape used by `NetworkMessage::Addr`. Tor
+/// entries can't be carried over v1 (the on-the-wire encoding has no room for
+/// a 32-byte pubkey) so we drop them; peers that requested addrv2 take the
+/// other branch in the GetAddr handler.
+fn addr_entry_to_v1(ts: u32, host_port: &str) -> Option<(u32, bitcoin::p2p::Address)> {
+    use std::str::FromStr;
+    if host_port.contains(".onion") {
         return None;
     }
-    Some(sock.to_string())
+    let sock = std::net::SocketAddr::from_str(host_port).ok()?;
+    Some((
+        ts,
+        bitcoin::p2p::Address::new(&sock, bitcoin::p2p::ServiceFlags::NETWORK),
+    ))
+}
+
+/// Convert a `(timestamp, host:port)` entry into a v2 `AddrV2Message`. Handles
+/// IPv4, IPv6, and Tor v3 .onion entries — the .onion path round-trips the
+/// hostname back through `tor_v3::hostname_to_pubkey` so we re-emit the same
+/// 32-byte pubkey we'd have ingested over the wire.
+fn addr_entry_to_v2(ts: u32, host_port: &str) -> Option<bitcoin::p2p::address::AddrV2Message> {
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::ServiceFlags;
+    use std::str::FromStr;
+
+    if host_port.contains(".onion") {
+        // Parse port from the trailing `:NNNN` — split from the right since
+        // hostnames may contain colons (IPv6 doesn't appear here, but be safe).
+        let port = host_port.rsplit(':').next()?.parse::<u16>().ok()?;
+        let pubkey = crate::tor_v3::hostname_to_pubkey(host_port)?;
+        return Some(AddrV2Message {
+            time: ts,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::TorV3(pubkey),
+            port,
+        });
+    }
+
+    let sock = std::net::SocketAddr::from_str(host_port).ok()?;
+    let v2 = match sock.ip() {
+        std::net::IpAddr::V4(v4) => AddrV2::Ipv4(v4),
+        std::net::IpAddr::V6(v6) => AddrV2::Ipv6(v6),
+    };
+    Some(AddrV2Message {
+        time: ts,
+        services: ServiceFlags::NETWORK,
+        addr: v2,
+        port: sock.port(),
+    })
+}
+
+/// Current Unix time clamped to a 32-bit `addrv2` timestamp. We saturate at
+/// `u32::MAX` rather than wrap so a clock skew bug never produces a 1970
+/// timestamp the receiving peer would aggressively age out.
+fn unix_now_u32() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
 }
 
 /// Reject obvious junk before we put an address into the AddrManager:
@@ -155,6 +242,9 @@ struct PeerRelayState {
     wants_sendheaders: bool,
     feefilter_rate: u64, // sat/kvB from BIP 133
     known_txids: HashSet<Txid>,
+    /// Bitcoin Core caps GetAddr responses to one per connection — repeated
+    /// requests are scrapers we should ignore. We mirror that behavior.
+    getaddr_responded: bool,
 }
 
 /// Pending transaction relay with Poisson delay.
@@ -201,6 +291,11 @@ pub struct HeaderSync {
     /// Set by handle_inv when a new block is announced — breaks the monitor
     /// loop early so we fetch the new block immediately instead of waiting.
     new_block_announced: AtomicBool,
+    /// Last time we re-broadcast our own onion address to all peers. Initial
+    /// value is `Instant::now()` (set on construction), so the first periodic
+    /// re-broadcast fires 24h after node start. The on-connect self-ad in
+    /// `PeerPool::maintain` covers fresh connections in the meantime.
+    last_self_ad: Mutex<Instant>,
 }
 
 impl HeaderSync {
@@ -283,6 +378,7 @@ impl HeaderSync {
             inbound_peer_count: AtomicU32::new(0),
             outbound_peer_count: AtomicU32::new(0),
             new_block_announced: AtomicBool::new(false),
+            last_self_ad: Mutex::new(Instant::now()),
         })
     }
 
@@ -952,6 +1048,18 @@ impl HeaderSync {
                         }
                     }
 
+                    // Periodic 24h re-broadcast of our own onion address.
+                    // Cheap when nothing is due — just a Mutex check + elapsed
+                    // comparison — so safe to evaluate every loop iteration.
+                    {
+                        let mut last = self.last_self_ad.lock().unwrap();
+                        if last.elapsed() >= SELF_AD_REBROADCAST_INTERVAL {
+                            *last = Instant::now();
+                            drop(last);
+                            self.rebroadcast_self_ad(&pool);
+                        }
+                    }
+
                     // Periodic maintenance
                     if last_maintain.elapsed() >= Duration::from_secs(30) {
                         pool.maintain();
@@ -1303,11 +1411,18 @@ impl HeaderSync {
     /// through all peers typically takes ~100ms * peer_count.
     fn service_peer_messages(&self, pool: &mut PeerPool) {
         let poll_timeout = Duration::from_millis(100);
+        // Reborrow `pool` as a shared reference so the closure can capture it
+        // and call the message handler with `&PeerPool` access (e.g. for the
+        // `GetAddr` handler, which samples our address book). `for_each_peer`
+        // is itself `&self` and only briefly locks the slots Mutex when
+        // checking peers in/out, so re-entry is safe — the closure runs
+        // *outside* that lock and only touches the orthogonal addrs HashMap.
+        let pool_shared: &PeerPool = pool;
 
-        pool.for_each_peer(|addr, _is_inbound, peer| {
+        pool_shared.for_each_peer(|addr, _is_inbound, peer| {
             match peer.poll_message(poll_timeout) {
                 Ok(Some(msg)) => {
-                    if let Err(e) = self.handle_peer_message(addr, msg, peer) {
+                    if let Err(e) = self.handle_peer_message(addr, msg, peer, pool_shared) {
                         warn!("Error handling message from {}: {}", addr, e);
                     }
                     Ok(())
@@ -1324,6 +1439,7 @@ impl HeaderSync {
         addr: &str,
         msg: NetworkMessage,
         peer: &mut crate::p2p::Peer,
+        pool: &PeerPool,
     ) -> Result<(), String> {
         match msg {
             NetworkMessage::Ping(nonce) => {
@@ -1355,6 +1471,7 @@ impl HeaderSync {
                         wants_sendheaders: false,
                         feefilter_rate: 0,
                         known_txids: HashSet::new(),
+                        getaddr_responded: false,
                     })
                     .wants_sendheaders = true;
             }
@@ -1369,6 +1486,7 @@ impl HeaderSync {
                         wants_sendheaders: false,
                         feefilter_rate: 0,
                         known_txids: HashSet::new(),
+                        getaddr_responded: false,
                     })
                     .feefilter_rate = clamped;
             }
@@ -1385,12 +1503,69 @@ impl HeaderSync {
             }
 
             NetworkMessage::GetAddr => {
-                // We don't maintain an address book, so respond with an empty
-                // addr message. Bitcoin Core only responds to inbound peers and
-                // only once per connection to prevent address scraping — we
-                // simplify by always sending empty. Proper addrman is future work.
-                peer.send(NetworkMessage::Addr(Vec::new()))
-                    .map_err(|e| format!("addr: {}", e))?;
+                // Bitcoin Core caps `getaddr` at one response per connection
+                // to make address scraping unattractive. Mirror that — silently
+                // ignore repeats so we don't drip our address book to a peer
+                // running a long-lived survey job.
+                {
+                    let mut state = self.relay_state.lock().unwrap();
+                    let entry = state
+                        .entry(addr.to_string())
+                        .or_insert_with(|| PeerRelayState {
+                            wants_sendheaders: false,
+                            feefilter_rate: 0,
+                            known_txids: HashSet::new(),
+                            getaddr_responded: false,
+                        });
+                    if entry.getaddr_responded {
+                        return Ok(());
+                    }
+                    entry.getaddr_responded = true;
+                }
+
+                // Sample up to 999 addresses from the AddrManager, leaving one
+                // slot in the 1000-entry budget for our own self-advertisement.
+                let sample = pool.sample_addresses(999);
+                let our_pubkey = self
+                    .tor
+                    .as_ref()
+                    .and_then(|t| t.our_onion_pubkey());
+
+                if peer.wants_addrv2() {
+                    let mut entries: Vec<bitcoin::p2p::address::AddrV2Message> = sample
+                        .iter()
+                        .filter_map(|(ts, host_port)| addr_entry_to_v2(*ts, host_port))
+                        .collect();
+                    // Self-advertise: append a TorV3 entry for our own onion
+                    // service so this peer can dial us back. This is the whole
+                    // point of the addrman → gossip → inbound loop and is what
+                    // closes the `inbound_peers = 0` gap.
+                    if let Some(pubkey) = our_pubkey {
+                        entries.push(bitcoin::p2p::address::AddrV2Message {
+                            time: unix_now_u32(),
+                            services: bitcoin::p2p::ServiceFlags::NETWORK_LIMITED
+                                | bitcoin::p2p::ServiceFlags::WITNESS,
+                            addr: bitcoin::p2p::address::AddrV2::TorV3(pubkey),
+                            port: 8333,
+                        });
+                    }
+                    let count = entries.len();
+                    peer.send(NetworkMessage::AddrV2(entries))
+                        .map_err(|e| format!("addrv2: {}", e))?;
+                    debug!("Sent addrv2 with {} entries to {}", count, addr);
+                } else {
+                    // Peer didn't negotiate addrv2 — fall back to v1. Tor
+                    // entries are silently dropped (v1 has no encoding for
+                    // them) and we cannot self-advertise our onion either.
+                    let entries: Vec<(u32, bitcoin::p2p::Address)> = sample
+                        .iter()
+                        .filter_map(|(ts, host_port)| addr_entry_to_v1(*ts, host_port))
+                        .collect();
+                    let count = entries.len();
+                    peer.send(NetworkMessage::Addr(entries))
+                        .map_err(|e| format!("addr: {}", e))?;
+                    debug!("Sent addr with {} entries to {}", count, addr);
+                }
             }
 
             NetworkMessage::Addr(entries) => {
@@ -1578,6 +1753,7 @@ impl HeaderSync {
                                 wants_sendheaders: false,
                                 feefilter_rate: 0,
                                 known_txids: HashSet::new(),
+                                getaddr_responded: false,
                             })
                             .known_txids
                             .insert(*txid);
@@ -1631,6 +1807,35 @@ impl HeaderSync {
             }
         }
         Ok(())
+    }
+
+    /// Re-broadcast our own onion address to every addrv2-capable peer.
+    /// Called from the monitor loop on a 24h cadence — Bitcoin Core does the
+    /// same so other nodes refresh our entry in their addrman before it ages
+    /// out. No-op if we have no onion service yet (still bootstrapping Tor)
+    /// or no peers connected.
+    fn rebroadcast_self_ad(&self, pool: &PeerPool) {
+        let Some(pubkey) = self.tor.as_ref().and_then(|t| t.our_onion_pubkey()) else {
+            return;
+        };
+        let mut sent = 0usize;
+        pool.for_each_peer(|_addr, _is_inbound, peer| {
+            // send_self_advertisement silently no-ops on peers that didn't
+            // negotiate addrv2, so we don't need to filter here. Errors are
+            // surfaced as Err to let `for_each_peer` drop dead connections.
+            match peer.send_self_advertisement(pubkey, 8333) {
+                Ok(()) => {
+                    if peer.wants_addrv2() {
+                        sent += 1;
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(format!("self-ad: {}", e)),
+            }
+        });
+        if sent > 0 {
+            info!("Re-broadcast self-ad to {} peers", sent);
+        }
     }
 
     /// Send pending relay inv messages for transactions whose delay has elapsed.
@@ -1981,4 +2186,238 @@ pub(crate) fn derive_sibling_path(db_path: &str, name: &str) -> String {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     parent.join(name).to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+    use bitcoin::p2p::ServiceFlags;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+    // ── is_routable ────────────────────────────────────────────────────
+
+    #[test]
+    fn is_routable_rejects_loopback() {
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333);
+        assert!(!is_routable(&v4));
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8333);
+        assert!(!is_routable(&v6));
+    }
+
+    #[test]
+    fn is_routable_rejects_unspecified_and_multicast() {
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8333);
+        assert!(!is_routable(&v4));
+        let mcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 8333);
+        assert!(!is_routable(&mcast));
+    }
+
+    #[test]
+    fn is_routable_rejects_link_local_and_broadcast() {
+        let link = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 8333);
+        assert!(!is_routable(&link));
+        let bcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 8333);
+        assert!(!is_routable(&bcast));
+    }
+
+    #[test]
+    fn is_routable_accepts_normal_v4() {
+        // 1.2.3.4 — public-ish, not in any reject list.
+        let sock = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        assert!(is_routable(&sock));
+    }
+
+    #[test]
+    fn is_routable_accepts_rfc1918() {
+        // We deliberately allow RFC1918 so node operators can talk to a
+        // self-hosted peer on the LAN. This pins down that decision.
+        let sock = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 8333);
+        assert!(is_routable(&sock));
+    }
+
+    // ── unix_now_u32 ───────────────────────────────────────────────────
+
+    #[test]
+    fn unix_now_u32_is_after_2024() {
+        // Sanity: the timestamp should be well past 2024-01-01 = 1704067200.
+        // If this trips, the host clock is broken or we wrapped to 0.
+        let ts = unix_now_u32();
+        assert!(ts > 1_700_000_000, "ts={} suspiciously small", ts);
+    }
+
+    // ── format_v2_address ──────────────────────────────────────────────
+
+    #[test]
+    fn format_v2_address_ipv4() {
+        let msg = AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(8, 8, 8, 8)),
+            port: 8333,
+        };
+        assert_eq!(format_v2_address(&msg), Some("8.8.8.8:8333".to_string()));
+    }
+
+    #[test]
+    fn format_v2_address_ipv6() {
+        let msg = AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            port: 8333,
+        };
+        let formatted = format_v2_address(&msg).unwrap();
+        // SocketAddr's IPv6 Display wraps the address in brackets.
+        assert!(formatted.contains("2001:db8"));
+        assert!(formatted.ends_with(":8333"));
+    }
+
+    #[test]
+    fn format_v2_address_torv3_round_trip() {
+        // Encode a known pubkey, format the AddrV2 message, parse the
+        // hostname back through tor_v3, and confirm we recover the pubkey.
+        let pubkey = [0x42u8; 32];
+        let msg = AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::TorV3(pubkey),
+            port: 8333,
+        };
+        let formatted = format_v2_address(&msg).expect("torv3 should format");
+        assert!(formatted.ends_with(":8333"));
+        assert!(formatted.contains(".onion"));
+        let recovered = crate::tor_v3::hostname_to_pubkey(&formatted).unwrap();
+        assert_eq!(recovered, pubkey);
+    }
+
+    #[test]
+    fn format_v2_address_rejects_zero_port() {
+        let msg = AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(8, 8, 8, 8)),
+            port: 0,
+        };
+        assert_eq!(format_v2_address(&msg), None);
+    }
+
+    #[test]
+    fn format_v2_address_rejects_loopback() {
+        let msg = AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
+            port: 8333,
+        };
+        assert_eq!(format_v2_address(&msg), None);
+    }
+
+    // ── addr_entry_to_v1 ───────────────────────────────────────────────
+
+    #[test]
+    fn addr_entry_to_v1_ipv4() {
+        let result = addr_entry_to_v1(123456, "1.2.3.4:8333");
+        let (ts, addr) = result.expect("ipv4 should parse");
+        assert_eq!(ts, 123456);
+        // The Address has services + ip + port. Re-serialize to inspect.
+        let sock = addr.socket_addr().unwrap();
+        assert_eq!(sock, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 8333)));
+    }
+
+    #[test]
+    fn addr_entry_to_v1_drops_onion() {
+        // V1 wire format can't carry a 32-byte pubkey, so onion entries
+        // must be silently dropped here. Peers that handle addrv2 take
+        // the other branch.
+        let result = addr_entry_to_v1(0, "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:8333");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn addr_entry_to_v1_rejects_garbage() {
+        assert!(addr_entry_to_v1(0, "not a socket addr").is_none());
+        assert!(addr_entry_to_v1(0, "1.2.3.4").is_none()); // missing port
+    }
+
+    // ── addr_entry_to_v2 ───────────────────────────────────────────────
+
+    #[test]
+    fn addr_entry_to_v2_ipv4() {
+        let msg = addr_entry_to_v2(99, "1.2.3.4:8333").expect("ipv4 should parse");
+        assert_eq!(msg.time, 99);
+        assert_eq!(msg.port, 8333);
+        match msg.addr {
+            AddrV2::Ipv4(v4) => assert_eq!(v4, Ipv4Addr::new(1, 2, 3, 4)),
+            _ => panic!("expected v4"),
+        }
+    }
+
+    #[test]
+    fn addr_entry_to_v2_ipv6() {
+        let msg = addr_entry_to_v2(0, "[2001:db8::1]:8333").expect("ipv6 should parse");
+        assert_eq!(msg.port, 8333);
+        match msg.addr {
+            AddrV2::Ipv6(v6) => {
+                assert_eq!(v6, Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+            }
+            _ => panic!("expected v6"),
+        }
+    }
+
+    #[test]
+    fn addr_entry_to_v2_torv3_round_trip() {
+        // Round-trip through tor_v3 to make sure the host:port → pubkey
+        // path inside addr_entry_to_v2 is wired correctly.
+        let pubkey = [0x99u8; 32];
+        let host = crate::tor_v3::pubkey_to_hostname(&pubkey);
+        let entry = format!("{}:8333", host);
+        let msg = addr_entry_to_v2(42, &entry).expect("torv3 should parse");
+        assert_eq!(msg.time, 42);
+        assert_eq!(msg.port, 8333);
+        match msg.addr {
+            AddrV2::TorV3(pk) => assert_eq!(pk, pubkey),
+            _ => panic!("expected torv3"),
+        }
+    }
+
+    #[test]
+    fn addr_entry_to_v2_rejects_garbage() {
+        assert!(addr_entry_to_v2(0, "garbage").is_none());
+        // .onion suffix but not a valid v3 hostname (wrong length).
+        assert!(addr_entry_to_v2(0, "shortbutfake.onion:8333").is_none());
+    }
+
+    // ── derive_sibling_path ────────────────────────────────────────────
+
+    #[test]
+    fn derive_sibling_path_with_parent() {
+        let result = derive_sibling_path("/var/data/headers.sqlite3", "utxo-lmdb");
+        assert_eq!(result, "/var/data/utxo-lmdb");
+    }
+
+    #[test]
+    fn derive_sibling_path_bare_filename() {
+        // No usable parent → fall back to "./<name>". The "./" prefix is
+        // important: a bare relative name would be ambiguous if cwd ever
+        // changes, while "./" pins it to the current directory.
+        let result = derive_sibling_path("headers.sqlite3", "utxo-lmdb");
+        assert_eq!(result, "./utxo-lmdb");
+    }
+
+    // ── poisson_delay_secs ─────────────────────────────────────────────
+
+    #[test]
+    fn poisson_delay_is_positive_and_bounded() {
+        // Each call uses a fresh RandomState; we just verify the value
+        // is in a sane range. -ln(u) for u in (0, 1] is in [0, ~34) when
+        // u >= 1e-15 (we clamp at the bottom).
+        let mean = 2.0;
+        for _ in 0..100 {
+            let d = poisson_delay_secs(mean);
+            assert!(d >= 0.0, "delay should be non-negative: {}", d);
+            // 1e-15 floor → max -ln = ~34.5, times mean=2 → ~69.
+            assert!(d < 100.0, "delay should be bounded: {}", d);
+        }
+    }
 }

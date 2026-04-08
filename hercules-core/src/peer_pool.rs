@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
 
 use crate::p2p::{Peer, PeerError};
-use crate::peer_store::PeerStore;
+use crate::peer_store::{AddrRecord, PeerStore};
 use crate::tor::TorManager;
 
 /// Maximum number of outbound connections (matches Bitcoin Core default).
@@ -78,27 +78,115 @@ const ADDR_RETRY_BASE: Duration = Duration::from_secs(60);
 /// rather than being shadow-banned forever.
 const ADDR_RETRY_MAX: Duration = Duration::from_secs(3600);
 
+/// How we first learned about an address. Recorded for diagnostics — neither
+/// eviction nor candidate selection reads this — but it makes peer-discovery
+/// bugs much easier to investigate from the SQLite shell. New variants must
+/// also be reflected in `AddrSource::as_str` / `from_str`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddrSource {
+    Dns,
+    Gossip,
+    Inbound,
+    Manual,
+}
+
+impl AddrSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AddrSource::Dns => "dns",
+            AddrSource::Gossip => "gossip",
+            AddrSource::Inbound => "inbound",
+            AddrSource::Manual => "manual",
+        }
+    }
+
+    fn from_str(s: &str) -> AddrSource {
+        match s {
+            "dns" => AddrSource::Dns,
+            "inbound" => AddrSource::Inbound,
+            "manual" => AddrSource::Manual,
+            // Default to gossip for unknown / legacy values — gossip is the
+            // most common source and the safest bucket for an unknown tag.
+            _ => AddrSource::Gossip,
+        }
+    }
+}
+
 /// Per-address bookkeeping for the in-memory address manager. Tracks when
 /// we first heard about an address, when we last tried it, the last time
 /// we successfully connected to it, and how many failures we've seen. This
 /// is the minimum state needed to schedule retries with backoff and to rank
 /// candidates by reliability without dragging in a full Bitcoin Core
 /// new/tried addrman implementation.
+///
+/// `dirty` is set whenever any other field changes between flushes; the
+/// periodic `flush_addrs` only writes back rows whose `dirty` flag is on,
+/// so a steady-state idle pool produces zero SQLite writes.
 #[derive(Debug, Clone)]
 struct AddrMeta {
     first_seen: Instant,
     last_tried: Option<Instant>,
     last_success: Option<Instant>,
     failure_count: u32,
+    source: AddrSource,
+    dirty: bool,
 }
 
 impl AddrMeta {
-    fn new() -> AddrMeta {
+    fn new(source: AddrSource) -> AddrMeta {
         AddrMeta {
             first_seen: Instant::now(),
             last_tried: None,
             last_success: None,
             failure_count: 0,
+            source,
+            dirty: true,
+        }
+    }
+
+    /// Reconstruct an in-memory entry from a persisted record. Restored
+    /// entries are *not* dirty: they reflect what's already on disk and
+    /// shouldn't be re-written until something actually changes.
+    fn from_record(record: &AddrRecord) -> AddrMeta {
+        let now_unix = unix_now();
+        let now = Instant::now();
+        // We can't recover the original `Instant` for first_seen across a
+        // process restart — `Instant` is monotonic. Walk the offset from
+        // "now" so the relative ordering between addresses is preserved
+        // (older first_seen → earlier Instant) and the candidate ranker's
+        // tiebreaker stays meaningful.
+        let first_seen = unix_to_instant_offset(record.first_seen, now_unix, now);
+        let last_tried = record
+            .last_tried
+            .map(|t| unix_to_instant_offset(t, now_unix, now));
+        let last_success = record
+            .last_success
+            .map(|t| unix_to_instant_offset(t, now_unix, now));
+        AddrMeta {
+            first_seen,
+            last_tried,
+            last_success,
+            failure_count: record.failure_count,
+            source: AddrSource::from_str(&record.source),
+            dirty: false,
+        }
+    }
+
+    /// Convert this entry to its on-disk form for `save_addrs_bulk`.
+    fn to_record(&self, addr: &str) -> AddrRecord {
+        let now_unix = unix_now();
+        let now = Instant::now();
+        AddrRecord {
+            addr: addr.to_string(),
+            first_seen: instant_to_unix_offset(self.first_seen, now, now_unix),
+            last_tried: self
+                .last_tried
+                .map(|t| instant_to_unix_offset(t, now, now_unix)),
+            last_success: self
+                .last_success
+                .map(|t| instant_to_unix_offset(t, now, now_unix)),
+            failure_count: self.failure_count,
+            source: self.source.as_str().to_string(),
         }
     }
 
@@ -161,6 +249,10 @@ impl AddrMeta {
 struct AddrManager {
     addrs: HashMap<String, AddrMeta>,
     max_size: usize,
+    /// Addresses evicted (or otherwise removed) since the last flush, queued
+    /// for `delete_addrs_bulk` so the on-disk view stays consistent with the
+    /// in-memory cap. Cleared by `take_pending_deletes` after flush.
+    pending_deletes: Vec<String>,
 }
 
 impl AddrManager {
@@ -168,6 +260,7 @@ impl AddrManager {
         AddrManager {
             addrs: HashMap::new(),
             max_size,
+            pending_deletes: Vec::new(),
         }
     }
 
@@ -175,28 +268,65 @@ impl AddrManager {
         self.addrs.len()
     }
 
-    /// Insert a single address. New addresses get a fresh AddrMeta; existing
-    /// addresses are left alone (we don't want gossip to wipe out a peer's
-    /// established success/failure history). Returns true if a new entry
-    /// was actually added.
-    fn insert(&mut self, addr: String) -> bool {
+    /// Insert a single address with a `source` tag. New addresses get a
+    /// fresh AddrMeta; existing addresses are left alone (we don't want
+    /// gossip to wipe out a peer's established success/failure history).
+    /// Returns true if a new entry was actually added.
+    fn insert(&mut self, addr: String, source: AddrSource) -> bool {
         if self.addrs.contains_key(&addr) {
             return false;
         }
         self.evict_if_full();
-        self.addrs.insert(addr, AddrMeta::new());
+        self.addrs.insert(addr, AddrMeta::new(source));
+        true
+    }
+
+    /// Restore an entry from the persistence layer. Unlike `insert`, this
+    /// preserves the original `first_seen` / `failure_count` so a known-good
+    /// peer comes back at the same tier it had before the restart, and
+    /// leaves `dirty=false` so we don't immediately rewrite it.
+    fn insert_from_record(&mut self, record: &AddrRecord) -> bool {
+        if self.addrs.contains_key(&record.addr) {
+            return false;
+        }
+        self.evict_if_full();
+        self.addrs
+            .insert(record.addr.clone(), AddrMeta::from_record(record));
         true
     }
 
     /// Bulk insert. Returns the number of brand-new entries added.
-    fn insert_many<I: IntoIterator<Item = String>>(&mut self, addrs: I) -> usize {
+    fn insert_many<I: IntoIterator<Item = String>>(
+        &mut self,
+        addrs: I,
+        source: AddrSource,
+    ) -> usize {
         let mut added = 0;
         for addr in addrs {
-            if self.insert(addr) {
+            if self.insert(addr, source) {
                 added += 1;
             }
         }
         added
+    }
+
+    /// Drain the queued delete list for the next flush.
+    fn take_pending_deletes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_deletes)
+    }
+
+    /// Drain dirty entries as on-disk records, clearing their dirty flag.
+    /// Used by `flush_addrs` so the next flush is a no-op until something
+    /// else changes.
+    fn take_dirty_records(&mut self) -> Vec<AddrRecord> {
+        let mut out = Vec::new();
+        for (addr, meta) in self.addrs.iter_mut() {
+            if meta.dirty {
+                out.push(meta.to_record(addr));
+                meta.dirty = false;
+            }
+        }
+        out
     }
 
     /// Evict one entry to make room when at capacity.
@@ -231,6 +361,7 @@ impl AddrManager {
 
         if let Some(addr) = victim {
             self.addrs.remove(&addr);
+            self.pending_deletes.push(addr);
             return;
         }
 
@@ -242,20 +373,24 @@ impl AddrManager {
             .map(|(addr, _)| addr.clone())
         {
             self.addrs.remove(&addr);
+            self.pending_deletes.push(addr);
         }
     }
 
     /// Mark an address as successfully connected. Resets failure count and
     /// stamps last_success/last_tried so the entry is treated as known-good.
+    /// New entries created by this path are tagged as `Dns` since the only
+    /// caller that creates a *new* entry here is the bootstrap connect path.
     fn record_success(&mut self, addr: &str) {
         let now = Instant::now();
         let entry = self
             .addrs
             .entry(addr.to_string())
-            .or_insert_with(AddrMeta::new);
+            .or_insert_with(|| AddrMeta::new(AddrSource::Dns));
         entry.last_tried = Some(now);
         entry.last_success = Some(now);
         entry.failure_count = 0;
+        entry.dirty = true;
     }
 
     /// Mark an address as having failed to connect. Increments failure_count
@@ -265,9 +400,10 @@ impl AddrManager {
         let entry = self
             .addrs
             .entry(addr.to_string())
-            .or_insert_with(AddrMeta::new);
+            .or_insert_with(|| AddrMeta::new(AddrSource::Dns));
         entry.last_tried = Some(now);
         entry.failure_count = entry.failure_count.saturating_add(1);
+        entry.dirty = true;
     }
 
     /// Number of addresses currently eligible for a connection attempt
@@ -335,8 +471,57 @@ const MAX_BANS: usize = 1024;
 /// chatty header-sync session doesn't hammer SQLite.
 const SCORE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often we flush dirty AddrManager entries to disk. Same rationale as
+/// `SCORE_FLUSH_INTERVAL`: a chatty gossip stream can produce hundreds of
+/// updates per minute and we don't want a SQLite write per update. The
+/// final state is also flushed on `Drop`, so a clean shutdown after a
+/// shorter session won't lose the work.
+const ADDR_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Timeout for checked-out peer slots before they are reclaimed (prevents slot leaks).
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Current Unix timestamp in seconds. Used at the boundary between in-memory
+/// `Instant`s (monotonic, opaque) and on-disk `u64` wall-clock seconds.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Convert a Unix timestamp into an `Instant` relative to `now_instant` /
+/// `now_unix`. Past timestamps land in the past, future ones in the future.
+/// Both directions saturate so a corrupted-far-future row from disk can't
+/// trigger an `Instant` overflow.
+fn unix_to_instant_offset(unix: u64, now_unix: u64, now_instant: Instant) -> Instant {
+    if unix >= now_unix {
+        let delta = unix - now_unix;
+        // Clamp to one year to defend against junk DB rows claiming year 2099.
+        let one_year_secs: u64 = 365 * 24 * 3600;
+        let delta = delta.min(one_year_secs);
+        now_instant + Duration::from_secs(delta)
+    } else {
+        let delta = now_unix - unix;
+        // Clamp the past offset too — `Instant - huge_duration` would saturate
+        // anyway, but doing it explicitly makes the intent obvious.
+        let one_year_secs: u64 = 10 * 365 * 24 * 3600;
+        let delta = delta.min(one_year_secs);
+        now_instant
+            .checked_sub(Duration::from_secs(delta))
+            .unwrap_or(now_instant)
+    }
+}
+
+/// Reverse of `unix_to_instant_offset`: convert an `Instant` back into Unix
+/// seconds by walking the offset from `now_instant` / `now_unix`.
+fn instant_to_unix_offset(instant: Instant, now_instant: Instant, now_unix: u64) -> u64 {
+    if instant >= now_instant {
+        now_unix.saturating_add(instant.duration_since(now_instant).as_secs())
+    } else {
+        now_unix.saturating_sub(now_instant.duration_since(instant).as_secs())
+    }
+}
 
 /// Compute a coarse "subnet bucket" for an address used to enforce outbound
 /// peer diversity. The goal is to prevent an attacker who controls a single
@@ -394,6 +579,9 @@ pub struct PeerPool {
     store: Option<Arc<PeerStore>>,
     /// Last time we flushed scores to the store (rate-limit bulk writes).
     last_score_flush: Instant,
+    /// Last time we flushed dirty AddrManager entries to the store. Same
+    /// rate-limiting purpose as `last_score_flush` — gossip can be chatty.
+    last_addr_flush: Instant,
 }
 
 impl PeerPool {
@@ -408,25 +596,10 @@ impl PeerPool {
         tor: Option<Arc<TorManager>>,
         peers_db_path: Option<&str>,
     ) -> Result<PeerPool, PeerError> {
-        let seeds = if let Some(ref tor) = tor {
-            Peer::discover_peers_tor(tor)
-        } else {
-            Peer::discover_peers()
-        };
-
-        if seeds.is_empty() {
-            return Err(PeerError::Connection("no peers discovered via DNS".into()));
-        }
-
-        info!(
-            "PeerPool: bootstrap from DNS produced {} addresses, connecting up to {}",
-            seeds.len(),
-            MAX_OUTBOUND
-        );
-
-        // Open the persistence store and hydrate any existing bans. Failures
-        // are logged but non-fatal — the pool still works without persistence.
-        let (store, bans) = match peers_db_path {
+        // Open the persistence store and hydrate any existing bans + known
+        // addresses. Failures are logged but non-fatal — the pool still works
+        // without persistence (just slower to find peers on first launch).
+        let (store, bans, restored_addrs) = match peers_db_path {
             Some(path) => match PeerStore::open(path) {
                 Ok(s) => {
                     let bans = s.load_active_bans().unwrap_or_else(|e| {
@@ -436,18 +609,60 @@ impl PeerPool {
                     if !bans.is_empty() {
                         info!("PeerPool: restored {} ban(s) from disk", bans.len());
                     }
-                    (Some(Arc::new(s)), bans)
+                    let restored_addrs = s.load_all_addrs().unwrap_or_else(|e| {
+                        warn!("PeerPool: failed to load known addresses: {}", e);
+                        Vec::new()
+                    });
+                    if !restored_addrs.is_empty() {
+                        info!(
+                            "PeerPool: restored {} known address(es) from disk",
+                            restored_addrs.len()
+                        );
+                    }
+                    (Some(Arc::new(s)), bans, restored_addrs)
                 }
                 Err(e) => {
                     warn!("PeerPool: peer store unavailable, running without persistence: {}", e);
-                    (None, HashMap::new())
+                    (None, HashMap::new(), Vec::new())
                 }
             },
-            None => (None, HashMap::new()),
+            None => (None, HashMap::new(), Vec::new()),
         };
 
         let mut addrs = AddrManager::new(MAX_KNOWN_ADDRS);
-        addrs.insert_many(seeds);
+        for record in &restored_addrs {
+            addrs.insert_from_record(record);
+        }
+
+        // DNS is now a fallback: only consult seeds when the persisted set
+        // can't sustain a healthy outbound pool. The first launch always hits
+        // this branch (empty disk → 0 < threshold); subsequent launches with
+        // a populated peers.sqlite skip DNS entirely and start cold-syncing
+        // against known-good peers.
+        if addrs.candidate_count() < DNS_FALLBACK_THRESHOLD {
+            let seeds = if let Some(ref tor) = tor {
+                Peer::discover_peers_tor(tor)
+            } else {
+                Peer::discover_peers()
+            };
+            if seeds.is_empty() && addrs.len() == 0 {
+                return Err(PeerError::Connection(
+                    "no peers discovered via DNS and no addresses on disk".into(),
+                ));
+            }
+            let added = addrs.insert_many(seeds, AddrSource::Dns);
+            info!(
+                "PeerPool: bootstrap added {} new addresses from DNS (total known: {})",
+                added,
+                addrs.len()
+            );
+        } else {
+            info!(
+                "PeerPool: skipping DNS — disk has {} addresses ({} eligible)",
+                addrs.len(),
+                addrs.candidate_count()
+            );
+        }
 
         let mut pool = PeerPool {
             slots: Arc::new(Mutex::new(Vec::new())),
@@ -458,6 +673,7 @@ impl PeerPool {
             tor,
             store,
             last_score_flush: Instant::now(),
+            last_addr_flush: Instant::now(),
         };
 
         pool.maintain();
@@ -510,6 +726,12 @@ impl PeerPool {
         if self.last_score_flush.elapsed() >= SCORE_FLUSH_INTERVAL {
             self.flush_scores();
         }
+        // Same rate-limit pattern for the addr book — gossip can produce
+        // hundreds of dirty entries per minute and we don't want a SQLite
+        // write per gossip message.
+        if self.last_addr_flush.elapsed() >= ADDR_FLUSH_INTERVAL {
+            self.flush_addrs();
+        }
 
         // Reclaim slots where a peer was checked out but never returned
         // (prevents permanent slot loss from dropped Peer handles)
@@ -550,7 +772,7 @@ impl PeerPool {
                 Peer::discover_peers()
             };
             if !fresh.is_empty() {
-                let added = self.addrs.insert_many(fresh);
+                let added = self.addrs.insert_many(fresh, AddrSource::Dns);
                 info!(
                     "PeerPool: DNS fallback added {} new addresses (total known: {})",
                     added,
@@ -611,6 +833,14 @@ impl PeerPool {
         // back-to-back successful connects both come from the same /16.
         let mut claimed_buckets: HashSet<String> = HashSet::new();
 
+        // Snapshot our own onion pubkey once per maintain pass — it's the
+        // same for every successful connect, and there's no point asking
+        // TorManager twice. `None` means either Tor isn't enabled or the
+        // onion service hasn't been started yet, in which case we just
+        // skip the self-ad until the next maintain cycle.
+        let our_onion_pubkey: Option<[u8; 32]> =
+            self.tor.as_ref().and_then(|t| t.our_onion_pubkey());
+
         for addr in candidates {
             if connected >= needed {
                 break;
@@ -639,7 +869,7 @@ impl PeerPool {
             };
 
             match result {
-                Ok(peer) => {
+                Ok(mut peer) => {
                     let user_agent = peer.peer_user_agent().unwrap_or_default();
                     let height = peer.peer_height().unwrap_or(0).max(0) as u32;
                     info!(
@@ -647,6 +877,19 @@ impl PeerPool {
                         addr, user_agent, height
                     );
                     self.addrs.record_success(&addr);
+
+                    // Self-advertise unsolicited so this peer learns our
+                    // onion address immediately and can start gossiping it
+                    // onward. `send_self_advertisement` no-ops if the peer
+                    // didn't negotiate addrv2, so we don't need to filter
+                    // here. A failure on the self-ad is non-fatal — the
+                    // peer is still usable for header sync, we just won't
+                    // get inbound discovery via this particular path.
+                    if let Some(pubkey) = our_onion_pubkey {
+                        if let Err(e) = peer.send_self_advertisement(pubkey, 8333) {
+                            warn!("PeerPool: self-ad to {} failed: {}", addr, e);
+                        }
+                    }
 
                     // Restore any persisted score so a known-good peer comes
                     // back at its earned reputation, not as a stranger.
@@ -698,7 +941,7 @@ impl PeerPool {
     /// brand-new addresses added (existing entries are left untouched so
     /// gossip can't reset earned reputation).
     pub fn ingest_gossip_addrs(&mut self, addrs: Vec<String>) -> usize {
-        let added = self.addrs.insert_many(addrs);
+        let added = self.addrs.insert_many(addrs, AddrSource::Gossip);
         if added > 0 {
             info!(
                 "PeerPool: ingested {} new gossip addresses (total known: {})",
@@ -714,6 +957,42 @@ impl PeerPool {
     /// whether to issue a fresh `getaddr` to top up.
     pub fn known_addr_count(&self) -> usize {
         self.addrs.len()
+    }
+
+    /// Pseudo-random sample of up to `limit` known addresses for serving
+    /// inbound `getaddr` requests. Each entry is `(timestamp, host:port)`,
+    /// where `timestamp` is the Unix-seconds equivalent of `last_success`
+    /// (or `first_seen` for never-tried entries) — Bitcoin Core peers use
+    /// this to age out stale gossip.
+    ///
+    /// The sampler walks the HashMap in iteration order and pulls every
+    /// Nth entry; this is biased but cheap, and the bias doesn't matter
+    /// for `getaddr` (which Bitcoin Core itself caps at 1000 random
+    /// addresses). For an honest replacement we'd want a Fisher-Yates
+    /// reservoir sampler, but that's overkill until we see evidence
+    /// peers care about sample uniformity here.
+    pub fn sample_addresses(&self, limit: usize) -> Vec<(u32, String)> {
+        if limit == 0 || self.addrs.len() == 0 {
+            return Vec::new();
+        }
+        let now_unix = unix_now();
+        let now_instant = Instant::now();
+        let stride = (self.addrs.len() / limit).max(1);
+        let mut out = Vec::with_capacity(limit.min(self.addrs.len()));
+        for (i, (addr, meta)) in self.addrs.addrs.iter().enumerate() {
+            if i % stride != 0 {
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
+            let when = meta.last_success.unwrap_or(meta.first_seen);
+            let ts = instant_to_unix_offset(when, now_instant, now_unix);
+            // Clamp to u32 — addrv2 timestamps are 32-bit Unix seconds.
+            let ts32 = ts.min(u32::MAX as u64) as u32;
+            out.push((ts32, addr.clone()));
+        }
+        out
     }
 
     /// Return the "best" peer for header sync, temporarily taking it out of
@@ -832,6 +1111,40 @@ impl PeerPool {
             warn!("PeerPool: failed to flush scores: {}", e);
         }
         self.last_score_flush = Instant::now();
+    }
+
+    /// Flush dirty AddrManager entries (and any queued deletes) to disk in
+    /// a pair of transactions. Same rate-limit pattern as `flush_scores`:
+    /// called periodically from `maintain()` and one final time on `Drop`.
+    /// Deletes run BEFORE inserts so an entry that was evicted-and-readded
+    /// in the same flush window ends up in the correct final state.
+    pub fn flush_addrs(&mut self) {
+        let store = match self.store.clone() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let deletes = self.addrs.take_pending_deletes();
+        if !deletes.is_empty() {
+            if let Err(e) = store.delete_addrs_bulk(&deletes) {
+                warn!("PeerPool: failed to flush addr deletes: {}", e);
+            }
+        }
+
+        let dirty = self.addrs.take_dirty_records();
+        if !dirty.is_empty() {
+            if let Err(e) = store.save_addrs_bulk(&dirty) {
+                warn!("PeerPool: failed to flush dirty addrs: {}", e);
+                // Re-mark as dirty so the next flush retries them, otherwise
+                // a transient SQLite error would silently lose the updates.
+                for record in &dirty {
+                    if let Some(meta) = self.addrs.addrs.get_mut(&record.addr) {
+                        meta.dirty = true;
+                    }
+                }
+            }
+        }
+        self.last_addr_flush = Instant::now();
     }
 
     /// Record misbehavior for a peer. Subtracts `howmuch` from the peer's
@@ -1139,11 +1452,14 @@ impl PeerPool {
 }
 
 impl Drop for PeerPool {
-    /// Last-chance flush of in-memory scores so a clean shutdown after a
-    /// shorter session than `SCORE_FLUSH_INTERVAL` doesn't lose the work.
+    /// Last-chance flush of in-memory scores and addresses so a clean
+    /// shutdown after a shorter session than the flush intervals doesn't
+    /// lose the work. Particularly load-bearing on iOS, where the OS
+    /// terminates backgrounded apps aggressively.
     fn drop(&mut self) {
         if self.store.is_some() {
             self.flush_scores();
+            self.flush_addrs();
         }
     }
 }
@@ -1163,6 +1479,7 @@ mod tests {
             tor: None,
             store: None,
             last_score_flush: Instant::now(),
+            last_addr_flush: Instant::now(),
         }
     }
 
@@ -1178,6 +1495,7 @@ mod tests {
             tor: None,
             store: Some(Arc::new(PeerStore::open(":memory:").unwrap())),
             last_score_flush: Instant::now(),
+            last_addr_flush: Instant::now(),
         }
     }
 
@@ -1645,22 +1963,30 @@ mod tests {
 
     // ── AddrManager tests ────────────────────────────────────────────
 
+    /// Shorthand for tests: insert with the gossip source tag (most common).
+    fn ti(m: &mut AddrManager, addr: &str) -> bool {
+        m.insert(addr.to_string(), AddrSource::Gossip)
+    }
+
     #[test]
     fn addrman_insert_dedupes() {
         let mut m = AddrManager::new(100);
-        assert!(m.insert("1.2.3.4:8333".to_string()));
-        assert!(!m.insert("1.2.3.4:8333".to_string()));
+        assert!(ti(&mut m, "1.2.3.4:8333"));
+        assert!(!ti(&mut m, "1.2.3.4:8333"));
         assert_eq!(m.len(), 1);
     }
 
     #[test]
     fn addrman_insert_many_counts_only_new() {
         let mut m = AddrManager::new(100);
-        let added = m.insert_many(vec![
-            "1.2.3.4:8333".to_string(),
-            "5.6.7.8:8333".to_string(),
-            "1.2.3.4:8333".to_string(), // duplicate
-        ]);
+        let added = m.insert_many(
+            vec![
+                "1.2.3.4:8333".to_string(),
+                "5.6.7.8:8333".to_string(),
+                "1.2.3.4:8333".to_string(), // duplicate
+            ],
+            AddrSource::Gossip,
+        );
         assert_eq!(added, 2);
         assert_eq!(m.len(), 2);
     }
@@ -1668,7 +1994,7 @@ mod tests {
     #[test]
     fn addrman_record_success_marks_known_good() {
         let mut m = AddrManager::new(100);
-        m.insert("1.2.3.4:8333".to_string());
+        ti(&mut m, "1.2.3.4:8333");
         m.record_success("1.2.3.4:8333");
         let meta = m.addrs.get("1.2.3.4:8333").unwrap();
         assert!(meta.last_success.is_some());
@@ -1679,7 +2005,7 @@ mod tests {
     #[test]
     fn addrman_record_failure_increments_count() {
         let mut m = AddrManager::new(100);
-        m.insert("1.2.3.4:8333".to_string());
+        ti(&mut m, "1.2.3.4:8333");
         m.record_failure("1.2.3.4:8333");
         m.record_failure("1.2.3.4:8333");
         let meta = m.addrs.get("1.2.3.4:8333").unwrap();
@@ -1690,7 +2016,7 @@ mod tests {
     #[test]
     fn addrman_record_success_after_failures_resets() {
         let mut m = AddrManager::new(100);
-        m.insert("1.2.3.4:8333".to_string());
+        ti(&mut m, "1.2.3.4:8333");
         m.record_failure("1.2.3.4:8333");
         m.record_failure("1.2.3.4:8333");
         m.record_success("1.2.3.4:8333");
@@ -1702,7 +2028,7 @@ mod tests {
     #[test]
     fn addrman_backoff_grows_with_failures() {
         // Backoff doubles per failure, starting from ADDR_RETRY_BASE.
-        let mut meta = AddrMeta::new();
+        let mut meta = AddrMeta::new(AddrSource::Gossip);
         meta.last_tried = Some(Instant::now());
 
         meta.failure_count = 1;
@@ -1719,7 +2045,7 @@ mod tests {
     fn addrman_backoff_caps_at_max() {
         // After enough failures the backoff plateaus at ADDR_RETRY_MAX
         // instead of growing without bound.
-        let mut meta = AddrMeta::new();
+        let mut meta = AddrMeta::new(AddrSource::Gossip);
         meta.last_tried = Some(Instant::now());
         meta.failure_count = 50;
         assert_eq!(meta.current_backoff(), ADDR_RETRY_MAX);
@@ -1727,7 +2053,7 @@ mod tests {
 
     #[test]
     fn addrman_eligible_for_never_tried() {
-        let meta = AddrMeta::new();
+        let meta = AddrMeta::new(AddrSource::Gossip);
         assert!(meta.is_eligible(Instant::now()));
     }
 
@@ -1735,7 +2061,7 @@ mod tests {
     fn addrman_eligible_after_backoff_elapsed() {
         // Synthesise an entry whose last_tried was long ago, so even with
         // failures the backoff has elapsed.
-        let mut meta = AddrMeta::new();
+        let mut meta = AddrMeta::new(AddrSource::Gossip);
         meta.failure_count = 1;
         meta.last_tried = Some(Instant::now() - (ADDR_RETRY_BASE * 2));
         assert!(meta.is_eligible(Instant::now()));
@@ -1744,8 +2070,8 @@ mod tests {
     #[test]
     fn addrman_pick_candidates_orders_known_good_first() {
         let mut m = AddrManager::new(100);
-        m.insert("never:8333".to_string());
-        m.insert("good:8333".to_string());
+        ti(&mut m, "never:8333");
+        ti(&mut m, "good:8333");
         m.record_success("good:8333");
 
         let picked = m.pick_candidates(10, &|_| false);
@@ -1756,9 +2082,9 @@ mod tests {
     #[test]
     fn addrman_pick_candidates_respects_exclude() {
         let mut m = AddrManager::new(100);
-        m.insert("a:8333".to_string());
-        m.insert("b:8333".to_string());
-        m.insert("c:8333".to_string());
+        ti(&mut m, "a:8333");
+        ti(&mut m, "b:8333");
+        ti(&mut m, "c:8333");
 
         let picked = m.pick_candidates(10, &|addr| addr == "b:8333");
         assert_eq!(picked.len(), 2);
@@ -1769,7 +2095,7 @@ mod tests {
     fn addrman_pick_candidates_respects_limit() {
         let mut m = AddrManager::new(100);
         for i in 0..10 {
-            m.insert(format!("peer{}:8333", i));
+            ti(&mut m, &format!("peer{}:8333", i));
         }
         let picked = m.pick_candidates(3, &|_| false);
         assert_eq!(picked.len(), 3);
@@ -1782,13 +2108,13 @@ mod tests {
         // marks the entry as the highest tier, so eviction picks the
         // remaining lower-tier entry.)
         let mut m = AddrManager::new(2);
-        m.insert("good:8333".to_string());
+        ti(&mut m, "good:8333");
         m.record_success("good:8333");
-        m.insert("never:8333".to_string());
+        ti(&mut m, "never:8333");
         assert_eq!(m.len(), 2);
 
         // Inserting a third should evict "never", not "good".
-        m.insert("new:8333".to_string());
+        ti(&mut m, "new:8333");
         assert_eq!(m.len(), 2);
         assert!(m.addrs.contains_key("good:8333"));
         assert!(m.addrs.contains_key("new:8333"));
@@ -1801,16 +2127,16 @@ mod tests {
         // entry with the highest failure_count should be evicted first
         // (this is the actual policy implemented by `evict_if_full`).
         let mut m = AddrManager::new(2);
-        m.insert("flaky:8333".to_string());
+        ti(&mut m, "flaky:8333");
         m.record_failure("flaky:8333");
         m.record_failure("flaky:8333");
         m.record_failure("flaky:8333");
-        m.insert("fresh:8333".to_string());
+        ti(&mut m, "fresh:8333");
         assert_eq!(m.len(), 2);
 
         // A new insertion should evict "flaky" (3 failures) over "fresh"
         // (0 failures).
-        m.insert("newcomer:8333".to_string());
+        ti(&mut m, "newcomer:8333");
         assert_eq!(m.len(), 2);
         assert!(!m.addrs.contains_key("flaky:8333"));
         assert!(m.addrs.contains_key("fresh:8333"));
@@ -1818,13 +2144,78 @@ mod tests {
     }
 
     #[test]
+    fn addrman_eviction_queues_pending_delete() {
+        // The flush layer drives `delete_addrs_bulk` from the queue that
+        // `evict_if_full` populates — verify the queue actually gets the
+        // evicted addr so the on-disk view doesn't grow without bound.
+        let mut m = AddrManager::new(2);
+        ti(&mut m, "loser:8333");
+        m.record_failure("loser:8333");
+        ti(&mut m, "fresh:8333");
+        ti(&mut m, "newcomer:8333"); // evicts "loser"
+
+        let pending = m.take_pending_deletes();
+        assert_eq!(pending, vec!["loser:8333".to_string()]);
+        // After taking the queue should be empty so the next flush doesn't
+        // re-issue the same DELETE.
+        assert!(m.take_pending_deletes().is_empty());
+    }
+
+    #[test]
     fn addrman_candidate_count_excludes_in_backoff() {
         let mut m = AddrManager::new(100);
-        m.insert("eligible:8333".to_string());
-        m.insert("backoff:8333".to_string());
+        ti(&mut m, "eligible:8333");
+        ti(&mut m, "backoff:8333");
         m.record_failure("backoff:8333");
         // backoff:8333 just failed → not eligible until ADDR_RETRY_BASE elapses
         assert_eq!(m.candidate_count(), 1);
+    }
+
+    #[test]
+    fn addrman_insert_from_record_preserves_failure_count() {
+        // Restored entries should come back at the same tier they had on
+        // disk — a peer with three failures stays in backoff after a
+        // restart, doesn't get promoted to "never tried".
+        let mut m = AddrManager::new(100);
+        let record = AddrRecord {
+            addr: "restored:8333".to_string(),
+            first_seen: 1_700_000_000,
+            last_tried: Some(1_700_000_500),
+            last_success: None,
+            failure_count: 3,
+            source: "gossip".to_string(),
+        };
+        assert!(m.insert_from_record(&record));
+        let meta = m.addrs.get("restored:8333").unwrap();
+        assert_eq!(meta.failure_count, 3);
+        assert!(meta.last_success.is_none());
+        assert!(!meta.dirty); // freshly restored, not yet modified
+    }
+
+    #[test]
+    fn addrman_take_dirty_records_clears_dirty_flag() {
+        // After a successful flush the entries should not be re-flushed on
+        // the next tick — `take_dirty_records` clears the flag inline.
+        let mut m = AddrManager::new(100);
+        ti(&mut m, "1.2.3.4:8333");
+        let first = m.take_dirty_records();
+        assert_eq!(first.len(), 1);
+        let second = m.take_dirty_records();
+        assert!(second.is_empty(), "second flush should be a no-op");
+    }
+
+    #[test]
+    fn addrman_record_failure_marks_dirty() {
+        // Mutating an existing entry should re-arm the dirty flag so the
+        // updated failure_count gets persisted on the next flush.
+        let mut m = AddrManager::new(100);
+        ti(&mut m, "peer:8333");
+        m.take_dirty_records(); // clear initial dirty
+        m.record_failure("peer:8333");
+        let dirty = m.take_dirty_records();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].addr, "peer:8333");
+        assert_eq!(dirty[0].failure_count, 1);
     }
 
     #[test]
@@ -1852,5 +2243,93 @@ mod tests {
         let added2 = pool.ingest_gossip_addrs(vec!["1.2.3.4:8333".to_string()]);
         assert_eq!(added2, 0);
         assert_eq!(pool.known_addr_count(), 2);
+    }
+
+    // ── Persistence wiring tests ─────────────────────────────────────
+
+    #[test]
+    fn flush_addrs_writes_dirty_entries_to_store() {
+        let mut pool = test_pool_with_store();
+        pool.ingest_gossip_addrs(vec![
+            "1.2.3.4:8333".to_string(),
+            "5.6.7.8:8333".to_string(),
+        ]);
+        pool.flush_addrs();
+
+        // The store should now hold both addresses.
+        let store = pool.store.as_ref().unwrap().clone();
+        let loaded = store.load_all_addrs().unwrap();
+        assert_eq!(loaded.len(), 2);
+        let addrs: HashSet<String> = loaded.iter().map(|r| r.addr.clone()).collect();
+        assert!(addrs.contains("1.2.3.4:8333"));
+        assert!(addrs.contains("5.6.7.8:8333"));
+        // Both came in via ingest_gossip_addrs → tagged "gossip".
+        assert!(loaded.iter().all(|r| r.source == "gossip"));
+    }
+
+    #[test]
+    fn flush_addrs_drains_pending_deletes_from_eviction() {
+        // Force an eviction by stuffing the manager past its cap, then verify
+        // the evicted row is DELETEd from the store on flush.
+        let store = Arc::new(PeerStore::open(":memory:").unwrap());
+        let mut pool = PeerPool {
+            slots: Arc::new(Mutex::new(Vec::new())),
+            addrs: AddrManager::new(2),
+            our_height: 0,
+            last_dns_query: Instant::now(),
+            bans: HashMap::new(),
+            tor: None,
+            store: Some(store.clone()),
+            last_score_flush: Instant::now(),
+            last_addr_flush: Instant::now(),
+        };
+
+        pool.ingest_gossip_addrs(vec!["a:8333".to_string(), "b:8333".to_string()]);
+        pool.flush_addrs(); // baseline: both written
+
+        // Insert a third → cap=2 forces eviction. Eviction prefers the
+        // entry with most failures, but with all-zero failures it falls
+        // through to "highest failure_count among never-success" (0 here)
+        // which then breaks ties on first_seen age, evicting the oldest.
+        pool.ingest_gossip_addrs(vec!["c:8333".to_string()]);
+        pool.flush_addrs();
+
+        let loaded = store.load_all_addrs().unwrap();
+        assert_eq!(loaded.len(), 2, "store should reflect the post-eviction cap");
+        let addrs: HashSet<String> = loaded.iter().map(|r| r.addr.clone()).collect();
+        assert!(addrs.contains("c:8333"), "newest entry should still be present");
+    }
+
+    #[test]
+    fn flush_addrs_is_idempotent_when_nothing_dirty() {
+        // A second flush with no intervening mutation should issue zero
+        // INSERTs (verified indirectly: no panic, store contents unchanged).
+        let mut pool = test_pool_with_store();
+        pool.ingest_gossip_addrs(vec!["a:8333".to_string()]);
+        pool.flush_addrs();
+        let before = pool.store.as_ref().unwrap().load_all_addrs().unwrap();
+        pool.flush_addrs();
+        let after = pool.store.as_ref().unwrap().load_all_addrs().unwrap();
+        assert_eq!(before.len(), after.len());
+    }
+
+    #[test]
+    fn restored_addrs_skip_dns_fallback_threshold() {
+        // The hydration path in PeerPool::new is what makes second-launch
+        // skip DNS, so verify the in-memory shape: insert_from_record on
+        // enough entries should push candidate_count above the threshold.
+        let mut m = AddrManager::new(MAX_KNOWN_ADDRS);
+        for i in 0..(DNS_FALLBACK_THRESHOLD + 10) {
+            let record = AddrRecord {
+                addr: format!("restored{}:8333", i),
+                first_seen: 1_700_000_000,
+                last_tried: None,
+                last_success: None,
+                failure_count: 0,
+                source: "dns".to_string(),
+            };
+            assert!(m.insert_from_record(&record));
+        }
+        assert!(m.candidate_count() >= DNS_FALLBACK_THRESHOLD);
     }
 }

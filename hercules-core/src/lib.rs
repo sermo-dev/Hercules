@@ -14,6 +14,7 @@ mod peer_store;
 mod store;
 mod sync;
 mod tor;
+mod tor_v3;
 mod utxo;
 mod validation;
 

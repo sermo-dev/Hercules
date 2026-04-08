@@ -9,8 +9,16 @@ use log::{debug, info};
 
 use crate::utxo::{UtxoEntry, UtxoSet};
 
-/// Default maximum mempool size in bytes (50 MB).
-const DEFAULT_MAX_SIZE: usize = 50_000_000;
+/// Default maximum mempool size in bytes (150 MB).
+///
+/// Halfway between Bitcoin Core's 300 MB default and our previous 50 MB cap.
+/// 150 MB covers the entire historical "normal" mempool occupancy range
+/// (typical mainnet sits at 5–30 MB; mild congestion 50–150 MB) without
+/// adding meaningful iOS memory pressure. During severe fee events the
+/// mempool will still hit the cap and start fee-rate evicting, but those
+/// events are rare and we'd rather pay the eviction cost than risk an iOS
+/// background-kill from a 300 MB resident allocation.
+const DEFAULT_MAX_SIZE: usize = 150_000_000;
 
 /// Minimum relay fee rate in sat/vB.
 const MIN_RELAY_FEE_RATE: f64 = 1.0;
@@ -316,10 +324,16 @@ impl Mempool {
         // If missing, fall back to the mempool — but skip any tx in
         // `to_evict`, because a replacement cannot legitimately depend on
         // the txs it's about to remove.
+        //
+        // Resolution and script verification are split into two phases so
+        // that the libbitcoinconsensus 26.0 API can see *all* spent outputs
+        // up-front (BIP 341 sighash commits to every spent output, not just
+        // the one being verified).
         let serialized_tx = serialize(&tx);
         let flags = bitcoinconsensus::height_to_flags(current_height);
         let mut input_sum: u64 = 0;
         let mut parents: HashSet<Txid> = HashSet::new();
+        let mut spent: Vec<(u64, Vec<u8>)> = Vec::with_capacity(tx.input.len());
 
         for (input_idx, input) in tx.input.iter().enumerate() {
             let prev_txid = &input.previous_output.txid;
@@ -373,11 +387,31 @@ impl Mempool {
                 });
             }
 
-            if !skip_consensus {
+            input_sum = input_sum
+                .checked_add(utxo.amount)
+                .ok_or(MempoolError::MathOverflow)?;
+            spent.push((utxo.amount, utxo.script_pubkey));
+        }
+
+        if !skip_consensus {
+            // Build the FFI Utxo array. Raw pointers reference the heap
+            // allocations owned by `spent`, which lives until the end of
+            // accept_tx_internal — well past these verify calls.
+            let utxos: Vec<bitcoinconsensus::Utxo> = spent
+                .iter()
+                .map(|(amt, spk)| bitcoinconsensus::Utxo {
+                    script_pubkey: spk.as_ptr(),
+                    script_pubkey_len: spk.len() as u32,
+                    value: *amt as i64,
+                })
+                .collect();
+
+            for (input_idx, (amount, script_pubkey)) in spent.iter().enumerate() {
                 bitcoinconsensus::verify_with_flags(
-                    &utxo.script_pubkey,
-                    utxo.amount,
+                    script_pubkey,
+                    *amount,
                     &serialized_tx,
+                    Some(&utxos),
                     input_idx,
                     flags,
                 )
@@ -386,10 +420,6 @@ impl Mempool {
                     error: format!("{:?}", e),
                 })?;
             }
-
-            input_sum = input_sum
-                .checked_add(utxo.amount)
-                .ok_or(MempoolError::MathOverflow)?;
         }
 
         // ── Phase 3: value math + fee bounds ────────────────────────────

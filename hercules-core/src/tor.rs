@@ -251,6 +251,25 @@ impl TorManager {
     pub fn handle(&self) -> tokio::runtime::Handle {
         self.runtime.handle().clone()
     }
+
+    /// Our own .onion service address as a `host:port` string, if a
+    /// hidden service has been started. `None` while Tor is still
+    /// bootstrapping or if the iOS build hasn't enabled inbound serving.
+    /// Used by the self-advertisement path so we only emit `addrv2(self)`
+    /// once we actually have a routable address to advertise.
+    pub fn our_onion_address(&self) -> Option<String> {
+        self.onion_address.clone()
+    }
+
+    /// Our own .onion service ed25519 public key (32 bytes), decoded from
+    /// `our_onion_address`. Returns `None` if no service is running, or
+    /// (defensively) if Arti somehow handed us a hostname that fails the
+    /// rend-spec-v3 checksum — that should be impossible in practice but
+    /// returning `None` is safer than panicking on the self-ad path.
+    pub fn our_onion_pubkey(&self) -> Option<[u8; 32]> {
+        let host_port = self.onion_address.as_ref()?;
+        crate::tor_v3::hostname_to_pubkey(host_port)
+    }
 }
 
 // ── OnionServiceHandle ────────────────────────────────────────────────

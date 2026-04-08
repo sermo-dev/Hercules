@@ -9,10 +9,11 @@ name = "hercules_core"
 
 [dependencies]
 uniffi = { version = "0.28", features = ["cli"] }
-bitcoin = { version = "0.32", features = ["serde", "bitcoinconsensus"] }
-bitcoinconsensus = "0.105"
+bitcoin = { version = "0.32", features = ["serde"] }
+bitcoinconsensus = "0.106"
 hex = "0.4"
 sha2 = "0.10"
+sha3 = "0.10"
 flate2 = "1.0"
 rusqlite = { version = "0.36", features = ["bundled"] }
 heed = "0.20"
