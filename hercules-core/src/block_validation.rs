@@ -237,12 +237,17 @@ pub fn validate_block_scripts(
             let serialized_tx = serialize(tx);
             let mut input_sum: u64 = 0;
 
+            // Phase A: resolve every spent output up-front. Taproot's BIP 341
+            // sighash commits to *all* spent outputs in a transaction, so the
+            // libbitcoinconsensus 26.0 API requires us to hand the full slice
+            // of (amount, script_pubkey) to every per-input verification.
+            // We collect once here, then verify in Phase C below.
+            let mut spent: Vec<(u64, Vec<u8>)> = Vec::with_capacity(tx.input.len());
             for (input_idx, input) in tx.input.iter().enumerate() {
                 let prev_txid = input.previous_output.txid;
                 let prev_vout = input.previous_output.vout;
                 let key = (prev_txid, prev_vout);
 
-                // Resolve the spent output: check in-block first, then persistent UTXO set
                 let (amount, script_pubkey) =
                     if let Some(entry) = block_utxos.remove(&key) {
                         // In-block spend (output created earlier in this block).
@@ -296,11 +301,36 @@ pub fn validate_block_scripts(
                         (utxo.amount, utxo.script_pubkey)
                     };
 
-                // Verify script using libbitcoinconsensus
+                input_sum = input_sum
+                    .checked_add(amount)
+                    .ok_or(BlockValidationError::ValueOverflow {
+                        height,
+                        tx_index: tx_idx,
+                    })?;
+                spent.push((amount, script_pubkey));
+            }
+
+            // Phase B: build the FFI Utxo array. The raw pointers reference
+            // the heap allocations owned by `spent`, which lives until the
+            // end of this scope (well past the verify calls below).
+            let utxos: Vec<bitcoinconsensus::Utxo> = spent
+                .iter()
+                .map(|(amt, spk)| bitcoinconsensus::Utxo {
+                    script_pubkey: spk.as_ptr(),
+                    script_pubkey_len: spk.len() as u32,
+                    value: *amt as i64,
+                })
+                .collect();
+
+            // Phase C: verify each input. Passing `Some(&utxos)` enables
+            // taproot validation when VERIFY_TAPROOT is set in `flags`
+            // (post-709632). Pre-taproot blocks safely ignore the slice.
+            for (input_idx, (amount, script_pubkey)) in spent.iter().enumerate() {
                 bitcoinconsensus::verify_with_flags(
-                    &script_pubkey,
-                    amount,
+                    script_pubkey,
+                    *amount,
                     &serialized_tx,
+                    Some(&utxos),
                     input_idx,
                     flags,
                 )
@@ -310,13 +340,6 @@ pub fn validate_block_scripts(
                     input_index: input_idx,
                     error: format!("{}", e),
                 })?;
-
-                input_sum = input_sum
-                    .checked_add(amount)
-                    .ok_or(BlockValidationError::ValueOverflow {
-                        height,
-                        tx_index: tx_idx,
-                    })?;
             }
 
             let output_sum: u64 = tx
@@ -687,5 +710,140 @@ mod tests {
             .push_slice(&[0x01, 0x02, 0x03])
             .into_script();
         assert_eq!(count_script_sigops(&script), 0);
+    }
+
+    // ── Real-mainnet taproot validation ─────────────────────────────
+    //
+    // Fixture: the historic first key-path P2TR spend on Bitcoin mainnet.
+    //
+    //   txid:   33e794d097969002ee05d336686fc03c9e15a597c1b9827669460fac98799036
+    //   block:  709635 (first block after taproot activation at 709632)
+    //   memo:   "I like Schnorr sigs and I cannot lie. @bitbug42"
+    //
+    // The tx has a single P2TR input spending UTXO
+    // 5849051cf3ce36257a1d844e28959f368a35adc9520fb9679175f6cdf8c1f1d1:1,
+    // worth 88,480 sats with scriptPubKey
+    // 5120339ce7e165e67d93adb3fef88a6d4beed33f01fa876f05a225242b82a631abc0
+    // (OP_PUSHNUM_1 OP_PUSHBYTES_32 <x-only pubkey>).
+    //
+    // The full witness is a single 64-byte Schnorr signature over the
+    // BIP 341 sighash. Validating this exercises the libbitcoinconsensus
+    // 0.106.0+26.0 spent_outputs path and the VERIFY_TAPROOT flag — both
+    // of which were unavailable in the 0.105.0+25.1 version we used to
+    // ship and would have caused this test to fail to compile or run.
+
+    /// Hex of the spending transaction (BIP141 serialization, with witnesses).
+    const TAPROOT_FIXTURE_TX_HEX: &str = "01000000000101d1f1c1f8cdf6759167b90f52c9ad358a369f95284e841d7a2536cef31c0549580100000000fdffffff020000000000000000316a2f49206c696b65205363686e6f7272207369677320616e6420492063616e6e6f74206c69652e204062697462756734329e06010000000000225120a37c3903c8d0db6512e2b40b0dffa05e5a3ab73603ce8c9c4b7771e5412328f90140a60c383f71bac0ec919b1d7dbc3eb72dd56e7aa99583615564f9f99b8ae4e837b758773a5b2e4c51348854c8389f008e05029db7f464a5ff2e01d5e6e626174affd30a00";
+    /// scriptPubKey of the prevout being spent (P2TR: OP_1 <32-byte x-only pk>).
+    const TAPROOT_FIXTURE_PREV_SPK_HEX: &str =
+        "5120339ce7e165e67d93adb3fef88a6d4beed33f01fa876f05a225242b82a631abc0";
+    /// Value of the prevout being spent, in satoshis.
+    const TAPROOT_FIXTURE_PREV_VALUE: u64 = 88_480;
+    /// Block height containing the spending tx (must satisfy `> 709632` so
+    /// that `bitcoinconsensus::height_to_flags` enables VERIFY_TAPROOT).
+    const TAPROOT_FIXTURE_HEIGHT: u32 = 709_635;
+
+    /// Build the (serialized_tx, prev_spk, prev_amount, flags) tuple shared by
+    /// the positive and negative taproot tests so they can't drift apart.
+    fn taproot_fixture() -> (Vec<u8>, Vec<u8>, u64, u32) {
+        let tx_bytes = hex::decode(TAPROOT_FIXTURE_TX_HEX).expect("fixture tx hex parses");
+        let prev_spk =
+            hex::decode(TAPROOT_FIXTURE_PREV_SPK_HEX).expect("fixture prev spk hex parses");
+        let flags = bitcoinconsensus::height_to_flags(TAPROOT_FIXTURE_HEIGHT);
+        (tx_bytes, prev_spk, TAPROOT_FIXTURE_PREV_VALUE, flags)
+    }
+
+    #[test]
+    fn taproot_activation_flag_is_set_post_709632() {
+        // Sanity-check the precondition that the rest of the taproot tests
+        // implicitly rely on: at the fixture block height, libbitcoinconsensus
+        // returns flags that include VERIFY_TAPROOT. If this ever changes
+        // upstream, the script-validation tests below would silently start
+        // covering only pre-taproot rules and miss the whole point.
+        let flags = bitcoinconsensus::height_to_flags(TAPROOT_FIXTURE_HEIGHT);
+        assert!(
+            flags & bitcoinconsensus::VERIFY_TAPROOT != 0,
+            "expected VERIFY_TAPROOT in flags for height {}, got {:#x}",
+            TAPROOT_FIXTURE_HEIGHT,
+            flags
+        );
+    }
+
+    #[test]
+    fn verifies_real_mainnet_taproot_keypath_spend() {
+        let (tx_bytes, prev_spk, prev_value, flags) = taproot_fixture();
+
+        // Build the spent_outputs slice that BIP 341 sighash needs. For a
+        // single-input tx this is one entry, but the FFI takes a slice so
+        // we still allocate a Vec to keep the script_pubkey buffer rooted.
+        let utxos = vec![bitcoinconsensus::Utxo {
+            script_pubkey: prev_spk.as_ptr(),
+            script_pubkey_len: prev_spk.len() as u32,
+            value: prev_value as i64,
+        }];
+
+        let result = bitcoinconsensus::verify_with_flags(
+            &prev_spk,
+            prev_value,
+            &tx_bytes,
+            Some(&utxos),
+            0,
+            flags,
+        );
+
+        assert!(
+            result.is_ok(),
+            "real mainnet taproot key-path spend should validate, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn rejects_taproot_spend_with_corrupted_witness_signature() {
+        use bitcoin::consensus::deserialize;
+
+        let (tx_bytes, prev_spk, prev_value, flags) = taproot_fixture();
+
+        // Round-trip through the bitcoin crate so we can mutate the witness
+        // safely without hand-editing serialized bytes (and so we exercise
+        // the same deserialize path block validation uses).
+        let mut tx: bitcoin::Transaction =
+            deserialize(&tx_bytes).expect("fixture tx deserializes");
+        assert_eq!(tx.input.len(), 1);
+
+        // Flip the high bit of the first signature byte. The witness for
+        // a key-path P2TR spend is a single 64-byte Schnorr signature; any
+        // single-bit perturbation invalidates it under BIP 340.
+        let witness_stack: Vec<Vec<u8>> = tx.input[0].witness.to_vec();
+        assert_eq!(
+            witness_stack.len(),
+            1,
+            "key-path spend should have a 1-element witness stack"
+        );
+        let mut sig = witness_stack[0].clone();
+        assert_eq!(sig.len(), 64, "Schnorr signature should be 64 bytes");
+        sig[0] ^= 0x80;
+        tx.input[0].witness = bitcoin::Witness::from_slice(&[sig]);
+
+        let mutated_tx_bytes = serialize(&tx);
+        let utxos = vec![bitcoinconsensus::Utxo {
+            script_pubkey: prev_spk.as_ptr(),
+            script_pubkey_len: prev_spk.len() as u32,
+            value: prev_value as i64,
+        }];
+
+        let result = bitcoinconsensus::verify_with_flags(
+            &prev_spk,
+            prev_value,
+            &mutated_tx_bytes,
+            Some(&utxos),
+            0,
+            flags,
+        );
+
+        assert!(
+            result.is_err(),
+            "corrupted Schnorr signature must fail BIP 340 verification, got Ok"
+        );
     }
 }
