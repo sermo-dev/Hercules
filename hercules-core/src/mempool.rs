@@ -54,25 +54,40 @@ const MAX_DESCENDANTS: usize = 25;
 /// decision to perform.
 const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 
+/// Anti-foot-shoot fee ceiling. A transaction whose absolute fee exceeds
+/// this is rejected outright. Matches Bitcoin Core's `-maxtxfee` default
+/// (0.1 BTC). The intent is to catch wallet bugs and crafted txs that
+/// would burn the entire input value as fees, not to enforce policy.
+const ABSURD_FEE_THRESHOLD: u64 = 10_000_000;
+
 /// A transaction in the mempool with fee metadata and CPFP graph state.
 ///
 /// `parents` and `ancestors` describe the unconfirmed parent chain (parents =
 /// direct, ancestors = transitive); both omit `self`. `descendants` is the
 /// transitive descendant set, also omitting self. `ancestor_fee` /
-/// `ancestor_size` are the running sums over `ancestors` only — the
-/// "self + ancestors" view used by limit checks adds `self.fee` / `self.size`
+/// `ancestor_vsize` are the running sums over `ancestors` only — the
+/// "self + ancestors" view used by limit checks adds `self.fee` / `self.vsize`
 /// at the call site.
+///
+/// Two distinct sizes are tracked because they serve different purposes:
+/// `size` is the raw serialized byte length and drives memory accounting
+/// (`Mempool::total_size`, the 50 MB cap). `vsize` is the virtual size
+/// (weight / 4, rounded up) and drives every fee-rate / policy decision
+/// (BIP 125, ancestor / descendant limits, package eviction ordering).
+/// Mixing the two — comparing a sat/vB rate against a sat/raw-byte rate —
+/// causes SegWit txs to be ranked incorrectly relative to Bitcoin Core.
 struct MempoolEntry {
     tx: Transaction,
     fee: u64,
-    fee_rate: f64, // sat/vB = fee / (weight / 4)
-    size: usize,   // serialized byte size
+    fee_rate: f64, // sat/vB = fee / vsize
+    size: usize,   // serialized byte size (memory accounting)
+    vsize: u64,    // virtual size = weight / 4, rounded up (policy)
     added_at: Instant,
     parents: HashSet<Txid>,
     ancestors: HashSet<Txid>,
     descendants: HashSet<Txid>,
     ancestor_fee: u64,
-    ancestor_size: usize,
+    ancestor_vsize: u64,
 }
 
 /// In-memory transaction pool for unconfirmed transactions.
@@ -120,13 +135,31 @@ impl Mempool {
     ///    chain spending. Inputs that hit `to_evict` are treated as missing
     ///    so a replacement can't depend on the txs it's replacing.
     /// 3. Script validation via libbitcoinconsensus, value math, fee rate
-    ///    floor.
-    /// 4. BIP 125 RBF rules 2/3/5 (only if `conflicts` is non-empty).
+    ///    floor, absurd-fee guardrail.
+    /// 4. BIP 125 RBF rules 2/3/5 (only if conflicts is non-empty).
     /// 5. Ancestor closure + 25-ancestor / 101 kvB limit checks.
     /// 6. Descendant-limit check on each ancestor.
-    /// 7. Mutate: evict the conflict set, insert the new entry, update
-    ///    parents' descendant sets, and run package-aware capacity eviction
-    ///    if we're now over `max_size`.
+    /// 7. **Capacity admission (inline label "Phase 6.5")** — simulate the
+    ///    eviction loop without mutating state. If the new tx (or its
+    ///    containing package) would be evicted as collateral damage from
+    ///    over-cap eviction, reject here so we never destroy innocent txs
+    ///    on a doomed accept.
+    /// 8. Mutate (inline label "Phase 7"): evict the conflict set, insert
+    ///    the new entry, update parents' descendant sets, and run
+    ///    package-aware capacity eviction if we're now over `max_size`.
+    ///    Capacity eviction at this point can only remove packages that the
+    ///    admission check has already certified to be cheaper than the new
+    ///    tx, so the new tx is guaranteed to survive.
+    ///
+    /// `current_height` is the chain tip height as understood by the
+    /// caller. There is a small staleness window (one block at most)
+    /// between when the caller reads the height and when this function
+    /// runs under the mempool lock; the consequence is at worst a
+    /// spurious `NonFinal` or `ImmatureCoinbase` rejection of one tx,
+    /// which the peer can resubmit. Closing the window properly requires
+    /// either (a) plumbing the height through an Arc<AtomicU32> shared
+    /// with block validation, or (b) holding both header-store and
+    /// mempool locks atomically — left for a follow-up.
     pub fn accept_tx(
         &mut self,
         tx: Transaction,
@@ -180,22 +213,30 @@ impl Mempool {
 
         // Finality (nLockTime). A tx is final if nLockTime == 0, all inputs
         // are nSequence==0xFFFFFFFF, or the locktime has been reached.
+        // Saturating arithmetic on the height + 1 comparison prevents a
+        // wraparound at u32::MAX (irrelevant for current Bitcoin heights
+        // but cheap defensiveness).
         let all_final = tx.input.iter().all(|i| i.sequence.0 == 0xFFFFFFFF);
         if !all_final {
             let lock_time = tx.lock_time.to_consensus_u32();
             if lock_time != 0 {
                 if lock_time < 500_000_000 {
-                    if lock_time > current_height + 1 {
+                    if lock_time > current_height.saturating_add(1) {
                         return Err(MempoolError::NonFinal {
                             lock_time,
                             current_height,
                         });
                     }
                 } else {
-                    let now = std::time::SystemTime::now()
+                    // Saturating cast: u64 → u32 wraps in 2106 if we just
+                    // `as`-cast. Treating "secs since epoch" as u32 with
+                    // saturation gives us correct rejection past 2106
+                    // instead of accepting a tx with a 2107 locktime.
+                    let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs() as u32;
+                        .as_secs();
+                    let now: u32 = now_secs.try_into().unwrap_or(u32::MAX);
                     if lock_time > now {
                         return Err(MempoolError::NonFinal {
                             lock_time,
@@ -210,6 +251,11 @@ impl Mempool {
         if weight > MAX_TX_WEIGHT {
             return Err(MempoolError::OversizedTx { weight });
         }
+        // Virtual size = ceil(weight / 4). All policy decisions (fee rate,
+        // ancestor / descendant limits, package rate) use this — never the
+        // raw serialized byte length. The bitcoin crate's `Transaction::vsize`
+        // already does the round-up correctly.
+        let vsize: u64 = tx.vsize() as u64;
 
         for (i, output) in tx.output.iter().enumerate() {
             if output.script_pubkey.is_op_return() {
@@ -343,24 +389,34 @@ impl Mempool {
 
             input_sum = input_sum
                 .checked_add(utxo.amount)
-                .ok_or(MempoolError::Inflation)?;
+                .ok_or(MempoolError::MathOverflow)?;
         }
 
-        // ── Phase 3: value math + minimum fee rate ──────────────────────
+        // ── Phase 3: value math + fee bounds ────────────────────────────
         let output_sum: u64 = tx
             .output
             .iter()
             .map(|o| o.value.to_sat())
             .try_fold(0u64, |acc, v| acc.checked_add(v))
-            .ok_or(MempoolError::Inflation)?;
+            .ok_or(MempoolError::MathOverflow)?;
 
         if input_sum < output_sum {
             return Err(MempoolError::Inflation);
         }
 
         let fee = input_sum - output_sum;
-        let vsize = weight as f64 / 4.0;
-        let fee_rate = fee as f64 / vsize;
+
+        // Absurd-fee guardrail. Catches wallet bugs and crafted txs that
+        // would burn the entire input value as fees. Bitcoin Core uses
+        // the same default (`-maxtxfee=0.1 BTC`).
+        if fee > ABSURD_FEE_THRESHOLD {
+            return Err(MempoolError::AbsurdFee {
+                fee,
+                limit: ABSURD_FEE_THRESHOLD,
+            });
+        }
+
+        let fee_rate = fee as f64 / vsize as f64;
         if fee_rate < MIN_RELAY_FEE_RATE {
             return Err(MempoolError::InsufficientFee {
                 fee_rate,
@@ -372,23 +428,19 @@ impl Mempool {
 
         // ── Phase 4: BIP 125 RBF enforcement ────────────────────────────
         if !direct_conflicts.is_empty() {
-            self.check_bip125(
-                fee,
-                size,
-                &parents,
-                &direct_conflicts,
-                &to_evict,
-            )?;
+            self.check_bip125(fee, vsize, &direct_conflicts, &to_evict)?;
         }
 
         // ── Phase 5: ancestor closure + limit enforcement ───────────────
         //
         // Walk the parent chain breadth-first; the diamond case (same
         // ancestor reachable via multiple paths) is naturally deduplicated
-        // by the visited HashSet.
+        // by the visited HashSet. We accumulate fees and *vsizes* (not raw
+        // bytes) to compare against MAX_ANCESTOR_VBYTES, which is in
+        // virtual bytes per Bitcoin Core's DEFAULT_ANCESTOR_SIZE_LIMIT.
         let mut ancestors: HashSet<Txid> = HashSet::new();
         let mut ancestor_fee: u64 = 0;
-        let mut ancestor_size: usize = 0;
+        let mut ancestor_vsize: u64 = 0;
         let mut frontier: VecDeque<Txid> = parents.iter().copied().collect();
 
         while let Some(parent_txid) = frontier.pop_front() {
@@ -399,8 +451,12 @@ impl Mempool {
                 .txs
                 .get(&parent_txid)
                 .expect("parent must exist — phase 2 just looked it up");
-            ancestor_fee = ancestor_fee.saturating_add(parent.fee);
-            ancestor_size = ancestor_size.saturating_add(parent.size);
+            ancestor_fee = ancestor_fee
+                .checked_add(parent.fee)
+                .ok_or(MempoolError::MathOverflow)?;
+            ancestor_vsize = ancestor_vsize
+                .checked_add(parent.vsize)
+                .ok_or(MempoolError::MathOverflow)?;
             for grandparent in &parent.parents {
                 if !ancestors.contains(grandparent) {
                     frontier.push_back(*grandparent);
@@ -414,10 +470,13 @@ impl Mempool {
                 limit: MAX_ANCESTORS,
             });
         }
-        if ancestor_size + size > MAX_ANCESTOR_VBYTES {
+        let pkg_vsize = ancestor_vsize
+            .checked_add(vsize)
+            .ok_or(MempoolError::MathOverflow)?;
+        if pkg_vsize > MAX_ANCESTOR_VBYTES as u64 {
             return Err(MempoolError::AncestorSetTooLarge {
-                vbytes: ancestor_size + size,
-                limit: MAX_ANCESTOR_VBYTES,
+                vbytes: pkg_vsize,
+                limit: MAX_ANCESTOR_VBYTES as u64,
             });
         }
 
@@ -446,14 +505,31 @@ impl Mempool {
             }
         }
 
+        // ── Phase 6.5: capacity admission (collateral-eviction guard) ───
+        //
+        // Before *any* mutation, simulate the capacity-eviction loop to
+        // check whether the new tx would survive. If not — i.e., the new
+        // tx (or the package containing it) would itself end up the worst
+        // package after insertion and get evicted — reject here. Without
+        // this guard, Phase 7 would commit the insertion, the eviction
+        // loop would unwind it *and* take other innocent txs along for
+        // the ride, and we'd return an error to the caller after having
+        // permanently destroyed unrelated mempool state. That's both a
+        // correctness bug (lost data on a failed accept) and a free DoS
+        // amplifier (one low-fee submission → up to MAX_DESCENDANTS
+        // evicted innocents).
+        self.check_capacity_admission(size, fee, vsize, &ancestors)?;
+
         // ── Phase 7: mutate ─────────────────────────────────────────────
         //
-        // From here down every operation must succeed; we've passed every
-        // validation gate. Mutations in order:
+        // Every check that could fail has run. Mutations in order:
         //   1. Evict the BIP 125 conflict set (cascade).
         //   2. Insert the new entry, wire its spends index, and update
         //      every ancestor's descendant set.
         //   3. Run package-aware capacity eviction if we're over max_size.
+        //      Phase 6.5 has already certified that the eviction loop
+        //      will only target packages strictly cheaper than the new
+        //      tx, so the new tx is guaranteed to survive.
 
         if !to_evict.is_empty() {
             // Evict each top-level direct conflict; cascade handles the
@@ -478,12 +554,13 @@ impl Mempool {
             fee,
             fee_rate,
             size,
+            vsize,
             added_at: Instant::now(),
             parents: parents.clone(),
             ancestors: ancestors.clone(),
             descendants: HashSet::new(),
             ancestor_fee,
-            ancestor_size,
+            ancestor_vsize,
         };
         self.txs.insert(txid, entry);
 
@@ -505,37 +582,204 @@ impl Mempool {
             ancestors.len()
         );
 
-        // Capacity eviction. Use the package-aware path so a low-fee parent
-        // with high-fee children isn't unfairly evicted.
+        // Capacity eviction. Phase 6.5 already proved that nothing in the
+        // new tx's package will be evicted here.
         while self.total_size > self.max_size && !self.txs.is_empty() {
             if !self.evict_lowest_package() {
                 break;
             }
         }
+        debug_assert!(
+            self.txs.contains_key(&txid),
+            "phase 6.5 admission check should guarantee the new tx survives"
+        );
 
-        // If the eviction loop ate the tx we just inserted (because its
-        // package fee rate was the worst in the pool), surface that as a
-        // fee error rather than silently dropping it. The caller would
-        // otherwise see an Ok(txid) for a tx that's no longer present.
-        if !self.txs.contains_key(&txid) {
-            return Err(MempoolError::InsufficientFee {
-                fee_rate,
-                min_rate: self.min_fee_rate(),
+        Ok(txid)
+    }
+
+    /// Capacity admission pre-check (Phase 6.5).
+    ///
+    /// Determine, *without* mutating mempool state, whether the
+    /// post-insertion eviction loop in `accept_tx_internal` would end up
+    /// evicting the new tx (or the package containing it). If so, reject
+    /// here so that no innocent mempool entries are destroyed by a doomed
+    /// accept.
+    ///
+    /// Algorithm:
+    ///
+    /// 1. Fast-path: if `total_size + new_size <= max_size`, no eviction
+    ///    is needed and the new tx is trivially safe.
+    /// 2. Identify the *root ancestors* of the new tx (entries with empty
+    ///    `ancestors` that the new tx descends from). These are the roots
+    ///    whose packages will fold the new tx in after insertion.
+    /// 3. Build a snapshot of every current root's package
+    ///    `(pkg_fee, pkg_vsize, pkg_size)`. For affected roots (containing
+    ///    the new tx after insertion), add the new tx's contribution.
+    /// 4. If the new tx has no ancestors at all, it forms its own root
+    ///    package containing only itself.
+    /// 5. Sort packages by ascending fee rate (sat/vB) and walk in order,
+    ///    simulating evictions until the projected total size is back
+    ///    under cap. If we hit a package that contains the new tx,
+    ///    reject — that's the runtime saying "the new tx is the next
+    ///    thing I'd evict". The conservative direction is correct:
+    ///    rejecting is always safe, accepting must be provably safe.
+    ///
+    /// Multi-root caveat: a tx whose parents live in two different roots
+    /// will, after insertion, *merge* those roots into one package
+    /// (because both can now reach the new tx as a common descendant).
+    /// This simulation treats them as separate packages and marks the
+    /// new tx as belonging to all of them. The result is conservative —
+    /// it can produce a spurious rejection in rare merge-shaped graphs
+    /// but cannot produce an incorrect acceptance.
+    fn check_capacity_admission(
+        &self,
+        new_size: usize,
+        new_fee: u64,
+        new_vsize: u64,
+        our_ancestors: &HashSet<Txid>,
+    ) -> Result<(), MempoolError> {
+        // Fast path: insertion fits without eviction.
+        if self.total_size.saturating_add(new_size) <= self.max_size {
+            return Ok(());
+        }
+
+        // Roots that the new tx descends from. `our_ancestors` is the
+        // *transitive* closure (Phase 5), so the roots are the elements
+        // with empty `ancestors`.
+        let mut affected_roots: HashSet<Txid> = HashSet::new();
+        for ancestor_txid in our_ancestors {
+            if let Some(ancestor) = self.txs.get(ancestor_txid) {
+                if ancestor.ancestors.is_empty() {
+                    affected_roots.insert(*ancestor_txid);
+                }
+            }
+        }
+
+        struct PkgSnapshot {
+            pkg_fee: u64,
+            pkg_vsize: u64,
+            pkg_size: usize,
+            contains_new: bool,
+        }
+
+        let mut packages: Vec<PkgSnapshot> = Vec::with_capacity(self.txs.len() / 4 + 1);
+        let mut new_tx_in_some_package = false;
+
+        for (txid, entry) in &self.txs {
+            if !entry.ancestors.is_empty() {
+                continue;
+            }
+            let mut pkg_fee = entry.fee;
+            let mut pkg_vsize = entry.vsize;
+            let mut pkg_size = entry.size;
+            for d in &entry.descendants {
+                if let Some(de) = self.txs.get(d) {
+                    pkg_fee = pkg_fee.saturating_add(de.fee);
+                    pkg_vsize = pkg_vsize.saturating_add(de.vsize);
+                    pkg_size = pkg_size.saturating_add(de.size);
+                }
+            }
+
+            let contains_new = affected_roots.contains(txid);
+            if contains_new {
+                pkg_fee = pkg_fee.saturating_add(new_fee);
+                pkg_vsize = pkg_vsize.saturating_add(new_vsize);
+                pkg_size = pkg_size.saturating_add(new_size);
+                new_tx_in_some_package = true;
+            }
+
+            packages.push(PkgSnapshot {
+                pkg_fee,
+                pkg_vsize,
+                pkg_size,
+                contains_new,
             });
         }
 
-        Ok(txid)
+        // No ancestors → the new tx becomes its own root package. (Or
+        // we somehow failed to attach it to any existing root, which
+        // shouldn't happen but is harmless to treat the same way.)
+        if !new_tx_in_some_package {
+            packages.push(PkgSnapshot {
+                pkg_fee: new_fee,
+                pkg_vsize: new_vsize,
+                pkg_size: new_size,
+                contains_new: true,
+            });
+        }
+
+        // Sort by ascending package rate (sat/vB). NaN is impossible
+        // because pkg_vsize is always > 0 for any non-empty tx.
+        packages.sort_by(|a, b| {
+            let ra = a.pkg_fee as f64 / a.pkg_vsize.max(1) as f64;
+            let rb = b.pkg_fee as f64 / b.pkg_vsize.max(1) as f64;
+            ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Walk packages worst-first, simulating evictions until we'd be
+        // under the cap. If we reach a package containing the new tx
+        // before that, reject.
+        let mut projected_total = self.total_size.saturating_add(new_size);
+        let new_fee_rate = new_fee as f64 / new_vsize.max(1) as f64;
+        for pkg in &packages {
+            if projected_total <= self.max_size {
+                return Ok(());
+            }
+            if pkg.contains_new {
+                // The eviction loop would target the new tx. Report the
+                // smallest *surviving* package rate so the caller knows
+                // what the new tx would have to beat to be admitted.
+                let min_surviving = packages
+                    .iter()
+                    .filter(|p| !p.contains_new)
+                    .map(|p| p.pkg_fee as f64 / p.pkg_vsize.max(1) as f64)
+                    .fold(f64::INFINITY, f64::min);
+                let min_pkg_fee_rate = if min_surviving.is_finite() {
+                    min_surviving
+                } else {
+                    0.0
+                };
+                return Err(MempoolError::MempoolFull {
+                    new_fee_rate,
+                    min_pkg_fee_rate,
+                });
+            }
+            projected_total = projected_total.saturating_sub(pkg.pkg_size);
+        }
+
+        // Walked every package and still over cap (only possible if the
+        // new tx's package is the very last one, which the loop above
+        // would already have caught — but be defensive).
+        if projected_total > self.max_size {
+            return Err(MempoolError::MempoolFull {
+                new_fee_rate,
+                min_pkg_fee_rate: 0.0,
+            });
+        }
+        Ok(())
     }
 
     /// Walk the descendant graph of every txid in `roots` and return the
     /// union (roots ∪ all transitive descendants). Used by RBF to compute
     /// the set of mempool txs a replacement would evict.
+    ///
+    /// Early-terminates once the union exceeds `MAX_REPLACEMENT_EVICTIONS`
+    /// — past that point, the caller is going to reject anyway, and
+    /// continuing the walk is a wasted attack surface for crafted-deep
+    /// descendant graphs.
     fn collect_eviction_set(&self, roots: &HashSet<Txid>) -> HashSet<Txid> {
         let mut out: HashSet<Txid> = HashSet::new();
         let mut frontier: VecDeque<Txid> = roots.iter().copied().collect();
         while let Some(txid) = frontier.pop_front() {
             if !out.insert(txid) {
                 continue;
+            }
+            // Early-exit. The caller checks `out.len() > MAX_REPLACEMENT_EVICTIONS`
+            // and rejects, so the additional walk work is wasted. Bound
+            // it explicitly so an adversary can't force unbounded BFS by
+            // crafting a wide descendant graph.
+            if out.len() > MAX_REPLACEMENT_EVICTIONS {
+                return out;
             }
             if let Some(entry) = self.txs.get(&txid) {
                 for d in &entry.descendants {
@@ -550,32 +794,35 @@ impl Mempool {
 
     /// BIP 125 rules 2, 3, 5. Rule 1 (signaling) is intentionally omitted —
     /// we follow Bitcoin Core v28+ full RBF semantics. Rule 4 (eviction
-    /// count) is enforced before this is called.
+    /// count) is enforced before this is called. Rule 5 (no new unconfirmed
+    /// parents) is intentionally **not** enforced here: it would have been
+    /// vacuous given how `parents` is constructed (every entry comes from
+    /// a successful mempool lookup in Phase 2), and it has been removed
+    /// from the loop instead. Phase 2 already rejects replacements that
+    /// try to spend an output of one of the txs they're replacing
+    /// (`to_evict.contains(prev_txid)` → `MissingInput`), which is the
+    /// only legitimate concern rule 5 was guarding against.
     ///
-    /// * Rule 2 — replacement fee_rate must be strictly higher than every
-    ///   directly-conflicting tx's fee_rate.
+    /// * Rule 2 — replacement fee_rate (sat/vB) must be strictly higher
+    ///   than every directly-conflicting tx's fee_rate. Both sides use
+    ///   *vsize* (virtual bytes), never raw serialized bytes — mixing
+    ///   the two ranks SegWit txs incorrectly.
     /// * Rule 3 — replacement absolute fee must cover the originals' fees
-    ///   *plus* a relay-cost surcharge: `replacement_size * incremental_relay_fee`.
-    /// * Rule 5 — replacement must not introduce any new unconfirmed parents
-    ///   that weren't already a parent of one of the directly-conflicting
-    ///   txs. (Newly-introduced unconfirmed inputs are an attack surface
-    ///   the original BIP 125 paper called out explicitly.)
+    ///   *plus* a relay-cost surcharge: `replacement_vsize * incremental_relay_fee`.
     fn check_bip125(
         &self,
         replacement_fee: u64,
-        replacement_size: usize,
-        replacement_parents: &HashSet<Txid>,
+        replacement_vsize: u64,
         direct_conflicts: &HashSet<Txid>,
         to_evict: &HashSet<Txid>,
     ) -> Result<(), MempoolError> {
         // Rule 2 — replacement fee_rate strictly greater than each direct
-        // conflict's individual fee_rate.
-        let replacement_fee_rate = replacement_fee as f64 / (replacement_size as f64);
+        // conflict's individual fee_rate. Both sides use sat/vB so SegWit
+        // discount is applied symmetrically.
+        let replacement_fee_rate = replacement_fee as f64 / replacement_vsize as f64;
         for txid in direct_conflicts {
             let entry = self.txs.get(txid).expect("direct conflict must exist");
-            // Compare against the per-byte rate (sat/byte, not vbyte) so
-            // both sides use the same denominator.
-            let conflict_rate = entry.fee as f64 / (entry.size as f64);
+            let conflict_rate = entry.fee as f64 / entry.vsize as f64;
             if replacement_fee_rate <= conflict_rate {
                 return Err(MempoolError::ReplacementFeeTooLow {
                     replacement: replacement_fee_rate,
@@ -585,16 +832,22 @@ impl Mempool {
         }
 
         // Rule 3 — total fee must cover the *entire* eviction set's fees
-        // plus the relay cost of the replacement.
-        let evicted_fee_total: u64 = to_evict
-            .iter()
-            .map(|t| self.txs.get(t).map(|e| e.fee).unwrap_or(0))
-            .sum();
+        // plus the relay cost of the replacement. Surcharge uses vsize
+        // (the same denomination Bitcoin Core's incremental_relay_feerate
+        // is expressed in).
+        let mut evicted_fee_total: u64 = 0;
+        for t in to_evict {
+            if let Some(e) = self.txs.get(t) {
+                evicted_fee_total = evicted_fee_total
+                    .checked_add(e.fee)
+                    .ok_or(MempoolError::MathOverflow)?;
+            }
+        }
         let relay_surcharge =
-            (replacement_size as f64 * INCREMENTAL_RELAY_FEE_RATE).ceil() as u64;
+            (replacement_vsize as f64 * INCREMENTAL_RELAY_FEE_RATE).ceil() as u64;
         let required_fee = evicted_fee_total
             .checked_add(relay_surcharge)
-            .ok_or(MempoolError::Inflation)?;
+            .ok_or(MempoolError::MathOverflow)?;
         if replacement_fee < required_fee {
             return Err(MempoolError::ReplacementFeeInsufficient {
                 provided: replacement_fee,
@@ -602,21 +855,6 @@ impl Mempool {
                 evicted_fee_total,
                 relay_surcharge,
             });
-        }
-
-        // Rule 5 — replacement's *direct* unconfirmed parents must be a
-        // subset of the union of the directly-conflicting txs' direct
-        // parents. New unconfirmed inputs are forbidden.
-        let mut allowed_parents: HashSet<Txid> = HashSet::new();
-        for txid in direct_conflicts {
-            if let Some(entry) = self.txs.get(txid) {
-                allowed_parents.extend(entry.parents.iter().copied());
-            }
-        }
-        for parent in replacement_parents {
-            if !allowed_parents.contains(parent) {
-                return Err(MempoolError::ReplacementAddsNewUnconfirmedInput { parent: *parent });
-            }
         }
 
         Ok(())
@@ -728,8 +966,8 @@ impl Mempool {
                 if descendant.ancestors.remove(txid) {
                     descendant.ancestor_fee =
                         descendant.ancestor_fee.saturating_sub(entry.fee);
-                    descendant.ancestor_size =
-                        descendant.ancestor_size.saturating_sub(entry.size);
+                    descendant.ancestor_vsize =
+                        descendant.ancestor_vsize.saturating_sub(entry.vsize);
                 }
                 descendant.parents.remove(txid);
             }
@@ -798,29 +1036,46 @@ impl Mempool {
     }
 
     /// Remove expired transactions (older than 14 days).
+    ///
+    /// Cascades through descendants: an expired tx's children depend on
+    /// outputs that no longer exist anywhere, so they cannot survive
+    /// independently. Without the cascade we'd leave orphaned children
+    /// in the pool whose `parents` set references a vanished entry,
+    /// breaking graph invariants and any future replacement attempt.
     pub fn expire_old(&mut self) {
-        let expired: Vec<Txid> = self
+        let expired_roots: Vec<Txid> = self
             .txs
             .iter()
             .filter(|(_, e)| e.added_at.elapsed() > MAX_TX_AGE)
             .map(|(txid, _)| *txid)
             .collect();
 
-        for txid in &expired {
-            self.remove_tx(txid);
+        let mut total_removed = 0usize;
+        for txid in &expired_roots {
+            // An earlier iteration's cascade may have already removed
+            // this tx. Skip silently in that case.
+            if self.txs.contains_key(txid) {
+                total_removed += self.evict_with_descendants(txid);
+            }
         }
-        if !expired.is_empty() {
-            info!("Mempool: expired {} old transactions", expired.len());
+        if total_removed > 0 {
+            info!(
+                "Mempool: expired {} txs ({} expired roots, {} cascaded descendants)",
+                total_removed,
+                expired_roots.len(),
+                total_removed - expired_roots.len().min(total_removed),
+            );
         }
     }
 
     /// Package-aware capacity eviction.
     ///
     /// For each *root* tx (one with no surviving ancestors in the
-    /// mempool), compute the cumulative fee rate of the entire descendant
-    /// package — `(self.fee + Σ descendant.fee) / (self.size + Σ descendant.size)`.
-    /// Pick the root with the lowest package fee rate and evict it together
-    /// with every descendant via `evict_with_descendants`.
+    /// mempool), compute the cumulative virtual fee rate of the entire
+    /// descendant package — `(self.fee + Σ descendant.fee) / (self.vsize +
+    /// Σ descendant.vsize)`. Pick the root with the lowest package fee
+    /// rate and evict it together with every descendant via
+    /// `evict_with_descendants`.
     ///
     /// Why root-only: a low-fee parent with high-fee children should not
     /// be evicted (the children pay for it). Roots are the natural eviction
@@ -832,26 +1087,29 @@ impl Mempool {
     /// `accept_tx_internal` to detect a stuck state).
     fn evict_lowest_package(&mut self) -> bool {
         // A "root" is a tx with no ancestors in the mempool. Every
-    // package is rooted at one or more roots; an eviction starting at any
-    // root removes the smallest meaningful package.
+        // package is rooted at one or more roots; an eviction starting at
+        // any root removes the smallest meaningful package.
         let mut worst_root: Option<(Txid, f64)> = None;
         for (txid, entry) in &self.txs {
             if !entry.ancestors.is_empty() {
                 continue;
             }
-            // Package = self + all descendants.
+            // Package = self + all descendants. Use vsize so the
+            // selection criterion matches the per-tx fee_rate (sat/vB)
+            // and CPFP packages with high-fee children outrank unrelated
+            // standalone txs at the same raw fee.
             let mut pkg_fee = entry.fee;
-            let mut pkg_size = entry.size;
+            let mut pkg_vsize = entry.vsize;
             for d in &entry.descendants {
                 if let Some(de) = self.txs.get(d) {
                     pkg_fee = pkg_fee.saturating_add(de.fee);
-                    pkg_size = pkg_size.saturating_add(de.size);
+                    pkg_vsize = pkg_vsize.saturating_add(de.vsize);
                 }
             }
-            if pkg_size == 0 {
+            if pkg_vsize == 0 {
                 continue;
             }
-            let pkg_rate = pkg_fee as f64 / pkg_size as f64;
+            let pkg_rate = pkg_fee as f64 / pkg_vsize as f64;
             match worst_root {
                 None => worst_root = Some((*txid, pkg_rate)),
                 Some((_, best_rate)) if pkg_rate < best_rate => {
@@ -902,7 +1160,20 @@ pub enum MempoolError {
     ImmatureCoinbase { input_index: usize, coinbase_height: u32 },
     ScriptFailure { input_index: usize, error: String },
     Inflation,
+    /// Arithmetic overflow during fee/size accounting. Distinct from
+    /// `Inflation` (outputs > inputs) — this is a checked-arithmetic
+    /// failure that can only occur for adversarial or malformed values.
+    MathOverflow,
     InsufficientFee { fee_rate: f64, min_rate: f64 },
+    /// Absolute fee exceeds the wallet-safety ceiling (`ABSURD_FEE_THRESHOLD`).
+    AbsurdFee { fee: u64, limit: u64 },
+    /// Mempool is at capacity and the incoming tx (or its package) has a
+    /// low enough fee rate that the post-insertion eviction loop would
+    /// take it back out — possibly evicting unrelated innocent txs along
+    /// the way. Rejected pre-mutation by the Phase 6.5 admission guard.
+    /// `min_pkg_fee_rate` is the lowest surviving package rate the new tx
+    /// would have to beat to displace something else.
+    MempoolFull { new_fee_rate: f64, min_pkg_fee_rate: f64 },
     OversizedTx { weight: u64 },
     DustOutput { index: usize, amount: u64 },
     NonStandardScript { index: usize },
@@ -910,7 +1181,7 @@ pub enum MempoolError {
     UtxoLookup(String),
     // CPFP / ancestor tracking (ticket 010)
     TooManyAncestors { count: usize, limit: usize },
-    AncestorSetTooLarge { vbytes: usize, limit: usize },
+    AncestorSetTooLarge { vbytes: u64, limit: u64 },
     TooManyDescendants { ancestor: Txid, count: usize, limit: usize },
     // BIP 125 RBF (ticket 009)
     TooManyReplacements { evicted: usize, limit: usize },
@@ -921,7 +1192,6 @@ pub enum MempoolError {
         evicted_fee_total: u64,
         relay_surcharge: u64,
     },
-    ReplacementAddsNewUnconfirmedInput { parent: Txid },
 }
 
 impl std::fmt::Display for MempoolError {
@@ -944,11 +1214,31 @@ impl std::fmt::Display for MempoolError {
                 write!(f, "script validation failed for input {}: {}", input_index, error)
             }
             MempoolError::Inflation => write!(f, "outputs exceed inputs"),
+            MempoolError::MathOverflow => {
+                write!(f, "arithmetic overflow in fee or size accounting")
+            }
             MempoolError::InsufficientFee { fee_rate, min_rate } => {
                 write!(
                     f,
                     "fee rate {:.2} sat/vB below minimum {:.2}",
                     fee_rate, min_rate
+                )
+            }
+            MempoolError::AbsurdFee { fee, limit } => {
+                write!(
+                    f,
+                    "absolute fee {} sats exceeds safety ceiling {} sats",
+                    fee, limit
+                )
+            }
+            MempoolError::MempoolFull {
+                new_fee_rate,
+                min_pkg_fee_rate,
+            } => {
+                write!(
+                    f,
+                    "mempool full: tx fee rate {:.2} sat/vB does not exceed lowest surviving package rate {:.2} sat/vB",
+                    new_fee_rate, min_pkg_fee_rate
                 )
             }
             MempoolError::OversizedTx { weight } => {
@@ -1013,13 +1303,6 @@ impl std::fmt::Display for MempoolError {
                 "replacement fee {} below required {} (evicted={} + relay_surcharge={})",
                 provided, required, evicted_fee_total, relay_surcharge
             ),
-            MempoolError::ReplacementAddsNewUnconfirmedInput { parent } => {
-                write!(
-                    f,
-                    "replacement introduces new unconfirmed parent {} (BIP 125 rule 5)",
-                    parent
-                )
-            }
         }
     }
 }
@@ -1243,7 +1526,7 @@ mod tests {
         assert!(child_entry.ancestors.contains(&parent_txid));
         assert!(child_entry.parents.contains(&parent_txid));
         assert_eq!(child_entry.ancestor_fee, parent_entry.fee);
-        assert_eq!(child_entry.ancestor_size, parent_entry.size);
+        assert_eq!(child_entry.ancestor_vsize, parent_entry.vsize);
     }
 
     #[test]
@@ -1341,14 +1624,14 @@ mod tests {
         let a_entry = pool.txs.get(&a_txid).unwrap();
         let b_entry = pool.txs.get(&b_txid).unwrap();
         let c_entry = pool.txs.get(&c_txid).unwrap();
-        // ancestor_fee/size sums each ancestor once.
+        // ancestor_fee/vsize sums each ancestor once.
         assert_eq!(
             d_entry.ancestor_fee,
             a_entry.fee + b_entry.fee + c_entry.fee
         );
         assert_eq!(
-            d_entry.ancestor_size,
-            a_entry.size + b_entry.size + c_entry.size
+            d_entry.ancestor_vsize,
+            a_entry.vsize + b_entry.vsize + c_entry.vsize
         );
     }
 
@@ -1390,9 +1673,13 @@ mod tests {
         // A produces MAX_DESCENDANTS outputs. We accept MAX_DESCENDANTS - 1
         // children spending one each. The next child would push A's
         // descendant count over the limit.
+        //
+        // Sizing note: keep A's fee comfortably below ABSURD_FEE_THRESHOLD
+        // (10 BTC). Outputs sum to ~75 M sats; root UTXO is sized to make
+        // A's fee a tidy 10 k sats.
         let (utxo, _dir) = fresh_utxo();
         let root = seed_txid(1);
-        seed_utxo(&utxo, root, 0, 100_000_000);
+        seed_utxo(&utxo, root, 0, 75_010_000);
 
         let mut pool = Mempool::new();
         // A has MAX_DESCENDANTS outputs of 3,000,000 each.
@@ -1438,9 +1725,9 @@ mod tests {
 
         let c_before = pool.txs.get(&c_txid).unwrap();
         let b_fee = pool.txs.get(&b_txid).unwrap().fee;
-        let b_size = pool.txs.get(&b_txid).unwrap().size;
+        let b_vsize = pool.txs.get(&b_txid).unwrap().vsize;
         let original_ancestor_fee = c_before.ancestor_fee;
-        let original_ancestor_size = c_before.ancestor_size;
+        let original_ancestor_vsize = c_before.ancestor_vsize;
 
         assert!(pool.remove_tx(&b_txid));
 
@@ -1451,7 +1738,7 @@ mod tests {
         assert!(c_after.ancestors.contains(&a_txid));
         assert!(!c_after.parents.contains(&b_txid));
         assert_eq!(c_after.ancestor_fee, original_ancestor_fee - b_fee);
-        assert_eq!(c_after.ancestor_size, original_ancestor_size - b_size);
+        assert_eq!(c_after.ancestor_vsize, original_ancestor_vsize - b_vsize);
 
         // A should no longer count B as a descendant.
         let a_after = pool.txs.get(&a_txid).unwrap();
@@ -1531,7 +1818,7 @@ mod tests {
         assert!(!b_entry.ancestors.contains(&a_txid));
         assert!(!b_entry.parents.contains(&a_txid));
         assert_eq!(b_entry.ancestor_fee, 0);
-        assert_eq!(b_entry.ancestor_size, 0);
+        assert_eq!(b_entry.ancestor_vsize, 0);
     }
 
     // ── Ticket 9: BIP 125 RBF ──────────────────────────────────────────
@@ -1647,11 +1934,19 @@ mod tests {
     }
 
     #[test]
-    fn rbf_rejects_replacement_introducing_new_unconfirmed_parent() {
-        // Setup: P1, P2 are both unconfirmed parents.
-        // Original A spends an output of P1 only.
-        // Replacement A' spends the same output of P1 *and* an output of P2.
-        // BIP 125 rule 5: A' adds P2 as a new unconfirmed parent → reject.
+    fn rbf_allows_replacement_with_existing_mempool_parent() {
+        // The original BIP 125 "rule 5" forbade a replacement from adding
+        // any new unconfirmed parent that wasn't already a parent of one
+        // of the directly-conflicting txs. We've intentionally relaxed
+        // that: as long as every parent already exists in the mempool,
+        // the replacement doesn't introduce *new* unconfirmed dependency
+        // — only rearranges who depends on whom. The legitimate concern
+        // (replacement spending an output of the tx it's replacing) is
+        // caught earlier in Phase 2.
+        //
+        // Setup: P1, P2 both in mempool. A spends P1.0 only. A' spends
+        // P1.0 (the conflict) and P2.0 (a parent that already exists in
+        // the mempool but wasn't a parent of A). Expected: A' is accepted.
         let (utxo, _dir) = fresh_utxo();
         let r1 = seed_txid(1);
         let r2 = seed_txid(2);
@@ -1659,7 +1954,8 @@ mod tests {
         seed_utxo(&utxo, r2, 0, 1_000_000);
 
         let mut pool = Mempool::new();
-        // P1 has two outputs so we can spend one (in A) and another (in A').
+        // P1 has two outputs so we can spend one (in A) and the other
+        // (left untouched, just to ensure P1 stays in the mempool).
         let p1 = make_tx(&[(r1, 0)], &[400_000, 400_000]);
         let p1_txid = pool.accept_tx_test(p1, &utxo, TEST_HEIGHT).unwrap();
         let p2 = make_tx(&[(r2, 0)], &[990_000]);
@@ -1667,19 +1963,21 @@ mod tests {
 
         // A spends P1.0 only.
         let a = make_tx_marked(&[(p1_txid, 0)], &[390_000], 0xa);
-        pool.accept_tx_test(a, &utxo, TEST_HEIGHT).unwrap();
+        let a_txid = pool.accept_tx_test(a, &utxo, TEST_HEIGHT).unwrap();
 
-        // A' spends P1.0 (conflict) AND P2.0 (NEW unconfirmed parent).
-        let a_prime = make_tx_marked(
-            &[(p1_txid, 0), (p2_txid, 0)],
-            &[1_300_000],
-            0xb,
-        );
-        let err = pool.accept_tx_test(a_prime, &utxo, TEST_HEIGHT).unwrap_err();
-        assert!(matches!(
-            err,
-            MempoolError::ReplacementAddsNewUnconfirmedInput { .. }
-        ));
+        // A' spends P1.0 (RBF conflict with A) AND P2.0 (parent already
+        // in mempool). It pays a much higher absolute fee.
+        let a_prime = make_tx_marked(&[(p1_txid, 0), (p2_txid, 0)], &[1_300_000], 0xb);
+        let a_prime_txid = pool
+            .accept_tx_test(a_prime, &utxo, TEST_HEIGHT)
+            .expect("loosened BIP 125 should accept replacement with existing-mempool parent");
+
+        assert!(pool.contains(&a_prime_txid));
+        assert!(!pool.contains(&a_txid));
+        // P2 is now a parent of A'.
+        let a_prime_entry = pool.txs.get(&a_prime_txid).unwrap();
+        assert!(a_prime_entry.parents.contains(&p2_txid));
+        assert!(a_prime_entry.parents.contains(&p1_txid));
     }
 
     #[test]
@@ -1757,5 +2055,179 @@ mod tests {
         assert!(!pool.contains(&x_txid));
         assert!(!pool.contains(&y_txid));
         assert_eq!(pool.count(), 1);
+    }
+
+    // ── Code-review fixes (Phase 6.5 admission, absurd fee, expire cascade) ──
+
+    #[test]
+    fn absurd_fee_rejected() {
+        // Burning the entire input as fees should trip the anti-foot-shoot
+        // ceiling. The threshold is 10 BTC; we make the input bigger than
+        // that and the output negligible to push fee well over the cap.
+        let (utxo, _dir) = fresh_utxo();
+        let parent = seed_txid(1);
+        seed_utxo(&utxo, parent, 0, 20 * 100_000_000); // 20 BTC
+
+        let mut pool = Mempool::new();
+        // Output of 1000 sats; fee = 20 BTC - 1000 sats > 10 BTC ceiling.
+        let tx = make_tx(&[(parent, 0)], &[1000]);
+        let err = pool.accept_tx_test(tx, &utxo, TEST_HEIGHT).unwrap_err();
+        assert!(matches!(
+            err,
+            MempoolError::AbsurdFee { fee, limit }
+                if fee > limit && limit == 10_000_000
+        ));
+    }
+
+    #[test]
+    fn capacity_admission_rejects_low_fee_tx_at_full_pool() {
+        // Pool is at capacity with a high-rate tx. A low-rate tx that
+        // would force eviction must be rejected by Phase 6.5 admission
+        // *before* the high-rate tx is touched. The bug being guarded
+        // against: pre-Phase-6.5 the post-mutation eviction loop would
+        // sometimes evict the new tx and return Err, but if any innocent
+        // package was evicted in an earlier loop iteration first, that
+        // damage was permanent.
+        let (utxo, _dir) = fresh_utxo();
+        let r1 = seed_txid(1);
+        let r2 = seed_txid(2);
+        seed_utxo(&utxo, r1, 0, 1_000_000);
+        seed_utxo(&utxo, r2, 0, 1_000_000);
+
+        // Tight cap that fits exactly one ~62-byte tx.
+        let mut pool = Mempool::with_max_size(70);
+
+        // High-rate incumbent: low output → high fee per byte.
+        let high = make_tx_marked(&[(r1, 0)], &[100_000], 0xa);
+        let high_txid = pool.accept_tx_test(high, &utxo, TEST_HEIGHT).unwrap();
+        assert!(pool.contains(&high_txid));
+
+        // Low-rate intruder: high output → low fee per byte. Total size
+        // after insertion exceeds cap, so the eviction loop has to drop
+        // something. Phase 6.5 should detect that the intruder is the
+        // worst-rate package and reject pre-mutation.
+        let low = make_tx_marked(&[(r2, 0)], &[990_000], 0xb);
+        let err = pool.accept_tx_test(low, &utxo, TEST_HEIGHT).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::MempoolFull { .. }),
+            "expected MempoolFull, got {:?}",
+            err
+        );
+
+        // Innocent high-rate tx must be untouched. This is the
+        // "no collateral damage" guarantee.
+        assert!(pool.contains(&high_txid));
+        assert_eq!(pool.count(), 1);
+    }
+
+    #[test]
+    fn capacity_admission_accepts_high_fee_tx_at_full_pool() {
+        // Mirror of the above: a high-rate intruder *should* displace a
+        // low-rate incumbent. Phase 6.5 must NOT reject in this case.
+        let (utxo, _dir) = fresh_utxo();
+        let r1 = seed_txid(1);
+        let r2 = seed_txid(2);
+        seed_utxo(&utxo, r1, 0, 1_000_000);
+        seed_utxo(&utxo, r2, 0, 1_000_000);
+
+        let mut pool = Mempool::with_max_size(70);
+
+        // Low-rate incumbent.
+        let low = make_tx_marked(&[(r1, 0)], &[990_000], 0xa);
+        let low_txid = pool.accept_tx_test(low, &utxo, TEST_HEIGHT).unwrap();
+
+        // High-rate intruder.
+        let high = make_tx_marked(&[(r2, 0)], &[100_000], 0xb);
+        let high_txid = pool.accept_tx_test(high, &utxo, TEST_HEIGHT).unwrap();
+
+        assert!(pool.contains(&high_txid));
+        assert!(!pool.contains(&low_txid));
+    }
+
+    #[test]
+    fn expire_old_cascades_to_descendants() {
+        // A → B → C in mempool. Manually age A past MAX_TX_AGE; expire_old
+        // should cascade and remove B and C as well, since they depend on
+        // A's outputs which would otherwise dangle.
+        let (utxo, _dir) = fresh_utxo();
+        let root = seed_txid(1);
+        seed_utxo(&utxo, root, 0, 1_000_000);
+
+        let mut pool = Mempool::new();
+        let a = make_tx(&[(root, 0)], &[990_000]);
+        let a_txid = pool.accept_tx_test(a, &utxo, TEST_HEIGHT).unwrap();
+        let b = make_tx(&[(a_txid, 0)], &[980_000]);
+        let b_txid = pool.accept_tx_test(b, &utxo, TEST_HEIGHT).unwrap();
+        let c = make_tx(&[(b_txid, 0)], &[970_000]);
+        let c_txid = pool.accept_tx_test(c, &utxo, TEST_HEIGHT).unwrap();
+        assert_eq!(pool.count(), 3);
+
+        // Forge A's added_at to be older than the expiry window.
+        let stale = Instant::now()
+            .checked_sub(MAX_TX_AGE + std::time::Duration::from_secs(60))
+            .expect("test machine clock should be far enough into uptime");
+        pool.txs.get_mut(&a_txid).unwrap().added_at = stale;
+
+        pool.expire_old();
+
+        // The cascade should have removed all three.
+        assert!(!pool.contains(&a_txid));
+        assert!(!pool.contains(&b_txid));
+        assert!(!pool.contains(&c_txid));
+        assert_eq!(pool.count(), 0);
+    }
+
+    #[test]
+    fn vsize_used_for_fee_rate_not_raw_bytes() {
+        // Sanity check that fee_rate is computed against vsize. Our test
+        // helper builds non-witness txs, so vsize == size, but the
+        // semantics are: fee_rate = fee / vsize. Confirm the stored
+        // fee_rate matches that math.
+        let (utxo, _dir) = fresh_utxo();
+        let parent = seed_txid(1);
+        seed_utxo(&utxo, parent, 0, 100_000);
+
+        let mut pool = Mempool::new();
+        let tx = make_tx(&[(parent, 0)], &[90_000]);
+        let txid = pool.accept_tx_test(tx, &utxo, TEST_HEIGHT).unwrap();
+        let entry = pool.txs.get(&txid).unwrap();
+        let expected_rate = entry.fee as f64 / entry.vsize as f64;
+        assert!(
+            (entry.fee_rate - expected_rate).abs() < 1e-9,
+            "fee_rate should be fee/vsize: got {} expected {}",
+            entry.fee_rate,
+            expected_rate
+        );
+    }
+
+    #[test]
+    fn missing_input_when_parent_in_evict_set() {
+        // RBF setup where the replacement tries to spend an output of
+        // the very tx it's replacing — must be MissingInput, not a
+        // successful chained spend. This was already correct behavior
+        // but is worth pinning down with a regression test now that the
+        // accept loop is in flux.
+        let (utxo, _dir) = fresh_utxo();
+        let root = seed_txid(1);
+        seed_utxo(&utxo, root, 0, 1_000_000);
+
+        let mut pool = Mempool::new();
+        // Original A spends `root`, produces an output.
+        let a = make_tx_marked(&[(root, 0)], &[900_000], 0xa);
+        let a_txid = pool.accept_tx_test(a, &utxo, TEST_HEIGHT).unwrap();
+
+        // Replacement A' spends `root` (RBF conflict with A) and *also*
+        // tries to spend a.0 — but A is in `to_evict`, so a.0 should
+        // resolve as MissingInput rather than as a chained mempool spend.
+        let a_prime = make_tx_marked(&[(root, 0), (a_txid, 0)], &[1_700_000], 0xb);
+        let err = pool.accept_tx_test(a_prime, &utxo, TEST_HEIGHT).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::MissingInput { txid, .. } if txid == a_txid),
+            "expected MissingInput on a_txid, got {:?}",
+            err
+        );
+
+        // A is still in the mempool — the rejection happened pre-mutation.
+        assert!(pool.contains(&a_txid));
     }
 }

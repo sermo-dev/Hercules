@@ -1598,6 +1598,16 @@ impl HeaderSync {
     }
 
     /// Handle an incoming transaction — validate and add to mempool.
+    //
+    // Known race: `validated_height` is read here without holding the
+    // mempool lock, so a block could be applied between the read and
+    // `accept_tx`'s coinbase-maturity / nLockTime checks. The window is
+    // at most one block, and the worst case is a spurious `NonFinal` or
+    // `ImmatureCoinbase` rejection of a tx the peer can re-submit.
+    // Closing the window properly requires either an `Arc<AtomicU32>`
+    // shared with block validation or atomic acquisition of both the
+    // header-store and mempool locks. Deferred until the inbound peer
+    // path lands and we have a clearer picture of locking ordering.
     fn handle_tx(&self, addr: &str, tx: bitcoin::Transaction) -> Result<(), String> {
         let validated_height = self.store.validated_height().unwrap_or(0);
 
