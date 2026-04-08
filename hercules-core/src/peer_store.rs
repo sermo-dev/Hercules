@@ -23,6 +23,24 @@ pub struct PeerStore {
 #[derive(Debug, Clone)]
 pub struct PeerStoreError(pub String);
 
+/// On-disk record for a known peer address. The in-memory `AddrManager`
+/// holds the same fields as `Instant`s; we convert at the boundary because
+/// `Instant` is monotonic and meaningless across process restarts.
+///
+/// `source` records *how* we first learned about an address ("dns",
+/// "gossip", "inbound", or "manual") for diagnostics — eviction and
+/// candidate selection don't read it, but it makes peer-discovery bugs
+/// far easier to investigate from the SQLite shell.
+#[derive(Debug, Clone)]
+pub struct AddrRecord {
+    pub addr: String,
+    pub first_seen: u64,
+    pub last_tried: Option<u64>,
+    pub last_success: Option<u64>,
+    pub failure_count: u32,
+    pub source: String,
+}
+
 impl std::fmt::Display for PeerStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PeerStoreError: {}", self.0)
@@ -53,6 +71,16 @@ impl PeerStore {
                 addr TEXT PRIMARY KEY,
                 expiry_unix INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS known_addrs (
+                addr TEXT PRIMARY KEY,
+                first_seen INTEGER NOT NULL,
+                last_tried INTEGER,
+                last_success INTEGER,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS known_addrs_last_success
+                ON known_addrs(last_success);
             ",
         )
         .map_err(|e| PeerStoreError(format!("create tables: {}", e)))?;
@@ -187,6 +215,103 @@ impl PeerStore {
             .map_err(|e| PeerStoreError(format!("commit: {}", e)))?;
         Ok(out)
     }
+
+    /// Persist (or upsert) a batch of known addresses in a single transaction.
+    /// Used by `PeerPool::flush_addrs` so a busy session isn't writing on
+    /// every gossip message — same pattern as `save_scores_bulk`. Empty input
+    /// is a no-op.
+    pub fn save_addrs_bulk(&self, records: &[AddrRecord]) -> Result<(), PeerStoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| PeerStoreError(format!("begin tx: {}", e)))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO known_addrs
+                        (addr, first_seen, last_tried, last_success, failure_count, source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(addr) DO UPDATE SET
+                        first_seen = excluded.first_seen,
+                        last_tried = excluded.last_tried,
+                        last_success = excluded.last_success,
+                        failure_count = excluded.failure_count,
+                        source = excluded.source",
+                )
+                .map_err(|e| PeerStoreError(format!("prepare: {}", e)))?;
+            for r in records {
+                stmt.execute(params![
+                    r.addr,
+                    r.first_seen as i64,
+                    r.last_tried.map(|t| t as i64),
+                    r.last_success.map(|t| t as i64),
+                    r.failure_count as i64,
+                    r.source,
+                ])
+                .map_err(|e| PeerStoreError(format!("save addr: {}", e)))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| PeerStoreError(format!("commit: {}", e)))?;
+        Ok(())
+    }
+
+    /// Load all known addresses. Called once at `PeerPool::new` to hydrate
+    /// the in-memory `AddrManager` before falling back to DNS.
+    pub fn load_all_addrs(&self) -> Result<Vec<AddrRecord>, PeerStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT addr, first_seen, last_tried, last_success, failure_count, source
+                 FROM known_addrs",
+            )
+            .map_err(|e| PeerStoreError(format!("prepare: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(AddrRecord {
+                    addr: row.get::<_, String>(0)?,
+                    first_seen: row.get::<_, i64>(1)? as u64,
+                    last_tried: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    last_success: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    failure_count: row.get::<_, i64>(4)? as u32,
+                    source: row.get::<_, String>(5)?,
+                })
+            })
+            .map_err(|e| PeerStoreError(format!("query: {}", e)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| PeerStoreError(format!("row: {}", e)))?);
+        }
+        Ok(out)
+    }
+
+    /// Delete a batch of addresses by key. Called from `flush_addrs` to drop
+    /// rows the in-memory eviction policy chose to discard, so the on-disk
+    /// view stays bounded at MAX_KNOWN_ADDRS. Empty input is a no-op.
+    pub fn delete_addrs_bulk(&self, addrs: &[String]) -> Result<(), PeerStoreError> {
+        if addrs.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| PeerStoreError(format!("begin tx: {}", e)))?;
+        {
+            let mut stmt = tx
+                .prepare("DELETE FROM known_addrs WHERE addr = ?1")
+                .map_err(|e| PeerStoreError(format!("prepare: {}", e)))?;
+            for addr in addrs {
+                stmt.execute(params![addr])
+                    .map_err(|e| PeerStoreError(format!("delete addr: {}", e)))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| PeerStoreError(format!("commit: {}", e)))?;
+        Ok(())
+    }
 }
 
 /// Current Unix timestamp in seconds. Falls back to 0 if the system clock is
@@ -320,5 +445,109 @@ mod tests {
             original.duration_since(recovered)
         };
         assert!(diff < Duration::from_secs(5));
+    }
+
+    fn sample_record(addr: &str) -> AddrRecord {
+        AddrRecord {
+            addr: addr.to_string(),
+            first_seen: 1_700_000_000,
+            last_tried: Some(1_700_000_500),
+            last_success: Some(1_700_000_400),
+            failure_count: 2,
+            source: "gossip".to_string(),
+        }
+    }
+
+    #[test]
+    fn save_addrs_and_load_roundtrip() {
+        let store = fresh_store();
+        let records = vec![sample_record("1.2.3.4:8333"), sample_record("5.6.7.8:8333")];
+        store.save_addrs_bulk(&records).unwrap();
+
+        let loaded = store.load_all_addrs().unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        // Order from SELECT is unspecified — index by addr for the assertions.
+        let by_addr: HashMap<_, _> =
+            loaded.into_iter().map(|r| (r.addr.clone(), r)).collect();
+
+        let a = by_addr.get("1.2.3.4:8333").unwrap();
+        assert_eq!(a.first_seen, 1_700_000_000);
+        assert_eq!(a.last_tried, Some(1_700_000_500));
+        assert_eq!(a.last_success, Some(1_700_000_400));
+        assert_eq!(a.failure_count, 2);
+        assert_eq!(a.source, "gossip");
+    }
+
+    #[test]
+    fn save_addrs_overwrites_existing_entry() {
+        let store = fresh_store();
+        let mut r = sample_record("peer:8333");
+        store.save_addrs_bulk(&[r.clone()]).unwrap();
+
+        // Simulate a successful connection: bump last_success and reset failures.
+        r.last_success = Some(1_700_001_000);
+        r.failure_count = 0;
+        r.source = "dns".to_string();
+        store.save_addrs_bulk(&[r.clone()]).unwrap();
+
+        let loaded = store.load_all_addrs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].last_success, Some(1_700_001_000));
+        assert_eq!(loaded[0].failure_count, 0);
+        assert_eq!(loaded[0].source, "dns");
+    }
+
+    #[test]
+    fn save_addrs_empty_is_noop() {
+        let store = fresh_store();
+        store.save_addrs_bulk(&[]).unwrap();
+        assert!(store.load_all_addrs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_addrs_bulk_removes_only_named_rows() {
+        let store = fresh_store();
+        let records = vec![
+            sample_record("a:8333"),
+            sample_record("b:8333"),
+            sample_record("c:8333"),
+        ];
+        store.save_addrs_bulk(&records).unwrap();
+
+        store
+            .delete_addrs_bulk(&["a:8333".to_string(), "c:8333".to_string()])
+            .unwrap();
+
+        let loaded = store.load_all_addrs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].addr, "b:8333");
+    }
+
+    #[test]
+    fn delete_addrs_empty_is_noop() {
+        let store = fresh_store();
+        store.save_addrs_bulk(&[sample_record("x:8333")]).unwrap();
+        store.delete_addrs_bulk(&[]).unwrap();
+        assert_eq!(store.load_all_addrs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn load_addrs_preserves_null_optional_columns() {
+        // A brand-new gossip address has no last_tried / last_success yet.
+        let store = fresh_store();
+        let r = AddrRecord {
+            addr: "fresh:8333".to_string(),
+            first_seen: 1_700_000_000,
+            last_tried: None,
+            last_success: None,
+            failure_count: 0,
+            source: "gossip".to_string(),
+        };
+        store.save_addrs_bulk(&[r]).unwrap();
+        let loaded = store.load_all_addrs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].last_tried.is_none());
+        assert!(loaded[0].last_success.is_none());
     }
 }

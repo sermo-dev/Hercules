@@ -105,6 +105,11 @@ pub struct Peer {
     their_version: Option<VersionMessage>,
     /// True if this peer connected to us (inbound), false if we connected to them.
     pub inbound: bool,
+    /// True if this peer sent us a `sendaddrv2` during the handshake (BIP 155),
+    /// meaning we should send them BIP 155 `addrv2` messages instead of legacy
+    /// v1 `addr`. Required for advertising our own .onion address — TorV3
+    /// can't be encoded in the v1 form.
+    wants_addrv2: bool,
 }
 
 impl Peer {
@@ -176,6 +181,7 @@ impl Peer {
             addr: addr.to_string(),
             their_version: None,
             inbound: false,
+            wants_addrv2: false,
         };
 
         peer.handshake(our_height)?;
@@ -202,6 +208,7 @@ impl Peer {
             addr: addr.to_string(),
             their_version: None,
             inbound: false,
+            wants_addrv2: false,
         };
 
         peer.handshake(our_height)?;
@@ -220,6 +227,7 @@ impl Peer {
             addr: String::new(), // filled after receiving their version
             their_version: None,
             inbound: true,
+            wants_addrv2: false,
         };
 
         // Receive their version first
@@ -269,9 +277,14 @@ impl Peer {
             relay: true,
         };
         peer.send(NetworkMessage::Version(our_version))?;
+        // BIP 155: announce addrv2 support before our verack. Same rationale
+        // as the outbound path — without this, peers strip our TorV3 self-ad
+        // from gossip and inbound discovery never bootstraps.
+        peer.send(NetworkMessage::SendAddrV2)?;
         peer.send(NetworkMessage::Verack)?;
 
-        // Wait for their verack
+        // Wait for their verack. Track sendaddrv2 here too — the inbound
+        // peer may send it in the same window.
         let mut got_verack = false;
         for _ in 0..10 {
             let msg = peer.receive()?;
@@ -279,6 +292,9 @@ impl Peer {
                 NetworkMessage::Verack => {
                     got_verack = true;
                     break;
+                }
+                NetworkMessage::SendAddrV2 => {
+                    peer.wants_addrv2 = true;
                 }
                 NetworkMessage::Ping(nonce) => {
                     peer.send(NetworkMessage::Pong(nonce))?;
@@ -330,6 +346,14 @@ impl Peer {
         self.send(NetworkMessage::Version(our_version))?;
         debug!("Sent version to {}", self.addr);
 
+        // BIP 155: announce that we accept addrv2. MUST be sent after our
+        // version and before our verack. Sending it immediately after the
+        // version keeps the handshake one round-trip — without it, peers
+        // fall back to legacy v1 `addr` and silently strip our TorV3
+        // self-advertisement out of the gossip mesh.
+        self.send(NetworkMessage::SendAddrV2)?;
+        debug!("Sent sendaddrv2 to {}", self.addr);
+
         // Receive their version and verack (order can vary)
         let mut got_version = false;
         let mut got_verack = false;
@@ -366,6 +390,7 @@ impl Peer {
                 }
                 NetworkMessage::SendAddrV2 => {
                     debug!("Peer {} requested SendAddrV2", self.addr);
+                    self.wants_addrv2 = true;
                 }
                 NetworkMessage::WtxidRelay => {
                     debug!("Peer {} requested WtxidRelay", self.addr);
@@ -570,6 +595,14 @@ impl Peer {
         &self.addr
     }
 
+    /// Whether this peer announced BIP 155 `sendaddrv2` during the
+    /// handshake. Required to know whether `addr` or `addrv2` is the
+    /// correct gossip envelope when sending peer addresses (in particular,
+    /// our own .onion can only be encoded in `addrv2`).
+    pub fn wants_addrv2(&self) -> bool {
+        self.wants_addrv2
+    }
+
     /// Poll for a single incoming message with the given timeout.
     /// Returns `Ok(Some(msg))` if a message was received, `Ok(None)` on timeout,
     /// or `Err` on connection failure. Unlike `idle_wait`, this returns the
@@ -630,6 +663,34 @@ impl Peer {
     /// lifetime; we follow the same pattern.
     pub fn send_getaddr(&mut self) -> Result<(), PeerError> {
         self.send(NetworkMessage::GetAddr)
+    }
+
+    /// Send an unsolicited `addrv2` carrying our own .onion address so this
+    /// peer can relay it onward (and dial us back). This is the smoking-gun
+    /// fix for `inbound_peers = 0` — without it, no other node ever learns
+    /// where to find us. Silently no-ops on peers that didn't negotiate
+    /// addrv2 (BIP 155): the legacy `addr` encoding has no slot for a 32-byte
+    /// pubkey, and silently dropping our self-ad is preferable to advertising
+    /// a fake clearnet address that won't actually accept connections.
+    pub fn send_self_advertisement(
+        &mut self,
+        pubkey: [u8; 32],
+        port: u16,
+    ) -> Result<(), PeerError> {
+        if !self.wants_addrv2 {
+            return Ok(());
+        }
+        let entry = bitcoin::p2p::address::AddrV2Message {
+            time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
+            services: ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            addr: bitcoin::p2p::address::AddrV2::TorV3(pubkey),
+            port,
+        };
+        self.send(NetworkMessage::AddrV2(vec![entry]))
     }
 
     /// Wait for a duration while responding to pings to keep the connection alive.
