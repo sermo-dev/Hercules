@@ -9,8 +9,16 @@ use log::{debug, info};
 
 use crate::utxo::{UtxoEntry, UtxoSet};
 
-/// Default maximum mempool size in bytes (50 MB).
-const DEFAULT_MAX_SIZE: usize = 50_000_000;
+/// Default maximum mempool size in bytes (150 MB).
+///
+/// Halfway between Bitcoin Core's 300 MB default and our previous 50 MB cap.
+/// 150 MB covers the entire historical "normal" mempool occupancy range
+/// (typical mainnet sits at 5–30 MB; mild congestion 50–150 MB) without
+/// adding meaningful iOS memory pressure. During severe fee events the
+/// mempool will still hit the cap and start fee-rate evicting, but those
+/// events are rare and we'd rather pay the eviction cost than risk an iOS
+/// background-kill from a 300 MB resident allocation.
+const DEFAULT_MAX_SIZE: usize = 150_000_000;
 
 /// Minimum relay fee rate in sat/vB.
 const MIN_RELAY_FEE_RATE: f64 = 1.0;
