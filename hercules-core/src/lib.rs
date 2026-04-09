@@ -200,6 +200,31 @@ impl From<sync::BlockNotification> for BlockNotification {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CatchUpStatus {
+    pub caught_up: bool,
+    pub blocks_validated: u32,
+    pub current_height: u32,
+    pub target_height: u32,
+    pub tip_block_hash: String,
+    pub tip_timestamp: u32,
+    pub error: Option<String>,
+}
+
+impl From<sync::CatchUpStatus> for CatchUpStatus {
+    fn from(s: sync::CatchUpStatus) -> Self {
+        CatchUpStatus {
+            caught_up: s.caught_up,
+            blocks_validated: s.blocks_validated,
+            current_height: s.current_height,
+            target_height: s.target_height,
+            tip_block_hash: s.tip_block_hash,
+            tip_timestamp: s.tip_timestamp,
+            error: s.error,
+        }
+    }
+}
+
 // ── Phase 5 types (fully participating node) ──────────────────────
 
 #[derive(Debug, Clone)]
@@ -385,6 +410,27 @@ impl HerculesNode {
         self.syncer
             .validate_latest_block(timeout_secs)
             .map(|n| n.into())
+            .map_err(|e| match e {
+                sync::SyncError::NoPeers => HerculesError::NetworkError {
+                    msg: "no peers found".into(),
+                },
+                sync::SyncError::Peer(s) => HerculesError::NetworkError { msg: s },
+                sync::SyncError::Validation(s) => HerculesError::SyncFailed { msg: s },
+                sync::SyncError::Store(s) => HerculesError::StorageError { msg: s },
+            })
+    }
+
+    /// Budgeted multi-block catch-up for push notification background wakes.
+    /// Validates up to `max_blocks` blocks within `budget_secs`, returning
+    /// partial progress if the budget is exhausted.
+    pub fn catch_up_blocks(
+        &self,
+        max_blocks: u32,
+        budget_secs: u32,
+    ) -> Result<CatchUpStatus, HerculesError> {
+        self.syncer
+            .catch_up_blocks(max_blocks, budget_secs)
+            .map(|s| s.into())
             .map_err(|e| match e {
                 sync::SyncError::NoPeers => HerculesError::NetworkError {
                     msg: "no peers found".into(),

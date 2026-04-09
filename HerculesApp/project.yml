@@ -31,6 +31,9 @@ targets:
       properties:
         UIBackgroundModes:
           - remote-notification
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - dev.sermo.hercules.catchup
     dependencies:
       - framework: ../build/herculesFFI.xcframework
         embed: false

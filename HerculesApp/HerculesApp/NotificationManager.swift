@@ -1,4 +1,5 @@
 import ActivityKit
+import BackgroundTasks
 import Foundation
 import UserNotifications
 import UIKit
@@ -162,24 +163,19 @@ class NotificationManager: ObservableObject {
                 let torDir = Self.torDataDir()
                 let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
 
-                // 25 seconds — leaving 5s margin within the 30s iOS window
-                let result = try node.validateLatestBlock(timeoutSecs: 25)
-                let record = Self.makeRecord(from: result)
+                // 25 seconds, up to 7 blocks — leaving 5s margin within the 30s iOS window
+                let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
+                let record = Self.makeRecord(from: status)
 
-                // Read peer count for the widget. We do this *after* the
-                // validation call rather than concurrently because the FFI
-                // surface is not documented as reentrant from the same
-                // process — better to be cheap and serial inside this
-                // 25-second budget than chase a race.
                 let peerCount = (try? node.getStatus().peers.count) ?? 0
                 SharedNodeStore.publishValidation(
-                    height: result.height,
-                    blockHash: result.blockHash,
+                    height: status.currentHeight,
+                    blockHash: status.tipBlockHash,
                     peerCount: UInt32(peerCount)
                 )
 
                 activityController.finishSuccess(
-                    height: result.height,
+                    height: status.currentHeight,
                     peerCount: UInt32(peerCount)
                 )
 
@@ -187,7 +183,13 @@ class NotificationManager: ObservableObject {
                     self.appendRecord(record)
                 }
 
-                Self.postLocalNotification(for: record)
+                Self.postLocalNotification(for: record, blocksValidated: status.blocksValidated, remaining: status.targetHeight - status.currentHeight)
+
+                // If still behind, request a follow-up wake for accelerated catch-up
+                if !status.caughtUp && status.blocksValidated > 0 {
+                    Self.requestFollowUpWake()
+                }
+
                 completionHandler(.newData)
 
             } catch {
@@ -243,24 +245,24 @@ class NotificationManager: ObservableObject {
                 let torDir = Self.torDataDir()
                 let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
 
-                let result = try node.validateLatestBlock(timeoutSecs: 25)
-                let record = Self.makeRecord(from: result)
+                let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
+                let record = Self.makeRecord(from: status)
 
                 let peerCount = (try? node.getStatus().peers.count) ?? 0
                 SharedNodeStore.publishValidation(
-                    height: result.height,
-                    blockHash: result.blockHash,
+                    height: status.currentHeight,
+                    blockHash: status.tipBlockHash,
                     peerCount: UInt32(peerCount)
                 )
 
                 activityController.finishSuccess(
-                    height: result.height,
+                    height: status.currentHeight,
                     peerCount: UInt32(peerCount)
                 )
 
                 DispatchQueue.main.async {
                     self.appendRecord(record)
-                    Self.postLocalNotification(for: record)
+                    Self.postLocalNotification(for: record, blocksValidated: status.blocksValidated, remaining: status.targetHeight - status.currentHeight)
                     completion(.success(record))
                 }
             } catch {
@@ -293,6 +295,29 @@ class NotificationManager: ObservableObject {
         )
     }
 
+    private static func makeRecord(from status: CatchUpStatus) -> BlockNotificationRecord {
+        let source: NotificationSource
+        if status.caughtUp {
+            source = .fullValidation
+        } else if status.blocksValidated > 0 {
+            source = .catchUpProgress
+        } else {
+            source = .headerOnly
+        }
+        return BlockNotificationRecord(
+            id: UUID(),
+            height: status.currentHeight,
+            blockHash: status.tipBlockHash,
+            timestamp: status.tipTimestamp,
+            timestampHuman: "",
+            validated: status.caughtUp,
+            headerValidated: true,
+            receivedAt: Date(),
+            source: source,
+            validationError: status.error
+        )
+    }
+
     // MARK: - History
 
     private func appendRecord(_ record: BlockNotificationRecord) {
@@ -305,13 +330,21 @@ class NotificationManager: ObservableObject {
 
     // MARK: - Local Notifications
 
-    private static func postLocalNotification(for record: BlockNotificationRecord) {
+    private static func postLocalNotification(
+        for record: BlockNotificationRecord,
+        blocksValidated: UInt32 = 1,
+        remaining: UInt32 = 0
+    ) {
         let content = UNMutableNotificationContent()
 
         switch record.source {
         case .fullValidation:
             content.title = "Block #\(record.height) Validated"
             content.body = "Fully validated with script verification"
+        case .catchUpProgress:
+            let startHeight = record.height - blocksValidated + 1
+            content.title = "Catching up: blocks #\(startHeight)–#\(record.height)"
+            content.body = "\(blocksValidated) blocks validated, \(remaining) remaining"
         case .headerOnly:
             content.title = "Block #\(record.height) Header Verified"
             content.body = "PoW validated, full block validation pending"
@@ -352,6 +385,65 @@ class NotificationManager: ObservableObject {
             return nil
         }
         return PushBlockInfo(height: height, hash: hash, timestamp: timestamp)
+    }
+
+    // MARK: - Background Catch-Up Task
+
+    static let catchUpTaskIdentifier = "dev.sermo.hercules.catchup"
+
+    /// Handle a BGAppRefreshTask for accelerated catch-up after a gap.
+    func handleCatchUpTask(_ task: BGAppRefreshTask) {
+        // Respect the same network policy gate as silent push wakes.
+        guard NetworkPolicy.shared.shouldValidate else {
+            task.setTaskCompleted(success: true)
+            return
+        }
+
+        task.expirationHandler = { /* Rust respects budget_secs */ }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let node = try HerculesNode(
+                    dbPath: Self.dbPath(),
+                    torDataDir: Self.torDataDir()
+                )
+                let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
+
+                // Update widget with new height
+                if status.blocksValidated > 0 {
+                    let peerCount = (try? node.getStatus().peers.count) ?? 0
+                    SharedNodeStore.publishValidation(
+                        height: status.currentHeight,
+                        blockHash: status.tipBlockHash,
+                        peerCount: UInt32(peerCount)
+                    )
+                }
+
+                if !status.caughtUp && status.blocksValidated > 0 {
+                    Self.requestFollowUpWake()
+                }
+
+                let record = Self.makeRecord(from: status)
+                DispatchQueue.main.async {
+                    self.appendRecord(record)
+                }
+
+                task.setTaskCompleted(success: true)
+            } catch {
+                task.setTaskCompleted(success: false)
+            }
+        }
+    }
+
+    /// Request iOS to wake us again soon for continued catch-up.
+    private static func requestFollowUpWake() {
+        let request = BGAppRefreshTaskRequest(identifier: catchUpTaskIdentifier)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 30)
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            // Non-fatal: next natural push wake from APNs will continue catch-up
+        }
     }
 
     // MARK: - Paths

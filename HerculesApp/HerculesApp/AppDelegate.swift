@@ -1,3 +1,4 @@
+import BackgroundTasks
 import Combine
 import UIKit
 import UserNotifications
@@ -38,6 +39,14 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
         // policy + last-known state is correct *now*, not on the next
         // change.
         SharedNodeStore.markPaused(!policy.shouldValidate)
+
+        // Register BGAppRefreshTask for accelerated catch-up after gaps.
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: NotificationManager.catchUpTaskIdentifier,
+            using: nil
+        ) { task in
+            NotificationManager.shared.handleCatchUpTask(task as! BGAppRefreshTask)
+        }
 
         return true
     }
