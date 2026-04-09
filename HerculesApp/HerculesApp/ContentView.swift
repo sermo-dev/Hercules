@@ -92,6 +92,12 @@ class NodeViewModel: ObservableObject {
     // Continuation that the download flow awaits while the download runs.
     private var downloadWaiter: ((Result<URL, Error>) -> Void)?
 
+    /// Tracks the last block height we wrote to the App Group container so
+    /// the home-screen widget gets a single republish per validated block
+    /// instead of one per `SyncProgressCallback` tick. Per-tick writes
+    /// would burn the WidgetKit reload budget within minutes.
+    private var lastPublishedHeight: UInt32 = 0
+
     init() {
         // Mirror SnapshotDownloader's @Published state into ours so the UI
         // observing NodeViewModel sees download progress without depending on
@@ -121,6 +127,31 @@ class NodeViewModel: ObservableObject {
             .autoconnect()
             .sink { [weak self] _ in self?.pollParticipationStats() }
             .store(in: &downloadCancellables)
+    }
+
+    /// Publish a fresh `SharedNodeState` to the App Group container so the
+    /// home-screen widget reflects the current tip. Gated on
+    /// `validatedBlocks` actually advancing — we don't want to spend
+    /// WidgetKit reload budget on the dozens of header-sync ticks per
+    /// second. Always called on the main thread; cheap (one JSON encode +
+    /// one atomic file write + one WidgetCenter nudge).
+    func maybePublishWidgetState(from status: SyncStatus) {
+        guard status.validatedBlocks > lastPublishedHeight else { return }
+        // We don't have a per-block hash in `SyncStatus` (the chain tip
+        // hash isn't on the struct). Leave it empty for the foreground
+        // path; the silent-push path is the one that has the canonical
+        // BlockNotification with hash bytes, and it republishes through
+        // `publishValidation` directly.
+        SharedNodeStore.write(SharedNodeState(
+            blockHeight: status.validatedBlocks,
+            blockHash: "",
+            lastBlockTime: Date(),
+            peerCount: UInt32(status.peers.count),
+            isAwake: false,
+            isPaused: false,
+            updatedAt: Date()
+        ))
+        lastPublishedHeight = status.validatedBlocks
     }
 
     /// Read mempool + node-status from the live HerculesNode. Off main thread
@@ -371,6 +402,7 @@ class NodeViewModel: ObservableObject {
                         self?.syncStatus = status
                         self?.isConnecting = false
                         self?.errorMessage = status.error
+                        self?.maybePublishWidgetState(from: status)
                     }
                 }
 
@@ -462,6 +494,7 @@ class SnapshotProgressCallback: SnapshotCallback {
 
 struct ContentView: View {
     @StateObject private var viewModel = NodeViewModel()
+    @ObservedObject private var networkPolicy = NetworkPolicy.shared
     @State private var showSettings = false
     @State private var showAbout = false
 
@@ -499,6 +532,14 @@ struct ContentView: View {
                                 }
 
                                 Spacer()
+
+                                Button(action: { showSettings = true }) {
+                                    Image(systemName: networkIconName)
+                                        .font(.system(size: 15))
+                                        .foregroundStyle(networkIconColor)
+                                        .padding(8)
+                                }
+                                .accessibilityLabel(networkIconAccessibilityLabel)
 
                                 Button(action: { showSettings = true }) {
                                     Image(systemName: "gearshape.fill")
@@ -594,6 +635,42 @@ struct ContentView: View {
         }
         .toolbarBackground(Theme.bg, for: .navigationBar)
         .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Network Indicator
+
+    /// SF Symbol for the header-bar network status icon. Reflects the live
+    /// `NetworkPolicy.indicator` value, so the user gets immediate feedback
+    /// when they toggle Wi-Fi, plug into a hotspot, or flip the cellular
+    /// preference in Settings.
+    private var networkIconName: String {
+        switch networkPolicy.indicator {
+        case .unmetered: return "wifi"
+        case .meteredAllowed: return "antenna.radiowaves.left.and.right"
+        case .meteredBlocked: return "antenna.radiowaves.left.and.right.slash"
+        case .offline: return "wifi.slash"
+        }
+    }
+
+    /// Color follows the same green/yellow/red convention as the rest of
+    /// the app: green = free to validate, yellow = validating with metered
+    /// opt-in (heads-up), red = validation paused.
+    private var networkIconColor: Color {
+        switch networkPolicy.indicator {
+        case .unmetered: return Theme.success
+        case .meteredAllowed: return Theme.warning
+        case .meteredBlocked: return Theme.error
+        case .offline: return Theme.textTertiary
+        }
+    }
+
+    private var networkIconAccessibilityLabel: String {
+        switch networkPolicy.indicator {
+        case .unmetered: return "Network: Wi-Fi, validating"
+        case .meteredAllowed: return "Network: cellular, validating with opt-in"
+        case .meteredBlocked: return "Network: cellular, validation paused"
+        case .offline: return "Network: offline"
+        }
     }
 }
 

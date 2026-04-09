@@ -1,3 +1,4 @@
+import ActivityKit
 import Foundation
 import UserNotifications
 import UIKit
@@ -92,12 +93,68 @@ class NotificationManager: ObservableObject {
 
     /// Handle a silent push notification. Creates a HerculesNode, validates
     /// the latest block within 25 seconds, and posts a local notification.
+    ///
+    /// If the device is on a metered network and the user has not opted into
+    /// "Use Cellular Data", we skip the block download entirely — opening a
+    /// P2P connection during a silent-push wake on cellular would burn the
+    /// user's allowance without warning. We still record the wake (using the
+    /// push payload's height/hash) and post a notification so the user sees
+    /// what would have happened, marked clearly as paused.
     func handleSilentPush(
         userInfo: [AnyHashable: Any],
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         // Parse block info from push payload (used as fallback if validation fails)
         let pushBlock = parsePushPayload(userInfo)
+
+        // Network policy gate: refuse to validate over metered links unless
+        // the user has explicitly opted in. Record a paused entry so the
+        // user can see in the notification history that we declined the wake.
+        if !NetworkPolicy.shared.shouldValidate {
+            // Republish shared state with isPaused=true so the home-screen
+            // widget flips to its red "paused" indicator without waiting
+            // for the user to open the app.
+            SharedNodeStore.markPaused(true)
+            if let push = pushBlock {
+                let record = BlockNotificationRecord(
+                    id: UUID(),
+                    height: push.height,
+                    blockHash: push.hash,
+                    timestamp: push.timestamp,
+                    timestampHuman: "",
+                    validated: false,
+                    headerValidated: false,
+                    receivedAt: Date(),
+                    source: .networkPolicyPaused,
+                    validationError: "Validation skipped: metered network without Use Cellular Data opt-in"
+                )
+                DispatchQueue.main.async {
+                    self.appendRecord(record)
+                }
+                Self.postLocalNotification(for: record)
+            }
+            completionHandler(.noData)
+            return
+        }
+
+        // Mark the wake start so the widget can flip to its "awake" dot.
+        // Cleared in every exit path below (success, failure, paused).
+        SharedNodeStore.markAwake(true)
+
+        // Request a Live Activity for the wake. The controller drives a
+        // heuristic phase progression on a side timer because the FFI
+        // surface is single-shot — there's no progress callback we can
+        // hook into. The expected/known initial values come from either
+        // the push payload or the widget's last-known state.
+        let initialState = SharedNodeStore.load()
+        let initialHeight = pushBlock?.height ?? initialState.blockHeight
+        let activityController: WakeActivityControllerProtocol
+        if #available(iOS 16.2, *) {
+            activityController = WakeActivityController()
+        } else {
+            activityController = NoopWakeActivityController()
+        }
+        activityController.start(initialHeight: initialHeight, peerCount: initialState.peerCount)
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -109,6 +166,23 @@ class NotificationManager: ObservableObject {
                 let result = try node.validateLatestBlock(timeoutSecs: 25)
                 let record = Self.makeRecord(from: result)
 
+                // Read peer count for the widget. We do this *after* the
+                // validation call rather than concurrently because the FFI
+                // surface is not documented as reentrant from the same
+                // process — better to be cheap and serial inside this
+                // 25-second budget than chase a race.
+                let peerCount = (try? node.getStatus().peers.count) ?? 0
+                SharedNodeStore.publishValidation(
+                    height: result.height,
+                    blockHash: result.blockHash,
+                    peerCount: UInt32(peerCount)
+                )
+
+                activityController.finishSuccess(
+                    height: result.height,
+                    peerCount: UInt32(peerCount)
+                )
+
                 DispatchQueue.main.async {
                     self.appendRecord(record)
                 }
@@ -117,6 +191,11 @@ class NotificationManager: ObservableObject {
                 completionHandler(.newData)
 
             } catch {
+                SharedNodeStore.markAwake(false)
+                activityController.finishFailure(
+                    height: initialHeight,
+                    peerCount: initialState.peerCount
+                )
                 // Validation failed — post notification from push payload if available
                 if let push = pushBlock {
                     let record = BlockNotificationRecord(
@@ -145,6 +224,19 @@ class NotificationManager: ObservableObject {
 
     /// Simulate a push notification by running validate_latest_block directly.
     func testNotification(completion: @escaping (Result<BlockNotificationRecord, Error>) -> Void) {
+        SharedNodeStore.markAwake(true)
+        let initialState = SharedNodeStore.load()
+        let activityController: WakeActivityControllerProtocol
+        if #available(iOS 16.2, *) {
+            activityController = WakeActivityController()
+        } else {
+            activityController = NoopWakeActivityController()
+        }
+        activityController.start(
+            initialHeight: initialState.blockHeight,
+            peerCount: initialState.peerCount
+        )
+
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let dbPath = Self.dbPath()
@@ -154,12 +246,29 @@ class NotificationManager: ObservableObject {
                 let result = try node.validateLatestBlock(timeoutSecs: 25)
                 let record = Self.makeRecord(from: result)
 
+                let peerCount = (try? node.getStatus().peers.count) ?? 0
+                SharedNodeStore.publishValidation(
+                    height: result.height,
+                    blockHash: result.blockHash,
+                    peerCount: UInt32(peerCount)
+                )
+
+                activityController.finishSuccess(
+                    height: result.height,
+                    peerCount: UInt32(peerCount)
+                )
+
                 DispatchQueue.main.async {
                     self.appendRecord(record)
                     Self.postLocalNotification(for: record)
                     completion(.success(record))
                 }
             } catch {
+                SharedNodeStore.markAwake(false)
+                activityController.finishFailure(
+                    height: initialState.blockHeight,
+                    peerCount: initialState.peerCount
+                )
                 DispatchQueue.main.async {
                     completion(.failure(error))
                 }
@@ -209,6 +318,9 @@ class NotificationManager: ObservableObject {
         case .pushPayload:
             content.title = "New Block #\(record.height)"
             content.body = "Received from relay (not yet validated)"
+        case .networkPolicyPaused:
+            content.title = "Block #\(record.height) — Validation Paused"
+            content.body = "Skipped to save cellular data. Connect to Wi-Fi or enable Use Cellular Data."
         }
 
         content.sound = .default
@@ -252,5 +364,166 @@ class NotificationManager: ObservableObject {
     private static func torDataDir() -> String {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("tor").path
+    }
+}
+
+// MARK: - Live Activity controller
+
+/// Common surface so the wake handler doesn't need to branch on
+/// `#available(iOS 16.2, *)` at every call site. The real implementation
+/// (`WakeActivityController`) is gated; everything else gets a no-op.
+protocol WakeActivityControllerProtocol {
+    func start(initialHeight: UInt32, peerCount: UInt32)
+    func finishSuccess(height: UInt32, peerCount: UInt32)
+    func finishFailure(height: UInt32, peerCount: UInt32)
+}
+
+/// Fallback for iOS 16.0/16.1 — Live Activities aren't available so we
+/// satisfy the protocol with no-ops. The widget extension still ships
+/// (the home/lock-screen widget is iOS 17+ via project deployment target,
+/// but the protocol surface is decoupled from the OS check).
+final class NoopWakeActivityController: WakeActivityControllerProtocol {
+    func start(initialHeight: UInt32, peerCount: UInt32) {}
+    func finishSuccess(height: UInt32, peerCount: UInt32) {}
+    func finishFailure(height: UInt32, peerCount: UInt32) {}
+}
+
+/// Owns one `Activity<NodeActivityAttributes>` for the lifetime of a
+/// single push wake. Schedules heuristic phase transitions on a side
+/// timer because the FFI's `validateLatestBlock` is a single blocking
+/// call with no progress callback — we step through the visual phases on
+/// fixed delays, then snap to `.done` or `.failed` when the call returns.
+///
+/// The heuristic schedule (4 s → 9 s → 16 s) is sized for the typical
+/// 25-second wake budget. If validation finishes earlier than 16 s, the
+/// `validating` transition simply never fires because `finishSuccess`
+/// cancels the timer first.
+@available(iOS 16.2, *)
+final class WakeActivityController: WakeActivityControllerProtocol {
+    private var activity: Activity<NodeActivityAttributes>?
+    private var phaseTimer: DispatchSourceTimer?
+    private let startedAt = Date()
+    private let lock = NSLock()
+    private var finished = false
+
+    func start(initialHeight: UInt32, peerCount: UInt32) {
+        guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+            // User has disabled Live Activities globally — silently bail.
+            // The widget timeline still updates so they're not blind to
+            // node state, just no per-wake activity.
+            return
+        }
+
+        let attributes = NodeActivityAttributes(wakeId: UUID())
+        let state = NodeActivityAttributes.ContentState(
+            blockHeight: initialHeight,
+            phase: .connecting,
+            peerCount: peerCount,
+            startedAt: startedAt
+        )
+
+        do {
+            let content = ActivityContent(state: state, staleDate: nil)
+            activity = try Activity<NodeActivityAttributes>.request(
+                attributes: attributes,
+                content: content,
+                pushType: nil
+            )
+        } catch {
+            print("Live Activity request failed: \(error.localizedDescription)")
+            return
+        }
+
+        scheduleHeuristicTransitions(height: initialHeight, peerCount: peerCount)
+    }
+
+    func finishSuccess(height: UInt32, peerCount: UInt32) {
+        end(phase: .done, height: height, peerCount: peerCount)
+    }
+
+    func finishFailure(height: UInt32, peerCount: UInt32) {
+        end(phase: .failed, height: height, peerCount: peerCount)
+    }
+
+    // MARK: - Private
+
+    private func scheduleHeuristicTransitions(height: UInt32, peerCount: UInt32) {
+        // Three transitions: connecting → headers → block → validating.
+        // The .done transition fires from finishSuccess instead.
+        let transitions: [(delay: TimeInterval, phase: WakePhase)] = [
+            (4, .headers),
+            (9, .block),
+            (16, .validating),
+        ]
+
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue.global(qos: .utility)
+        )
+        var index = 0
+        timer.schedule(deadline: .now() + transitions[0].delay)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            let stillRunning = !self.finished
+            self.lock.unlock()
+            guard stillRunning, index < transitions.count else {
+                timer.cancel()
+                return
+            }
+            let phase = transitions[index].phase
+            self.update(phase: phase, height: height, peerCount: peerCount)
+            index += 1
+            if index < transitions.count {
+                let next = transitions[index].delay - transitions[index - 1].delay
+                timer.schedule(deadline: .now() + next)
+            } else {
+                timer.cancel()
+            }
+        }
+        timer.resume()
+        phaseTimer = timer
+    }
+
+    private func update(phase: WakePhase, height: UInt32, peerCount: UInt32) {
+        guard let activity = activity else { return }
+        let state = NodeActivityAttributes.ContentState(
+            blockHeight: height,
+            phase: phase,
+            peerCount: peerCount,
+            startedAt: startedAt
+        )
+        let content = ActivityContent(state: state, staleDate: nil)
+        Task {
+            await activity.update(content)
+        }
+    }
+
+    private func end(phase: WakePhase, height: UInt32, peerCount: UInt32) {
+        lock.lock()
+        let alreadyFinished = finished
+        finished = true
+        lock.unlock()
+        guard !alreadyFinished else { return }
+
+        phaseTimer?.cancel()
+        phaseTimer = nil
+
+        guard let activity = activity else { return }
+        let finalState = NodeActivityAttributes.ContentState(
+            blockHeight: height,
+            phase: phase,
+            peerCount: peerCount,
+            startedAt: startedAt
+        )
+        let content = ActivityContent(state: finalState, staleDate: nil)
+        // Leave the activity on screen briefly so the user can glance at
+        // the result, then let iOS dismiss it. 8 s is long enough to
+        // notice but short enough that it doesn't clutter the Lock Screen.
+        Task {
+            await activity.end(
+                content,
+                dismissalPolicy: .after(Date().addingTimeInterval(8))
+            )
+        }
     }
 }

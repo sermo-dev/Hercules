@@ -2,9 +2,10 @@ import Foundation
 
 /// How the block notification was verified.
 enum NotificationSource: String, Codable {
-    case fullValidation   // Block downloaded and scripts verified
-    case headerOnly       // Header PoW verified, no full block
-    case pushPayload      // Info from push relay only, not verified
+    case fullValidation     // Block downloaded and scripts verified
+    case headerOnly         // Header PoW verified, no full block
+    case pushPayload        // Info from push relay only, not verified
+    case networkPolicyPaused // Validation skipped: metered network without opt-in
 }
 
 /// A record of a block notification, persisted to disk.

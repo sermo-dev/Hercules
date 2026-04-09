@@ -52,14 +52,25 @@ class SnapshotDownloader: NSObject, ObservableObject {
         // "unknown error" (NSCocoaErrorDomain 4097). Fall back to a default
         // session in simulator builds. Real devices keep the background
         // session so the download continues across app suspension.
+        //
+        // `allowsCellularAccess` is read once at session-construction time
+        // from `NetworkPolicy.shared.cellularAllowed`. URLSession does not
+        // re-read this flag if the preference changes mid-session, so a
+        // user toggling Settings → Use Cellular Data while a download is
+        // in flight will see the new policy take effect on the *next* app
+        // launch. The pre-flight gate in `start()` enforces the policy at
+        // download-kick-off time, which is the case that matters: an 8 GB
+        // download that's already running on Wi-Fi won't pivot to cellular
+        // on its own.
+        let allowCellular = NetworkPolicy.shared.cellularAllowed
         #if targetEnvironment(simulator)
         let config = URLSessionConfiguration.default
-        config.allowsCellularAccess = false
+        config.allowsCellularAccess = allowCellular
         #else
         let config = URLSessionConfiguration.background(withIdentifier: Self.backgroundSessionId)
         config.isDiscretionary = false       // user-initiated, run promptly
         config.sessionSendsLaunchEvents = true
-        config.allowsCellularAccess = false  // 8.2 GB — Wi-Fi only by default
+        config.allowsCellularAccess = allowCellular
         #endif
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
@@ -128,6 +139,13 @@ class SnapshotDownloader: NSObject, ObservableObject {
 
     /// Begin the download. Idempotent: if a task is already running or the
     /// file already exists, this is a no-op.
+    ///
+    /// Refuses to start when `NetworkPolicy.shouldValidate` is false — i.e.
+    /// no network at all, or a metered connection without the user's
+    /// explicit cellular opt-in. The status transitions to `.failed` with a
+    /// human-readable reason so SettingsView's snapshot card can surface
+    /// the block to the user instead of leaving them staring at a stalled
+    /// progress bar.
     func start() {
         if Self.hasDownloadedFile() {
             DispatchQueue.main.async {
@@ -138,6 +156,22 @@ class SnapshotDownloader: NSObject, ObservableObject {
             return
         }
         if activeTask != nil {
+            return
+        }
+        let policy = NetworkPolicy.shared
+        guard policy.shouldValidate else {
+            let reason: String
+            switch policy.indicator {
+            case .offline:
+                reason = "No network connection"
+            case .meteredBlocked:
+                reason = "On cellular or hotspot — enable Use Cellular Data in Settings to download over metered networks"
+            case .meteredAllowed, .unmetered:
+                reason = "Network unavailable"
+            }
+            DispatchQueue.main.async {
+                self.status = .failed(reason)
+            }
             return
         }
         DispatchQueue.main.async {
