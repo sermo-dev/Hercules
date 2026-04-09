@@ -51,6 +51,16 @@ dictionary BlockNotification {
     string? validation_error;
 };
 
+dictionary CatchUpStatus {
+    boolean caught_up;
+    u32 blocks_validated;
+    u32 current_height;
+    u32 target_height;
+    string tip_block_hash;
+    u32 tip_timestamp;
+    string? error;
+};
+
 dictionary TorStatus {
     boolean is_bootstrapped;
     u8 bootstrap_progress;
@@ -96,6 +106,9 @@ interface HerculesNode {
 
     [Throws=HerculesError]
     BlockNotification validate_latest_block(u32 timeout_secs);
+
+    [Throws=HerculesError]
+    CatchUpStatus catch_up_blocks(u32 max_blocks, u32 budget_secs);
 
     void stop_sync();
     void set_validation_paused(boolean paused);

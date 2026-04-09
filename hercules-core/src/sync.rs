@@ -252,6 +252,26 @@ impl BlockNotification {
     }
 }
 
+/// Result of a budgeted multi-block catch-up attempt.
+#[derive(Debug, Clone)]
+pub struct CatchUpStatus {
+    /// True if validated_height == header tip after this call.
+    pub caught_up: bool,
+    /// Number of blocks fully validated during this call.
+    pub blocks_validated: u32,
+    /// Current validated height after this call.
+    pub current_height: u32,
+    /// Header-chain tip height (the target).
+    pub target_height: u32,
+    /// Block hash at current_height (for notification records).
+    pub tip_block_hash: String,
+    /// Timestamp at current_height.
+    pub tip_timestamp: u32,
+    /// If non-None, the catch-up was aborted due to this error.
+    /// Partial progress (blocks_validated > 0) may still have been made.
+    pub error: Option<String>,
+}
+
 /// Sync block headers and validate full blocks from the Bitcoin P2P network.
 /// Per-peer relay state tracking.
 struct PeerRelayState {
@@ -2268,6 +2288,274 @@ impl HeaderSync {
         }
 
         Ok(notification)
+    }
+
+    /// Validate multiple blocks within a time budget. Preferred over
+    /// `validate_latest_block` for push wakes when the node may be
+    /// multiple blocks behind.
+    pub fn catch_up_blocks(
+        &self,
+        max_blocks: u32,
+        budget_secs: u32,
+    ) -> Result<CatchUpStatus, SyncError> {
+        let deadline = Instant::now() + Duration::from_secs(budget_secs as u64);
+
+        // Read current state
+        let (tip_height, tip_hash, tip_header) = self
+            .store
+            .tip()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .ok_or_else(|| SyncError::Store("store has no headers".into()))?;
+
+        let our_height = self
+            .store
+            .count()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .saturating_sub(1);
+
+        let mut validated_height = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        info!(
+            "catch_up_blocks: tip {}, validated {}, max_blocks {}, budget {}s",
+            tip_height, validated_height, max_blocks, budget_secs
+        );
+
+        // Connect to peers
+        if Instant::now() >= deadline {
+            return Ok(self.make_catchup_status(
+                validated_height >= tip_height,
+                0,
+                validated_height,
+                tip_height,
+            ));
+        }
+
+        let pool = PeerPool::new(
+            our_height,
+            self.tor.clone(),
+            self.peers_db_path.as_deref(),
+        )
+        .map_err(|e| {
+            if format!("{}", e).contains("no peers discovered") {
+                SyncError::NoPeers
+            } else {
+                SyncError::Peer(format!("{}", e))
+            }
+        })?;
+
+        // Sync headers to tip
+        if Instant::now() >= deadline {
+            return Ok(self.make_catchup_status(
+                validated_height >= tip_height,
+                0,
+                validated_height,
+                tip_height,
+            ));
+        }
+
+        let mut peer = pool
+            .best_peer()
+            .ok_or_else(|| SyncError::Peer("no peers available".into()))?;
+        let peer_addr = peer.addr().to_string();
+
+        let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
+            Ok(h) => {
+                pool.return_peer(peer);
+                h
+            }
+            Err(e) => {
+                return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
+            }
+        };
+
+        let mut new_tip = tip_height;
+
+        if !headers.is_empty() {
+            if headers.len() > 2000 {
+                return Err(SyncError::Validation(format!(
+                    "peer sent {} headers (max 2000)",
+                    headers.len()
+                )));
+            }
+
+            let timestamps = self
+                .store
+                .last_timestamps(11)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+            let store = &self.store;
+            let epoch_lookup = |height: u32| -> Result<u32, String> {
+                store
+                    .get_timestamp_at(height)
+                    .map_err(|e| format!("{}", e))?
+                    .ok_or_else(|| format!("no header at height {}", height))
+            };
+
+            validate_headers(
+                &headers,
+                tip_hash,
+                tip_height,
+                &timestamps,
+                tip_header.bits,
+                &epoch_lookup,
+            )
+            .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+
+            let new_start = tip_height + 1;
+            self.store
+                .store_headers(&headers, new_start)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+            new_tip = tip_height + headers.len() as u32;
+            info!(
+                "catch_up_blocks: synced headers {}-{} (PoW validated)",
+                new_start, new_tip
+            );
+        }
+
+        // Block validation loop — oldest-first
+        let mut blocks_validated: u32 = 0;
+
+        while validated_height < new_tip
+            && blocks_validated < max_blocks
+            && Instant::now() < deadline
+        {
+            let next_height = validated_height + 1;
+
+            let block_hash = self
+                .store
+                .get_hash_at_height(next_height)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?
+                .ok_or_else(|| {
+                    SyncError::Store(format!("no hash at height {}", next_height))
+                })?;
+
+            let mut block_peer = match pool.any_peer() {
+                Some(p) => p,
+                None => {
+                    return Ok(CatchUpStatus {
+                        error: Some("no peers available for block download".into()),
+                        ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
+                    });
+                }
+            };
+
+            let block = match block_peer.get_block(block_hash) {
+                Ok(b) => {
+                    pool.return_peer(block_peer);
+                    b
+                }
+                Err(e) => {
+                    return Ok(CatchUpStatus {
+                        error: Some(format!("block download at {}: {}", next_height, e)),
+                        ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
+                    });
+                }
+            };
+
+            if block.block_hash() != block_hash {
+                return Err(SyncError::Validation(format!(
+                    "block {} hash mismatch: expected {}, got {}",
+                    next_height,
+                    block_hash,
+                    block.block_hash()
+                )));
+            }
+
+            // Crash recovery: if UTXOs from this block already exist,
+            // the block was applied but validated_height wasn't updated.
+            let already_applied = self
+                .utxo
+                .has_utxos_at_height(next_height)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+            if already_applied {
+                info!(
+                    "catch_up_blocks: block {} already applied (crash recovery)",
+                    next_height
+                );
+                self.store
+                    .set_validated_height(next_height)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                validated_height = next_height;
+                blocks_validated += 1;
+                continue;
+            }
+
+            // Structural validation
+            validate_block(&block, next_height)
+                .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+
+            // Script validation + UTXO verification
+            validate_block_scripts(&block, next_height, &self.utxo)
+                .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+
+            // Update UTXO set
+            self.utxo
+                .apply_block(&block, next_height)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+            // Store block for NODE_NETWORK_LIMITED serving
+            if let Err(e) = self.block_store.store_block(&block, next_height) {
+                return Ok(CatchUpStatus {
+                    error: Some(format!("block store at {}: {}", next_height, e)),
+                    ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
+                });
+            }
+
+            // Remove confirmed transactions from mempool
+            self.mempool.lock().unwrap().remove_confirmed(&block);
+
+            self.store
+                .set_validated_height(next_height)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+            validated_height = next_height;
+            blocks_validated += 1;
+
+            info!(
+                "catch_up_blocks: validated block {} ({}/{})",
+                next_height, blocks_validated, max_blocks
+            );
+        }
+
+        let caught_up = validated_height >= new_tip;
+        info!(
+            "catch_up_blocks: done — validated {} blocks, height {}/{}, caught_up={}",
+            blocks_validated, validated_height, new_tip, caught_up
+        );
+
+        Ok(self.make_catchup_status(caught_up, blocks_validated, validated_height, new_tip))
+    }
+
+    /// Build a CatchUpStatus, reading block hash/timestamp from the store.
+    fn make_catchup_status(
+        &self,
+        caught_up: bool,
+        blocks_validated: u32,
+        current_height: u32,
+        target_height: u32,
+    ) -> CatchUpStatus {
+        let (tip_block_hash, tip_timestamp) = self
+            .store
+            .get_header_at_height(current_height)
+            .ok()
+            .flatten()
+            .map(|(hash, header)| (hash.to_string(), header.time))
+            .unwrap_or_else(|| ("".into(), 0));
+
+        CatchUpStatus {
+            caught_up,
+            blocks_validated,
+            current_height,
+            target_height,
+            tip_block_hash,
+            tip_timestamp,
+            error: None,
+        }
     }
 
     /// Get current sync status without syncing.

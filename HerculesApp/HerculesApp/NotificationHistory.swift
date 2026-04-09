@@ -5,6 +5,7 @@ enum NotificationSource: String, Codable {
     case fullValidation     // Block downloaded and scripts verified
     case headerOnly         // Header PoW verified, no full block
     case pushPayload        // Info from push relay only, not verified
+    case catchUpProgress    // Multi-block catch-up (some blocks validated, more remain)
     case networkPolicyPaused // Validation skipped: metered network without opt-in
 }
 
