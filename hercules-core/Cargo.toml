@@ -43,3 +43,6 @@ path = "uniffi-bindgen.rs"
 [[bin]]
 name = "convert_snapshot"
 path = "src/bin/convert_snapshot.rs"
+
+[patch.crates-io]
+bitcoinconsensus = { path = "patches/bitcoinconsensus" }
