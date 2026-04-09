@@ -500,6 +500,107 @@ impl HeaderSync {
         }
     }
 
+    // ── Wallet RPC accessors (ticket 014) ────────────────────────────
+    //
+    // These methods provide read-only access to node state for the wallet
+    // JSON-RPC server. All stores use internal Mutex or LMDB transactions,
+    // so these are safe to call from the wallet RPC thread while the sync
+    // loop runs on its own thread.
+
+    /// Current chain tip: (height, hash, header).
+    pub fn rpc_get_tip(&self) -> Result<Option<(u32, BlockHash, Header)>, SyncError> {
+        self.store
+            .tip()
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// Block header at a given height: (hash, header).
+    pub fn rpc_get_header_at_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<(BlockHash, Header)>, SyncError> {
+        self.store
+            .get_header_at_height(height)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// Block hash at a given height.
+    pub fn rpc_get_block_hash(&self, height: u32) -> Result<Option<BlockHash>, SyncError> {
+        self.store
+            .get_hash_at_height(height)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// Find the height of a block hash.
+    pub fn rpc_find_height(&self, hash: BlockHash) -> Result<Option<u32>, SyncError> {
+        self.store
+            .find_height_of_hash(hash)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// Full serialized block by hash (within prune window only).
+    pub fn rpc_get_block(
+        &self,
+        hash: &BlockHash,
+    ) -> Result<Option<bitcoin::Block>, SyncError> {
+        self.block_store
+            .get_block_by_hash(hash)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// UTXO lookup by outpoint.
+    pub fn rpc_get_utxo(
+        &self,
+        txid: &bitcoin::Txid,
+        vout: u32,
+    ) -> Result<Option<crate::utxo::UtxoEntry>, SyncError> {
+        self.utxo
+            .get(txid, vout)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// Mempool entry info by txid.
+    pub fn rpc_get_mempool_entry(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Option<crate::mempool::MempoolEntryInfo> {
+        let pool = self.mempool.lock().unwrap();
+        pool.get_entry_info(txid)
+    }
+
+    /// Fee rate estimates.
+    pub fn rpc_get_fee_estimates(&self) -> crate::mempool::FeeEstimates {
+        let pool = self.mempool.lock().unwrap();
+        pool.estimate_fee_rates()
+    }
+
+    /// Broadcast a raw transaction: deserialize, validate against mempool +
+    /// UTXO set, and add to the mempool. Returns the txid on success.
+    /// Relay to peers happens on the next monitor-loop tick.
+    pub fn rpc_broadcast_tx(&self, raw: &[u8]) -> Result<bitcoin::Txid, SyncError> {
+        let tx: bitcoin::Transaction = deserialize(raw)
+            .map_err(|e| SyncError::Validation(format!("invalid tx: {}", e)))?;
+
+        let tip = self
+            .store
+            .tip()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        let current_height = tip.map(|(h, _, _)| h).unwrap_or(0);
+
+        let mut pool = self.mempool.lock().unwrap();
+        let txid = pool
+            .accept_tx(tx, &self.utxo, current_height)
+            .map_err(|e| SyncError::Validation(format!("mempool reject: {}", e)))?;
+        Ok(txid)
+    }
+
+    /// Height of the last block whose scripts were fully validated.
+    pub fn rpc_validated_height(&self) -> Result<u32, SyncError> {
+        self.store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
     /// Update cached peer counts from the pool (called from monitor loop).
     fn update_peer_counts(&self, pool: &PeerPool) {
         self.inbound_peer_count

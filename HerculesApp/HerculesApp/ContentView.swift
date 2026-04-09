@@ -78,6 +78,11 @@ class NodeViewModel: ObservableObject {
     @Published var mempoolStatus: MempoolStatus?
     @Published var nodeStatus: NodeStatus?
 
+    // Wallet API (ticket 014) — external wallet connectivity.
+    @Published var isWalletApiRunning = false
+    @Published var walletApiConnectionString: String?
+    @Published var walletApiError: String?
+
     // Thread-safe access to the node: set from background thread, read from main thread
     private var _node: HerculesNode?
     private let nodeLock = NSLock()
@@ -439,6 +444,64 @@ class NodeViewModel: ObservableObject {
             DispatchQueue.main.async {
                 self?.isSyncRunning = false
                 self?.isConnecting = false
+            }
+        }
+    }
+
+    // MARK: - Wallet API
+
+    func startWalletApi() {
+        guard let node = node else {
+            walletApiError = "Node not running"
+            return
+        }
+        walletApiError = nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let connString = try node.startWalletApi()
+                DispatchQueue.main.async {
+                    self?.walletApiConnectionString = connString
+                    self?.isWalletApiRunning = true
+                    self?.walletApiError = nil
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.walletApiError = error.localizedDescription
+                    self?.isWalletApiRunning = false
+                }
+            }
+        }
+    }
+
+    func stopWalletApi() {
+        guard let node = node else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            node.stopWalletApi()
+            DispatchQueue.main.async {
+                self?.isWalletApiRunning = false
+                self?.walletApiConnectionString = nil
+            }
+        }
+    }
+
+    func rotateWalletAuthToken() {
+        guard let node = node else { return }
+        walletApiError = nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let result = try node.rotateWalletAuthToken()
+                DispatchQueue.main.async {
+                    // If server was running, result is the new connection string.
+                    // If not, result is just the new token.
+                    if self?.isWalletApiRunning == true {
+                        self?.walletApiConnectionString = result
+                    }
+                    self?.walletApiError = nil
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.walletApiError = error.localizedDescription
+                }
             }
         }
     }

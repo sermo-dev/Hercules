@@ -1178,6 +1178,97 @@ impl Mempool {
             .map(|e| e.fee_rate)
             .fold(f64::INFINITY, f64::min)
     }
+
+    // ── Wallet RPC accessors (ticket 014) ────────────────────────────
+
+    /// Get detailed information about a mempool entry for the wallet RPC.
+    pub fn get_entry_info(&self, txid: &Txid) -> Option<MempoolEntryInfo> {
+        let e = self.txs.get(txid)?;
+        Some(MempoolEntryInfo {
+            fee: e.fee,
+            vsize: e.vsize,
+            fee_rate: e.fee_rate,
+            ancestor_count: e.ancestors.len() as u32 + 1, // include self
+            descendant_count: e.descendants.len() as u32 + 1,
+            ancestor_fee: e.ancestor_fee,
+            ancestor_vsize: e.ancestor_vsize,
+        })
+    }
+
+    /// Estimate fee rates for various confirmation targets by analyzing the
+    /// mempool fee distribution. Returns (1-block, 6-block, 144-block) in sat/vB.
+    ///
+    /// Approach: sort all entries by fee rate descending, then estimate which
+    /// fee rate puts you at the Nth block boundary assuming 4M weight units
+    /// per block. Simple and correct enough for v1 — real-world miners have
+    /// slightly different selection algorithms, but this is what wallet users
+    /// need: a rough estimate, not a guarantee.
+    pub fn estimate_fee_rates(&self) -> FeeEstimates {
+        if self.txs.is_empty() {
+            return FeeEstimates {
+                one_block: 1.0,
+                six_blocks: 1.0,
+                twelve_blocks: 1.0,
+                twenty_four_blocks: 1.0,
+                one_forty_four_blocks: 1.0,
+            };
+        }
+
+        // Collect (fee_rate, weight) pairs and sort by fee rate descending.
+        let mut entries: Vec<(f64, u64)> = self
+            .txs
+            .values()
+            .map(|e| (e.fee_rate, e.vsize * 4)) // vsize * 4 = weight
+            .collect();
+        entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+
+        let fee_at_block = |target_blocks: u64| -> f64 {
+            let capacity = MAX_BLOCK_WEIGHT * target_blocks;
+            let mut cumulative_weight: u64 = 0;
+            let mut last_rate = 1.0_f64;
+            for &(rate, weight) in &entries {
+                cumulative_weight = cumulative_weight.saturating_add(weight);
+                last_rate = rate;
+                if cumulative_weight >= capacity {
+                    return rate.max(1.0);
+                }
+            }
+            // Mempool fits in fewer than target_blocks — minimum relay fee.
+            last_rate.max(1.0)
+        };
+
+        FeeEstimates {
+            one_block: fee_at_block(1),
+            six_blocks: fee_at_block(6),
+            twelve_blocks: fee_at_block(12),
+            twenty_four_blocks: fee_at_block(24),
+            one_forty_four_blocks: fee_at_block(144),
+        }
+    }
+}
+
+/// Mempool entry information exposed to the wallet RPC.
+#[derive(Debug, Clone)]
+pub struct MempoolEntryInfo {
+    pub fee: u64,
+    pub vsize: u64,
+    pub fee_rate: f64,
+    pub ancestor_count: u32,
+    pub descendant_count: u32,
+    pub ancestor_fee: u64,
+    pub ancestor_vsize: u64,
+}
+
+/// Fee rate estimates for various confirmation targets.
+#[derive(Debug, Clone)]
+pub struct FeeEstimates {
+    pub one_block: f64,
+    pub six_blocks: f64,
+    pub twelve_blocks: f64,
+    pub twenty_four_blocks: f64,
+    pub one_forty_four_blocks: f64,
 }
 
 /// Errors from mempool transaction validation.
