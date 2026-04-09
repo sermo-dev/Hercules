@@ -846,4 +846,251 @@ mod tests {
             "corrupted Schnorr signature must fail BIP 340 verification, got Ok"
         );
     }
+
+    // ── Structural validation: synthetic block builders ──────────────
+    //
+    // The structural rules in `validate_block` are independently checked
+    // in the tests below. We build minimal blocks from scratch (rather
+    // than mutating the genesis fixture) so each test can target one
+    // failure mode without dragging in BIP-34 / SegWit / merkle-root
+    // interactions from a real block.
+    //
+    // All synthetic blocks here use `height = 1` so they sit in the
+    // pre-BIP-34 / pre-SegWit window — we want to test rules 1-7 in
+    // isolation, not the witness-commitment / coinbase-height paths.
+
+    /// Build a coinbase transaction with the given output value (in sats).
+    fn synth_coinbase(value_sats: u64) -> bitcoin::Transaction {
+        use bitcoin::blockdata::transaction::{OutPoint, Sequence, TxIn, TxOut, Version};
+        use bitcoin::{absolute::LockTime, Amount, ScriptBuf, Witness};
+        bitcoin::Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                // Coinbase: previous_output is the null outpoint.
+                previous_output: OutPoint::null(),
+                // Pre-BIP-34 we can put anything in script_sig; one byte is
+                // enough to avoid the empty-script edge case.
+                script_sig: ScriptBuf::from_bytes(vec![0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value_sats),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
+            }],
+        }
+    }
+
+    /// Build a non-coinbase transaction (real-looking input pointing at a
+    /// dummy outpoint). The validator's structural pass doesn't check that
+    /// the input actually exists — that's `validate_block_scripts`.
+    fn synth_noncoinbase(marker: u8) -> bitcoin::Transaction {
+        use bitcoin::blockdata::transaction::{OutPoint, Sequence, TxIn, TxOut, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{absolute::LockTime, Amount, ScriptBuf, Txid, Witness};
+        bitcoin::Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_slice(&[marker; 32]).unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac, marker]),
+            }],
+        }
+    }
+
+    /// Wrap a list of transactions into a Block whose merkle root is set
+    /// to the *correct* value computed from the transactions. Tests that
+    /// want a bad merkle root mutate the resulting block afterwards.
+    fn wrap_block(txdata: Vec<bitcoin::Transaction>) -> Block {
+        use bitcoin::blockdata::block::{Header, Version};
+        use bitcoin::hashes::Hash;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+
+        // Compute the correct merkle root for the supplied txdata so the
+        // BadMerkleRoot path isn't taken accidentally by tests targeting
+        // a different rule.
+        let merkle_root = bitcoin::merkle_tree::calculate_root(
+            txdata.iter().map(|tx| tx.compute_txid().to_raw_hash()),
+        )
+        .map(|h| TxMerkleNode::from_raw_hash(h))
+        .unwrap_or(TxMerkleNode::all_zeros());
+
+        Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root,
+                time: 0,
+                bits: CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_block() {
+        let block = wrap_block(vec![]);
+        let err = validate_block(&block, 1).unwrap_err();
+        assert!(
+            matches!(err, BlockValidationError::EmptyBlock { height: 1 }),
+            "expected EmptyBlock at height 1, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_block_whose_first_tx_is_not_coinbase() {
+        // A single non-coinbase tx — the very first tx must be a coinbase.
+        let block = wrap_block(vec![synth_noncoinbase(1)]);
+        let err = validate_block(&block, 1).unwrap_err();
+        assert!(
+            matches!(err, BlockValidationError::NoCoinbase { height: 1 }),
+            "expected NoCoinbase at height 1, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_block_with_two_coinbase_transactions() {
+        // Two valid coinbases back-to-back. Bitcoin allows exactly one;
+        // the second must be flagged at index 1.
+        let block = wrap_block(vec![synth_coinbase(50), synth_coinbase(50)]);
+        let err = validate_block(&block, 1).unwrap_err();
+        match err {
+            BlockValidationError::MultipleCoinbase { height, index } => {
+                assert_eq!(height, 1);
+                assert_eq!(index, 1, "second coinbase should be flagged at index 1");
+            }
+            other => panic!("expected MultipleCoinbase, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_block_with_bad_merkle_root() {
+        // Build a valid one-tx block, then poison the header's merkle root.
+        use bitcoin::hashes::Hash;
+        let mut block = wrap_block(vec![synth_coinbase(50)]);
+        block.header.merkle_root = bitcoin::TxMerkleNode::from_raw_hash(
+            bitcoin::hashes::sha256d::Hash::from_byte_array([0xff; 32]),
+        );
+        let err = validate_block(&block, 1).unwrap_err();
+        assert!(
+            matches!(err, BlockValidationError::BadMerkleRoot { height: 1 }),
+            "expected BadMerkleRoot at height 1, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_block_with_duplicate_transactions() {
+        // BIP-30 / structural rule: every txid in a block must be unique.
+        // Two identical coinbases would trip the MultipleCoinbase rule
+        // (rule 3) first, so we use a coinbase plus two identical
+        // non-coinbase txs to target the DuplicateTx path (rule 7) directly.
+        let dup = synth_noncoinbase(7);
+        let block = wrap_block(vec![synth_coinbase(50), dup.clone(), dup]);
+        let err = validate_block(&block, 1).unwrap_err();
+        match err {
+            BlockValidationError::DuplicateTx { height, txid: _ } => {
+                assert_eq!(height, 1);
+            }
+            other => panic!("expected DuplicateTx, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_coinbase_overpayment_above_max_money() {
+        // Structural rule 8 catches the trivial upper bound: a coinbase
+        // whose total output exceeds 21M BTC must be rejected even before
+        // we know the actual subsidy + fees.
+        let huge = MAX_MONEY + 1;
+        let block = wrap_block(vec![synth_coinbase(huge)]);
+        let err = validate_block(&block, 1).unwrap_err();
+        // The output_value > MAX_MONEY check (rule 6) catches this first
+        // since it runs per-output before the coinbase-total check. Either
+        // is a correct rejection of overpayment, but we assert which one
+        // so future reorderings of the rules are caught explicitly.
+        match err {
+            BlockValidationError::OutputExceedsMaxMoney {
+                height,
+                tx_index,
+                output_index,
+                amount,
+            } => {
+                assert_eq!(height, 1);
+                assert_eq!(tx_index, 0);
+                assert_eq!(output_index, 0);
+                assert_eq!(amount, huge);
+            }
+            other => panic!(
+                "expected OutputExceedsMaxMoney for coinbase overpayment, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn rejects_block_exceeding_max_weight() {
+        // Build a coinbase whose script_sig is enormous. Each script_sig
+        // byte contributes 4 weight units (non-witness data is scaled by
+        // WITNESS_SCALE_FACTOR=4), so >1MB of script_sig is enough to
+        // blow past MAX_BLOCK_WEIGHT (4M WU) without needing real txs.
+        use bitcoin::blockdata::transaction::{OutPoint, Sequence, TxIn, TxOut, Version};
+        use bitcoin::{absolute::LockTime, Amount, ScriptBuf, Witness};
+        let huge_script = vec![0x00u8; 1_100_000];
+        let coinbase = bitcoin::Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(huge_script),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
+            }],
+        };
+        let block = wrap_block(vec![coinbase]);
+        let err = validate_block(&block, 1).unwrap_err();
+        match err {
+            BlockValidationError::ExcessiveWeight {
+                height,
+                weight,
+                max,
+            } => {
+                assert_eq!(height, 1);
+                assert_eq!(max, MAX_BLOCK_WEIGHT);
+                assert!(
+                    weight > MAX_BLOCK_WEIGHT,
+                    "weight {} should exceed MAX_BLOCK_WEIGHT {}",
+                    weight,
+                    MAX_BLOCK_WEIGHT
+                );
+            }
+            other => panic!("expected ExcessiveWeight, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn accepts_minimal_one_coinbase_block() {
+        // Sanity check the synth helpers: a single-coinbase block at a
+        // pre-BIP-34 height should pass structural validation cleanly.
+        // This guards the helpers from silently regressing under the
+        // negative tests above.
+        let block = wrap_block(vec![synth_coinbase(50)]);
+        validate_block(&block, 1).expect("minimal coinbase block should validate");
+    }
 }
