@@ -1,13 +1,44 @@
+import Combine
 import UIKit
 import UserNotifications
 
 class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+
+    /// Combine subscriptions held for the lifetime of the app delegate so
+    /// the network-policy → widget-state bridge stays live across the
+    /// whole foreground process. Cleared on dealloc, which only fires at
+    /// app termination.
+    private var cancellables = Set<AnyCancellable>()
 
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
+
+        // Touch NetworkPolicy.shared early so its NWPathMonitor starts
+        // before any wake or download attempt; bridge its published
+        // metered/blocked state into the App Group container so the
+        // home-screen widget reflects it without needing a wake to fire.
+        let policy = NetworkPolicy.shared
+        policy.objectWillChange
+            .sink { _ in
+                // `objectWillChange` fires *before* the new value is
+                // published, but we read through `cellularAllowed` and
+                // `pathStatus` which are settled by the time the next
+                // runloop tick processes our handler. A microtask hop
+                // gives the publisher a chance to apply.
+                DispatchQueue.main.async {
+                    SharedNodeStore.markPaused(!policy.shouldValidate)
+                }
+            }
+            .store(in: &cancellables)
+
+        // Initial publish at launch so the widget reflects whatever
+        // policy + last-known state is correct *now*, not on the next
+        // change.
+        SharedNodeStore.markPaused(!policy.shouldValidate)
+
         return true
     }
 

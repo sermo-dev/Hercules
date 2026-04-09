@@ -110,6 +110,10 @@ class NotificationManager: ObservableObject {
         // the user has explicitly opted in. Record a paused entry so the
         // user can see in the notification history that we declined the wake.
         if !NetworkPolicy.shared.shouldValidate {
+            // Republish shared state with isPaused=true so the home-screen
+            // widget flips to its red "paused" indicator without waiting
+            // for the user to open the app.
+            SharedNodeStore.markPaused(true)
             if let push = pushBlock {
                 let record = BlockNotificationRecord(
                     id: UUID(),
@@ -132,6 +136,10 @@ class NotificationManager: ObservableObject {
             return
         }
 
+        // Mark the wake start so the widget can flip to its "awake" dot.
+        // Cleared in every exit path below (success, failure).
+        SharedNodeStore.markAwake(true)
+
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let dbPath = Self.dbPath()
@@ -142,6 +150,18 @@ class NotificationManager: ObservableObject {
                 let result = try node.validateLatestBlock(timeoutSecs: 25)
                 let record = Self.makeRecord(from: result)
 
+                // Read peer count for the widget. We do this *after* the
+                // validation call rather than concurrently because the FFI
+                // surface is not documented as reentrant from the same
+                // process — better to be cheap and serial inside this
+                // 25-second budget than chase a race.
+                let peerCount = (try? node.getStatus().peers.count) ?? 0
+                SharedNodeStore.publishValidation(
+                    height: result.height,
+                    blockHash: result.blockHash,
+                    peerCount: UInt32(peerCount)
+                )
+
                 DispatchQueue.main.async {
                     self.appendRecord(record)
                 }
@@ -150,6 +170,7 @@ class NotificationManager: ObservableObject {
                 completionHandler(.newData)
 
             } catch {
+                SharedNodeStore.markAwake(false)
                 // Validation failed — post notification from push payload if available
                 if let push = pushBlock {
                     let record = BlockNotificationRecord(
@@ -178,6 +199,8 @@ class NotificationManager: ObservableObject {
 
     /// Simulate a push notification by running validate_latest_block directly.
     func testNotification(completion: @escaping (Result<BlockNotificationRecord, Error>) -> Void) {
+        SharedNodeStore.markAwake(true)
+
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let dbPath = Self.dbPath()
@@ -187,12 +210,20 @@ class NotificationManager: ObservableObject {
                 let result = try node.validateLatestBlock(timeoutSecs: 25)
                 let record = Self.makeRecord(from: result)
 
+                let peerCount = (try? node.getStatus().peers.count) ?? 0
+                SharedNodeStore.publishValidation(
+                    height: result.height,
+                    blockHash: result.blockHash,
+                    peerCount: UInt32(peerCount)
+                )
+
                 DispatchQueue.main.async {
                     self.appendRecord(record)
                     Self.postLocalNotification(for: record)
                     completion(.success(record))
                 }
             } catch {
+                SharedNodeStore.markAwake(false)
                 DispatchQueue.main.async {
                     completion(.failure(error))
                 }
