@@ -111,6 +111,15 @@ impl Write for TorStream {
 
 // ── TorManager ────────────────────────────────────────────────────────
 
+/// Interior-mutable state for the wallet API onion service. Bundled
+/// behind a single `Mutex` on `TorManager` so all wallet-onion methods
+/// can take `&self` (needed because `TorManager` sits behind `Arc`).
+struct WalletOnionState {
+    address: Option<String>,
+    inbound_rx: Option<std::sync::mpsc::Receiver<TorStream>>,
+    handle: Option<OnionServiceHandle>,
+}
+
 /// Manages the Tor client lifecycle. Owns a background tokio runtime
 /// and an Arti TorClient. All public methods are synchronous (blocking).
 pub struct TorManager {
@@ -118,10 +127,15 @@ pub struct TorManager {
     client: TorClient<PreferredRuntime>,
     bootstrap_progress: Arc<AtomicU8>,
     onion_address: Option<String>,
-    /// Channel receiving inbound connections from the onion service.
+    /// Channel receiving inbound connections from the P2P onion service.
     inbound_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<TorStream>>>,
-    /// Handle to the running onion service. Dropping this stops the service.
+    /// Handle to the running P2P onion service. Dropping this stops the service.
     _onion_handle: Option<OnionServiceHandle>,
+    // ── Wallet API onion service (ticket 014) ────────────────────────
+    /// All mutable wallet-onion state behind a single Mutex so
+    /// start/stop/accept can take `&self` (required because TorManager
+    /// lives behind Arc in HerculesNode).
+    wallet_state: std::sync::Mutex<WalletOnionState>,
 }
 
 impl TorManager {
@@ -176,6 +190,11 @@ impl TorManager {
             onion_address: None,
             inbound_rx: None,
             _onion_handle: None,
+            wallet_state: std::sync::Mutex::new(WalletOnionState {
+                address: None,
+                inbound_rx: None,
+                handle: None,
+            }),
         })
     }
 
@@ -379,12 +398,129 @@ impl TorManager {
         Ok(onion_addr)
     }
 
-    /// Try to accept a pending inbound connection from the onion service.
+    /// Try to accept a pending inbound connection from the P2P onion service.
     /// Returns `None` if no connection is waiting (non-blocking).
     pub fn accept_inbound(&self) -> Option<TorStream> {
         self.inbound_rx
             .as_ref()
             .and_then(|rx| rx.lock().unwrap().try_recv().ok())
+    }
+
+    // ── Wallet API onion service (ticket 014) ────────────────────────
+
+    /// Start a second onion service for the wallet JSON-RPC API.
+    /// Uses a separate Arti nickname ("hercules-wallet") so the keypair
+    /// is distinct from the P2P onion — the two addresses are unlinkable.
+    pub fn start_wallet_onion_service(&self, port: u16) -> Result<String, TorError> {
+        // If already running, return the existing address.
+        {
+            let state = self.wallet_state.lock().unwrap();
+            if let Some(ref addr) = state.address {
+                return Ok(addr.clone());
+            }
+        }
+
+        info!("Tor: starting wallet API onion service on port {}", port);
+
+        let handle = self.runtime.handle().clone();
+
+        let (service, address, request_stream) = self.runtime.block_on(async {
+            use arti_client::config::onion_service::OnionServiceConfigBuilder;
+
+            let svc_config = OnionServiceConfigBuilder::default()
+                .nickname("hercules-wallet".parse().map_err(|e| {
+                    TorError::OnionService(format!("invalid nickname: {}", e))
+                })?)
+                .build()
+                .map_err(|e| {
+                    TorError::OnionService(format!("config: {}", e))
+                })?;
+
+            let (service, request_stream) = self
+                .client
+                .launch_onion_service(svc_config)
+                .map_err(|e| {
+                    TorError::OnionService(format!("launch wallet service: {}", e))
+                })?
+                .ok_or_else(|| {
+                    TorError::OnionService("onion service disabled in config".into())
+                })?;
+
+            use safelog::DisplayRedacted;
+            let hs_id = service.onion_address().ok_or_else(|| {
+                TorError::OnionService("no onion address assigned yet".into())
+            })?;
+            let address = format!("{}", hs_id.display_unredacted());
+
+            Ok::<_, TorError>((service, address, request_stream))
+        })?;
+
+        let onion_addr = format!("{}:{}", address, port);
+        info!("Tor: wallet API onion service running at {}", onion_addr);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TorStream>(16);
+        let accept_handle = handle.clone();
+        handle.spawn(async move {
+            use tokio_stream::StreamExt;
+            let mut rend_stream = request_stream;
+            while let Some(rend_request) = rend_stream.next().await {
+                match rend_request.accept().await {
+                    Ok(mut stream_requests) => {
+                        let tx = tx.clone();
+                        let h = accept_handle.clone();
+                        tokio::spawn(async move {
+                            while let Some(stream_req) = stream_requests.next().await {
+                                use tor_cell::relaycell::msg::Connected;
+                                match stream_req.accept(Connected::new_empty()).await {
+                                    Ok(data_stream) => {
+                                        let tor_stream = TorStream::new(h.clone(), data_stream);
+                                        if tx.try_send(tor_stream).is_err() {
+                                            continue;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        info!("Tor: wallet service failed to accept stream: {}", e);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        info!("Tor: wallet service failed to accept rendezvous: {}", e);
+                    }
+                }
+            }
+        });
+
+        let mut state = self.wallet_state.lock().unwrap();
+        state.address = Some(onion_addr.clone());
+        state.inbound_rx = Some(rx);
+        state.handle = Some(OnionServiceHandle {
+            address: onion_addr.clone(),
+            _service: Box::new(service),
+        });
+
+        Ok(onion_addr)
+    }
+
+    /// Try to accept a pending inbound connection from the wallet onion service.
+    pub fn accept_wallet_inbound(&self) -> Option<TorStream> {
+        let state = self.wallet_state.lock().unwrap();
+        state.inbound_rx.as_ref().and_then(|rx| rx.try_recv().ok())
+    }
+
+    /// Stop the wallet onion service by dropping the handle.
+    pub fn stop_wallet_onion_service(&self) {
+        let mut state = self.wallet_state.lock().unwrap();
+        state.handle = None;
+        state.inbound_rx = None;
+        state.address = None;
+        info!("Tor: wallet API onion service stopped");
+    }
+
+    /// The wallet API .onion address, if the service is running.
+    pub fn wallet_onion_address(&self) -> Option<String> {
+        self.wallet_state.lock().unwrap().address.clone()
     }
 }
 

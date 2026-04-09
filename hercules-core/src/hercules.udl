@@ -103,6 +103,17 @@ interface HerculesNode {
     TorStatus? get_tor_status();
     MempoolStatus get_mempool_status();
     NodeStatus get_node_status();
+
+    [Throws=HerculesError]
+    string start_wallet_api();
+
+    void stop_wallet_api();
+
+    [Throws=HerculesError]
+    string get_wallet_api_connection_string();
+
+    [Throws=HerculesError]
+    string rotate_wallet_auth_token();
 };
 
 [Error]

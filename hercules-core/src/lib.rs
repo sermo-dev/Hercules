@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
@@ -17,8 +18,10 @@ mod tor;
 mod tor_v3;
 mod utxo;
 mod validation;
+mod wallet_rpc;
 
 use tor::TorManager;
+use wallet_rpc::WalletRpcServer;
 
 uniffi::include_scaffolding!("hercules");
 
@@ -232,9 +235,20 @@ pub trait SyncCallback: Send + Sync {
     fn on_progress(&self, status: SyncStatus);
 }
 
+/// State for a running wallet RPC server thread.
+struct WalletRpcHandle {
+    server: Arc<WalletRpcServer>,
+    thread: Option<JoinHandle<()>>,
+}
+
 pub struct HerculesNode {
-    syncer: sync::HeaderSync,
+    syncer: Arc<sync::HeaderSync>,
     tor: Option<Arc<TorManager>>,
+    wallet_rpc: Mutex<Option<WalletRpcHandle>>,
+    /// Persisted auth token for wallet API connections.
+    wallet_auth_token: Mutex<Option<String>>,
+    /// Path to the directory where we persist wallet API secrets.
+    data_dir: String,
 }
 
 impl HerculesNode {
@@ -270,7 +284,20 @@ impl HerculesNode {
             sync::HeaderSync::new(&db_path, tor.clone()).map_err(|e| HerculesError::StorageError {
                 msg: format!("{}", e),
             })?;
-        Ok(HerculesNode { syncer, tor })
+
+        // Derive data_dir from the db_path (parent directory of headers DB).
+        let data_dir = std::path::Path::new(&db_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+
+        Ok(HerculesNode {
+            syncer: Arc::new(syncer),
+            tor,
+            wallet_rpc: Mutex::new(None),
+            wallet_auth_token: Mutex::new(None),
+            data_dir,
+        })
     }
 
     pub fn get_status(&self) -> Result<SyncStatus, HerculesError> {
@@ -387,6 +414,185 @@ impl HerculesNode {
     pub fn get_node_status(&self) -> NodeStatus {
         self.syncer.get_node_status()
     }
+
+    // ── Wallet API ────────────────────────────────────────────────
+
+    /// Start the wallet-facing JSON-RPC server on a dedicated Tor onion
+    /// service. Returns the connection string: `<onion>:<port>/<auth_token>`.
+    /// Calling this when the server is already running is a no-op that
+    /// returns the existing connection string.
+    pub fn start_wallet_api(&self) -> Result<String, HerculesError> {
+        let tor = self.tor.as_ref().ok_or_else(|| HerculesError::TorError {
+            msg: "Tor is not enabled — wallet API requires Tor".into(),
+        })?;
+
+        // If already running, return existing connection string.
+        {
+            let guard = self.wallet_rpc.lock().unwrap();
+            if guard.is_some() {
+                return self.get_wallet_api_connection_string();
+            }
+        }
+
+        // Get or generate auth token.
+        let token = self.get_or_create_auth_token()?;
+
+        // Start the wallet onion service (separate from P2P onion).
+        // Uses interior mutability, so &self is sufficient through Arc.
+        let onion_addr = tor.start_wallet_onion_service(18443).map_err(|e| {
+            HerculesError::TorError {
+                msg: format!("wallet onion service: {}", e),
+            }
+        })?;
+
+        let server = Arc::new(WalletRpcServer::new(
+            Arc::clone(&self.syncer),
+            Arc::clone(tor),
+            token.clone(),
+        ));
+
+        let server_clone = Arc::clone(&server);
+        let thread = std::thread::Builder::new()
+            .name("wallet-rpc".into())
+            .spawn(move || {
+                server_clone.serve();
+            })
+            .map_err(|e| HerculesError::NetworkError {
+                msg: format!("failed to spawn wallet RPC thread: {}", e),
+            })?;
+
+        *self.wallet_rpc.lock().unwrap() = Some(WalletRpcHandle {
+            server,
+            thread: Some(thread),
+        });
+
+        log::info!("Wallet API started at {}", onion_addr);
+
+        // Connection string format: <addr_with_port>/<auth_token>
+        // onion_addr already includes :18443 from start_wallet_onion_service.
+        Ok(format!("{}/{}", onion_addr, token))
+    }
+
+    /// Stop the wallet API server and its onion service.
+    pub fn stop_wallet_api(&self) {
+        let handle = self.wallet_rpc.lock().unwrap().take();
+        if let Some(mut h) = handle {
+            h.server.stop();
+            if let Some(thread) = h.thread.take() {
+                let _ = thread.join();
+            }
+        }
+
+        // Stop the wallet onion service.
+        if let Some(ref tor) = self.tor {
+            tor.stop_wallet_onion_service();
+        }
+
+        log::info!("Wallet API stopped");
+    }
+
+    /// Get the wallet API connection string, or None if not running.
+    pub fn get_wallet_api_connection_string(&self) -> Result<String, HerculesError> {
+        let guard = self.wallet_rpc.lock().unwrap();
+        if guard.is_none() {
+            return Err(HerculesError::NetworkError {
+                msg: "wallet API is not running".into(),
+            });
+        }
+
+        let tor = self.tor.as_ref().ok_or_else(|| HerculesError::TorError {
+            msg: "Tor is not enabled".into(),
+        })?;
+
+        let onion_addr = tor.wallet_onion_address().ok_or_else(|| HerculesError::TorError {
+            msg: "wallet onion service not available".into(),
+        })?;
+
+        let token = self.wallet_auth_token.lock().unwrap();
+        let token = token.as_ref().ok_or_else(|| HerculesError::NetworkError {
+            msg: "no auth token".into(),
+        })?;
+
+        Ok(format!("{}/{}", onion_addr, token))
+    }
+
+    /// Load or generate the persistent auth token for wallet API.
+    fn get_or_create_auth_token(&self) -> Result<String, HerculesError> {
+        // Check in-memory cache first.
+        {
+            let guard = self.wallet_auth_token.lock().unwrap();
+            if let Some(ref t) = *guard {
+                return Ok(t.clone());
+            }
+        }
+
+        let token_path = format!("{}/wallet_auth_token", self.data_dir);
+
+        // Try to read persisted token.
+        if let Ok(contents) = std::fs::read_to_string(&token_path) {
+            let token = contents.trim().to_string();
+            if token.len() == 64 {
+                *self.wallet_auth_token.lock().unwrap() = Some(token.clone());
+                return Ok(token);
+            }
+        }
+
+        // No valid token on disk — generate and persist.
+        self.generate_and_persist_token()
+    }
+
+    /// Generate a fresh auth token, write it to disk, and update the
+    /// in-memory cache. Shared by initial generation and rotation.
+    fn generate_and_persist_token(&self) -> Result<String, HerculesError> {
+        let token = generate_auth_token().map_err(|e| HerculesError::StorageError {
+            msg: format!("failed to generate auth token: {}", e),
+        })?;
+
+        let token_path = format!("{}/wallet_auth_token", self.data_dir);
+
+        // Persist with restrictive permissions (owner-only read/write).
+        // On iOS the sandbox + Data Protection already encrypt at rest, but
+        // 0600 is defense-in-depth for any future non-iOS target.
+        {
+            use std::io::Write;
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+
+            let mut f = opts.open(&token_path).map_err(|e| HerculesError::StorageError {
+                msg: format!("failed to persist auth token: {}", e),
+            })?;
+            f.write_all(token.as_bytes()).map_err(|e| HerculesError::StorageError {
+                msg: format!("failed to write auth token: {}", e),
+            })?;
+        }
+
+        *self.wallet_auth_token.lock().unwrap() = Some(token.clone());
+        Ok(token)
+    }
+
+    /// Rotate the wallet API auth token. Generates a new token, persists
+    /// it, and restarts the wallet RPC server if it's running. The old
+    /// token is immediately invalidated — any wallet using it will get
+    /// 401 Unauthorized on its next request. Returns the new connection
+    /// string if the server is running, or just the new token if it's not.
+    pub fn rotate_wallet_auth_token(&self) -> Result<String, HerculesError> {
+        let token = self.generate_and_persist_token()?;
+        log::info!("Wallet API auth token rotated");
+
+        // If the server is running, restart it with the new token.
+        let was_running = self.wallet_rpc.lock().unwrap().is_some();
+        if was_running {
+            self.stop_wallet_api();
+            return self.start_wallet_api();
+        }
+
+        Ok(token)
+    }
 }
 
 /// Callback for snapshot loading progress.
@@ -403,6 +609,15 @@ pub struct SnapshotInfo {
 }
 
 // ── Utilities ──────────────────────────────────────────────────────
+
+/// Generate a 64-char hex auth token from 32 bytes of OS entropy.
+fn generate_auth_token() -> Result<String, std::io::Error> {
+    let mut buf = [0u8; 32];
+    // Works on macOS, iOS, Linux. /dev/urandom never blocks post-boot.
+    let mut file = std::fs::File::open("/dev/urandom")?;
+    std::io::Read::read_exact(&mut file, &mut buf)?;
+    Ok(hex::encode(buf))
+}
 
 fn chrono_format(timestamp: u32) -> String {
     let secs = timestamp as i64;

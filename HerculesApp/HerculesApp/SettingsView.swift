@@ -11,6 +11,8 @@ struct SettingsView: View {
     @State private var showSwitchModeConfirm = false
     @State private var pendingSwitchMode: ValidationMode?
     @State private var switchModeError: String?
+    @State private var copiedConnectionString = false
+    @State private var showRotateConfirm = false
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -22,6 +24,7 @@ struct SettingsView: View {
                     header
                     validationModeCard
                     cellularDataCard
+                    walletApiCard
                     notificationToggleCard
                     relayServerCard
                     registrationStatusCard
@@ -33,6 +36,14 @@ struct SettingsView: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 40)
             }
+        }
+        .alert("Regenerate auth token?", isPresented: $showRotateConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Regenerate", role: .destructive) {
+                viewModel.rotateWalletAuthToken()
+            }
+        } message: {
+            Text("This will immediately invalidate the current token. Any wallet using the old connection string will lose access and need the new one.")
         }
         .alert("Switch validation mode?", isPresented: $showSwitchModeConfirm, presenting: pendingSwitchMode) { mode in
             Button("Cancel", role: .cancel) {
@@ -206,6 +217,121 @@ struct SettingsView: View {
             return "On metered network — validation paused. Toggle on to allow, or wait for Wi-Fi."
         case .offline:
             return "No network — validation paused until reconnected."
+        }
+    }
+
+    // MARK: - Wallet API
+
+    private var walletApiCard: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: "link.circle.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(viewModel.isWalletApiRunning ? Theme.success : Theme.accent)
+                    Text("Wallet API")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("External Wallet Access")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Theme.textPrimary)
+                        Text("Serve your node's blockchain data to external wallets over Tor")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { viewModel.isWalletApiRunning },
+                        set: { newValue in
+                            if newValue {
+                                viewModel.startWalletApi()
+                            } else {
+                                viewModel.stopWalletApi()
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                    .tint(Theme.accent)
+                    .disabled(!viewModel.isSyncRunning)
+                }
+
+                if let connString = viewModel.walletApiConnectionString, viewModel.isWalletApiRunning {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Connection String")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Theme.textTertiary)
+
+                        Text(connString)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(3)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.white.opacity(0.05))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                        HStack(spacing: 10) {
+                            Button(action: {
+                                UIPasteboard.general.string = connString
+                                copiedConnectionString = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                    copiedConnectionString = false
+                                }
+                            }) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: copiedConnectionString ? "checkmark" : "doc.on.doc")
+                                        .font(.system(size: 12))
+                                    Text(copiedConnectionString ? "Copied" : "Copy")
+                                        .font(.system(size: 13, weight: .medium))
+                                }
+                                .foregroundStyle(copiedConnectionString ? Theme.success : Theme.accent)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background((copiedConnectionString ? Theme.success : Theme.accent).opacity(0.12))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                            .buttonStyle(.plain)
+
+                            Button(action: { showRotateConfirm = true }) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                        .font(.system(size: 12))
+                                    Text("Regenerate")
+                                        .font(.system(size: 13, weight: .medium))
+                                }
+                                .foregroundStyle(Theme.warning)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(Theme.warning.opacity(0.12))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                if let error = viewModel.walletApiError {
+                    Text(error)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Theme.error)
+                }
+
+                if !viewModel.isSyncRunning {
+                    Text("Start the node first — the wallet API requires an active Tor connection.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textTertiary)
+                } else {
+                    Text("Paste the connection string into Sparrow, Fully Noded, or any wallet that supports Tor. The string contains your auth token — keep it private.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 
