@@ -34,6 +34,11 @@ const MAX_DBS: u32 = 8;
 /// LMDB key length for the `utxos` DB: txid (32) + vout (4 BE).
 const UTXO_KEY_LEN: usize = 36;
 
+/// Key inside the `meta` DB for the assume-valid floor: the highest block
+/// height covered by the most-recently loaded UTXO snapshot. Stored as 4
+/// little-endian bytes. Absent on a fresh-from-genesis install.
+const META_KEY_ASSUME_VALID_FLOOR: &[u8] = b"assume_valid_floor";
+
 /// LMDB key length for the `height_index` DB: height (4 BE) + txid (32) + vout (4 BE).
 const HEIGHT_INDEX_KEY_LEN: usize = 40;
 
@@ -108,6 +113,10 @@ pub struct UtxoEntry {
 ///   in O(matches) instead of scanning the full set, which rollback needs.
 ///   Also gives `has_utxos_at_height` a single cursor seek.
 ///
+/// * `meta` — `key = ascii name`, value = arbitrary bytes. Cross-restart
+///   metadata that doesn't fit the per-UTXO or per-height schemas (currently
+///   just the assume-valid floor written by `load_snapshot`).
+///
 /// All schema versioning is implicit in the snapshot format hash check —
 /// loading a snapshot computed under different on-disk semantics will fail
 /// the SHA256 verification before any data lands.
@@ -116,6 +125,7 @@ pub struct UtxoSet {
     utxos: Database<Bytes, Bytes>,
     undo: Database<Bytes, Bytes>,
     height_index: Database<Bytes, Unit>,
+    meta: Database<Bytes, Bytes>,
 }
 
 impl UtxoSet {
@@ -174,6 +184,9 @@ impl UtxoSet {
         let height_index: Database<Bytes, Unit> = env
             .create_database(&mut wtxn, Some("height_index"))
             .map_err(|e| UtxoError(format!("create height_index db: {}", e)))?;
+        let meta: Database<Bytes, Bytes> = env
+            .create_database(&mut wtxn, Some("meta"))
+            .map_err(|e| UtxoError(format!("create meta db: {}", e)))?;
         wtxn.commit()
             .map_err(|e| UtxoError(format!("commit create-tx: {}", e)))?;
 
@@ -188,6 +201,7 @@ impl UtxoSet {
             utxos,
             undo,
             height_index,
+            meta,
         })
     }
 
@@ -336,12 +350,59 @@ impl UtxoSet {
         Ok(())
     }
 
+    /// Highest block height covered by the most-recently loaded UTXO snapshot,
+    /// or 0 on a fresh-from-genesis install. Persisted by `load_snapshot` and
+    /// read out of the `meta` LMDB DB on every call so process restarts pick
+    /// it up automatically.
+    ///
+    /// `rollback_block` uses this as a hard floor: snapshot rows have no
+    /// `height_index` entries (see the comment in `load_snapshot`), so a
+    /// rollback at or below the snapshot height would silently leave them in
+    /// place — corrupting the UTXO set against any later re-application of a
+    /// different chain. Today this is unreachable in practice because the
+    /// snapshot floor sits well below `MAX_REORG_DEPTH` from tip, but it's
+    /// the kind of guard we'd rather have explicit than implicit.
+    pub fn assume_valid_floor(&self) -> Result<u32, UtxoError> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let bytes = self
+            .meta
+            .get(&rtxn, META_KEY_ASSUME_VALID_FLOOR)
+            .map_err(|e| UtxoError(format!("read assume_valid_floor: {}", e)))?;
+        match bytes {
+            Some(b) if b.len() == 4 => {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(b);
+                Ok(u32::from_le_bytes(buf))
+            }
+            Some(b) => Err(UtxoError(format!(
+                "corrupt assume_valid_floor: len {}",
+                b.len()
+            ))),
+            None => Ok(0),
+        }
+    }
+
     /// Undo a block's UTXO changes. Must be called from the chain tip downward.
     ///
     /// 1. Removes all outputs created at this height (via `height_index`).
     /// 2. Restores all outputs that were spent at this height (from `undo`).
     /// 3. Deletes the undo data for this height.
+    ///
+    /// Rejects rollbacks at or below the assume-valid floor — see
+    /// `assume_valid_floor` for the rationale.
     pub fn rollback_block(&self, height: u32) -> Result<(), UtxoError> {
+        let floor = self.assume_valid_floor()?;
+        if height <= floor && floor > 0 {
+            return Err(UtxoError(format!(
+                "rollback_block: height {} is at or below assume-valid floor {} \
+                 (snapshot rows have no height_index entries and cannot be rolled back)",
+                height, floor
+            )));
+        }
+
         let mut wtxn = self
             .env
             .write_txn()
@@ -836,6 +897,18 @@ impl UtxoSet {
                 )));
             }
 
+            // Record the assume-valid floor so `rollback_block` can refuse
+            // to roll back into snapshot territory across process restarts.
+            // Written in the same txn as the final batch so a commit failure
+            // (or earlier hash failure causing rollback) leaves no orphan.
+            self.meta
+                .put(
+                    &mut wtxn,
+                    META_KEY_ASSUME_VALID_FLOOR,
+                    &height.to_le_bytes(),
+                )
+                .map_err(|e| UtxoError(format!("put assume_valid_floor: {}", e)))?;
+
             wtxn.commit()
                 .map_err(|e| UtxoError(format!("commit snapshot: {}", e)))?;
             Ok(())
@@ -908,6 +981,9 @@ impl UtxoSet {
         self.height_index
             .clear(&mut wtxn)
             .map_err(|e| UtxoError(format!("clear_all height_index: {}", e)))?;
+        self.meta
+            .clear(&mut wtxn)
+            .map_err(|e| UtxoError(format!("clear_all meta: {}", e)))?;
         wtxn.commit()
             .map_err(|e| UtxoError(format!("clear_all commit: {}", e)))?;
         Ok(())
@@ -1539,6 +1615,104 @@ mod tests {
         // height_index empty: has_utxos_at_height should report false even
         // though height 0 has a UTXO in the main table.
         assert!(!utxo2.has_utxos_at_height(0).unwrap());
+    }
+
+    #[test]
+    fn assume_valid_floor_defaults_to_zero() {
+        // A fresh-from-genesis env has no snapshot, so the floor must be 0
+        // and rollback_block(0) must still be allowed (for the genesis
+        // rollback path that other tests in this file already exercise).
+        let (utxo, _dir) = fresh();
+        assert_eq!(utxo.assume_valid_floor().unwrap(), 0);
+    }
+
+    #[test]
+    fn load_snapshot_records_assume_valid_floor() {
+        // After a successful snapshot load at height H, the floor must
+        // equal H and persist across `assume_valid_floor()` reads.
+        let (utxo1, _dir1) = fresh();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+        let mut buf = Vec::new();
+        let meta = utxo1.write_snapshot(&mut buf, 12345, &[0u8; 32]).unwrap();
+
+        let (utxo2, _dir2) = fresh();
+        assert_eq!(utxo2.assume_valid_floor().unwrap(), 0);
+        utxo2
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .unwrap();
+        assert_eq!(utxo2.assume_valid_floor().unwrap(), 12345);
+    }
+
+    #[test]
+    fn assume_valid_floor_persists_across_reopen() {
+        // Critical for the rollback guard to be effective across process
+        // restarts: the floor must come back from disk on reopen.
+        let (utxo1, _dir1) = fresh();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+        let mut buf = Vec::new();
+        let meta = utxo1.write_snapshot(&mut buf, 700_000, &[0u8; 32]).unwrap();
+
+        let dir2 = TempDir::new().unwrap();
+        let env_path = dir2.path().join("utxo");
+        {
+            let utxo2 = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+            utxo2
+                .load_snapshot(
+                    std::io::Cursor::new(&buf),
+                    Some(&meta.utxo_hash),
+                    |_, _| {},
+                )
+                .unwrap();
+            assert_eq!(utxo2.assume_valid_floor().unwrap(), 700_000);
+        } // drop closes the env
+
+        let utxo_reopened = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        assert_eq!(utxo_reopened.assume_valid_floor().unwrap(), 700_000);
+    }
+
+    #[test]
+    fn rollback_block_rejects_at_or_below_assume_valid_floor() {
+        // After a snapshot load at H, rollback_block(H) and any
+        // rollback_block(< H) must error: snapshot rows have no
+        // height_index entries and would silently survive a rollback,
+        // corrupting the UTXO set.
+        let (utxo1, _dir1) = fresh();
+        let genesis = genesis_block();
+        utxo1.apply_block(&genesis, 0).unwrap();
+        let mut buf = Vec::new();
+        let meta = utxo1.write_snapshot(&mut buf, 100, &[0u8; 32]).unwrap();
+
+        let (utxo2, _dir2) = fresh();
+        utxo2
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .unwrap();
+
+        // Below the floor.
+        let err = utxo2
+            .rollback_block(50)
+            .expect_err("rollback below floor must be rejected");
+        assert!(
+            err.to_string().contains("assume-valid floor"),
+            "unexpected error: {}",
+            err
+        );
+
+        // At the floor (still rejected — the snapshot height itself is
+        // unrecoverable since its rows are not in height_index).
+        let err = utxo2
+            .rollback_block(100)
+            .expect_err("rollback at floor must be rejected");
+        assert!(err.to_string().contains("assume-valid floor"));
+
+        // Just above the floor — this would be rejected later by missing
+        // undo data, but the floor guard must NOT block it.
+        let result = utxo2.rollback_block(101);
+        assert!(
+            result.is_ok() || !format!("{}", result.unwrap_err()).contains("assume-valid floor"),
+            "rollback just above floor must not be blocked by the floor guard"
+        );
     }
 
     #[test]
