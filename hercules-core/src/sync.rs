@@ -37,6 +37,14 @@ const SELF_AD_REBROADCAST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60)
 /// Maximum reorg depth we'll accept (bounded by undo data retention window).
 const MAX_REORG_DEPTH: u32 = 288;
 
+/// Per-peer cap on the `known_txids` dedup set. A malicious peer that floods
+/// us with INV messages full of unique txids can otherwise grow this set
+/// unboundedly between maintenance ticks. 10k txids ≈ 320 KB per peer; with
+/// MAX_OUTBOUND + MAX_INBOUND ≈ 24 peers that's a hard ceiling around 8 MB.
+/// On overflow we clear the entire set rather than evicting individually —
+/// the dedup is best-effort and a coarse reset is acceptable.
+const MAX_KNOWN_TXIDS_PER_PEER: usize = 10_000;
+
 /// Penalty applied to a peer that produced a divergent header batch when
 /// cross-checked against the majority. Two strikes ban it (2 * 50 = 100,
 /// score drops to 0).
@@ -245,6 +253,17 @@ struct PeerRelayState {
     /// Bitcoin Core caps GetAddr responses to one per connection — repeated
     /// requests are scrapers we should ignore. We mirror that behavior.
     getaddr_responded: bool,
+}
+
+/// Insert `txid` into the per-peer dedup set, capped at
+/// `MAX_KNOWN_TXIDS_PER_PEER`. On overflow the entire set is cleared rather
+/// than evicting individually — the dedup is best-effort and a coarse reset
+/// is acceptable.
+fn record_known_txid(state: &mut PeerRelayState, txid: Txid) {
+    if state.known_txids.len() >= MAX_KNOWN_TXIDS_PER_PEER {
+        state.known_txids.clear();
+    }
+    state.known_txids.insert(txid);
 }
 
 /// Pending transaction relay with Poisson delay.
@@ -1065,8 +1084,10 @@ impl HeaderSync {
                         pool.maintain();
                         self.mempool.lock().unwrap().expire_old();
                         self.update_peer_counts(&pool);
-                        // Clean up relay_state: remove entries for disconnected peers
-                        // and cap per-peer known_txids to prevent unbounded growth
+                        // Clean up relay_state: remove entries for disconnected
+                        // peers. The per-peer known_txids cap is enforced at
+                        // the INV insertion site (MAX_KNOWN_TXIDS_PER_PEER), so
+                        // there's nothing to cap here.
                         {
                             let connected: HashSet<String> = pool.peer_info()
                                 .iter()
@@ -1074,11 +1095,6 @@ impl HeaderSync {
                                 .collect();
                             let mut state = self.relay_state.lock().unwrap();
                             state.retain(|addr, _| connected.contains(addr));
-                            for rs in state.values_mut() {
-                                if rs.known_txids.len() > 10_000 {
-                                    rs.known_txids.clear();
-                                }
-                            }
                         }
                         last_maintain = Instant::now();
                     }
@@ -1745,18 +1761,20 @@ impl HeaderSync {
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     if !self.mempool.lock().unwrap().contains(txid) {
-                        // Record that this peer knows about this tx
+                        // Record that this peer knows about this tx. The
+                        // helper enforces MAX_KNOWN_TXIDS_PER_PEER on every
+                        // insert so a malicious INV burst can't grow this
+                        // set arbitrarily between maintenance ticks.
                         let mut state = self.relay_state.lock().unwrap();
-                        state
+                        let entry = state
                             .entry(addr.to_string())
                             .or_insert_with(|| PeerRelayState {
                                 wants_sendheaders: false,
                                 feefilter_rate: 0,
                                 known_txids: HashSet::new(),
                                 getaddr_responded: false,
-                            })
-                            .known_txids
-                            .insert(*txid);
+                            });
+                        record_known_txid(entry, *txid);
 
                         // Request with witness data for segwit transactions
                         request.push(Inventory::WitnessTransaction(*txid));
@@ -2093,8 +2111,17 @@ impl HeaderSync {
                     return Ok(notification);
                 }
 
-                // Store block for NODE_NETWORK_LIMITED serving
-                let _ = self.block_store.store_block(&block, new_tip);
+                // Store block for NODE_NETWORK_LIMITED serving. A failure here
+                // means the chain has advanced past `new_tip` in the UTXO set
+                // but `block_store` doesn't have the bytes — we'd be unable to
+                // serve this height to peers asking for it. Surface the error
+                // so the Swift caller can retry, matching the propagation
+                // pattern used in the main sync loop above.
+                if let Err(e) = self.block_store.store_block(&block, new_tip) {
+                    notification.validation_error =
+                        Some(format!("block store: {}", e));
+                    return Ok(notification);
+                }
 
                 // Remove confirmed transactions from mempool
                 self.mempool.lock().unwrap().remove_confirmed(&block);
@@ -2419,5 +2446,70 @@ mod tests {
             // 1e-15 floor → max -ln = ~34.5, times mean=2 → ~69.
             assert!(d < 100.0, "delay should be bounded: {}", d);
         }
+    }
+
+    // ── record_known_txid (per-peer dedup cap) ────────────────────────
+
+    /// Build a `PeerRelayState` with an empty txid set for the cap tests.
+    fn empty_relay_state() -> PeerRelayState {
+        PeerRelayState {
+            wants_sendheaders: false,
+            feefilter_rate: 0,
+            known_txids: HashSet::new(),
+            getaddr_responded: false,
+        }
+    }
+
+    /// Synthesize `n` distinct txids for use as test inputs. Each is the
+    /// little-endian counter padded to 32 bytes.
+    fn synthetic_txid(i: usize) -> Txid {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        Txid::from_byte_array(bytes)
+    }
+
+    #[test]
+    fn record_known_txid_inserts_below_cap() {
+        let mut s = empty_relay_state();
+        for i in 0..50 {
+            record_known_txid(&mut s, synthetic_txid(i));
+        }
+        assert_eq!(s.known_txids.len(), 50);
+    }
+
+    #[test]
+    fn record_known_txid_resets_on_overflow() {
+        // Drive the helper past MAX_KNOWN_TXIDS_PER_PEER and assert the
+        // set never grows above the cap. The reset is coarse — we clear the
+        // entire set rather than evict individually — so after the (cap+1)th
+        // insert the size drops back to 1 and starts climbing again.
+        let mut s = empty_relay_state();
+        for i in 0..(MAX_KNOWN_TXIDS_PER_PEER + 5) {
+            record_known_txid(&mut s, synthetic_txid(i));
+            assert!(
+                s.known_txids.len() <= MAX_KNOWN_TXIDS_PER_PEER,
+                "known_txids grew past cap at i={}: len={}",
+                i,
+                s.known_txids.len()
+            );
+        }
+        // After the overflow, the set has been cleared and the last 5
+        // insertions accumulated on a fresh set.
+        assert_eq!(s.known_txids.len(), 5);
+    }
+
+    #[test]
+    fn record_known_txid_burst_stays_bounded() {
+        // Worst case: an attacker bursts 50k unique txids in a single INV
+        // (the Bitcoin protocol max). The cap must hold throughout.
+        let mut s = empty_relay_state();
+        for i in 0..50_000 {
+            record_known_txid(&mut s, synthetic_txid(i));
+        }
+        assert!(
+            s.known_txids.len() <= MAX_KNOWN_TXIDS_PER_PEER,
+            "burst grew set past cap: {}",
+            s.known_txids.len()
+        );
     }
 }
