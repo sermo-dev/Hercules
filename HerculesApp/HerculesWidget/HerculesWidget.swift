@@ -1,15 +1,22 @@
+import ActivityKit
 import SwiftUI
 import WidgetKit
 
 // MARK: - Widget Bundle (entry point)
 
-/// Single `@main` entry point that exposes the home/lock screen widget
-/// (`HerculesNodeWidget`). A Live Activity configuration will be added
-/// alongside it in a later patch.
+/// Single `@main` entry point that exposes both the home/lock screen widget
+/// (`HerculesNodeWidget`) and the Live Activity / Dynamic Island
+/// configuration (`HerculesNodeActivity`). The Live Activity is registered
+/// here even though it's iOS 16.1+ only — the `@available` guard on
+/// `HerculesNodeActivity` itself keeps the bundle compiling against the
+/// iOS 17 deployment target.
 @main
 struct HerculesWidgetBundle: WidgetBundle {
     var body: some Widget {
         HerculesNodeWidget()
+        if #available(iOS 16.2, *) {
+            HerculesNodeActivity()
+        }
     }
 }
 
@@ -316,3 +323,162 @@ private func relativeBlockTime(state: SharedNodeState) -> some View {
     }
 }
 
+// MARK: - Live Activity
+
+/// Live Activity / Dynamic Island configuration. Gated on iOS 16.2+ (when
+/// `ActivityKit` reached its current API surface). On older OS versions
+/// the widget bundle simply omits this — the home/lock-screen widget
+/// remains available all the way back to the project's iOS 17 deployment
+/// target.
+@available(iOS 16.2, *)
+struct HerculesNodeActivity: Widget {
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: NodeActivityAttributes.self) { context in
+            // Lock Screen / banner presentation (used on non-Pro iPhones
+            // and on the Lock Screen of all devices).
+            ActivityBannerView(context: context)
+                .activityBackgroundTint(Color.black.opacity(0.5))
+                .activitySystemActionForegroundColor(.white)
+        } dynamicIsland: { context in
+            DynamicIsland {
+                // Expanded layout (long-press)
+                DynamicIslandExpandedRegion(.leading) {
+                    HStack(spacing: 6) {
+                        Image(systemName: context.state.phase.icon)
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(context.state.phase.tint)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text("Hercules")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Text(context.state.phase.label)
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                    }
+                }
+                DynamicIslandExpandedRegion(.trailing) {
+                    VStack(alignment: .trailing, spacing: 0) {
+                        Text("\(context.state.blockHeight)")
+                            .font(.system(size: 22, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                        Text("\(context.state.peerCount) peers")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                DynamicIslandExpandedRegion(.bottom) {
+                    PhaseProgressBar(phase: context.state.phase)
+                        .padding(.horizontal, 4)
+                        .padding(.top, 4)
+                }
+            } compactLeading: {
+                Image(systemName: context.state.phase.icon)
+                    .foregroundStyle(context.state.phase.tint)
+            } compactTrailing: {
+                Text("\(context.state.blockHeight)")
+                    .monospacedDigit()
+                    .font(.system(size: 13, weight: .semibold))
+            } minimal: {
+                Image(systemName: context.state.phase.icon)
+                    .foregroundStyle(context.state.phase.tint)
+            }
+            .keylineTint(context.state.phase.tint)
+        }
+    }
+}
+
+/// Lock Screen banner / non-Pro iPhone presentation. Same data as the
+/// Dynamic Island expanded view but with more vertical room.
+@available(iOS 16.2, *)
+struct ActivityBannerView: View {
+    let context: ActivityViewContext<NodeActivityAttributes>
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: context.state.phase.icon)
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(context.state.phase.tint)
+                .frame(width: 36)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(context.state.phase.label)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text("Block \(context.state.blockHeight) · \(context.state.peerCount) peers")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.7))
+                PhaseProgressBar(phase: context.state.phase)
+                    .padding(.top, 2)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+}
+
+/// 5-step phase indicator: ⚪️→⚪️→⚪️→⚪️→⚪️ with the current phase filled.
+/// One row, no labels — the textual label sits above this in the parent
+/// view, so this exists purely as a visual heartbeat showing forward
+/// progress through the wake.
+@available(iOS 16.2, *)
+struct PhaseProgressBar: View {
+    let phase: WakePhase
+
+    private static let order: [WakePhase] = [.connecting, .headers, .block, .validating, .done]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(Self.order, id: \.self) { p in
+                Capsule()
+                    .fill(phaseColor(for: p))
+                    .frame(height: 4)
+            }
+        }
+    }
+
+    private func phaseColor(for p: WakePhase) -> Color {
+        if phase == .failed { return .red.opacity(0.6) }
+        let currentIndex = Self.order.firstIndex(of: phase) ?? 0
+        let thisIndex = Self.order.firstIndex(of: p) ?? 0
+        if thisIndex <= currentIndex {
+            return phase.tint
+        }
+        return Color.white.opacity(0.2)
+    }
+}
+
+@available(iOS 16.2, *)
+extension WakePhase {
+    var icon: String {
+        switch self {
+        case .connecting: return "network"
+        case .headers:    return "arrow.down.doc"
+        case .block:      return "cube"
+        case .validating: return "checkmark.shield"
+        case .done:       return "checkmark.circle.fill"
+        case .failed:     return "xmark.octagon.fill"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .connecting: return .blue
+        case .headers:    return .blue
+        case .block:      return .yellow
+        case .validating: return .yellow
+        case .done:       return .green
+        case .failed:     return .red
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .connecting: return "Connecting to peers"
+        case .headers:    return "Receiving headers"
+        case .block:      return "Downloading block"
+        case .validating: return "Validating block"
+        case .done:       return "Block validated"
+        case .failed:     return "Wake failed"
+        }
+    }
+}

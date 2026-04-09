@@ -23,6 +23,8 @@
 		DA7A00000000000000000002 /* HerculesWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000006 /* HerculesWidget.swift */; };
 		DA7A00000000000000000013 /* SharedNodeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000012 /* SharedNodeState.swift */; };
 		DA7A00000000000000000014 /* SharedNodeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000012 /* SharedNodeState.swift */; };
+		DA7A00000000000000000016 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000015 /* NodeActivityAttributes.swift */; };
+		DA7A00000000000000000017 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000015 /* NodeActivityAttributes.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -70,6 +72,7 @@
 		DA7A00000000000000000007 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		DA7A00000000000000000008 /* HerculesWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesWidget.entitlements; sourceTree = "<group>"; };
 		DA7A00000000000000000012 /* SharedNodeState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedNodeState.swift; sourceTree = "<group>"; };
+		DA7A00000000000000000015 /* NodeActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeActivityAttributes.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -131,6 +134,7 @@
 				8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */,
 				4CB3647C90E7FDE042B14BD4 /* Info.plist */,
 				0F1E2D3C4B5A69788796A5B4 /* NetworkPolicy.swift */,
+				DA7A00000000000000000015 /* NodeActivityAttributes.swift */,
 				F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */,
 				369D4212C2AB889A298C77F9 /* NotificationManager.swift */,
 				91B6627F64A7DEA672DD126A /* SettingsView.swift */,
@@ -266,6 +270,7 @@
 				6E11490B9C8FBFC3B743B3B1 /* ContentView.swift in Sources */,
 				207BCB9D380A6282E1252A39 /* HerculesApp.swift in Sources */,
 				A1B2C3D4E5F60718293A4B5C /* NetworkPolicy.swift in Sources */,
+				DA7A00000000000000000016 /* NodeActivityAttributes.swift in Sources */,
 				B3EF5D8882B4179A23DF8B64 /* NotificationHistory.swift in Sources */,
 				FEA13ADA8F49AAA14C5EB73F /* NotificationManager.swift in Sources */,
 				BC2233A312C88F1BCD98652D /* SettingsView.swift in Sources */,
@@ -280,6 +285,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				DA7A00000000000000000002 /* HerculesWidget.swift in Sources */,
+				DA7A00000000000000000017 /* NodeActivityAttributes.swift in Sources */,
 				DA7A00000000000000000014 /* SharedNodeState.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
