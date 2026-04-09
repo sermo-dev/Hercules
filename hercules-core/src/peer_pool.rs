@@ -1099,9 +1099,8 @@ impl PeerPool {
     /// write on every reward (which would be many writes per second during
     /// header sync).
     pub fn flush_scores(&mut self) {
-        let store = match self.store.clone() {
-            Some(s) => s,
-            None => return,
+        let Some(store) = self.store.as_ref() else {
+            return;
         };
         let entries: Vec<(String, i32)> = {
             let slots = self.slots.lock().unwrap();
@@ -1119,9 +1118,8 @@ impl PeerPool {
     /// Deletes run BEFORE inserts so an entry that was evicted-and-readded
     /// in the same flush window ends up in the correct final state.
     pub fn flush_addrs(&mut self) {
-        let store = match self.store.clone() {
-            Some(s) => s,
-            None => return,
+        let Some(store) = self.store.as_ref() else {
+            return;
         };
 
         let deletes = self.addrs.take_pending_deletes();

@@ -35,6 +35,14 @@ const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
 const SELF_AD_REBROADCAST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Maximum reorg depth we'll accept (bounded by undo data retention window).
+///
+/// This number must stay in lock-step with the prune horizon below: every
+/// 1000 blocks the sync loop calls `prune_undo_below(next_height - 288)`,
+/// which keeps undo records for heights `>= next_height - 288`. A max-depth
+/// reorg targets exactly `current_tip - 288`, so the boundary is *exact*,
+/// not tight-with-bug — if you bump this constant you must also bump the
+/// `next_height - 288` arithmetic in `sync.rs::prune_undo_below` and in
+/// `block_store.prune_below`.
 const MAX_REORG_DEPTH: u32 = 288;
 
 /// Per-peer cap on the `known_txids` dedup set. A malicious peer that floods
@@ -329,11 +337,16 @@ impl HeaderSync {
         let utxo =
             UtxoSet::open(&utxo_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-        // Derive block store path for NODE_NETWORK_LIMITED serving
+        // Derive block store path for NODE_NETWORK_LIMITED serving. Use the
+        // sibling-path helper instead of `db_path.replace("headers", "blocks")`
+        // — the substring approach silently misbehaves if a parent directory
+        // happens to contain "headers" (e.g. `/var/headers-data/headers.sqlite3`
+        // → `/var/blocks-data/blocks.sqlite3`) or if the operator picks a
+        // headers filename like `mainnet.sqlite3`.
         let blocks_path = if db_path == ":memory:" {
             ":memory:".to_string()
         } else {
-            db_path.replace("headers", "blocks")
+            derive_sibling_path(db_path, "blocks.sqlite3")
         };
         let block_store =
             BlockStore::open(&blocks_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
@@ -343,7 +356,7 @@ impl HeaderSync {
         let peers_db_path = if db_path == ":memory:" {
             None
         } else {
-            Some(db_path.replace("headers", "peers"))
+            Some(derive_sibling_path(db_path, "peers.sqlite3"))
         };
 
         // Ensure genesis header is stored
@@ -1050,9 +1063,21 @@ impl HeaderSync {
                     // Drain the relay queue (send pending tx inv messages)
                     self.drain_relay_queue(&pool);
 
-                    // Accept pending inbound connections from Tor onion service
+                    // Accept pending inbound connections from Tor onion
+                    // service. Cap per-iteration so a sudden burst of
+                    // inbound circuits can't starve the header-sync work
+                    // below — each accept runs a full handshake, which
+                    // is expensive enough that >10 in a single tick would
+                    // visibly stall progress. Anything beyond the cap
+                    // waits for the next monitor-loop pass.
+                    const MAX_INBOUND_ACCEPTS_PER_TICK: usize = 10;
                     if let Some(ref tor) = self.tor {
-                        while let Some(inbound_stream) = tor.accept_inbound() {
+                        let mut accepted_this_tick = 0;
+                        while accepted_this_tick < MAX_INBOUND_ACCEPTS_PER_TICK {
+                            let Some(inbound_stream) = tor.accept_inbound() else {
+                                break;
+                            };
+                            accepted_this_tick += 1;
                             let peer_stream = crate::p2p::PeerStream::Tor(inbound_stream);
                             match crate::p2p::Peer::accept(peer_stream, tip_height as i32) {
                                 Ok(peer) => {

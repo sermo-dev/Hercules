@@ -786,3 +786,258 @@ fn rand_nonce() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish()
 }
+
+#[cfg(test)]
+mod tests {
+    //! Send-helper serialization round-trips.
+    //!
+    //! These tests cover the thin `send_*` wrappers (`send_headers`,
+    //! `send_block`, `send_tx`, `send_inv`, `send_not_found`) by attaching
+    //! a `Peer` to one half of a TCP loopback pair, calling the helper,
+    //! and decoding the bytes that arrived on the other end with the same
+    //! `RawNetworkMessage` codec the receive path uses.
+    //!
+    //! We deliberately don't run the version handshake here — these are
+    //! unit tests for the framing/serialization wrappers, not integration
+    //! tests for the protocol. Constructing a Peer in-place is the cheapest
+    //! way to exercise the send code without standing up a full responder.
+    use super::*;
+    use bitcoin::block::Header as BlockHeader;
+    use bitcoin::consensus::{deserialize, Decodable};
+    use bitcoin::hashes::Hash;
+    use bitcoin::p2p::message::RawNetworkMessage;
+    use std::net::{TcpListener, TcpStream};
+
+    /// Open a loopback TCP pair and wrap one half in a `Peer` so the
+    /// `send_*` helpers can write into it. The returned listener-side
+    /// `TcpStream` is what the test reads to decode the wire bytes.
+    fn loopback_peer_pair() -> (Peer, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Connect side runs in the test thread; accept side runs in a
+        // worker so we can join after the send completes.
+        let accept_handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            stream
+        });
+
+        let client = TcpStream::connect(addr).expect("connect loopback");
+        let server_side = accept_handle.join().expect("accept thread joined");
+
+        // Generous read timeout for the server side: tests on a busy CI
+        // machine occasionally need a few hundred ms to deliver. The send
+        // side never needs a timeout because it's writing into a kernel
+        // buffer, not waiting on the peer.
+        server_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set server read timeout");
+
+        let peer = Peer {
+            stream: PeerStream::Direct(client),
+            addr: addr.to_string(),
+            their_version: None,
+            inbound: false,
+            wants_addrv2: false,
+        };
+        (peer, server_side)
+    }
+
+    /// Read one full P2P message off `stream` and parse it via the same
+    /// `RawNetworkMessage` codec the production receive path uses, so the
+    /// tests catch any framing drift between sender and receiver.
+    fn read_one_message(stream: &mut TcpStream) -> NetworkMessage {
+        let mut header = [0u8; 24];
+        stream.read_exact(&mut header).expect("read header");
+        let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            stream.read_exact(&mut payload).expect("read payload");
+        }
+        let mut buf = Vec::with_capacity(24 + payload_len);
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(&payload);
+        let mut slice = buf.as_slice();
+        let raw = RawNetworkMessage::consensus_decode(&mut slice).expect("decode raw");
+        raw.payload().clone()
+    }
+
+    /// A minimal real block header — using the genesis header here so we
+    /// don't have to hand-roll a `Header` literal in every test that needs
+    /// to send headers.
+    fn sample_header() -> BlockHeader {
+        // Mainnet genesis block header (80 bytes).
+        let raw = hex::decode(
+            "0100000000000000000000000000000000000000000000000000000000000000\
+             000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa\
+             4b1e5e4a29ab5f49ffff001d1dac2b7c",
+        )
+        .unwrap();
+        deserialize(&raw).expect("genesis header")
+    }
+
+    #[test]
+    fn send_headers_writes_headers_message() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        let h = sample_header();
+        peer.send_headers(vec![h, h]).expect("send_headers");
+
+        match read_one_message(&mut server) {
+            NetworkMessage::Headers(hdrs) => {
+                assert_eq!(hdrs.len(), 2);
+                assert_eq!(hdrs[0].block_hash(), h.block_hash());
+                assert_eq!(hdrs[1].block_hash(), h.block_hash());
+            }
+            other => panic!("expected Headers, got {}", msg_name(&other)),
+        }
+    }
+
+    #[test]
+    fn send_inv_writes_inv_message_with_items_in_order() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        let h1 = BlockHash::from_byte_array([0x01; 32]);
+        let h2 = BlockHash::from_byte_array([0x02; 32]);
+        let h3 = BlockHash::from_byte_array([0x03; 32]);
+        let items = vec![
+            Inventory::Block(h1),
+            Inventory::WitnessBlock(h2),
+            Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array([0x09; 32])),
+            Inventory::Block(h3),
+        ];
+        peer.send_inv(items.clone()).expect("send_inv");
+
+        match read_one_message(&mut server) {
+            NetworkMessage::Inv(received) => {
+                // We don't compare with `==` because Inventory's equality
+                // covers the variants we care about; iterating is clearer.
+                assert_eq!(received.len(), items.len());
+                for (sent, got) in items.iter().zip(received.iter()) {
+                    match (sent, got) {
+                        (Inventory::Block(a), Inventory::Block(b)) => assert_eq!(a, b),
+                        (Inventory::WitnessBlock(a), Inventory::WitnessBlock(b)) => {
+                            assert_eq!(a, b)
+                        }
+                        (
+                            Inventory::WitnessTransaction(a),
+                            Inventory::WitnessTransaction(b),
+                        ) => assert_eq!(a, b),
+                        _ => panic!("inventory variant mismatch: {:?} vs {:?}", sent, got),
+                    }
+                }
+            }
+            other => panic!("expected Inv, got {}", msg_name(&other)),
+        }
+    }
+
+    #[test]
+    fn send_not_found_writes_notfound_with_inventory() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        let missing = vec![Inventory::WitnessBlock(BlockHash::from_byte_array(
+            [0xfe; 32],
+        ))];
+        peer.send_not_found(missing.clone()).expect("send_not_found");
+
+        match read_one_message(&mut server) {
+            NetworkMessage::NotFound(items) => {
+                assert_eq!(items.len(), 1);
+                match (&items[0], &missing[0]) {
+                    (Inventory::WitnessBlock(a), Inventory::WitnessBlock(b)) => {
+                        assert_eq!(a, b)
+                    }
+                    _ => panic!("expected single WitnessBlock entry"),
+                }
+            }
+            other => panic!("expected NotFound, got {}", msg_name(&other)),
+        }
+    }
+
+    #[test]
+    fn send_block_writes_block_message_preserving_txdata() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        // Build a tiny synthetic block with a single coinbase. Header
+        // checksum and merkle root don't matter — the wire codec only
+        // cares about byte layout.
+        use bitcoin::blockdata::block::{Header, Version};
+        use bitcoin::blockdata::transaction::{
+            OutPoint, Sequence, TxIn, TxOut, Version as TxVersion,
+        };
+        use bitcoin::{absolute::LockTime, Amount, CompactTarget, ScriptBuf, TxMerkleNode, Witness};
+        let coinbase = bitcoin::Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac]),
+            }],
+        };
+        let block = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        let expected_txid = block.txdata[0].compute_txid();
+
+        peer.send_block(block.clone()).expect("send_block");
+
+        match read_one_message(&mut server) {
+            NetworkMessage::Block(received) => {
+                assert_eq!(received.txdata.len(), 1);
+                assert_eq!(received.txdata[0].compute_txid(), expected_txid);
+                assert_eq!(received.header.time, 0);
+            }
+            other => panic!("expected Block, got {}", msg_name(&other)),
+        }
+    }
+
+    #[test]
+    fn send_tx_writes_tx_message_preserving_outpoints_and_amounts() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        use bitcoin::blockdata::transaction::{
+            OutPoint, Sequence, TxIn, TxOut, Version as TxVersion,
+        };
+        use bitcoin::{absolute::LockTime, Amount, ScriptBuf, Txid, Witness};
+        let tx = bitcoin::Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([0x55; 32]),
+                    vout: 7,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(123_456),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xac, 0xab]),
+            }],
+        };
+        let expected_txid = tx.compute_txid();
+
+        peer.send_tx(tx).expect("send_tx");
+
+        match read_one_message(&mut server) {
+            NetworkMessage::Tx(received) => {
+                assert_eq!(received.compute_txid(), expected_txid);
+                assert_eq!(received.input.len(), 1);
+                assert_eq!(received.input[0].previous_output.vout, 7);
+                assert_eq!(received.output.len(), 1);
+                assert_eq!(received.output[0].value.to_sat(), 123_456);
+            }
+            other => panic!("expected Tx, got {}", msg_name(&other)),
+        }
+    }
+}

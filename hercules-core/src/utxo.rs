@@ -1466,6 +1466,162 @@ mod tests {
     }
 
     #[test]
+    fn rollback_unwinds_chain_of_blocks_in_reverse_order() {
+        // A multi-height reorg scenario. We build a "chain":
+        //
+        //   h=5  : create UTXO A (txid 0xaa)
+        //   h=10 : create UTXO B (txid 0xbb), spend A (undo at h=10 restores A)
+        //   h=11 : create UTXO C (txid 0xcc), spend B (undo at h=11 restores B)
+        //   h=12 : create UTXO D (txid 0xdd), spend C (undo at h=12 restores C)
+        //
+        // After this seed, only D should be live ({A,B,C} are spent), and
+        // there should be three undo records (one per spent height).
+        //
+        // We then roll back 12 → 11 → 10 → 5 in order and verify the live
+        // UTXO set after each step:
+        //
+        //   after rollback(12): {C}
+        //   after rollback(11): {B}
+        //   after rollback(10): {A}
+        //   after rollback(5):  {}
+        //
+        // This is the closest unit-level test we can write to a real reorg
+        // — it exercises rollback's two-phase walk (delete-by-height +
+        // undo-replay) across multiple heights and checks that the
+        // height_index entries the next rollback depends on are correctly
+        // re-planted by the undo step.
+        let (utxo, _dir) = fresh();
+
+        let mk = |amt: u64, h: u32, coinbase: bool| UtxoEntry {
+            amount: amt,
+            script_pubkey: vec![0xac],
+            height: h,
+            is_coinbase: coinbase,
+        };
+        let txid_a = [0xaa; 32];
+        let txid_b = [0xbb; 32];
+        let txid_c = [0xcc; 32];
+        let txid_d = [0xdd; 32];
+
+        // Seed the FINAL on-disk state (after all four blocks have been
+        // applied): only D is live, and the undo log has restorations for
+        // A, B, C at the heights that consumed them.
+        utxo.test_insert_utxo(txid_d, 0, mk(40, 12, false)).unwrap();
+        utxo.test_insert_undo(12, 0, txid_c, 0, mk(30, 11, false))
+            .unwrap();
+        utxo.test_insert_undo(11, 0, txid_b, 0, mk(20, 10, false))
+            .unwrap();
+        utxo.test_insert_undo(10, 0, txid_a, 0, mk(10, 5, false))
+            .unwrap();
+
+        let id_a = Txid::from_byte_array(txid_a);
+        let id_b = Txid::from_byte_array(txid_b);
+        let id_c = Txid::from_byte_array(txid_c);
+        let id_d = Txid::from_byte_array(txid_d);
+
+        assert_eq!(utxo.count().unwrap(), 1);
+        assert_eq!(utxo.test_count_undo().unwrap(), 3);
+        assert!(utxo.get(&id_d, 0).unwrap().is_some());
+
+        // Step 1: rollback height 12 → D removed, C restored.
+        utxo.rollback_block(12).unwrap();
+        assert_eq!(utxo.count().unwrap(), 1);
+        assert!(utxo.get(&id_d, 0).unwrap().is_none());
+        let restored_c = utxo
+            .get(&id_c, 0)
+            .unwrap()
+            .expect("C should be restored after rollback(12)");
+        assert_eq!(restored_c.amount, 30);
+        assert_eq!(restored_c.height, 11);
+        // The undo entry consumed by this rollback should be gone, but the
+        // earlier ones remain.
+        assert_eq!(utxo.test_count_undo().unwrap(), 2);
+
+        // Step 2: rollback height 11 → C removed, B restored.
+        utxo.rollback_block(11).unwrap();
+        assert_eq!(utxo.count().unwrap(), 1);
+        assert!(utxo.get(&id_c, 0).unwrap().is_none());
+        let restored_b = utxo
+            .get(&id_b, 0)
+            .unwrap()
+            .expect("B should be restored after rollback(11)");
+        assert_eq!(restored_b.amount, 20);
+        assert_eq!(restored_b.height, 10);
+        assert_eq!(utxo.test_count_undo().unwrap(), 1);
+
+        // Step 3: rollback height 10 → B removed, A restored.
+        utxo.rollback_block(10).unwrap();
+        assert_eq!(utxo.count().unwrap(), 1);
+        assert!(utxo.get(&id_b, 0).unwrap().is_none());
+        let restored_a = utxo
+            .get(&id_a, 0)
+            .unwrap()
+            .expect("A should be restored after rollback(10)");
+        assert_eq!(restored_a.amount, 10);
+        assert_eq!(restored_a.height, 5);
+        assert_eq!(utxo.test_count_undo().unwrap(), 0);
+
+        // Step 4: rollback height 5 → A removed (no undo to replay; this
+        // is the first block in the chain so it created A from nothing).
+        // This is the same shape as the rollback_genesis_restores_empty_set
+        // case, but we're verifying it works after a sequence of restorations.
+        utxo.rollback_block(5).unwrap();
+        assert_eq!(utxo.count().unwrap(), 0);
+        assert!(utxo.get(&id_a, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn rollback_handles_height_with_multiple_outputs_and_spends() {
+        // Single block at height 7 that creates two UTXOs (X and Y) and
+        // simultaneously spends two pre-existing UTXOs (P and Q from h=3).
+        // Rolling back must:
+        //   - delete both new outputs from `utxos` AND `height_index`
+        //   - restore both spent inputs from the undo log
+        //   - leave the undo log empty for height 7
+        let (utxo, _dir) = fresh();
+        let mk = |amt: u64, h: u32| UtxoEntry {
+            amount: amt,
+            script_pubkey: vec![0xac],
+            height: h,
+            is_coinbase: false,
+        };
+
+        let txid_x = [0x11; 32];
+        let txid_y = [0x22; 32];
+        let txid_p = [0x33; 32];
+        let txid_q = [0x44; 32];
+
+        // Final state: X and Y are live at h=7. P and Q have been spent
+        // (so they're not in the live set) but their undo entries at h=7
+        // can resurrect them.
+        utxo.test_insert_utxo(txid_x, 0, mk(100, 7)).unwrap();
+        utxo.test_insert_utxo(txid_y, 0, mk(200, 7)).unwrap();
+        utxo.test_insert_undo(7, 0, txid_p, 0, mk(50, 3)).unwrap();
+        utxo.test_insert_undo(7, 1, txid_q, 0, mk(75, 3)).unwrap();
+
+        assert_eq!(utxo.count().unwrap(), 2);
+        assert_eq!(utxo.test_count_undo().unwrap(), 2);
+
+        utxo.rollback_block(7).unwrap();
+
+        let id_x = Txid::from_byte_array(txid_x);
+        let id_y = Txid::from_byte_array(txid_y);
+        let id_p = Txid::from_byte_array(txid_p);
+        let id_q = Txid::from_byte_array(txid_q);
+        assert!(utxo.get(&id_x, 0).unwrap().is_none());
+        assert!(utxo.get(&id_y, 0).unwrap().is_none());
+        let restored_p = utxo.get(&id_p, 0).unwrap().expect("P restored");
+        let restored_q = utxo.get(&id_q, 0).unwrap().expect("Q restored");
+        assert_eq!(restored_p.amount, 50);
+        assert_eq!(restored_p.height, 3);
+        assert_eq!(restored_q.amount, 75);
+        assert_eq!(restored_q.height, 3);
+        // Live set is now {P, Q}; the undo log for height 7 is drained.
+        assert_eq!(utxo.count().unwrap(), 2);
+        assert_eq!(utxo.test_count_undo().unwrap(), 0);
+    }
+
+    #[test]
     fn prune_undo_removes_old_data() {
         let (utxo, _dir) = fresh();
         let dummy = UtxoEntry {
