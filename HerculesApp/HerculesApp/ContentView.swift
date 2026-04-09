@@ -462,6 +462,7 @@ class SnapshotProgressCallback: SnapshotCallback {
 
 struct ContentView: View {
     @StateObject private var viewModel = NodeViewModel()
+    @ObservedObject private var networkPolicy = NetworkPolicy.shared
     @State private var showSettings = false
     @State private var showAbout = false
 
@@ -499,6 +500,14 @@ struct ContentView: View {
                                 }
 
                                 Spacer()
+
+                                Button(action: { showSettings = true }) {
+                                    Image(systemName: networkIconName)
+                                        .font(.system(size: 15))
+                                        .foregroundStyle(networkIconColor)
+                                        .padding(8)
+                                }
+                                .accessibilityLabel(networkIconAccessibilityLabel)
 
                                 Button(action: { showSettings = true }) {
                                     Image(systemName: "gearshape.fill")
@@ -594,6 +603,42 @@ struct ContentView: View {
         }
         .toolbarBackground(Theme.bg, for: .navigationBar)
         .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Network Indicator
+
+    /// SF Symbol for the header-bar network status icon. Reflects the live
+    /// `NetworkPolicy.indicator` value, so the user gets immediate feedback
+    /// when they toggle Wi-Fi, plug into a hotspot, or flip the cellular
+    /// preference in Settings.
+    private var networkIconName: String {
+        switch networkPolicy.indicator {
+        case .unmetered: return "wifi"
+        case .meteredAllowed: return "antenna.radiowaves.left.and.right"
+        case .meteredBlocked: return "antenna.radiowaves.left.and.right.slash"
+        case .offline: return "wifi.slash"
+        }
+    }
+
+    /// Color follows the same green/yellow/red convention as the rest of
+    /// the app: green = free to validate, yellow = validating with metered
+    /// opt-in (heads-up), red = validation paused.
+    private var networkIconColor: Color {
+        switch networkPolicy.indicator {
+        case .unmetered: return Theme.success
+        case .meteredAllowed: return Theme.warning
+        case .meteredBlocked: return Theme.error
+        case .offline: return Theme.textTertiary
+        }
+    }
+
+    private var networkIconAccessibilityLabel: String {
+        switch networkPolicy.indicator {
+        case .unmetered: return "Network: Wi-Fi, validating"
+        case .meteredAllowed: return "Network: cellular, validating with opt-in"
+        case .meteredBlocked: return "Network: cellular, validation paused"
+        case .offline: return "Network: offline"
+        }
     }
 }
 

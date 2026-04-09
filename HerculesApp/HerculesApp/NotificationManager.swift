@@ -92,12 +92,45 @@ class NotificationManager: ObservableObject {
 
     /// Handle a silent push notification. Creates a HerculesNode, validates
     /// the latest block within 25 seconds, and posts a local notification.
+    ///
+    /// If the device is on a metered network and the user has not opted into
+    /// "Use Cellular Data", we skip the block download entirely — opening a
+    /// P2P connection during a silent-push wake on cellular would burn the
+    /// user's allowance without warning. We still record the wake (using the
+    /// push payload's height/hash) and post a notification so the user sees
+    /// what would have happened, marked clearly as paused.
     func handleSilentPush(
         userInfo: [AnyHashable: Any],
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         // Parse block info from push payload (used as fallback if validation fails)
         let pushBlock = parsePushPayload(userInfo)
+
+        // Network policy gate: refuse to validate over metered links unless
+        // the user has explicitly opted in. Record a paused entry so the
+        // user can see in the notification history that we declined the wake.
+        if !NetworkPolicy.shared.shouldValidate {
+            if let push = pushBlock {
+                let record = BlockNotificationRecord(
+                    id: UUID(),
+                    height: push.height,
+                    blockHash: push.hash,
+                    timestamp: push.timestamp,
+                    timestampHuman: "",
+                    validated: false,
+                    headerValidated: false,
+                    receivedAt: Date(),
+                    source: .networkPolicyPaused,
+                    validationError: "Validation skipped: metered network without Use Cellular Data opt-in"
+                )
+                DispatchQueue.main.async {
+                    self.appendRecord(record)
+                }
+                Self.postLocalNotification(for: record)
+            }
+            completionHandler(.noData)
+            return
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -209,6 +242,9 @@ class NotificationManager: ObservableObject {
         case .pushPayload:
             content.title = "New Block #\(record.height)"
             content.body = "Received from relay (not yet validated)"
+        case .networkPolicyPaused:
+            content.title = "Block #\(record.height) — Validation Paused"
+            content.body = "Skipped to save cellular data. Connect to Wi-Fi or enable Use Cellular Data."
         }
 
         content.sound = .default

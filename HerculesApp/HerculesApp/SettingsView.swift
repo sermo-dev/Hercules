@@ -3,6 +3,8 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var viewModel: NodeViewModel
     @ObservedObject var notificationManager = NotificationManager.shared
+    @ObservedObject private var networkPolicy = NetworkPolicy.shared
+    @AppStorage(NetworkPolicy.useCellularDataKey) private var useCellularData: Bool = false
     @State private var relayURL: String = NotificationManager.shared.relayServerURL
     @State private var isTestingNotification = false
     @State private var testResult: String?
@@ -19,6 +21,7 @@ struct SettingsView: View {
                 VStack(spacing: 20) {
                     header
                     validationModeCard
+                    cellularDataCard
                     notificationToggleCard
                     relayServerCard
                     registrationStatusCard
@@ -130,6 +133,80 @@ struct SettingsView: View {
             Color.clear.frame(width: 24)
         }
         .padding(.top, 16)
+    }
+
+    // MARK: - Cellular Data
+
+    private var cellularDataCard: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: cellularIcon)
+                        .font(.system(size: 13))
+                        .foregroundStyle(cellularIconColor)
+                    Text("Network Usage")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Use Cellular Data")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Theme.textPrimary)
+                        Text("Validate blocks and download the snapshot over cellular, hotspot, or Low Data Mode")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $useCellularData)
+                        .labelsHidden()
+                        .tint(Theme.accent)
+                }
+
+                Text(cellularStatusText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(cellularIconColor)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Off by default. Each validated block uses ~2 MB; the snapshot is ~8 GB. With cellular off, block validation is paused on metered networks but resumes automatically on Wi-Fi.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var cellularIcon: String {
+        switch networkPolicy.indicator {
+        case .unmetered: return "wifi"
+        case .meteredAllowed: return "antenna.radiowaves.left.and.right"
+        case .meteredBlocked: return "antenna.radiowaves.left.and.right.slash"
+        case .offline: return "wifi.slash"
+        }
+    }
+
+    private var cellularIconColor: Color {
+        switch networkPolicy.indicator {
+        case .unmetered: return Theme.success
+        case .meteredAllowed: return Theme.warning
+        case .meteredBlocked: return Theme.error
+        case .offline: return Theme.textTertiary
+        }
+    }
+
+    private var cellularStatusText: String {
+        switch networkPolicy.indicator {
+        case .unmetered:
+            return "On Wi-Fi — validating freely."
+        case .meteredAllowed:
+            return "On metered network — validating with your opt-in. Watch your data usage."
+        case .meteredBlocked:
+            return "On metered network — validation paused. Toggle on to allow, or wait for Wi-Fi."
+        case .offline:
+            return "No network — validation paused until reconnected."
+        }
     }
 
     // MARK: - Notifications Toggle
@@ -355,6 +432,7 @@ struct SettingsView: View {
         case .fullValidation: return "checkmark.shield.fill"
         case .headerOnly: return "checkmark.circle.fill"
         case .pushPayload: return "bell.fill"
+        case .networkPolicyPaused: return "pause.circle.fill"
         }
     }
 
@@ -363,6 +441,7 @@ struct SettingsView: View {
         case .fullValidation: return Theme.success
         case .headerOnly: return Theme.warning
         case .pushPayload: return Theme.textSecondary
+        case .networkPolicyPaused: return Theme.warning
         }
     }
 
@@ -371,6 +450,7 @@ struct SettingsView: View {
         case .fullValidation: return "Validated"
         case .headerOnly: return "Header"
         case .pushPayload: return "Unverified"
+        case .networkPolicyPaused: return "Paused"
         }
     }
 }

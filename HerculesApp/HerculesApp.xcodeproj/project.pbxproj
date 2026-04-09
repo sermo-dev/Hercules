@@ -18,6 +18,7 @@
 		CB293751781200CE7EC2D89D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 422A25EDC51BDB37202B75C3 /* Assets.xcassets */; };
 		F313F11A848D8F6B84BC798E /* AboutView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26E678542C2644F95BA080C9 /* AboutView.swift */; };
 		FEA13ADA8F49AAA14C5EB73F /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 369D4212C2AB889A298C77F9 /* NotificationManager.swift */; };
+		A1B2C3D4E5F60718293A4B5C /* NetworkPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F1E2D3C4B5A69788796A5B4 /* NetworkPolicy.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -35,6 +36,7 @@
 		91B6627F64A7DEA672DD126A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		D447B442663275E674A34B07 /* hercules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = hercules.swift; sourceTree = "<group>"; };
 		F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationHistory.swift; sourceTree = "<group>"; };
+		0F1E2D3C4B5A69788796A5B4 /* NetworkPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPolicy.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -86,6 +88,7 @@
 				5DF36E0E80A83078F748A223 /* HerculesApp.entitlements */,
 				8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */,
 				4CB3647C90E7FDE042B14BD4 /* Info.plist */,
+				0F1E2D3C4B5A69788796A5B4 /* NetworkPolicy.swift */,
 				F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */,
 				369D4212C2AB889A298C77F9 /* NotificationManager.swift */,
 				91B6627F64A7DEA672DD126A /* SettingsView.swift */,
@@ -177,6 +180,7 @@
 				A128B0A9D11BC0123589A67B /* AppDelegate.swift in Sources */,
 				6E11490B9C8FBFC3B743B3B1 /* ContentView.swift in Sources */,
 				207BCB9D380A6282E1252A39 /* HerculesApp.swift in Sources */,
+				A1B2C3D4E5F60718293A4B5C /* NetworkPolicy.swift in Sources */,
 				B3EF5D8882B4179A23DF8B64 /* NotificationHistory.swift in Sources */,
 				FEA13ADA8F49AAA14C5EB73F /* NotificationManager.swift in Sources */,
 				BC2233A312C88F1BCD98652D /* SettingsView.swift in Sources */,
