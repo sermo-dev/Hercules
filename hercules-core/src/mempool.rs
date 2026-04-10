@@ -280,17 +280,25 @@ impl Mempool {
         if !skip_consensus {
             for (i, output) in tx.output.iter().enumerate() {
                 let spk = &output.script_pubkey;
+                // Bare P2PK and bare multisig are intentionally excluded:
+                // P2PK is obsolete (no modern wallet generates it), and bare
+                // multisig is the primary vector for Stamps/SRC-20 data
+                // embedding. Wrapped versions (P2SH, P2WSH) remain standard
+                // via is_p2sh() and is_witness_program().
                 let is_standard = spk.is_p2pkh()
                     || spk.is_p2sh()
                     || spk.is_witness_program()
-                    || spk.is_p2pk()
-                    || spk.is_multisig()
                     || (spk.is_op_return() && spk.len() <= MAX_OP_RETURN_SIZE);
 
                 if !is_standard {
                     return Err(MempoolError::NonStandardScript { index: i });
                 }
             }
+
+            // Knots-aligned relay policy: reject inscriptions, token
+            // protocols, data injection, and parasitic patterns.
+            crate::relay_policy::check_relay_policy(&tx)
+                .map_err(MempoolError::PolicyRejection)?;
         }
 
         // ── Phase 1: conflict detection ─────────────────────────────────
@@ -1298,6 +1306,8 @@ pub enum MempoolError {
     OversizedTx { weight: u64 },
     DustOutput { index: usize, amount: u64 },
     NonStandardScript { index: usize },
+    /// Transaction rejected by Knots-aligned relay policy (spam filters).
+    PolicyRejection(crate::relay_policy::PolicyRejection),
     NonFinal { lock_time: u32, current_height: u32 },
     UtxoLookup(String),
     // CPFP / ancestor tracking (ticket 010)
@@ -1374,6 +1384,9 @@ impl std::fmt::Display for MempoolError {
             }
             MempoolError::NonStandardScript { index } => {
                 write!(f, "output {} has non-standard script type", index)
+            }
+            MempoolError::PolicyRejection(ref r) => {
+                write!(f, "relay policy: {:?}", r)
             }
             MempoolError::NonFinal { lock_time, current_height } => {
                 write!(
