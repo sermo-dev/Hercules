@@ -885,6 +885,7 @@ struct NodeStatePill: View {
 /// SyncButton becomes enabled.
 struct ValidationModePickerCard: View {
     @ObservedObject var viewModel: NodeViewModel
+    @State private var showSnapshotDisclosure = false
 
     var body: some View {
         CardContainer {
@@ -919,6 +920,12 @@ struct ValidationModePickerCard: View {
                 )
             }
         }
+        .sheet(isPresented: $showSnapshotDisclosure) {
+            SnapshotPrivacyDisclosure {
+                showSnapshotDisclosure = false
+                viewModel.setValidationMode(.assumeUtxo)
+            }
+        }
     }
 
     @ViewBuilder
@@ -929,7 +936,13 @@ struct ValidationModePickerCard: View {
         subtitle: String,
         icon: String
     ) -> some View {
-        Button(action: { viewModel.setValidationMode(mode) }) {
+        Button(action: {
+            if mode == .assumeUtxo {
+                showSnapshotDisclosure = true
+            } else {
+                viewModel.setValidationMode(mode)
+            }
+        }) {
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: icon)
                     .font(.system(size: 18))
@@ -968,6 +981,116 @@ struct ValidationModePickerCard: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Snapshot Privacy Disclosure
+
+/// One-time disclosure sheet shown before committing to AssumeUTXO mode.
+/// Explains that the ~8 GB snapshot download is the only network request
+/// not routed through Tor, and suggests practical mitigations.
+struct SnapshotPrivacyDisclosure: View {
+    let onAccept: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea(.all)
+
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 20) {
+                    HStack {
+                        Spacer()
+                        Image(systemName: "network.badge.shield.half.filled")
+                            .font(.system(size: 36))
+                            .foregroundStyle(Theme.warning)
+                        Spacer()
+                    }
+                    .padding(.top, 24)
+
+                    Text("One-Time Download Over Clearnet")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundStyle(Theme.textPrimary)
+                        .frame(maxWidth: .infinity)
+                        .multilineTextAlignment(.center)
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        disclosureRow(
+                            icon: "arrow.down.circle",
+                            text: "Hercules needs to download an ~8 GB snapshot from Cloudflare to bootstrap your node. This is the only network request not routed through Tor."
+                        )
+
+                        disclosureRow(
+                            icon: "eye",
+                            text: "Your IP address will be visible to Cloudflare and your internet provider during this download."
+                        )
+
+                        disclosureRow(
+                            icon: "lock.shield",
+                            text: "After bootstrap, all Bitcoin traffic is routed exclusively through Tor."
+                        )
+
+                        disclosureRow(
+                            icon: "checkmark.seal",
+                            text: "The snapshot is cryptographically verified before use — the download source cannot tamper with your UTXO set."
+                        )
+                    }
+
+                    CardContainer {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "lightbulb.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Theme.accent)
+                                Text("To reduce exposure")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(Theme.textSecondary)
+                            }
+                            Text("Connect to a VPN or a public Wi-Fi network (e.g. a coffee shop) before starting the download. This prevents your home IP from being associated with the request.")
+                                .font(.system(size: 12))
+                                .foregroundStyle(Theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    Button(action: onAccept) {
+                        Text("I Understand — Continue")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                            .background(Theme.accent)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: { dismiss() }) {
+                        Text("Go Back")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Theme.textTertiary)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 24)
+                }
+                .padding(.horizontal, 24)
+            }
+        }
+        .presentationDetents([.large])
+    }
+
+    private func disclosureRow(icon: String, text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 14))
+                .foregroundStyle(Theme.textSecondary)
+                .frame(width: 20)
+                .padding(.top, 1)
+            Text(text)
+                .font(.system(size: 13))
+                .foregroundStyle(Theme.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 
@@ -1150,7 +1273,8 @@ struct SyncProgressCard: View {
     }
 
     var percentText: String {
-        String(format: "%.1f%%", progress * 100)
+        let pct = isSynced ? progress * 100 : min(progress * 100, 99.9)
+        return String(format: "%.1f%%", pct)
     }
 
     var isSynced: Bool {
@@ -1219,7 +1343,8 @@ struct BlockValidationCard: View {
     }
 
     var percentText: String {
-        String(format: "%.1f%%", progress * 100)
+        let pct = isComplete ? progress * 100 : min(progress * 100, 99.9)
+        return String(format: "%.1f%%", pct)
     }
 
     var isComplete: Bool {
