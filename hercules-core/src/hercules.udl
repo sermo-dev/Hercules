@@ -81,6 +81,13 @@ dictionary NodeStatus {
     u64 txs_relayed;
 };
 
+dictionary TrustInfo {
+    u32 snapshot_height;
+    u32 validated_height;
+    u32 forward_validated_blocks;
+    string? muhash;
+};
+
 callback interface SyncCallback {
     void on_progress(SyncStatus status);
 };
@@ -117,6 +124,9 @@ interface HerculesNode {
     TorStatus? get_tor_status();
     MempoolStatus get_mempool_status();
     NodeStatus get_node_status();
+
+    [Throws=HerculesError]
+    TrustInfo get_trust_info();
 
     [Throws=HerculesError]
     string start_wallet_api();

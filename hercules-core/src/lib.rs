@@ -244,6 +244,27 @@ pub struct NodeStatus {
     pub txs_relayed: u64,
 }
 
+// ── Trust info ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TrustInfo {
+    pub snapshot_height: u32,
+    pub validated_height: u32,
+    pub forward_validated_blocks: u32,
+    pub muhash: Option<String>,
+}
+
+impl From<sync::TrustInfo> for TrustInfo {
+    fn from(t: sync::TrustInfo) -> Self {
+        TrustInfo {
+            snapshot_height: t.snapshot_height,
+            validated_height: t.validated_height,
+            forward_validated_blocks: t.forward_validated_blocks,
+            muhash: t.muhash,
+        }
+    }
+}
+
 // ── Errors ─────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -461,6 +482,15 @@ impl HerculesNode {
     /// Get node serving/relay statistics.
     pub fn get_node_status(&self) -> NodeStatus {
         self.syncer.get_node_status()
+    }
+
+    pub fn get_trust_info(&self) -> Result<TrustInfo, HerculesError> {
+        self.syncer
+            .get_trust_info()
+            .map(Into::into)
+            .map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })
     }
 
     // ── Wallet API ────────────────────────────────────────────────

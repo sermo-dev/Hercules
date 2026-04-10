@@ -8,6 +8,7 @@ use bitcoin::Txid;
 use heed::types::{Bytes, Unit};
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, PutFlags};
 use sha2::{Digest, Sha256};
+use blvm_muhash::{MuHash3072, serialize_coin_for_muhash};
 
 use log::{info, warn};
 
@@ -38,6 +39,11 @@ const UTXO_KEY_LEN: usize = 36;
 /// height covered by the most-recently loaded UTXO snapshot. Stored as 4
 /// little-endian bytes. Absent on a fresh-from-genesis install.
 const META_KEY_ASSUME_VALID_FLOOR: &[u8] = b"assume_valid_floor";
+
+/// Key inside the `meta` DB for the MuHash of the UTXO set at the snapshot
+/// height. Stored as 32 bytes (SHA256 finalization of the MuHash3072
+/// accumulator). Compatible with `bitcoin-cli gettxoutsetinfo muhash`.
+const META_KEY_MUHASH: &[u8] = b"muhash";
 
 /// LMDB key length for the `height_index` DB: height (4 BE) + txid (32) + vout (4 BE).
 const HEIGHT_INDEX_KEY_LEN: usize = 40;
@@ -382,6 +388,28 @@ impl UtxoSet {
                 b.len()
             ))),
             None => Ok(0),
+        }
+    }
+
+    /// Read the stored MuHash from the meta database. Returns `None` if no
+    /// snapshot has been loaded (genesis-mode sync).
+    pub fn muhash(&self) -> Result<Option<[u8; 32]>, UtxoError> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let bytes = self
+            .meta
+            .get(&rtxn, META_KEY_MUHASH)
+            .map_err(|e| UtxoError(format!("read muhash: {}", e)))?;
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(b);
+                Ok(Some(buf))
+            }
+            Some(b) => Err(UtxoError(format!("corrupt muhash: len {}", b.len()))),
+            None => Ok(None),
         }
     }
 
@@ -789,6 +817,7 @@ impl UtxoSet {
             let mut buf4 = [0u8; 4];
             let mut buf8 = [0u8; 8];
             let mut hasher = Sha256::new();
+            let mut muhash = MuHash3072::new();
             let mut prev_key: Option<[u8; UTXO_KEY_LEN]> = None;
             // Reuse a single allocation for the value buffer across the inner loop.
             let mut value_buf: Vec<u8> = Vec::with_capacity(UTXO_VALUE_HEADER_LEN + 64);
@@ -852,6 +881,17 @@ impl UtxoSet {
                 hasher.update(&entry_height.to_le_bytes());
                 hasher.update(&[is_coinbase as u8]);
 
+                // MuHash accumulator — Core-compatible serialization
+                let coin_ser = serialize_coin_for_muhash(
+                    &txid,
+                    vout,
+                    entry_height,
+                    is_coinbase,
+                    amount as i64,
+                    &script,
+                );
+                muhash = muhash.insert(&coin_ser);
+
                 // Encode the value.
                 value_buf.clear();
                 value_buf.extend_from_slice(&amount.to_le_bytes());
@@ -897,6 +937,10 @@ impl UtxoSet {
                 )));
             }
 
+            // Finalize the MuHash accumulator — produces a 32-byte hash
+            // compatible with `bitcoin-cli gettxoutsetinfo muhash`.
+            let muhash_result = muhash.finalize();
+
             // Record the assume-valid floor so `rollback_block` can refuse
             // to roll back into snapshot territory across process restarts.
             // Written in the same txn as the final batch so a commit failure
@@ -908,6 +952,11 @@ impl UtxoSet {
                     &height.to_le_bytes(),
                 )
                 .map_err(|e| UtxoError(format!("put assume_valid_floor: {}", e)))?;
+
+            // Persist the MuHash for UI display and independent verification.
+            self.meta
+                .put(&mut wtxn, META_KEY_MUHASH, &muhash_result)
+                .map_err(|e| UtxoError(format!("put muhash: {}", e)))?;
 
             wtxn.commit()
                 .map_err(|e| UtxoError(format!("commit snapshot: {}", e)))?;

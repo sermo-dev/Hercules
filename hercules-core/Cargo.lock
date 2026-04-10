@@ -534,6 +534,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blvm-muhash"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f451a4e996cb3288dacb6f7ed0d24a712ad4d85e7a2cbbf86bb39c54a7ff82"
+dependencies = [
+ "chacha20",
+ "cipher",
+ "hex",
+ "sha2",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -629,6 +641,17 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
 
 [[package]]
 name = "chrono"
@@ -1762,6 +1785,7 @@ dependencies = [
  "arti-client",
  "bitcoin",
  "bitcoinconsensus",
+ "blvm-muhash",
  "flate2",
  "heed",
  "hex",
