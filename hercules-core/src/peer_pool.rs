@@ -8,8 +8,11 @@ use crate::p2p::{Peer, PeerError};
 use crate::peer_store::{AddrRecord, PeerStore};
 use crate::tor::TorManager;
 
-/// Maximum number of outbound connections (matches Bitcoin Core default).
-const MAX_OUTBOUND: usize = 8;
+/// Maximum number of outbound connections. Higher than Core's default of 8
+/// because Hercules's bursty wake model re-rolls peers each wake — more
+/// outbound connections improve eclipse resistance per wake and increase
+/// addr gossip fanout for inbound discovery.
+const MAX_OUTBOUND: usize = 12;
 
 /// Maximum number of inbound connections (conservative for mobile).
 const MAX_INBOUND: usize = 16;

@@ -6,6 +6,7 @@ enum NotificationSource: String, Codable {
     case headerOnly         // Header PoW verified, no full block
     case pushPayload        // Info from push relay only, not verified
     case catchUpProgress    // Multi-block catch-up (some blocks validated, more remain)
+    case tipDisagreement    // Header cross-check detected peer disagreement (possible eclipse)
     case networkPolicyPaused // Validation skipped: metered network without opt-in
 }
 

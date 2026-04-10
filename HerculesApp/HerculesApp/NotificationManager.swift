@@ -297,7 +297,9 @@ class NotificationManager: ObservableObject {
 
     private static func makeRecord(from status: CatchUpStatus) -> BlockNotificationRecord {
         let source: NotificationSource
-        if status.caughtUp {
+        if status.tipDisagreement {
+            source = .tipDisagreement
+        } else if status.caughtUp {
             source = .fullValidation
         } else if status.blocksValidated > 0 {
             source = .catchUpProgress
@@ -345,6 +347,9 @@ class NotificationManager: ObservableObject {
             let startHeight = record.height - blocksValidated + 1
             content.title = "Catching up: blocks #\(startHeight)–#\(record.height)"
             content.body = "\(blocksValidated) blocks validated, \(remaining) remaining"
+        case .tipDisagreement:
+            content.title = "Chain Tip Disagreement"
+            content.body = "Peers disagree on the chain tip at block #\(record.height). Retrying next wake."
         case .headerOnly:
             content.title = "Block #\(record.height) Header Verified"
             content.body = "PoW validated, full block validation pending"

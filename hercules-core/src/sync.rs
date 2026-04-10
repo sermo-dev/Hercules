@@ -48,7 +48,7 @@ const MAX_REORG_DEPTH: u32 = 288;
 /// Per-peer cap on the `known_txids` dedup set. A malicious peer that floods
 /// us with INV messages full of unique txids can otherwise grow this set
 /// unboundedly between maintenance ticks. 10k txids ≈ 320 KB per peer; with
-/// MAX_OUTBOUND + MAX_INBOUND ≈ 24 peers that's a hard ceiling around 8 MB.
+/// MAX_OUTBOUND + MAX_INBOUND ≈ 28 peers that's a hard ceiling around 9 MB.
 /// On overflow we clear the entire set rather than evicting individually —
 /// the dedup is best-effort and a coarse reset is acceptable.
 const MAX_KNOWN_TXIDS_PER_PEER: usize = 10_000;
@@ -270,6 +270,10 @@ pub struct CatchUpStatus {
     /// If non-None, the catch-up was aborted due to this error.
     /// Partial progress (blocks_validated > 0) may still have been made.
     pub error: Option<String>,
+    /// True if the header cross-check detected disagreement among peers,
+    /// signaling a possible eclipse attack. The wake still proceeds with
+    /// the best-work tip, but the UI should surface this to the user.
+    pub tip_disagreement: bool,
 }
 
 /// Sync block headers and validate full blocks from the Bitcoin P2P network.
@@ -2333,7 +2337,7 @@ impl HeaderSync {
             ));
         }
 
-        let pool = PeerPool::new(
+        let mut pool = PeerPool::new(
             our_height,
             self.tor.clone(),
             self.peers_db_path.as_deref(),
@@ -2381,6 +2385,37 @@ impl HeaderSync {
                 )));
             }
 
+            // Eclipse-resistance: cross-check the new headers against an
+            // independent peer BEFORE validating or storing. If the cross-check
+            // rejects, we drop the batch without touching the header store —
+            // same ordering as the main sync loop. Called once per wake, not
+            // per block — the per-block cost would be prohibitive during catch-up.
+            let cross_check_locator = self
+                .store
+                .get_locator_hashes()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            let active_first_hash = headers[0].block_hash();
+            match self.cross_check_headers(
+                &mut pool,
+                &cross_check_locator,
+                &peer_addr,
+                active_first_hash,
+            ) {
+                HeaderCrossCheck::Accept => {}
+                HeaderCrossCheck::Reject => {
+                    warn!("catch_up_blocks: header cross-check rejected batch from {}", peer_addr);
+                    let mut status = self.make_catchup_status(
+                        false,
+                        0,
+                        validated_height,
+                        tip_height,
+                    );
+                    status.tip_disagreement = true;
+                    status.error = Some("header tip cross-check failed: peer disagreement".into());
+                    return Ok(status);
+                }
+            }
+
             let timestamps = self
                 .store
                 .last_timestamps(11)
@@ -2411,7 +2446,7 @@ impl HeaderSync {
 
             new_tip = tip_height + headers.len() as u32;
             info!(
-                "catch_up_blocks: synced headers {}-{} (PoW validated)",
+                "catch_up_blocks: synced headers {}-{} (PoW validated, cross-checked)",
                 new_start, new_tip
             );
         }
@@ -2555,6 +2590,7 @@ impl HeaderSync {
             tip_block_hash,
             tip_timestamp,
             error: None,
+            tip_disagreement: false,
         }
     }
 

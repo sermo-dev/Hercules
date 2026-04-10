@@ -59,6 +59,7 @@ dictionary CatchUpStatus {
     string tip_block_hash;
     u32 tip_timestamp;
     string? error;
+    boolean tip_disagreement;
 };
 
 dictionary TorStatus {

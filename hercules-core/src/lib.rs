@@ -209,6 +209,7 @@ pub struct CatchUpStatus {
     pub tip_block_hash: String,
     pub tip_timestamp: u32,
     pub error: Option<String>,
+    pub tip_disagreement: bool,
 }
 
 impl From<sync::CatchUpStatus> for CatchUpStatus {
@@ -221,6 +222,7 @@ impl From<sync::CatchUpStatus> for CatchUpStatus {
             tip_block_hash: s.tip_block_hash,
             tip_timestamp: s.tip_timestamp,
             error: s.error,
+            tip_disagreement: s.tip_disagreement,
         }
     }
 }
