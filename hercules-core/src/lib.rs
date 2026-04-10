@@ -11,6 +11,7 @@ mod block_validation;
 mod mempool;
 mod p2p;
 mod peer_pool;
+mod relay_policy;
 mod peer_store;
 mod store;
 mod sync;
