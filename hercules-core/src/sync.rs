@@ -276,6 +276,20 @@ pub struct CatchUpStatus {
     pub tip_disagreement: bool,
 }
 
+/// Trust and verification info exposed to the UI.
+#[derive(Debug, Clone)]
+pub struct TrustInfo {
+    /// Height at which the UTXO snapshot was loaded (0 if synced from genesis).
+    pub snapshot_height: u32,
+    /// Current validated block height.
+    pub validated_height: u32,
+    /// Number of blocks fully validated since the snapshot was loaded.
+    pub forward_validated_blocks: u32,
+    /// MuHash of the UTXO set at the snapshot height, compatible with
+    /// `bitcoin-cli gettxoutsetinfo muhash`. None if synced from genesis.
+    pub muhash: Option<String>,
+}
+
 /// Sync block headers and validate full blocks from the Bitcoin P2P network.
 /// Per-peer relay state tracking.
 struct PeerRelayState {
@@ -477,6 +491,42 @@ impl HeaderSync {
         );
 
         Ok(meta)
+    }
+
+    /// Trust information for the UI: snapshot height, forward-validated
+    /// block count, and (future) MuHash for independent verification.
+    pub fn get_trust_info(&self) -> Result<TrustInfo, SyncError> {
+        let snapshot_height = self
+            .utxo
+            .assume_valid_floor()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        let validated_height = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        let forward_validated = if snapshot_height > 0 && validated_height > snapshot_height {
+            validated_height - snapshot_height
+        } else {
+            0
+        };
+
+        let muhash = self
+            .utxo
+            .muhash()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .map(|mut h| {
+                h.reverse(); // Match Core's uint256::GetHex() byte order
+                hex::encode(h)
+            });
+
+        Ok(TrustInfo {
+            snapshot_height,
+            validated_height,
+            forward_validated_blocks: forward_validated,
+            muhash,
+        })
     }
 
     /// Check if the UTXO set is empty (needs snapshot or full sync from genesis).

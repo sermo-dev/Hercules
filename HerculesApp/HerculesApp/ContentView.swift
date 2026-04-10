@@ -78,6 +78,9 @@ class NodeViewModel: ObservableObject {
     @Published var mempoolStatus: MempoolStatus?
     @Published var nodeStatus: NodeStatus?
 
+    // Trust verification info (snapshot height, forward-validated blocks).
+    @Published var trustInfo: TrustInfo?
+
     // Wallet API (ticket 014) — external wallet connectivity.
     @Published var isWalletApiRunning = false
     @Published var walletApiConnectionString: String?
@@ -165,18 +168,21 @@ class NodeViewModel: ObservableObject {
     private func pollParticipationStats() {
         guard let node = node, isSyncRunning else {
             // Clear stale stats so the card doesn't show ghost data after stop.
-            if mempoolStatus != nil || nodeStatus != nil {
+            if mempoolStatus != nil || nodeStatus != nil || trustInfo != nil {
                 mempoolStatus = nil
                 nodeStatus = nil
+                trustInfo = nil
             }
             return
         }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let mp = node.getMempoolStatus()
             let ns = node.getNodeStatus()
+            let ti = try? node.getTrustInfo()
             DispatchQueue.main.async {
                 self?.mempoolStatus = mp
                 self?.nodeStatus = ns
+                self?.trustInfo = ti
             }
         }
     }

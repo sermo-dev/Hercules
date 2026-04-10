@@ -12,6 +12,7 @@ struct SettingsView: View {
     @State private var pendingSwitchMode: ValidationMode?
     @State private var switchModeError: String?
     @State private var copiedConnectionString = false
+    @State private var copiedMuHash = false
     @State private var showRotateConfirm = false
     @Environment(\.dismiss) private var dismiss
 
@@ -23,6 +24,9 @@ struct SettingsView: View {
                 VStack(spacing: 20) {
                     header
                     validationModeCard
+                    if let trust = viewModel.trustInfo, trust.snapshotHeight > 0 {
+                        trustCard(trust)
+                    }
                     cellularDataCard
                     walletApiCard
                     notificationToggleCard
@@ -144,6 +148,100 @@ struct SettingsView: View {
             Color.clear.frame(width: 24)
         }
         .padding(.top, 16)
+    }
+
+    // MARK: - Trust Verification
+
+    private func trustCard(_ trust: TrustInfo) -> some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.success)
+                    Text("Trust Verification")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    trustRow(label: "Snapshot loaded at block", value: "#\(formatNumber(trust.snapshotHeight))")
+                    trustRow(label: "Current validated height", value: "#\(formatNumber(trust.validatedHeight))")
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "shield.checkerboard")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.accent)
+                        Text("Forward-validated against")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textPrimary)
+                        Text("\(formatNumber(trust.forwardValidatedBlocks)) blocks")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                    }
+                }
+
+                Text("Each block validated after the snapshot is an implicit check that the UTXO set is correct. Higher numbers indicate stronger empirical confidence.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textTertiary)
+
+                if let muhash = trust.muhash {
+                    Divider().background(Theme.cardBorder)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "number.square")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Theme.accent)
+                            Text("UTXO Set MuHash")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Theme.textSecondary)
+                        }
+
+                        Text(muhash)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(Theme.textPrimary)
+                            .textSelection(.enabled)
+
+                        Button(action: {
+                            UIPasteboard.general.string = muhash
+                            copiedMuHash = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                copiedMuHash = false
+                            }
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: copiedMuHash ? "checkmark" : "doc.on.doc")
+                                    .font(.system(size: 11))
+                                Text(copiedMuHash ? "Copied" : "Copy MuHash")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .foregroundStyle(Theme.accent)
+                        }
+
+                        Text("Verify on your Bitcoin Core node (requires coinstatsindex=1):")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textTertiary)
+                        Text("bitcoin-cli gettxoutsetinfo muhash \(trust.snapshotHeight)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(Theme.textSecondary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+        }
+    }
+
+    private func trustRow(label: String, value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textPrimary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(Theme.textPrimary)
+        }
     }
 
     // MARK: - Cellular Data
