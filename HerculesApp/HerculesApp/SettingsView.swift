@@ -95,6 +95,19 @@ struct SettingsView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.textTertiary)
 
+                if let trust = viewModel.trustInfo,
+                   trust.snapshotHeight > 0,
+                   trust.forwardValidatedBlocks > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "shield.checkerboard")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.accent)
+                        Text("Forward-validated \(formatNumber(trust.forwardValidatedBlocks)) blocks since snapshot")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                }
+
                 HStack(spacing: 10) {
                     switchButton(to: .assumeUtxo, label: "Switch to AssumeUTXO")
                     switchButton(to: .fromGenesis, label: "Switch to Genesis")
