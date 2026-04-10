@@ -616,6 +616,8 @@ struct ContentView: View {
                         }
                         .sheet(isPresented: $showSettings) {
                             SettingsView(viewModel: viewModel)
+                                .presentationDetents([.large])
+                                .interactiveDismissDisabled()
                         }
 
                         // High-level state pill (always visible — its job is
