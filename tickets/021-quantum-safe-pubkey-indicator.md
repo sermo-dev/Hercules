@@ -6,6 +6,13 @@ Add a small visual indicator to the wallet (from ticket 020) that tells the user
 
 This is a small feature — probably under a week of work once ticket 020 Phase 1 ships — but it makes a meaningful educational and product statement. Hercules is the only iOS wallet positioned to do this correctly, because it's the only one that has the full UTXO set and full chain access locally.
 
+## Amendment (2026-10-23)
+
+- **Option 2 below assumes BIP158 filters exist.** They don't: "the BIP158 filters we're already computing" is incorrect, and `get_compact_filter` is a stub (`hercules-core/src/wallet_rpc.rs:545-550`). Filters are **035** phase 2. Option 1 (local Bloom filter) is unaffected and remains the recommendation.
+- **Multi-wallet (037).** The indicator becomes per-wallet: main, each watch-only wallet, and each passphrase wallet. The spent-scriptPubKey filter is shared, but summaries are computed per wallet.
+- **Passphrase wallets (038).** Show and compute only while that hidden wallet is unlocked. Never persist a per-hidden-wallet summary that would reveal its existence.
+- **Coin control (042).** "Show details" gains a **"Move these coins"** action that pre-selects the exposed coins for a send-to-self to a fresh P2WPKH address.
+
 ## Why this is interesting
 
 Grover's algorithm halves the effective bit-security of SHA-256 and RIPEMD-160 — meaningful but not catastrophic on Bitcoin's time horizon. Shor's algorithm, on a sufficiently large quantum computer, breaks ECDSA and Schnorr outright: given an exposed secp256k1 pubkey, Shor recovers the private key. **This is the real quantum threat to Bitcoin.**

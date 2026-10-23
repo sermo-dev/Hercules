@@ -8,6 +8,35 @@ The goal at the end of this ticket: a personally-owned full node, running on you
 
 This is the first ticket where Hercules graduates from "an iOS app you can run" to "a real always-on Bitcoin node experience on your phone."
 
+## Amendment (2026-10-23)
+
+A code review found problems that must be fixed as part of this deployment, not after. Several would break production on day one.
+
+**Server (`server/`)**
+- **Notify Lambda can't load.** `require("jsonwebtoken")` (`server/notify/index.js:19`), but there's no `server/package.json` or bundled `node_modules`, and the `nodejs20.x` runtime only ships the AWS SDK. Add a `package.json` and a SAM build, or sign the ES256 JWT with Node's built-in `crypto`.
+- **Scan isn't paginated** (`notify/index.js:49-54`). DynamoDB Scan returns ≤ 1 MB per call, so devices beyond the first page never get pushed.
+- **One HTTP/2 connection per device** (`sendAPNs`, `:86-88`) with unbounded `Promise.allSettled` (`:64-68`). Reuse one session; bound concurrency; the 30 s Lambda timeout (`template.yaml` NotifyFunction) caps fan-out.
+- **Only `BadDeviceToken` is pruned** (`:72`). Also prune `Unregistered` (HTTP 410) and `DeviceTokenNotForTopic`.
+- **No dead-letter queue.** A thrown error makes SQS redeliver the message and **re-push every device**. Add a DLQ and make pushes idempotent per block hash.
+- **Push payload has no real height.** The `blocknotify` script sends only `hash` and `time` (`server/README.md:46-48`). The Lambda reads `block.height || 0` (`notify/index.js:30`). `server/README.md:51` claims the Lambda "enriches the message with block height", which it doesn't. The app then shows "New Block #0". Have the script call `bitcoin-cli getblockheader $1` and include the height.
+- **IAM too broad.** Both functions get `DynamoDBCrudPolicy` (`template.yaml:66-68` and NotifyFunction). Register needs `PutItem` (plus `DeleteItem` for unregister); Notify needs `Scan` + `DeleteItem`.
+- **APNs `.p8` key is a plaintext Lambda env var** (`APNS_KEY_BASE64`, `template.yaml:89`). The parameter is NoEcho, but the value is visible in the Lambda console. Move it to Secrets Manager or SSM SecureString.
+- **Register endpoint is open.** No auth, throttling or usage plan, and no token format/length validation (`server/register/index.js:22-25`). Anyone can stuff the table and inflate every block's fan-out cost. They can't push to real users, because the APNs key stays server-side. Add API Gateway throttling, token-format validation, and a per-install secret (below).
+- **No unregister endpoint.** Turning notifications off leaves the token until the 30-day TTL.
+
+**App**
+- **Tokens silently expire.** `registerForRemoteNotifications` is only called from `requestPermission()` (`NotificationManager.swift:33-43`), which only runs when the Settings toggle is flipped (`SettingsView.swift:468`). The comment at `register/index.js:6-7` assumes re-registration on every launch, but that never happens, so after 30 days the phone stops getting pushes. Re-register on every launch when permission is granted.
+- **Default relay URL is a placeholder** (`NotificationManager.swift:21`, `https://hercules-relay.example.com`). Replace it with the production URL via build configuration (031).
+- **Registration reveals IP + token to the relay** (plain `URLSession` POST). Acceptable if disclosed; optionally route over Tor when Tor is enabled (029).
+- **Layer 1 "What's missing" below is stale.** `AppDelegate` token plumbing (`AppDelegate.swift:58`) and `UIBackgroundModes: remote-notification` (`Info.plist:21-23`, `project.yml:32-33`) now exist.
+
+**The identifier question.** The relay identifies a phone *only* by its **APNs device token**: an opaque value Apple issues per app install, per device. It changes on reinstall and restore, and Apple may rotate it. It isn't a user identity and shouldn't become one.
+- Add a random **per-install registration secret**, generated on device and stored in the Keychain and sent with registration, so only that install can update or unregister its own row.
+- **Do not** link push registration to contacts or payment codes (043) or to the P2P onion key. Keeping these separate means a relay breach reveals no social graph.
+- The cooperative relay (045) can schedule shifts by hashing the token server-side, with no extra ID.
+
+**Shared infrastructure.** The snapshot publishing pipeline (032) can run on the same always-on `bitcoind` host as `blocknotify`.
+
 ## Background
 
 Three layers of work are already in place:

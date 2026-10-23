@@ -6,6 +6,24 @@ Tighten Hercules' mempool acceptance and relay policy to match **Bitcoin Knots**
 
 The change is **policy-only**, not consensus. Filtered transactions remain valid Bitcoin transactions and will still confirm if a miner mines them — we simply refuse to *relay* them through our node, freeing our mempool slots for actual payments.
 
+## Amendment (2026-10-23)
+
+The shipped code diverges from this spec in four places. Until the owner confirms otherwise, the **code is the decision of record**:
+
+| Spec | Shipped code | Status |
+|---|---|---|
+| Phase 1: drop datacarrier entirely, delete `MAX_OP_RETURN_SIZE` | OP_RETURN outputs ≤ 83 bytes still accepted (`hercules-core/src/mempool.rs:44`, `:291`) | Diverges. 83 bytes is Core's *pre-v30* default and matches neither current Core nor Knots |
+| Phase 3: 80-byte cap on pushdata *inside* `OP_FALSE OP_IF … OP_ENDIF` only | Global per-element witness cap `MAX_WITNESS_ITEM_SIZE = 1650` on every witness element (`hercules-core/src/relay_policy.rs:16`, `check_witness_size` ~`:88-99`), plus envelope detection | Diverges: different size and scope |
+| Phase 4/5: disable full-RBF; opt-in (BIP125-signalling) replacement only | Full RBF: "Rule 1 (signaling) is intentionally omitted — we follow Bitcoin Core v28+ full RBF semantics" (`mempool.rs:833`) | Reversed |
+| Pre-implementation research "Findings" section required (`:134-143`) | Never added | Missing |
+
+(`:134-143` refers to this file before this amendment was inserted.)
+
+**Follow-ups:**
+- Relay policy becomes a named, user-selectable **profile** (Core-like vs Knots-like) instead of a single hardcoded stance. The default is an open owner decision; see **041** (fee estimation must not be biased by whichever profile is active) and future **045** (cooperative relay groups phones by profile).
+- **033**: the user's *own* outgoing transactions must be accepted and relayed regardless of local relay policy. Never refuse to broadcast a consensus-valid transaction the user signed.
+- Either write the missing Findings section, or record here that the heuristics in `relay_policy.rs` are the accepted baseline and how they'll be kept current.
+
 ## Current state (2026-04-07)
 
 `hercules-core/src/mempool.rs::accept_tx_internal` (lines 272–286) implements Core-style standardness:

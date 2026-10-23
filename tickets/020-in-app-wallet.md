@@ -6,6 +6,26 @@ Embed a full Bitcoin wallet inside the Hercules iOS app so the same process that
 
 This ticket is **complementary** to ticket 014, not a replacement. Ticket 014 makes Hercules a backend for *external* wallets (Sparrow on a desktop, etc.) over a Tor onion JSON-RPC. Ticket 020 makes Hercules a *self-contained* wallet for users who want one app that does everything. Different audiences, different reachability constraints (014 is foreground-only because of iOS; 020 is foreground-and-push-wake), both legitimate.
 
+## Amendment (2026-10-23)
+
+The owner's vision (2026-10-20) promotes the wallet to the core of v1 and widens its scope. This ticket is now the **umbrella**. The detailed work lives in the tickets below, and where they conflict with this document, **they win**. (Line refs like `:285` point to this file as of commit `fed3118`, before this amendment was inserted.)
+
+| Topic | Overrides | Now tracked in |
+|---|---|---|
+| Multi-wallet in v1: main + watch-only + passphrase wallets, three-tab app (Wallet / Node / People) | "v1 ships single-wallet for simplicity" (`:285`) | **037** |
+| BIP39 passphrase ("25th word") hidden wallets | Not covered here | **038** |
+| Key custody and biometrics: `BiometryCurrentSet` re-enrolment lockout, passcode fallback, what locked-phone wakes may read | Custody design at `:138-178` is under review | **036** (DRAFT, needs owner discussion) |
+| BIP158 premise: "BIP158 filter computation is already happening for SPV serving" | `:67` is **incorrect**. No filter code exists; `get_compact_filter` is a stub (`hercules-core/src/wallet_rpc.rs:545-550`) | **035** (direct script matching in `apply_block`; BIP158 serving as phase 2) |
+| Wallet engine: hand-rolled on `bitcoin` + `miniscript` + `bip39` | Decision at `:256` is reopened pending a spike | **034** |
+| People / contacts via silent payments | "BIP47 / BIP352… out of scope for v1" (`:284`); "Address book… track separately" (`:287`); "no concept of who its users are" (`:276`) still holds **server-side**: contacts are local-only, with no server identity | **043** |
+| Backup, restore, device migration | Paper backup only | **039** |
+| Sending | Broadcast path never relays to peers today | **033** (prerequisite) |
+| Fee estimation | Mempool-only estimator, 1 sat/vB when cold | **041** |
+| Unconfirmed / pending payments (`unconfirmed_sats`, `:103`) | Unspecified | **040** |
+| Coin control, freezing, labels (BIP329) | Not covered | **042** |
+
+The Lightning exclusion (`:273`) stands and is now an owner decision. README cleanup is **044**.
+
 ## Background
 
 The architectural insight underneath this ticket is that **bringing the wallet inside the same process as the node sidesteps every iOS background-execution problem**. iOS will not let a suspended app accept inbound TCP connections, so a Tor-onion-fronted wallet API (ticket 014) is only reachable when the user has Hercules in the foreground. But an in-app wallet doesn't need inbound connectivity at all — its "client" (the Hercules UI) is the same process. Whenever the user opens the wallet tab, both the wallet code and the node code are by definition running, because they're literally the same binary.
