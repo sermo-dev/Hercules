@@ -12,6 +12,8 @@ use blvm_muhash::{MuHash3072, serialize_coin_for_muhash};
 
 use log::{info, warn};
 
+use crate::assumeutxo::SnapshotAnchor;
+
 /// Snapshot file magic bytes: "HUTX"
 const SNAPSHOT_MAGIC: [u8; 4] = [b'H', b'U', b'T', b'X'];
 
@@ -44,6 +46,13 @@ const META_KEY_ASSUME_VALID_FLOOR: &[u8] = b"assume_valid_floor";
 /// height. Stored as 32 bytes (SHA256 finalization of the MuHash3072
 /// accumulator). Compatible with `bitcoin-cli gettxoutsetinfo muhash`.
 const META_KEY_MUHASH: &[u8] = b"muhash";
+
+/// Key inside the `meta` DB for the block hash the loaded snapshot commits
+/// to (32 bytes, internal order). Written alongside the assume-valid floor
+/// so a snapshot whose activation is deferred until headers reach it (see
+/// `HeaderSync::load_snapshot`) still activates against the anchor it was
+/// verified with, even if a later app release bumps the compiled anchor.
+const META_KEY_SNAPSHOT_BLOCK_HASH: &[u8] = b"snapshot_block_hash";
 
 /// LMDB key length for the `height_index` DB: height (4 BE) + txid (32) + vout (4 BE).
 const HEIGHT_INDEX_KEY_LEN: usize = 40;
@@ -391,6 +400,32 @@ impl UtxoSet {
         }
     }
 
+    /// Block hash the loaded snapshot was taken at (internal byte order), or
+    /// `None` on a fresh-from-genesis install or a snapshot loaded before
+    /// this key existed.
+    pub fn snapshot_block_hash(&self) -> Result<Option<[u8; 32]>, UtxoError> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let bytes = self
+            .meta
+            .get(&rtxn, META_KEY_SNAPSHOT_BLOCK_HASH)
+            .map_err(|e| UtxoError(format!("read snapshot_block_hash: {}", e)))?;
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(b);
+                Ok(Some(buf))
+            }
+            Some(b) => Err(UtxoError(format!(
+                "corrupt snapshot_block_hash: len {}",
+                b.len()
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Read the stored MuHash from the meta database. Returns `None` if no
     /// snapshot has been loaded (genesis-mode sync).
     pub fn muhash(&self) -> Result<Option<[u8; 32]>, UtxoError> {
@@ -666,6 +701,13 @@ impl UtxoSet {
     /// Load a UTXO snapshot from a reader. Verifies the UTXO hash after loading.
     /// The UTXO set must be empty before calling this.
     ///
+    /// When `expected` is given, the file header's `height` and `block_hash`
+    /// must equal the anchor's and its stored hash must equal
+    /// `expected.utxo_hash`; otherwise the file is rejected before anything
+    /// (including the crash marker) is written. The content hash covers only
+    /// the entries (HUTX v1), so these explicit header checks are what bind
+    /// the snapshot to a position on the chain.
+    ///
     /// `on_progress` is called periodically with (loaded_count, total_count).
     ///
     /// ## Performance and crash safety
@@ -701,7 +743,7 @@ impl UtxoSet {
     pub fn load_snapshot<R: std::io::Read, F>(
         &self,
         reader: R,
-        expected_hash: Option<&[u8; 32]>,
+        expected: Option<&SnapshotAnchor>,
         on_progress: F,
     ) -> Result<SnapshotMeta, UtxoError>
     where
@@ -745,12 +787,25 @@ impl UtxoSet {
         r.read_exact(&mut file_hash)
             .map_err(|e| UtxoError(format!("read hash: {}", e)))?;
 
-        if let Some(expected) = expected_hash {
-            if file_hash != *expected {
+        if let Some(expected) = expected {
+            if height != expected.height {
+                return Err(UtxoError(format!(
+                    "snapshot height mismatch: file={}, expected={}",
+                    height, expected.height
+                )));
+            }
+            if block_hash != expected.block_hash {
+                return Err(UtxoError(format!(
+                    "snapshot block hash mismatch: file={}, expected={}",
+                    hex::encode(block_hash),
+                    hex::encode(expected.block_hash)
+                )));
+            }
+            if file_hash != expected.utxo_hash {
                 return Err(UtxoError(format!(
                     "snapshot hash mismatch: file={}, expected={}",
                     hex::encode(file_hash),
-                    hex::encode(expected)
+                    hex::encode(expected.utxo_hash)
                 )));
             }
         }
@@ -952,6 +1007,9 @@ impl UtxoSet {
                     &height.to_le_bytes(),
                 )
                 .map_err(|e| UtxoError(format!("put assume_valid_floor: {}", e)))?;
+            self.meta
+                .put(&mut wtxn, META_KEY_SNAPSHOT_BLOCK_HASH, &block_hash)
+                .map_err(|e| UtxoError(format!("put snapshot_block_hash: {}", e)))?;
 
             // Persist the MuHash for UI display and independent verification.
             self.meta
@@ -1372,13 +1430,13 @@ mod tests {
 
     /// Build a synthetic snapshot byte stream containing `n` distinct UTXOs
     /// with strictly increasing txids (`[0;32]`, `[1;32]`, ...). The
-    /// returned `expected_hash` is the snapshot's content hash, suitable
-    /// for passing to `load_snapshot` as `Some(&hash)`.
+    /// returned anchor matches the snapshot's header and content hash,
+    /// suitable for passing to `load_snapshot` as `Some(&anchor)`.
     ///
     /// Used by the periodic-commit and clear_all tests to drive
     /// `SNAPSHOT_LOAD_BATCH` (which is lowered to 4 under cfg(test))
     /// across multiple batch boundaries with a small entry count.
-    fn make_snapshot_with_n_utxos(n: u8) -> (Vec<u8>, [u8; 32]) {
+    fn make_snapshot_with_n_utxos(n: u8) -> (Vec<u8>, SnapshotAnchor) {
         let (utxo, _dir) = fresh();
         for i in 0..n {
             let mut txid = [0u8; 32];
@@ -1397,7 +1455,16 @@ mod tests {
         }
         let mut buf = Vec::new();
         let meta = utxo.write_snapshot(&mut buf, 1, &[0u8; 32]).unwrap();
-        (buf, meta.utxo_hash)
+        (buf, anchor_of(&meta))
+    }
+
+    /// The anchor a written snapshot commits to (header fields + hash).
+    fn anchor_of(meta: &SnapshotMeta) -> SnapshotAnchor {
+        SnapshotAnchor {
+            height: meta.height,
+            block_hash: meta.block_hash,
+            utxo_hash: meta.utxo_hash,
+        }
     }
 
     /// The full genesis block (header + coinbase transaction).
@@ -1737,7 +1804,7 @@ mod tests {
 
         let (utxo2, _dir2) = fresh();
         let loaded = utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
             .unwrap();
         assert_eq!(loaded.height, 0);
         assert_eq!(loaded.utxo_count, 1);
@@ -1762,7 +1829,11 @@ mod tests {
         let (utxo2, _dir2) = fresh();
         let result = utxo2.load_snapshot(
             std::io::Cursor::new(&buf),
-            Some(&[0xFFu8; 32]),
+            Some(&SnapshotAnchor {
+                height: 0,
+                block_hash: [0u8; 32],
+                utxo_hash: [0xFFu8; 32],
+            }),
             |_, _| {},
         );
         assert!(result.is_err());
@@ -1812,7 +1883,7 @@ mod tests {
 
         let (utxo2, _dir2) = fresh();
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
             .unwrap();
 
         // utxos populated as expected.
@@ -1844,7 +1915,7 @@ mod tests {
         let (utxo2, _dir2) = fresh();
         assert_eq!(utxo2.assume_valid_floor().unwrap(), 0);
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
             .unwrap();
         assert_eq!(utxo2.assume_valid_floor().unwrap(), 12345);
     }
@@ -1866,7 +1937,7 @@ mod tests {
             utxo2
                 .load_snapshot(
                     std::io::Cursor::new(&buf),
-                    Some(&meta.utxo_hash),
+                    Some(&anchor_of(&meta)),
                     |_, _| {},
                 )
                 .unwrap();
@@ -1891,7 +1962,7 @@ mod tests {
 
         let (utxo2, _dir2) = fresh();
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
             .unwrap();
 
         // Below the floor.
@@ -1932,7 +2003,7 @@ mod tests {
         let env_path = dir2.path().join("utxo");
         let utxo2 = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&meta.utxo_hash), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
             .unwrap();
 
         // Marker must be gone after a clean load.
@@ -1956,7 +2027,11 @@ mod tests {
         let utxo2 = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
         let result = utxo2.load_snapshot(
             std::io::Cursor::new(&buf),
-            Some(&[0xFFu8; 32]),
+            Some(&SnapshotAnchor {
+                height: 0,
+                block_hash: [0u8; 32],
+                utxo_hash: [0xFFu8; 32],
+            }),
             |_, _| {},
         );
         assert!(result.is_err());
@@ -1968,6 +2043,64 @@ mod tests {
         let marker = loading_marker_path(&env_path);
         assert!(!marker.exists());
         assert_eq!(utxo2.count().unwrap(), 0);
+    }
+
+    /// Load `bytes` into a fresh env against `anchor` and assert it was
+    /// rejected with `needle` before the env or marker were touched.
+    fn assert_rejected_untouched(bytes: &[u8], anchor: &SnapshotAnchor, needle: &str) {
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join("utxo");
+        let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        let err = utxo
+            .load_snapshot(std::io::Cursor::new(bytes), Some(anchor), |_, _| {})
+            .unwrap_err();
+        assert!(err.to_string().contains(needle), "got: {}", err);
+        assert!(!loading_marker_path(&env_path).exists());
+        assert_eq!(utxo.count().unwrap(), 0);
+        assert_eq!(utxo.assume_valid_floor().unwrap(), 0);
+        assert_eq!(utxo.snapshot_block_hash().unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_rejects_tampered_header_height() {
+        // Edit only the header's height field (bytes 8..12). The content
+        // hash covers only the entries, so it still matches — the explicit
+        // anchor check must catch it.
+        let (mut bytes, anchor) = make_snapshot_with_n_utxos(3);
+        bytes[8..12].copy_from_slice(&(anchor.height + 1).to_le_bytes());
+        assert_rejected_untouched(&bytes, &anchor, "snapshot height mismatch");
+    }
+
+    #[test]
+    fn snapshot_rejects_tampered_header_block_hash() {
+        // Edit only the header's block_hash field (bytes 12..44).
+        let (mut bytes, anchor) = make_snapshot_with_n_utxos(3);
+        bytes[12] ^= 0xFF;
+        assert_rejected_untouched(&bytes, &anchor, "snapshot block hash mismatch");
+    }
+
+    #[test]
+    fn snapshot_rejects_header_not_matching_anchor() {
+        // An untampered file for a different block than the anchor.
+        let (bytes, anchor) = make_snapshot_with_n_utxos(3);
+        let other_height = SnapshotAnchor { height: 943_500, ..anchor };
+        assert_rejected_untouched(&bytes, &other_height, "snapshot height mismatch");
+        let other_block = SnapshotAnchor { block_hash: [0x11; 32], ..anchor };
+        assert_rejected_untouched(&bytes, &other_block, "snapshot block hash mismatch");
+    }
+
+    #[test]
+    fn load_snapshot_records_snapshot_block_hash() {
+        let (utxo1, _dir1) = fresh();
+        utxo1.apply_block(&genesis_block(), 0).unwrap();
+        let mut buf = Vec::new();
+        let meta = utxo1.write_snapshot(&mut buf, 7, &[0x5Au8; 32]).unwrap();
+
+        let (utxo2, _dir2) = fresh();
+        utxo2
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
+            .unwrap();
+        assert_eq!(utxo2.snapshot_block_hash().unwrap(), Some([0x5Au8; 32]));
     }
 
     #[test]
@@ -2009,13 +2142,13 @@ mod tests {
         // forces 3 batch commits at i=4, 8, 12 plus a final commit. The
         // entire periodic-commit code path is exercised here — the whole
         // optimization being added — and every entry must round-trip.
-        let (snapshot_bytes, expected_hash) = make_snapshot_with_n_utxos(13);
+        let (snapshot_bytes, expected) = make_snapshot_with_n_utxos(13);
 
         let (utxo, _dir) = fresh();
         let meta = utxo
             .load_snapshot(
                 std::io::Cursor::new(&snapshot_bytes),
-                Some(&expected_hash),
+                Some(&expected),
                 |_, _| {},
             )
             .unwrap();
@@ -2047,7 +2180,7 @@ mod tests {
         // The cleanup path must clear_all those persisted entries — leaving
         // a non-empty env without a marker would be unrecoverable. The
         // marker must also be removed, since cleanup_ok == true here.
-        let (mut snapshot_bytes, expected_hash) = make_snapshot_with_n_utxos(13);
+        let (mut snapshot_bytes, expected) = make_snapshot_with_n_utxos(13);
         let last = snapshot_bytes.len() - 1;
         snapshot_bytes[last] ^= 0xFF;
 
@@ -2057,7 +2190,7 @@ mod tests {
 
         let result = utxo.load_snapshot(
             std::io::Cursor::new(&snapshot_bytes),
-            Some(&expected_hash),
+            Some(&expected),
             |_, _| {},
         );
         assert!(result.is_err());

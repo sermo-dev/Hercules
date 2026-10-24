@@ -13,7 +13,13 @@ pub const ASSUMEUTXO_HEIGHT: u32 = 943_500;
 
 /// SHA256 hash of the HUTX-format UTXO set, computed by `UtxoSet::compute_hash`.
 /// Verified against the file's stored hash on load, then recomputed during
-/// insertion to detect tampering of either the body or the header.
+/// insertion to detect tampering of the body (the entries).
+///
+/// This hash does NOT cover the HUTX header's `height` / `block_hash`
+/// fields (format v1). Those are authenticated separately by requiring them
+/// to equal `ASSUMEUTXO_HEIGHT` / `ASSUMEUTXO_BLOCK_HASH` (see
+/// `SnapshotAnchor` and `UtxoSet::load_snapshot`). A v2 format that folds
+/// the header into the hashed preimage is left to ticket 032.
 pub const ASSUMEUTXO_HASH: [u8; 32] = [
     0x70, 0x55, 0x28, 0xfe, 0x00, 0x33, 0x29, 0xe0,
     0xe6, 0xde, 0x5c, 0x85, 0x4b, 0x83, 0xd5, 0x7b,
@@ -29,6 +35,45 @@ pub const ASSUMEUTXO_BLOCK_HASH: [u8; 32] = [
     0xb9, 0x27, 0xe9, 0x8b, 0xd9, 0xfa, 0x01, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+
+/// Minimum cumulative chainwork a header chain must have before we trust it
+/// enough to validate blocks against it or activate a snapshot (the
+/// equivalent of Bitcoin Core's `nMinimumChainWork`). 256-bit little-endian,
+/// same representation as `validation::chainwork_for_headers`.
+///
+/// Derived from the anchor, not invented: this is the mainnet chainwork at
+/// `ASSUMEUTXO_HEIGHT` (943,500), i.e. Core's `getblockheader <anchor>`
+/// `chainwork` field. Computed by summing `work(bits)` over every header
+/// 0..=943,500 (bits taken from each 2016-block epoch). The same computation
+/// at height 938,343 reproduces Bitcoin Core v31.1's mainnet
+/// `nMinimumChainWork` (0x...01128750f82f4c366153a3a030, `chainparams.cpp`,
+/// tag v31.1 / bfa6a4b79cd4c1562fd32857e3147763efae37fb) exactly.
+///
+/// Must be regenerated whenever the anchor constants above are bumped.
+/// Display order (Core): 00000000000000000000000000000000000000011c9554a693f4170c17ba9148
+pub const MIN_CHAIN_WORK: [u8; 32] = [
+    0x48, 0x91, 0xba, 0x17, 0x0c, 0x17, 0xf4, 0x93,
+    0xa6, 0x54, 0x95, 0x1c, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// What a snapshot file must commit to before we load it: the header's
+/// `height` and `block_hash`, plus the content hash of its entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotAnchor {
+    pub height: u32,
+    /// Internal byte order, same as `ASSUMEUTXO_BLOCK_HASH`.
+    pub block_hash: [u8; 32],
+    pub utxo_hash: [u8; 32],
+}
+
+/// The anchor compiled into this release.
+pub const MAINNET_ANCHOR: SnapshotAnchor = SnapshotAnchor {
+    height: ASSUMEUTXO_HEIGHT,
+    block_hash: ASSUMEUTXO_BLOCK_HASH,
+    utxo_hash: ASSUMEUTXO_HASH,
+};
 
 /// Public download URL for the gzip-compressed HUTX snapshot.
 /// Hosted on Cloudflare R2 (zero egress fees, edge-cached).
@@ -55,5 +100,24 @@ mod tests {
         let display = "705528fe003329e0e6de5c854b83d57b0badc2b95b60dc73a7a40f22f62d133e";
         let from_display = hex::decode(display).unwrap();
         assert_eq!(&from_display[..], &ASSUMEUTXO_HASH[..]);
+    }
+
+    #[test]
+    fn min_chain_work_matches_display() {
+        let display = "00000000000000000000000000000000000000011c9554a693f4170c17ba9148";
+        let mut from_display = hex::decode(display).unwrap();
+        from_display.reverse();
+        assert_eq!(&from_display[..], &MIN_CHAIN_WORK[..]);
+    }
+
+    #[test]
+    fn min_chain_work_exceeds_core_v31_1_floor() {
+        // Core v31.1 mainnet nMinimumChainWork (block 938,343). Our anchor
+        // is higher, so our floor must be strictly above Core's.
+        let core = "0000000000000000000000000000000000000001128750f82f4c366153a3a030";
+        let mut core_le = [0u8; 32];
+        core_le.copy_from_slice(&hex::decode(core).unwrap());
+        core_le.reverse();
+        assert!(crate::validation::u256_gt(&MIN_CHAIN_WORK, &core_le));
     }
 }

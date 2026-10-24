@@ -15,6 +15,7 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::Txid;
 
+use crate::assumeutxo::{SnapshotAnchor, MAINNET_ANCHOR, MIN_CHAIN_WORK};
 use crate::block_store::BlockStore;
 use crate::block_validation::{validate_block, validate_block_scripts};
 use crate::mempool::Mempool;
@@ -23,7 +24,9 @@ use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
 use crate::tor::TorManager;
 use crate::utxo::{SnapshotMeta, UtxoSet};
-use crate::validation::{chainwork_for_headers, u256_gt, validate_headers};
+use crate::validation::{
+    check_anchor, chainwork_for_headers, u256_add, u256_gt, validate_headers,
+};
 
 /// How often to poll for new blocks after initial sync (seconds).
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
@@ -67,6 +70,11 @@ const HEADER_DISAGREEMENT_PENALTY: u32 = 10;
 /// honest peer racing an announcement can trip it; the full ban weight is
 /// reserved for a matching block that fails consensus (ticket 024).
 const BLOCK_NOT_RECEIVED_PENALTY: u32 = 10;
+
+/// Penalty for a peer whose headers conflict with the chain anchor (a
+/// different block at the anchor height, or a reorg across it). No honest
+/// peer can produce this, so it's an immediate ban.
+const ANCHOR_CONFLICT_PENALTY: u32 = 100;
 
 /// Cap on how many addresses we'll process from a single addr / addrv2
 /// message. Bitcoin Core's MAX_ADDR_TO_SEND is 1000; we accept the same
@@ -433,6 +441,19 @@ pub struct HeaderSync {
     /// re-broadcast fires 24h after node start. The on-connect self-ad in
     /// `PeerPool::maintain` covers fresh connections in the meantime.
     last_self_ad: Mutex<Instant>,
+    /// Chain anchor (ticket 023): the snapshot every loaded UTXO set must
+    /// match, and the block every header chain must contain at
+    /// `anchor.height`. Mainnet constants; tests (and the regtest harness,
+    /// ticket 027) override these together with `min_chain_work`.
+    anchor: SnapshotAnchor,
+    /// Cumulative work the stored header chain must reach before we
+    /// validate blocks, activate a snapshot, or report "synced".
+    min_chain_work: [u8; 32],
+    /// Running chainwork of the stored chain as (height, hash at that
+    /// height, work of 0..=height), so `has_min_chain_work` only sums the
+    /// headers added since its last call. Invalidated by any reorg below
+    /// the cached height (the hash at that height no longer matches).
+    chainwork_cache: Mutex<Option<(u32, BlockHash, [u8; 32])>>,
 }
 
 impl HeaderSync {
@@ -521,48 +542,217 @@ impl HeaderSync {
             outbound_peer_count: AtomicU32::new(0),
             new_block_announced: AtomicBool::new(false),
             last_self_ad: Mutex::new(Instant::now()),
+            anchor: MAINNET_ANCHOR,
+            min_chain_work: MIN_CHAIN_WORK,
+            chainwork_cache: Mutex::new(None),
         })
     }
 
-    /// Load a UTXO snapshot from a file path. Sets validated_height to the
-    /// snapshot height so sync resumes from there.
+    /// Load a UTXO snapshot from a file path. The file must match
+    /// `self.anchor` (header height, header block hash, content hash).
     ///
     /// Accepts either a raw `.hutx` file or a `.hutx.gz` gzipped file.
     /// The `.gz` form is decompressed on the fly so we never need to write
     /// the (much larger) decompressed file to disk on mobile.
+    ///
+    /// Binding to the header chain: if our headers already reach the anchor
+    /// height they must contain the anchor block there, or the load is
+    /// refused before the file is opened. If they don't reach it yet (the
+    /// app imports the snapshot before starting header sync), the UTXO set
+    /// is loaded but `validated_height` is left alone; the snapshot stays
+    /// *pending* until header sync stores the anchor block and
+    /// `activate_pending_snapshot` advances `validated_height` to it.
     pub fn load_snapshot<F>(
         &self,
         snapshot_path: &str,
-        expected_hash: Option<&[u8; 32]>,
         on_progress: F,
     ) -> Result<SnapshotMeta, SyncError>
     where
         F: Fn(u64, u64),
     {
+        if let Some(hash) = self
+            .store
+            .get_hash_at_height(self.anchor.height)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+        {
+            if hash.to_byte_array() != self.anchor.block_hash {
+                return Err(SyncError::Validation(format!(
+                    "header chain has {} at snapshot height {}, expected anchor {}",
+                    hash,
+                    self.anchor.height,
+                    BlockHash::from_byte_array(self.anchor.block_hash)
+                )));
+            }
+        }
+
         let file = std::fs::File::open(snapshot_path)
             .map_err(|e| SyncError::Store(format!("open snapshot: {}", e)))?;
 
         let meta = if snapshot_path.ends_with(".gz") {
             let decoder = flate2::read::GzDecoder::new(file);
             self.utxo
-                .load_snapshot(decoder, expected_hash, on_progress)
+                .load_snapshot(decoder, Some(&self.anchor), on_progress)
                 .map_err(|e| SyncError::Store(format!("{}", e)))?
         } else {
             self.utxo
-                .load_snapshot(file, expected_hash, on_progress)
+                .load_snapshot(file, Some(&self.anchor), on_progress)
                 .map_err(|e| SyncError::Store(format!("{}", e)))?
         };
-
-        self.store
-            .set_validated_height(meta.height)
-            .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
         info!(
             "Loaded UTXO snapshot at height {}, {} utxos",
             meta.height, meta.utxo_count
         );
 
+        if !self.activate_pending_snapshot()? {
+            info!(
+                "Snapshot activation deferred until headers reach height {}",
+                meta.height
+            );
+        }
+
         Ok(meta)
+    }
+
+    /// If a loaded snapshot is still pending (`validated_height` below the
+    /// assume-valid floor), activate it once the stored header chain has the
+    /// snapshot's block at the floor height. Returns `true` when block
+    /// validation may proceed (no snapshot, already active, or just
+    /// activated) and `false` while headers haven't reached the snapshot.
+    fn activate_pending_snapshot(&self) -> Result<bool, SyncError> {
+        let floor = self
+            .utxo
+            .assume_valid_floor()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if floor == 0 {
+            return Ok(true);
+        }
+        let validated = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if validated >= floor {
+            return Ok(true);
+        }
+
+        // The hash recorded at load time was checked against the anchor of
+        // the build that loaded it. Snapshots loaded before that key existed
+        // can only be bound if they sit at this build's anchor height.
+        let expected = match self
+            .utxo
+            .snapshot_block_hash()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+        {
+            Some(h) => h,
+            None if floor == self.anchor.height => self.anchor.block_hash,
+            None => {
+                return Err(SyncError::Validation(format!(
+                    "snapshot at height {} has no recorded block hash",
+                    floor
+                )))
+            }
+        };
+
+        match self
+            .store
+            .get_hash_at_height(floor)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+        {
+            Some(h) if h.to_byte_array() == expected => {
+                self.store
+                    .set_validated_height(floor)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                info!("Snapshot activated: header chain contains {} at {}", h, floor);
+                Ok(true)
+            }
+            Some(h) => Err(SyncError::Validation(format!(
+                "header chain has {} at snapshot height {}, expected {}",
+                h,
+                floor,
+                BlockHash::from_byte_array(expected)
+            ))),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether the stored header chain has at least `min_chain_work`.
+    ///
+    /// Fast path: if the chain contains the anchor block, prev-hash linkage
+    /// commits it to the anchor's exact ancestry, whose cumulative work is
+    /// `MIN_CHAIN_WORK` by construction (see `assumeutxo.rs`). Otherwise sum
+    /// the chain's work incrementally via `chainwork_cache`.
+    fn has_min_chain_work(&self) -> Result<bool, SyncError> {
+        if let Some(h) = self
+            .store
+            .get_hash_at_height(self.anchor.height)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+        {
+            if h.to_byte_array() == self.anchor.block_hash {
+                return Ok(true);
+            }
+        }
+        let work = self.stored_chainwork()?;
+        Ok(!u256_gt(&self.min_chain_work, &work))
+    }
+
+    /// Cumulative work of the stored header chain (genesis through tip),
+    /// reusing the cached prefix when it is still part of the chain.
+    fn stored_chainwork(&self) -> Result<[u8; 32], SyncError> {
+        let (tip_height, tip_hash, _) = self
+            .store
+            .tip()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .ok_or_else(|| SyncError::Store("store has no headers".into()))?;
+
+        let mut cache = self.chainwork_cache.lock().unwrap();
+        let (mut next, mut work) = match *cache {
+            Some((h, hash, w))
+                if h <= tip_height
+                    && self
+                        .store
+                        .get_hash_at_height(h)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?
+                        == Some(hash) =>
+            {
+                (h + 1, w)
+            }
+            _ => (0, [0u8; 32]),
+        };
+        while next <= tip_height {
+            let end = std::cmp::min(next.saturating_add(1999), tip_height);
+            let headers = self
+                .store
+                .get_headers_in_range(next, end)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            work = u256_add(work, chainwork_for_headers(&headers));
+            next = end + 1;
+        }
+        *cache = Some((tip_height, tip_hash, work));
+        Ok(work)
+    }
+
+    /// Block validation may run only once the header chain has minimum
+    /// work and any loaded snapshot is bound to it.
+    fn ready_to_validate_blocks(&self) -> Result<bool, SyncError> {
+        Ok(self.has_min_chain_work()? && self.activate_pending_snapshot()?)
+    }
+
+    /// A reorg from `fork_at` would disconnect (or replace the successors
+    /// of) the anchor block in a chain that already contains it.
+    fn reorg_crosses_anchor(&self, tip_height: u32, fork_at: u32) -> bool {
+        tip_height >= self.anchor.height && fork_at <= self.anchor.height
+    }
+
+    /// Reject a header batch (first header at `start_height`) that puts a
+    /// different block at the anchor height.
+    fn check_batch_anchor(&self, headers: &[Header], start_height: u32) -> Result<(), String> {
+        check_anchor(
+            headers,
+            start_height,
+            self.anchor.height,
+            &BlockHash::from_byte_array(self.anchor.block_hash),
+        )
+        .map_err(|e| format!("{}", e))
     }
 
     /// Trust information for the UI: snapshot height, forward-validated
@@ -781,16 +971,30 @@ impl HeaderSync {
     ///      batch — refusing to commit dubious headers is the safer default.
     /// 4. If only one peer in the pool → best-effort accept (we logged a
     ///    warning at sync start; this is a degraded mode).
+    ///
+    /// `strict` (initial sync, chain below minimum work): a missing or
+    /// unresponsive witness rejects the batch instead of accepting it, so a
+    /// fresh node only stores headers that two distinct peers agree on. The
+    /// caller retries on the next iteration. Steady-state behavior is
+    /// unchanged.
     fn cross_check_headers(
         &self,
         pool: &mut PeerPool,
         locator: &[BlockHash],
         active_addr: &str,
         active_first_hash: BlockHash,
+        strict: bool,
     ) -> HeaderCrossCheck {
         // Step 1: pick an independent witness peer.
         let witness_addr = match pool.peer_addr_other_than(active_addr) {
             Some(a) => a,
+            None if strict => {
+                debug!(
+                    "cross-check: no witness for {} during initial sync; rejecting batch",
+                    active_addr
+                );
+                return HeaderCrossCheck::Reject;
+            }
             None => {
                 debug!(
                     "cross-check skipped: only active peer {} available",
@@ -802,6 +1006,15 @@ impl HeaderSync {
 
         let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator) {
             Some(h) => h,
+            None if strict => {
+                // Same "can't conclude" case, but during initial sync we
+                // fail closed. No penalty for the active peer.
+                debug!(
+                    "cross-check witness {} failed during initial sync; rejecting batch",
+                    witness_addr
+                );
+                return HeaderCrossCheck::Reject;
+            }
             None => {
                 // Witness peer failed to respond — we can't conclude anything.
                 // Don't penalize the active peer over a network failure.
@@ -1065,12 +1278,48 @@ impl HeaderSync {
                 // Headers caught up — download and validate blocks
                 peer_height = std::cmp::max(peer_height, tip_height);
 
+                // Minimum-work floor: a peer that has nothing beyond a chain
+                // below `min_chain_work` is either behind or feeding us a
+                // cheap fake chain. Never validate blocks against it or
+                // report synced; drop the peer and keep syncing headers from
+                // others. Not a misbehavior penalty — an honest peer that is
+                // itself still syncing looks the same.
+                if !self.has_min_chain_work()? {
+                    warn!(
+                        "Peer {} has no headers above {}, but our chain is below minimum work; dropping peer",
+                        active_addr, tip_height
+                    );
+                    pool.remove_peer(&active_addr);
+                    pool.maintain();
+                    if pool.count() == 0 {
+                        return Err(SyncError::Peer("all peers disconnected".into()));
+                    }
+                    on_progress(self.make_status(
+                        tip_height,
+                        peer_height,
+                        &pool,
+                        "",
+                        true,
+                        current_validated,
+                        Some("Verifying chain work: header chain below minimum work".into()),
+                    ));
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+
+                // Headers now include the anchor, so a snapshot imported
+                // before header sync reached it can be bound and activated.
+                let snapshot_ready = self.activate_pending_snapshot()?;
+
                 let mut validated = self
                     .store
                     .validated_height()
                     .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-                // Guard: if validated_height exceeds tip (e.g. after reorg), reset
+                // Guard: if validated_height exceeds tip (e.g. after reorg), reset.
+                // Can't drop below the snapshot floor: we only get here with
+                // the anchor in the chain (min work), so tip >= anchor height
+                // >= floor, and reorgs across the anchor are refused.
                 if validated > tip_height {
                     warn!(
                         "validated_height {} exceeds tip {}, resetting",
@@ -1083,6 +1332,7 @@ impl HeaderSync {
                 }
 
                 if validated < tip_height
+                    && snapshot_ready
                     && !self.validation_paused.load(Ordering::Relaxed)
                 {
                     // Download and validate next block
@@ -1413,11 +1663,13 @@ impl HeaderSync {
                 .get_locator_hashes()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
             let active_first_hash = headers[0].block_hash();
+            let strict = !self.has_min_chain_work()?;
             match self.cross_check_headers(
                 &mut pool,
                 &cross_check_locator,
                 &active_addr,
                 active_first_hash,
+                strict,
             ) {
                 HeaderCrossCheck::Accept => {}
                 HeaderCrossCheck::Reject => {
@@ -1425,6 +1677,10 @@ impl HeaderSync {
                     // appropriate misbehavior penalty. Drop the batch and
                     // try again on the next iteration.
                     pool.maintain();
+                    if strict && pool.count() < 2 {
+                        // Waiting for a second peer to witness — don't spin.
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                     continue;
                 }
             }
@@ -1499,6 +1755,17 @@ impl HeaderSync {
                             continue;
                         }
 
+                        // Never reorg across the chain anchor: once our chain
+                        // contains it, a fork at or below it is refused.
+                        if self.reorg_crosses_anchor(tip_height, fork_at) {
+                            warn!(
+                                "Peer {} suggests reorg from fork point {} at or below anchor {}, refusing",
+                                active_addr, fork_at, self.anchor.height
+                            );
+                            pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY);
+                            continue;
+                        }
+
                         // Compare chainwork: our chain vs the fork
                         let our_headers = self
                             .store
@@ -1545,6 +1812,11 @@ impl HeaderSync {
                         // fork point. If this fails, our existing chain is
                         // untouched — just penalize the peer.
                         let new_headers = &headers[new_chain_offset..];
+                        if let Err(e) = self.check_batch_anchor(new_headers, fork_at + 1) {
+                            warn!("Reorg rejected: {}", e);
+                            pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY);
+                            continue;
+                        }
                         if let Err(e) = validate_headers(
                             new_headers,
                             fork_hash,
@@ -1648,6 +1920,15 @@ impl HeaderSync {
                 .store
                 .last_timestamps(11)
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+            // A chain that puts a different block at the anchor height is
+            // fake no matter how valid its PoW looks — ban the peer.
+            if let Err(e) = self.check_batch_anchor(&headers, tip_height + 1) {
+                warn!("Peer {} sent headers conflicting with anchor: {}", active_addr, e);
+                pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY);
+                pool.maintain();
+                continue;
+            }
 
             validate_headers(
                 &headers,
@@ -2293,6 +2574,9 @@ impl HeaderSync {
                 .ok_or_else(|| format!("no header at height {}", height))
         };
 
+        self.check_batch_anchor(&headers, tip_height + 1)
+            .map_err(SyncError::Validation)?;
+
         validate_headers(
             &headers,
             tip_hash,
@@ -2330,6 +2614,11 @@ impl HeaderSync {
         // If time remains, try full block validation
         if Instant::now() >= deadline {
             info!("validate_latest_block: deadline reached after header sync");
+            return Ok(notification);
+        }
+
+        if !self.ready_to_validate_blocks()? {
+            info!("validate_latest_block: chain below minimum work or snapshot pending, skipping block validation");
             return Ok(notification);
         }
 
@@ -2507,11 +2796,13 @@ impl HeaderSync {
                 .get_locator_hashes()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
             let active_first_hash = headers[0].block_hash();
+            let strict = !self.has_min_chain_work()?;
             match self.cross_check_headers(
                 &mut pool,
                 &cross_check_locator,
                 &peer_addr,
                 active_first_hash,
+                strict,
             ) {
                 HeaderCrossCheck::Accept => {}
                 HeaderCrossCheck::Reject => {
@@ -2541,6 +2832,9 @@ impl HeaderSync {
                     .ok_or_else(|| format!("no header at height {}", height))
             };
 
+            self.check_batch_anchor(&headers, tip_height + 1)
+                .map_err(SyncError::Validation)?;
+
             validate_headers(
                 &headers,
                 tip_hash,
@@ -2562,6 +2856,17 @@ impl HeaderSync {
                 new_start, new_tip
             );
         }
+
+        // No block validation until the chain has minimum work and any
+        // pending snapshot is bound to it (may advance validated_height).
+        if !self.ready_to_validate_blocks()? {
+            info!("catch_up_blocks: chain below minimum work or snapshot pending, skipping block validation");
+            return Ok(self.make_catchup_status(false, 0, validated_height, new_tip));
+        }
+        validated_height = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
         // Block validation loop — oldest-first
         let mut blocks_validated: u32 = 0;
@@ -3152,5 +3457,247 @@ mod tests {
             "burst grew set past cap: {}",
             s.known_txids.len()
         );
+    }
+
+    // ── Chain anchoring (ticket 023) ───────────────────────────────────
+
+    use crate::utxo::UtxoEntry;
+    use bitcoin::pow::CompactTarget;
+    use tempfile::TempDir;
+
+    /// Anchor height used by these tests (the mainnet one is 943,500).
+    const TEST_ANCHOR_HEIGHT: u32 = 5;
+
+    fn fresh_sync(dir: &TempDir) -> HeaderSync {
+        let db = dir.path().join("headers.sqlite3");
+        HeaderSync::new(db.to_str().unwrap(), None).unwrap()
+    }
+
+    /// `n` headers linked onto mainnet genesis at minimum (regtest)
+    /// difficulty. `HeaderStore` doesn't validate PoW, so these are cheap.
+    /// `salt` makes distinct chains.
+    fn cheap_chain(n: u32, salt: u32) -> Vec<Header> {
+        let mut prev = genesis_header().block_hash();
+        (1..=n)
+            .map(|i| {
+                let h = Header {
+                    version: bitcoin::block::Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                    time: 1_231_006_505 + i * 600,
+                    bits: CompactTarget::from_consensus(0x207fffff),
+                    nonce: i ^ (salt << 16),
+                };
+                prev = h.block_hash();
+                h
+            })
+            .collect()
+    }
+
+    /// Write a one-entry HUTX snapshot whose header claims `height` /
+    /// `block_hash`; returns its path and the anchor it satisfies.
+    fn write_test_snapshot(dir: &TempDir, height: u32, block_hash: [u8; 32]) -> (String, SnapshotAnchor) {
+        let src = UtxoSet::open(dir.path().join("src-utxo").to_str().unwrap()).unwrap();
+        src.test_insert_utxo(
+            [7u8; 32],
+            0,
+            UtxoEntry {
+                amount: 5000,
+                script_pubkey: vec![0x51],
+                height: 1,
+                is_coinbase: false,
+            },
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let meta = src.write_snapshot(&mut buf, height, &block_hash).unwrap();
+        let path = dir.path().join("snap.hutx");
+        std::fs::write(&path, &buf).unwrap();
+        (
+            path.to_str().unwrap().to_string(),
+            SnapshotAnchor {
+                height,
+                block_hash,
+                utxo_hash: meta.utxo_hash,
+            },
+        )
+    }
+
+    /// HeaderSync anchored at `TEST_ANCHOR_HEIGHT` of `chain`, with a
+    /// snapshot file for that anchor. Headers are NOT stored yet.
+    fn anchored_fixture(chain: &[Header]) -> (TempDir, HeaderSync, String) {
+        let dir = TempDir::new().unwrap();
+        let anchor_hash = chain[TEST_ANCHOR_HEIGHT as usize - 1]
+            .block_hash()
+            .to_byte_array();
+        let (path, anchor) = write_test_snapshot(&dir, TEST_ANCHOR_HEIGHT, anchor_hash);
+        let mut hs = fresh_sync(&dir);
+        hs.anchor = anchor;
+        (dir, hs, path)
+    }
+
+    #[test]
+    fn load_snapshot_activates_when_headers_include_anchor() {
+        let chain = cheap_chain(10, 0);
+        let (_dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain, 1).unwrap();
+
+        let meta = hs.load_snapshot(&path, |_, _| {}).unwrap();
+        assert_eq!(meta.height, TEST_ANCHOR_HEIGHT);
+        assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
+        assert_eq!(hs.utxo.count().unwrap(), 1);
+        assert!(hs.ready_to_validate_blocks().unwrap());
+    }
+
+    #[test]
+    fn load_snapshot_defers_activation_until_headers_reach_anchor() {
+        // The app imports the snapshot before header sync starts.
+        let chain = cheap_chain(10, 0);
+        let (_dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain[..3], 1).unwrap();
+
+        hs.load_snapshot(&path, |_, _| {}).unwrap();
+        assert_eq!(hs.utxo.count().unwrap(), 1);
+        assert_eq!(hs.store.validated_height().unwrap(), 0, "must stay pending");
+        assert!(!hs.ready_to_validate_blocks().unwrap());
+        assert!(!hs.needs_snapshot().unwrap(), "don't re-download a pending snapshot");
+
+        // Header sync reaches the anchor → activation.
+        hs.store.store_headers(&chain[3..], 4).unwrap();
+        assert!(hs.ready_to_validate_blocks().unwrap());
+        assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
+    }
+
+    #[test]
+    fn load_snapshot_refuses_header_chain_missing_anchor() {
+        // Our stored chain has a different block at the anchor height.
+        let chain = cheap_chain(10, 0);
+        let (_dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&cheap_chain(10, 1), 1).unwrap();
+
+        let err = hs.load_snapshot(&path, |_, _| {}).unwrap_err();
+        assert!(format!("{}", err).contains("expected anchor"), "got: {}", err);
+        assert_eq!(hs.utxo.count().unwrap(), 0, "UTXO db must be untouched");
+        assert_eq!(hs.utxo.assume_valid_floor().unwrap(), 0);
+        assert_eq!(hs.store.validated_height().unwrap(), 0);
+    }
+
+    #[test]
+    fn load_snapshot_rejects_wrong_height_or_hash() {
+        let chain = cheap_chain(10, 0);
+        for (height, block_hash) in [
+            (TEST_ANCHOR_HEIGHT + 1, chain[4].block_hash().to_byte_array()),
+            (TEST_ANCHOR_HEIGHT, chain[5].block_hash().to_byte_array()),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let (path, file_anchor) = write_test_snapshot(&dir, height, block_hash);
+            let mut hs = fresh_sync(&dir);
+            hs.anchor = SnapshotAnchor {
+                height: TEST_ANCHOR_HEIGHT,
+                block_hash: chain[4].block_hash().to_byte_array(),
+                utxo_hash: file_anchor.utxo_hash,
+            };
+            hs.store.store_headers(&chain, 1).unwrap();
+
+            let err = hs.load_snapshot(&path, |_, _| {}).unwrap_err();
+            assert!(format!("{}", err).contains("mismatch"), "got: {}", err);
+            assert_eq!(hs.utxo.count().unwrap(), 0);
+            assert_eq!(hs.store.validated_height().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn low_work_chain_is_below_min_chain_work() {
+        // A cheap chain that never reaches the anchor height can't satisfy
+        // the mainnet floor.
+        let dir = TempDir::new().unwrap();
+        let hs = fresh_sync(&dir);
+        hs.store.store_headers(&cheap_chain(50, 0), 1).unwrap();
+        assert_eq!(hs.min_chain_work, MIN_CHAIN_WORK);
+        assert!(!hs.has_min_chain_work().unwrap());
+        assert!(!hs.ready_to_validate_blocks().unwrap());
+    }
+
+    #[test]
+    fn chain_meeting_min_chain_work_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let mut hs = fresh_sync(&dir);
+        let chain = cheap_chain(50, 0);
+        hs.store.store_headers(&chain, 1).unwrap();
+        let mut all = vec![genesis_header()];
+        all.extend_from_slice(&chain);
+        let work = chainwork_for_headers(&all);
+
+        hs.min_chain_work = work;
+        assert!(hs.has_min_chain_work().unwrap(), "work == floor passes");
+
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        hs.min_chain_work = u256_add(work, one);
+        assert!(!hs.has_min_chain_work().unwrap(), "work < floor fails");
+    }
+
+    #[test]
+    fn anchor_in_chain_satisfies_min_chain_work() {
+        let chain = cheap_chain(10, 0);
+        let (_dir, hs, _path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain, 1).unwrap();
+        // min_chain_work is still the mainnet value; the anchor proves it.
+        assert!(hs.has_min_chain_work().unwrap());
+    }
+
+    #[test]
+    fn stored_chainwork_is_incremental_and_reorg_safe() {
+        let dir = TempDir::new().unwrap();
+        let hs = fresh_sync(&dir);
+        let chain = cheap_chain(30, 0);
+        hs.store.store_headers(&chain[..10], 1).unwrap();
+        hs.stored_chainwork().unwrap();
+        hs.store.store_headers(&chain[10..], 11).unwrap();
+
+        let mut all = vec![genesis_header()];
+        all.extend_from_slice(&chain);
+        assert_eq!(hs.stored_chainwork().unwrap(), chainwork_for_headers(&all));
+
+        // Replace the top of the chain: the cached prefix must be dropped.
+        hs.store.delete_headers_above(5).unwrap();
+        let fork = cheap_chain(40, 2);
+        let mut fork_tail: Vec<Header> = Vec::new();
+        let mut prev = chain[4].block_hash();
+        for h in &fork[5..40] {
+            let mut h = *h;
+            h.prev_blockhash = prev;
+            prev = h.block_hash();
+            fork_tail.push(h);
+        }
+        hs.store.store_headers(&fork_tail, 6).unwrap();
+        let mut all = vec![genesis_header()];
+        all.extend_from_slice(&chain[..5]);
+        all.extend_from_slice(&fork_tail);
+        assert_eq!(hs.stored_chainwork().unwrap(), chainwork_for_headers(&all));
+    }
+
+    #[test]
+    fn header_batch_conflicting_with_anchor_is_rejected() {
+        let chain = cheap_chain(10, 0);
+        let (_dir, hs, _path) = anchored_fixture(&chain);
+        assert!(hs.check_batch_anchor(&chain, 1).is_ok());
+        let fake = cheap_chain(10, 1);
+        let err = hs.check_batch_anchor(&fake, 1).unwrap_err();
+        assert!(err.contains("conflicts with the chain anchor"), "got: {}", err);
+        // A batch that stops short of the anchor can't conflict yet.
+        assert!(hs.check_batch_anchor(&fake[..3], 1).is_ok());
+    }
+
+    #[test]
+    fn reorg_across_anchor_is_refused() {
+        let chain = cheap_chain(10, 0);
+        let (_dir, hs, _path) = anchored_fixture(&chain);
+        let a = TEST_ANCHOR_HEIGHT;
+        assert!(hs.reorg_crosses_anchor(a + 3, a - 1));
+        assert!(hs.reorg_crosses_anchor(a + 3, a));
+        assert!(!hs.reorg_crosses_anchor(a + 3, a + 1));
+        // Below the anchor height nothing is anchored yet.
+        assert!(!hs.reorg_crosses_anchor(a - 1, a - 3));
     }
 }
