@@ -2800,8 +2800,8 @@ mod tests {
         (pool, servers)
     }
 
-    /// Fill the peer's 20-message bound with a block other than the one
-    /// being requested, so `get_block` ends in `BlockNotReceived`.
+    /// Stream blocks other than the one being requested, so `get_block`
+    /// ends in `BlockNotReceived` (unrequested-block cap or message bound).
     fn serve_wrong_block(server: &mut std::net::TcpStream) {
         for _ in 0..20 {
             write_message(server, NetworkMessage::Block(synthetic_block(2)));

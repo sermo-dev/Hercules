@@ -29,6 +29,12 @@ const TOR_BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Prevents OOM from malicious peers sending crafted headers claiming huge payloads.
 const MAX_P2P_PAYLOAD: u32 = 4_000_000;
 
+/// How many non-requested `block` messages `receive_block` will skip before
+/// giving up. Honest peers announce via inv/headers/cmpctblock rather than
+/// pushing full blocks, so one or two is already generous; without a cap a
+/// peer could make us download ~20 × 4 MB of junk per request (on cellular).
+const MAX_UNREQUESTED_BLOCKS: usize = 2;
+
 /// DNS seeds for discovering Bitcoin mainnet peers.
 const DNS_SEEDS: &[&str] = &[
     "seed.bitcoin.sipa.be",
@@ -563,8 +569,10 @@ impl Peer {
     /// returned: it may be an unsolicited announcement racing our getdata,
     /// or a peer trying to substitute a different block. Either way it must
     /// never be mistaken for the requested one. Running out of the message
-    /// bound or hitting the read timeout yields `BlockNotReceived`.
+    /// bound, skipping more than `MAX_UNREQUESTED_BLOCKS`, or hitting the
+    /// read timeout yields `BlockNotReceived`.
     fn receive_block(&mut self, expected: BlockHash) -> Result<Block, PeerError> {
+        let mut skipped_blocks = 0;
         for _ in 0..20 {
             let msg = match self.receive() {
                 Ok(m) => m,
@@ -578,6 +586,10 @@ impl Peer {
                     let got = block.block_hash();
                     if got == expected {
                         return Ok(block);
+                    }
+                    skipped_blocks += 1;
+                    if skipped_blocks > MAX_UNREQUESTED_BLOCKS {
+                        return Err(PeerError::BlockNotReceived { expected });
                     }
                     debug!(
                         "Skipping block {} while waiting for {}",
@@ -1143,14 +1155,52 @@ pub(crate) mod tests {
     fn get_block_never_returns_wrong_block_within_message_bound() {
         let (mut peer, mut server) = loopback_peer_pair();
         let wanted_hash = synthetic_block(1).block_hash();
-        // Exhaust the 20-message bound with nothing but the wrong block.
+        // Exhaust the 20-message bound with non-block noise.
         for _ in 0..20 {
-            write_message(&mut server, NetworkMessage::Block(synthetic_block(2)));
+            write_message(
+                &mut server,
+                NetworkMessage::Inv(vec![Inventory::Block(synthetic_block(3).block_hash())]),
+            );
         }
+        write_message(&mut server, NetworkMessage::Block(synthetic_block(2)));
 
         match peer.get_block(wanted_hash) {
             Err(PeerError::BlockNotReceived { expected }) => assert_eq!(expected, wanted_hash),
             Ok(b) => panic!("returned wrong block {}", b.block_hash()),
+            Err(e) => panic!("expected BlockNotReceived, got {}", e),
+        }
+    }
+
+    #[test]
+    fn get_block_tolerates_unrequested_blocks_up_to_cap() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        let wanted = synthetic_block(1);
+        let wanted_hash = wanted.block_hash();
+        for _ in 0..MAX_UNREQUESTED_BLOCKS {
+            write_message(&mut server, NetworkMessage::Block(synthetic_block(2)));
+        }
+        write_message(&mut server, NetworkMessage::Block(wanted));
+
+        let got = peer.get_block(wanted_hash).expect("get_block");
+        assert_eq!(got.block_hash(), wanted_hash);
+    }
+
+    #[test]
+    fn get_block_gives_up_after_too_many_unrequested_blocks() {
+        // A peer streaming wrong blocks must not make us download ~20 × 4 MB:
+        // we bail as soon as the cap is exceeded, even if the right block
+        // would have followed.
+        let (mut peer, mut server) = loopback_peer_pair();
+        let wanted = synthetic_block(1);
+        let wanted_hash = wanted.block_hash();
+        for _ in 0..=MAX_UNREQUESTED_BLOCKS {
+            write_message(&mut server, NetworkMessage::Block(synthetic_block(2)));
+        }
+        write_message(&mut server, NetworkMessage::Block(wanted));
+
+        match peer.get_block(wanted_hash) {
+            Err(PeerError::BlockNotReceived { expected }) => assert_eq!(expected, wanted_hash),
+            Ok(b) => panic!("expected give-up, got block {}", b.block_hash()),
             Err(e) => panic!("expected BlockNotReceived, got {}", e),
         }
     }
