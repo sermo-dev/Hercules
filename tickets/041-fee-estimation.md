@@ -1,5 +1,10 @@
 # Ticket 041: Fee Estimation That Works on a Phone
 
+## Decisions (2026-10-23)
+
+- **Decided:** relay policy does not change as part of this ticket. Accuracy comes from block-based estimation plus shadow-tracking the feerates of policy-filtered transactions; nothing extra is relayed or stored.
+- The default relay profile (Knots-like vs Core-like) is decided separately (see 018 amendment / 045 policy profiles).
+
 ## Summary
 
 Replace the current mempool-snapshot fee estimator with one that is (a) available immediately after every wake or launch, and (b) not biased low by our own relay-policy filtering. The primary signal becomes **recent validated blocks**. We see and fully validate every block, so we know what feerates actually got mined. The live mempool becomes a secondary signal when it's warm. This is a prerequisite for the send flow (020/037). Bad estimates mean either stuck transactions or overpaying, and both get blamed on the wallet.

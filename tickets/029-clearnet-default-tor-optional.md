@@ -1,5 +1,10 @@
 # Ticket 029: Clearnet by Default, Tor as an Opt-In Setting
 
+## Decisions (2026-10-23)
+
+- **Decided:** clearnet is the default for sync and relay. Tor is an opt-in setting.
+- **Decided:** the user's own transactions always go out via short-lived Tor connections ("private broadcast"), even in clearnet mode.
+
 ## Summary
 
 Proposal: make **clearnet** the default P2P transport and make **Tor an opt-in setting**. The user's own transactions should still leave the phone privately through a "private broadcast" path, so the main privacy cost of clearnet (linking a transaction to the IP that first sent it) is mitigated even in the default mode.

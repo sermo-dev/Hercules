@@ -1,5 +1,10 @@
 # Ticket 035: Wallet Chain Scanner
 
+## Decisions (2026-10-23)
+
+- **Decided:** Phase 2 (BIP158 filter serving for external wallets via ticket 014) is optional and deferred. v1 is the in-app wallet only, so only Phase 1 (direct script matching + UTXO-set walk) is in scope.
+- **Note:** a prototype of Phase 1 already exists as uncommitted work on branch `ticket-020-in-app-wallet` (`wallet.rs`, `wallet_store.rs`, `process_block` hooks). Reuse it rather than starting fresh.
+
 ## Summary
 
 Build the component that answers "which coins belong to my wallets?" from data the node already has. It has three entry points:

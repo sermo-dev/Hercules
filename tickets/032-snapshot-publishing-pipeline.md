@@ -1,5 +1,12 @@
 # Ticket 032: AssumeUTXO Snapshot Publishing Pipeline
 
+## Decisions (2026-10-23)
+
+- **Decided: Option A only.** The snapshot hash is baked into the app binary Apple signs. There is no runtime-fetched manifest, so Option B (signed manifests) is dropped.
+- Freshness comes from release cadence. The pipeline automates everything up to a PR that bumps the `assumeutxo.rs` constants; a human reviews, builds and submits.
+- Cadence is still open (weekly vs bi-weekly vs monthly). Only *new installs* use the snapshot, and they always get the latest App Store version, so cadence only sets how many blocks a new user must catch up.
+- Every snapshot file referenced by a shipped app version must stay hosted while that version can still be installed.
+
 ## Summary
 
 Today's AssumeUTXO snapshot was made by hand:

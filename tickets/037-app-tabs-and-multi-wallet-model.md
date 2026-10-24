@@ -1,5 +1,11 @@
 # Ticket 037: App Tabs and Multi-Wallet Model
 
+## Decisions (2026-10-23)
+
+- **Decided:** the tabs are **Wallet / Node / People**.
+- **Decided:** a single "Watch-only" entry in the Wallet tab opens the list of all watch-only wallets. By default it is gated by the same device authentication as the main wallet. The user can optionally add their own passcode/password on top to unlock that view.
+- **Decided:** v1 is multi-wallet (main + watch-only + passphrase entry point).
+
 ## Summary
 
 Restructure the app around three root tabs: **Wallet**, **Node**, **People** (tab name TBD, see Open questions). Define the multi-wallet data model v1 ships with: one main wallet, any number of watch-only wallets, and session-only passphrase wallets. This replaces 020's "v1 ships single-wallet for simplicity" (`020-in-app-wallet.md:285`). The owner's decision: v1 is multi-wallet. There's no reason not to ship a complete, simple product.
