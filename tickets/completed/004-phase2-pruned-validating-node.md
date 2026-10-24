@@ -1,5 +1,14 @@
 # Ticket 004: Phase 2 — Pruned Validating Node
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. Phase 2 shipped; boxes verified against code.
+
+- **Done:** block download + structural validation, script validation, LMDB UTXO set, AssumeUTXO load, real-time validation, pruning, catch-up (evidence on each box).
+- **Partly done → 030 / 046:** storage bound and the storage-usage UI. Pruning runs, but the ~10-12 GB bound is unverified on device (the UTXO set alone is now ~12 GB), and the UI shows no storage usage or UTXO-set size. 030 adds storage-used display, a low-disk guard, and the "Disk monitoring" item in Phase 2d. Showing UTXO set size is not in 030; it is listed as new work in 046.
+- **→ 032:** snapshot hosting decision (Phase 2d, "Snapshot hosting"). Currently a Cloudflare R2 dev URL; 032 is the publishing pipeline.
+- **Remaining new work (tracked in 046):** ETA when more than ~100 blocks behind (Phase 2d, "Catch-up Logic"). No ETA exists in `ContentView.swift`.
+
 ## Overview
 
 Transform Hercules from a header-only client into a fully-validating pruned Bitcoin node. This is the largest phase and is broken into four sub-phases.
@@ -158,14 +167,14 @@ UTXO entry value: `amount (8 bytes) || script_pubkey (variable, typically 22-34 
 
 ## Acceptance Criteria
 
-- [ ] Full blocks downloaded and structurally validated (merkle root, coinbase, weight)
-- [ ] Transaction scripts validated via libbitcoinconsensus
-- [ ] UTXO set maintained in LMDB, all spends verified
-- [ ] AssumeUTXO snapshot loads and verifies on first launch
-- [ ] New blocks validated in real-time while app is foregrounded
-- [ ] Old block data pruned, storage stays within ~10-12GB
-- [ ] Catch-up works after hours/days offline
-- [ ] UI shows block validation status, UTXO set size, storage usage
+- [x] Full blocks downloaded and structurally validated (merkle root, coinbase, weight) — `block_validation.rs:83-95` (merkle, weight), `:195` (witness commitment)
+- [x] Transaction scripts validated via libbitcoinconsensus — `bitcoinconsensus::height_to_flags` in `block_validation.rs:226`; crate pinned in `Cargo.toml:13` (patched, `:49`). Swap to libbitcoinkernel is 047
+- [x] UTXO set maintained in LMDB, all spends verified — `heed` env in `utxo.rs:8-9,175`
+- [x] AssumeUTXO snapshot loads and verifies on first launch — `load_snapshot` (`sync.rs:533`, `utxo.rs:701`), `ASSUMEUTXO_HASH` (`assumeutxo.rs:17`)
+- [x] New blocks validated in real-time while app is foregrounded — main sync/monitor loop in `sync.rs` (validation + prune at `sync.rs:1219-1222`)
+- [ ] Old block data pruned, storage stays within ~10-12GB — **partly done.** Pruning: `prune_below` / `prune_undo_below(next_height - 288)` (`sync.rs:1219-1222`, `block_store.rs:105`, `utxo.rs:510`). Storage bound unverified on device. **Deferred → ticket 030**
+- [x] Catch-up works after hours/days offline — `catch_up_blocks` (`sync.rs:2412`, `hercules.udl:119`), from ticket 015
+- [ ] UI shows block validation status, UTXO set size, storage usage — **partly done.** Validation status shown (`ContentView.swift:769-802`). UTXO set size (`utxo_count` exists only in `SnapshotInfo`, `hercules.udl:39`, not shown) and storage usage are missing. Storage usage **Deferred → ticket 030** (`030…md:100`); UTXO set size display is new work listed in 046
 
 ## Files to Create/Modify
 

@@ -1,5 +1,13 @@
 # Ticket 006: Chain Reorganization Handling
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. Reorg detection, rollback and replay shipped in `sync.rs` (fork detection and depth check at `sync.rs:1480-1500`, `rollback_block` at `sync.rs:1575`, `delete_headers_above` at `store.rs:237`).
+
+- **Decision recorded:** max reorg depth is `MAX_REORG_DEPTH = 288` (`sync.rs:46`), not the "e.g., 6 blocks" proposed below. 288 matches the block and undo prune window (`sync.rs:1219-1222`), so the undo data needed for any accepted reorg is always present.
+- **→ 027 / 025:** tests. Only unit-level pieces exist (multi-height UTXO rollback test at `utxo.rs:1537`, `delete_headers_above_removes_correct_headers` at `store.rs:615`). No sync-level fork/rollback/replay test exists. The 027 harness (`027…md:83,118-121`) plus 025 cover 1-, 2-, 288- and 289-block reorgs.
+- **→ 025:** UI surfacing. No `reorg_depth` field exists in `hercules.udl` or the Swift UI. 025 adds a reorg-pending state to the Live Activity and notifications (`025…md:106`).
+
 ## Summary
 
 Implement detection and handling of blockchain reorganizations (reorgs) so Hercules can follow the heaviest valid chain when competing blocks exist at the same height.

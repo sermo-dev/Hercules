@@ -1,5 +1,14 @@
 # Ticket 001: Multi-Peer Connections with Eclipse Attack Protection
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. Acceptance boxes below verified against code and ticked. The original 2026-04-06 status block is kept below for history (note it says `MAX_OUTBOUND = 8`; the code is now 12).
+
+- **Done:** all six acceptance criteria (evidence inline on each box).
+- **Caveat → 023:** the header cross-check compares only the *first* hash of each batch and accepts when the witness doesn't answer (`sync.rs:784-870`). Tightening it during initial sync is in 023 (`023-chain-anchoring.md:43,76`).
+- **Won't do (for now):** parallel range download. Single-peer header download is fast enough after AssumeUTXO.
+- **Remaining new work (tracked in 046):** optional manual "add my own node" peer (Proposed Changes §5). No code for it exists today.
+
 ## Status (as of 2026-04-06): Complete (parallel range download deferred)
 
 **Implemented:**
@@ -60,9 +69,9 @@ Hercules currently connects to a single peer for header sync. If that peer is ma
 
 ## Acceptance Criteria
 
-- [ ] Connects to at least 4 peers simultaneously
-- [ ] Headers are validated against 2+ independent peers before storage
-- [ ] Divergent peers are detected, flagged, and disconnected
-- [ ] Peers from the same /16 subnet are limited to 1 connection
-- [ ] Ban list persists across app launches
-- [ ] UI shows connected peer count and individual peer status
+- [x] Connects to at least 4 peers simultaneously — `MAX_OUTBOUND = 12` (`peer_pool.rs:15`), filled by `maintain()` (`peer_pool.rs:694`)
+- [x] Headers are validated against 2+ independent peers before storage — `cross_check_headers` (`sync.rs:784`), called at `sync.rs:1416`. First hash per batch only; stricter IBD check → 023
+- [x] Divergent peers are detected, flagged, and disconnected — `HEADER_DIVERGENCE_PENALTY = 50` (`sync.rs:59`, applied `:840,:848`); auto-ban at score ≤ `BAN_LOW_THRESHOLD = 20` (`peer_pool.rs:467`, `:1190-1196`), i.e. after a second divergence from the default score of 100
+- [x] Peers from the same /16 subnet are limited to 1 connection — `subnet_bucket()` (`peer_pool.rs:538`) enforced in `maintain()` (`peer_pool.rs:799-812`); tests at `peer_pool.rs:1922-1956`
+- [x] Ban list persists across app launches — `peer_store.rs:159` (insert), `load_active_bans()` (`peer_store.rs:178`); test `ban_persists_to_store` (`peer_pool.rs:1722`)
+- [x] UI shows connected peer count and individual peer status — `PeersCard` (`ContentView.swift:1592-1616`), inbound/outbound counts (`ContentView.swift:1089,1095`)

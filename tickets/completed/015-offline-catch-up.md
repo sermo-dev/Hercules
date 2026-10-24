@@ -1,5 +1,13 @@
 # Ticket 015: Offline Catch-Up After Long No-Network Period
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046.
+
+- **Done: Phase 1 (Approach A).** Budgeted catch-up `catch_up_blocks(max_blocks, budget_secs)` (`sync.rs:2412`, `hercules.udl:119`) returning `CatchUpStatus` (`hercules.udl:54`).
+- **→ 028: Phase 2 (Approach B).** Code registers only a `BGAppRefreshTask` (`AppDelegate.swift:43-48`, `NotificationManager.swift:400,445`), not a `BGProcessingTask`. 028 adds `BGProcessingTask` for large backlogs and passes a real budget into Rust (`028…md:27,76`).
+- **Remaining new work (tracked in 046):** the ">~288 blocks may fail" caveat from the open questions. No such copy exists in the Swift UI. One line of UI copy, or handle it in 028.
+
 ## Summary
 
 When Hercules is disconnected from the network for hours — no Wi-Fi with cellular policy disabled, airplane mode, dead zone, delayed APNs, anything — it accumulates a backlog of unvalidated blocks. When connectivity returns, the node needs to catch up multiple blocks without requiring the user to leave the app open. iOS background-execution constraints make this nontrivial: a single push wake (~25 s) is unlikely to validate dozens of blocks. This ticket designs the catch-up policy.
