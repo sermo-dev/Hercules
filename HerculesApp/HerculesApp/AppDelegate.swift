@@ -48,6 +48,11 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             NotificationManager.shared.handleCatchUpTask(task as! BGAppRefreshTask)
         }
 
+        // Re-register with the push relay on every launch while opted in, so
+        // a rotated APNs token is picked up and the relay's 30-day TTL never
+        // lapses. Throttled to one relay POST per day inside NotificationManager.
+        NotificationManager.shared.refreshRegistrationOnLaunch()
+
         return true
     }
 

@@ -13,25 +13,35 @@ This is the first ticket where Hercules graduates from "an iOS app you can run" 
 A code review found problems that must be fixed as part of this deployment, not after. Several would break production on day one.
 
 **Server (`server/`)**
-- **Notify Lambda can't load.** `require("jsonwebtoken")` (`server/notify/index.js:19`), but there's no `server/package.json` or bundled `node_modules`, and the `nodejs20.x` runtime only ships the AWS SDK. Add a `package.json` and a SAM build, or sign the ES256 JWT with Node's built-in `crypto`.
-- **Scan isn't paginated** (`notify/index.js:49-54`). DynamoDB Scan returns ≤ 1 MB per call, so devices beyond the first page never get pushed.
-- **One HTTP/2 connection per device** (`sendAPNs`, `:86-88`) with unbounded `Promise.allSettled` (`:64-68`). Reuse one session; bound concurrency; the 30 s Lambda timeout (`template.yaml` NotifyFunction) caps fan-out.
-- **Only `BadDeviceToken` is pruned** (`:72`). Also prune `Unregistered` (HTTP 410) and `DeviceTokenNotForTopic`.
-- **No dead-letter queue.** A thrown error makes SQS redeliver the message and **re-push every device**. Add a DLQ and make pushes idempotent per block hash.
-- **Push payload has no real height.** The `blocknotify` script sends only `hash` and `time` (`server/README.md:46-48`). The Lambda reads `block.height || 0` (`notify/index.js:30`). `server/README.md:51` claims the Lambda "enriches the message with block height", which it doesn't. The app then shows "New Block #0". Have the script call `bitcoin-cli getblockheader $1` and include the height.
-- **IAM too broad.** Both functions get `DynamoDBCrudPolicy` (`template.yaml:66-68` and NotifyFunction). Register needs `PutItem` (plus `DeleteItem` for unregister); Notify needs `Scan` + `DeleteItem`.
-- **APNs `.p8` key is a plaintext Lambda env var** (`APNS_KEY_BASE64`, `template.yaml:89`). The parameter is NoEcho, but the value is visible in the Lambda console. Move it to Secrets Manager or SSM SecureString.
-- **Register endpoint is open.** No auth, throttling or usage plan, and no token format/length validation (`server/register/index.js:22-25`). Anyone can stuff the table and inflate every block's fan-out cost. They can't push to real users, because the APNs key stays server-side. Add API Gateway throttling, token-format validation, and a per-install secret (below).
-- **No unregister endpoint.** Turning notifications off leaves the token until the 30-day TTL.
+- **Notify Lambda can't load.** `require("jsonwebtoken")` (`server/notify/index.js:19`), but there's no `server/package.json` or bundled `node_modules`, and the `nodejs20.x` runtime only ships the AWS SDK. Add a `package.json` and a SAM build, or sign the ES256 JWT with Node's built-in `crypto`. **Done (PR `ticket-019-relay-fixes`):** JWT is signed with built-in `crypto` (`ieee-p1363` ECDSA). Neither Lambda has npm dependencies. Each function has its own `CodeUri` with a `package.json`, and `server/package.json` runs the tests.
+- **Scan isn't paginated** (`notify/index.js:49-54`). DynamoDB Scan returns ≤ 1 MB per call, so devices beyond the first page never get pushed. **Done (PR `ticket-019-relay-fixes`):** the Lambda follows `LastEvaluatedKey`.
+- **One HTTP/2 connection per device** (`sendAPNs`, `:86-88`) with unbounded `Promise.allSettled` (`:64-68`). Reuse one session; bound concurrency; the 30 s Lambda timeout (`template.yaml` NotifyFunction) caps fan-out. **Done (PR `ticket-019-relay-fixes`):** there is one reused HTTP/2 session per warm container, with at most `APNS_CONCURRENCY` (50) streams in flight. The timeout is now 60 s, and the Lambda stops starting sends 3 s before the deadline. 429/5xx/transport errors get one retry, and `ExpiredProviderToken` triggers one re-sign.
+- **Only `BadDeviceToken` is pruned** (`:72`). Also prune `Unregistered` (HTTP 410) and `DeviceTokenNotForTopic`. **Done (PR `ticket-019-relay-fixes`):** all three are pruned.
+- **No dead-letter queue.** A thrown error makes SQS redeliver the message and **re-push every device**. Add a DLQ and make pushes idempotent per block hash. **Done (PR `ticket-019-relay-fixes`):** `hercules-new-blocks-dlq` is the DLQ (`maxReceiveCount` 3).
+  - Each block hash is claimed in a new `hercules-push-log` table (24 h TTL) before fan-out, so redeliveries skip it.
+  - Errors before fan-out release the claim and rethrow. Errors after fan-out starts are logged, never rethrown.
+  - Messages older than 30 minutes and malformed messages are dropped.
+- **Push payload has no real height.** The `blocknotify` script sends only `hash` and `time` (`server/README.md:46-48`). The Lambda reads `block.height || 0` (`notify/index.js:30`). `server/README.md:51` claims the Lambda "enriches the message with block height", which it doesn't. The app then shows "New Block #0". Have the script call `bitcoin-cli getblockheader $1` and include the height. **Done (PR `ticket-019-relay-fixes`):** the README script now sends `height` and the header `time`, and skips IBD. The Lambda passes height through and **omits** `block.height` when unknown instead of sending 0.
+- **IAM too broad.** Both functions get `DynamoDBCrudPolicy` (`template.yaml:66-68` and NotifyFunction). Register needs `PutItem` (plus `DeleteItem` for unregister); Notify needs `Scan` + `DeleteItem`. **Done (PR `ticket-019-relay-fixes`):** inline policies replace `DynamoDBCrudPolicy`.
+  - Register: `UpdateItem` + `DeleteItem`. It uses a conditional `UpdateItem` rather than `PutItem` so it can keep `created_at` and enforce the secret.
+  - Notify: `Scan` + `DeleteItem` on devices, `PutItem` + `DeleteItem` on the push log, and `ssm:GetParameter` on the key parameter.
+- **APNs `.p8` key is a plaintext Lambda env var** (`APNS_KEY_BASE64`, `template.yaml:89`). The parameter is NoEcho, but the value is visible in the Lambda console. Move it to Secrets Manager or SSM SecureString. **Done (PR `ticket-019-relay-fixes`):** the key is read from an SSM SecureString (`ApnsKeyParameterName`, default `/hercules/apns/p8`) once per cold start. The `ApnsKeyBase64` parameter and env var are removed. The owner creates the parameter out of band (README).
+- **Register endpoint is open.** No auth, throttling or usage plan, and no token format/length validation (`server/register/index.js:22-25`). Anyone can stuff the table and inflate every block's fan-out cost. They can't push to real users, because the APNs key stays server-side. Add API Gateway throttling, token-format validation, and a per-install secret (below). **Done (PR `ticket-019-relay-fixes`):** 
+  - Throttling: an explicit `RelayApi` with stage-wide throttling (`ApiRateLimit` 5 req/s, `ApiBurstLimit` 10).
+  - Validation: the token must be 64–200 hex chars, the platform must be `ios`, and the body is capped at 2 KB.
+  - Secret: the relay stores the SHA-256 of a per-install secret, and the row can only be updated or deleted with the matching secret (403 otherwise).
+- **No unregister endpoint.** Turning notifications off leaves the token until the 30-day TTL. **Done (PR `ticket-019-relay-fixes`):** `POST /unregister` (needs the secret; idempotent) is added, and the app calls it when the toggle goes off, retrying on next launch if it fails.
 
 **App**
-- **Tokens silently expire.** `registerForRemoteNotifications` is only called from `requestPermission()` (`NotificationManager.swift:33-43`), which only runs when the Settings toggle is flipped (`SettingsView.swift:468`). The comment at `register/index.js:6-7` assumes re-registration on every launch, but that never happens, so after 30 days the phone stops getting pushes. Re-register on every launch when permission is granted.
-- **Default relay URL is a placeholder** (`NotificationManager.swift:21`, `https://hercules-relay.example.com`). Replace it with the production URL via build configuration (031).
+- **Tokens silently expire.** `registerForRemoteNotifications` is only called from `requestPermission()` (`NotificationManager.swift:33-43`), which only runs when the Settings toggle is flipped (`SettingsView.swift:468`). The comment at `register/index.js:6-7` assumes re-registration on every launch, but that never happens, so after 30 days the phone stops getting pushes. Re-register on every launch when permission is granted. **Done (PR `ticket-019-relay-fixes`):** `AppDelegate` calls `NotificationManager.refreshRegistrationOnLaunch()` on every launch.
+  - When opted in and authorized, it calls `registerForRemoteNotifications`.
+  - The relay POST is skipped if the same token was registered with the same relay within 24 h. UserDefaults stores only a SHA-256 fingerprint of the token and relay, plus the registration time.
+- **Default relay URL is a placeholder** (`NotificationManager.swift:21`, `https://hercules-relay.example.com`). Replace it with the production URL via build configuration (031). *Partially done:* it is now the single constant `RelayConfig.defaultBaseURL` in `NotificationManager.swift`, still the placeholder. The real `ApiBaseUrl` stack output goes there after deployment (open).
 - **Registration reveals IP + token to the relay** (plain `URLSession` POST). Acceptable if disclosed; optionally route over Tor when Tor is enabled (029).
 - **Layer 1 "What's missing" below is stale.** `AppDelegate` token plumbing (`AppDelegate.swift:58`) and `UIBackgroundModes: remote-notification` (`Info.plist:21-23`, `project.yml:32-33`) now exist.
 
 **The identifier question.** The relay identifies a phone *only* by its **APNs device token**: an opaque value Apple issues per app install, per device. It changes on reinstall and restore, and Apple may rotate it. It isn't a user identity and shouldn't become one.
-- Add a random **per-install registration secret**, generated on device and stored in the Keychain and sent with registration, so only that install can update or unregister its own row.
+- Add a random **per-install registration secret**, generated on device and stored in the Keychain and sent with registration, so only that install can update or unregister its own row. **Done (PR `ticket-019-relay-fixes`):** `RelayInstallSecret` holds 32 random bytes, one per relay host, in the Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. It is never written to UserDefaults or files. The app now reads `block.height` from the payload when present and non-zero. Otherwise it shows "New Block" (no "#0").
 - **Do not** link push registration to contacts or payment codes (043) or to the P2P onion key. Keeping these separate means a relay breach reveals no social graph.
 - The cooperative relay (045) can schedule shifts by hashing the token server-side, with no extra ID.
 
@@ -117,37 +127,39 @@ Deploy the relay first because the iOS app needs the API Gateway URL, and you ca
 
 1. From `server/`:
    ```bash
-   APNS_KEY=$(base64 < AuthKey_XXXXXXXXXX.p8)
+   aws ssm put-parameter --name /hercules/apns/p8 --type SecureString \
+     --value file://AuthKey_XXXXXXXXXX.p8
+   sam build
    sam deploy --guided \
      --parameter-overrides \
        ApnsKeyId=YOUR_KEY_ID \
        ApnsTeamId=YOUR_TEAM_ID \
-       ApnsKeyBase64=$APNS_KEY \
+       ApnsKeyParameterName=/hercules/apns/p8 \
        ApnsTopic=dev.sermo.hercules.app \
        ApnsHost=api.sandbox.push.apple.com
    ```
-2. Capture the `ApiEndpoint`, `QueueUrl`, and `QueueArn` outputs into a local secrets file (do not commit).
+2. Capture the `ApiBaseUrl`, `ApiEndpoint`, `QueueUrl`, `QueueArn`, and `DeadLetterQueueUrl` outputs into a local secrets file (do not commit).
 3. Smoke-test the register endpoint with a fake token:
    ```bash
    curl -X POST "$API_ENDPOINT" \
      -H 'Content-Type: application/json' \
-     -d '{"device_token":"deadbeef..."}'
+     -d "{\"device_token\":\"$(openssl rand -hex 32)\",\"platform\":\"ios\",\"install_secret\":\"$(openssl rand -hex 32)\"}"
    ```
    Confirm the row appears in the `hercules-devices` DynamoDB table.
 4. Smoke-test the notify Lambda by sending a synthetic SQS message:
    ```bash
    aws sqs send-message --queue-url "$QUEUE_URL" \
-     --message-body '{"hash":"0000...","time":1700000000}'
+     --message-body "{\"hash\":\"$(openssl rand -hex 32)\",\"height\":1,\"time\":$(date +%s)}"
    ```
-   Confirm CloudWatch Logs show the Lambda invoking and (expectedly) failing on the fake token with `BadDeviceToken`. The `BadDeviceToken` cleanup path will then prune the fake row from DynamoDB — that's the expected end state.
+   (The hash must be 64 hex chars and unique per test, because the Lambda dedupes by block hash.) Confirm CloudWatch Logs show the Lambda invoking and (expectedly) failing on the fake token with `BadDeviceToken`. The `BadDeviceToken` cleanup path will then prune the fake row from DynamoDB — that's the expected end state.
 
 At this point the relay is live but has no real subscribers.
 
 ### Phase 2 — Wire up the iOS app and register a real device
 
-1. **Replace the placeholder URL** in `NotificationManager.swift:20`:
+1. **Replace the placeholder URL**: set `RelayConfig.defaultBaseURL` in `NotificationManager.swift` to the `ApiBaseUrl` output (the app appends `/register` and `/unregister`):
    ```swift
-   private let relayServerURL = "https://your-api-id.execute-api.us-east-1.amazonaws.com/Prod/register"
+   static let defaultBaseURL = "https://your-api-id.execute-api.us-east-1.amazonaws.com/Prod"
    ```
    This value is environment-specific. Either bake it in via a `Config.xcconfig` file or hard-code for now and revisit before any public release.
 2. **Audit `Info.plist`**: confirm `UIBackgroundModes` array contains `remote-notification`. If absent, add it.
@@ -160,7 +172,7 @@ At this point the relay is live but has no real subscribers.
    aws sqs send-message --queue-url "$QUEUE_URL" \
      --message-body '{"hash":"0000000000000000000000000000000000000000000000000000000000000000","time":1700000000}'
    ```
-   The `validateLatestBlock` path ignores the hash in the payload — it fetches whatever the real tip is from its own peers — so any well-formed JSON works. Within seconds the iPhone should:
+   The `validateLatestBlock` path ignores the hash in the payload — it fetches whatever the real tip is from its own peers — so any 64-hex-char hash works. Use a fresh hash per test (e.g. `$(openssl rand -hex 32)`): the notify Lambda dedupes by block hash for 24 h. Within seconds the iPhone should:
    - Wake silently
    - Start the Live Activity (Dynamic Island on Pro models, Lock Screen banner otherwise)
    - Run a real header fetch + block validation against the real network
@@ -183,14 +195,7 @@ This phase only matters if you want pushes triggered by real blocks instead of b
    aws configure --profile hercules-notify
    ```
 3. **Install `torsocks`** (`apt install torsocks` on Debian/Ubuntu, `brew install torsocks` on macOS). Tor needs to be running locally — Hercules's bundled arti-client is iOS-side, so the node machine needs its own `tor` daemon.
-4. **Write `/usr/local/bin/hercules-notify.sh`** matching `server/README.md:43-49`:
-   ```bash
-   #!/bin/bash
-   torsocks aws --profile hercules-notify sqs send-message \
-     --queue-url "$QUEUE_URL" \
-     --message-body "{\"hash\": \"$1\", \"time\": $(date +%s)}" \
-     >> /var/log/hercules-notify.log 2>&1
-   ```
+4. **Write `/usr/local/bin/hercules-notify.sh`** by copying the script in `server/README.md` ("Bitcoin Core Setup"). It looks up the height with `bitcoin-cli getblockheader`, skips IBD, and sends through `torsocks` with the `hercules-notify` profile.
    `chmod +x` it. Pipe stdout/stderr to a log file because `bitcoind` discards `blocknotify` output.
 5. **Add to `bitcoin.conf`**:
    ```
@@ -234,7 +239,7 @@ These are deliberately not part of this ticket and should be tracked separately 
 
 - **Simulator delivery**: APNs cannot deliver to the iOS Simulator over the network. Local injection via `xcrun simctl push` works for UI iteration but does not exercise the SQS→Lambda→APNs path. If we want a "fire the relay and have the simulator wake" loop for development, that's its own piece of tooling (shell script polling SQS, pulling the message, calling `xcrun simctl push`). Decide separately whether the dev-loop ergonomics justify it.
 - **Production APNs migration**: This ticket lands on `api.sandbox.push.apple.com` because the entitlement is `development`. Moving to TestFlight or the App Store requires a second `sam deploy` with `ApnsHost=api.push.apple.com` and `aps-environment=production`, plus a fresh device-token capture (sandbox and production tokens are not interchangeable). Track as a release-engineering follow-up.
-- **Block-height enrichment**: The current notify Lambda passes the hash through. If we want the push payload to carry a height (so the Live Activity can render the new height before the local validation completes), the script needs to call `bitcoin-cli getblockheader` and bake it into the SQS body. Cosmetic, not on the critical path.
+- **Block-height enrichment**: *Now done (see Amendment); kept here for history.* The current notify Lambda passes the hash through. If we want the push payload to carry a height (so the Live Activity can render the new height before the local validation completes), the script needs to call `bitcoin-cli getblockheader` and bake it into the SQS body. Cosmetic, not on the critical path.
 - **Multi-relay redundancy**: One AWS region = one point of failure. Acceptable for v1; revisit if we ever care about 99.9% delivery.
 
 ## Open questions
