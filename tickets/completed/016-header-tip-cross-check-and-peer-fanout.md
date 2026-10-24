@@ -1,5 +1,13 @@
 # Ticket 016: Header Tip Cross-Check and Peer Count Tuning
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046.
+
+- **Done (simplified): Part 1 (header tip cross-check).** The wake path (`NotificationManager.swift:167,248,415` → `catch_up_blocks`) cross-checks once per wake before storing headers (`sync.rs:2500-2526`), sets `tip_disagreement`, and the UI shows a purple history entry (`NotificationHistory.swift:9`, `SettingsView.swift:671-682`). It reuses `cross_check_headers` (`sync.rs:784`): one witness, with a tiebreaker only on disagreement, comparing the first header hash. It does not run the parallel 3-peer `getheaders` designed below. The legacy `validate_latest_block` (`sync.rs:2206`) has no cross-check, but the Swift wake path doesn't call it.
+- **→ 028: Part 2 (peer count).** `MAX_OUTBOUND` is already 12 (`peer_pool.rs:15`) with no wake-phase instrumentation, against this ticket's "don't change the constant blind". 028 adds the instrumentation (`028…md:35,39-50`) and then confirms or reverts; 028 also gives wakes their own fanout constant (`028…md:73`).
+- **Decision recorded: diversity proxy.** Peers are bucketed by /16 IPv4 and /32 IPv6 (`subnet_bucket`, `peer_pool.rs:529-538`), not by ASN. No ASN data exists in the codebase, and 023 doesn't add any. The /16 bucket is the accepted proxy for now. The text below calling ASN bucketing "completed" in ticket 001 is inaccurate. Unverified: whether the cross-check witness/tiebreaker selection (`peer_addr_other_than` / `peer_addr_excluding`) enforces distinct buckets. Pool membership is already bucket-diverse.
+
 ## Summary
 
 Hercules's bursty wake model creates a unique eclipse-resistance gap that doesn't exist in continuously-running nodes like Bitcoin Core. Each push wake re-rolls the dice on which peers we sample, and we have **one shot** per wake to learn the true chain tip — if our chosen peer is malicious or just unlucky, we won't find out for ~10 minutes (the next wake), during which the widget and Live Activity will confidently show a stale or forked chain.

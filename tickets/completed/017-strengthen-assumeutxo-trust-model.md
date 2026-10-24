@@ -1,5 +1,14 @@
 # Ticket 017: Strengthen AssumeUTXO Trust Model
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046.
+
+- **Done: Layer 3 (forward-validation counter).** `forward_validated_blocks` (`sync.rs:293,581-599`), shown in Settings (`SettingsView.swift:100-105,191`).
+- **Partly done: Layer 1 (MuHash).** A Core-compatible MuHash3072 is computed during snapshot load (`utxo.rs:11,820,884`), stored in LMDB meta (`utxo.rs:46,396`) and shown for manual comparison with `gettxoutsetinfo muhash` (`SettingsView.swift:201`). No hardcoded `ASSUMEUTXO_MUHASH` constant is enforced at load (`assumeutxo.rs` has only the file hash).
+- **→ 032: Layer 2 (multi-source attestations).** The publishing pipeline produces reproducible, signed manifests reviewers can attest to (`032…md:70,74`).
+- **Remaining new work (tracked in 046):** measure on-device MuHash cost on the oldest supported iPhone and record it (open question below).
+
 ## Summary
 
 The current AssumeUTXO trust anchor in `assumeutxo.rs` is a SHA256 hash over Hercules's HUTX file format. It catches transit corruption and detects tampering of the file *given* the constants are honest, but it has no external verifiability — a careful Bitcoin user running their own Bitcoin Core full node cannot directly compare Hercules's commitment to anything Core publishes. The trust anchor is "trust the Hercules developers."

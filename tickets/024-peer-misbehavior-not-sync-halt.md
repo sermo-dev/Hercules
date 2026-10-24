@@ -66,6 +66,18 @@ Today Hercules does neither. It stops.
 4. **Attempt cap.** If every connected peer gives `Delivery` failures for the same height N times in a row, surface a clear status ("peers are serving corrupted blocks at height X") instead of looping forever. Rotating to new peers through addrman is the remedy.
 5. **Surface failures.** `make_status` / `CatchUpStatus` gets an `invalid_chain_detected: bool` plus a message. The UI can then show "Rejected an invalid block from the network" instead of a generic error.
 
+### Follow-up from ticket 023 review: recovering from a fake low-work header chain
+
+Ticket 023 stops a fresh node from *accepting* a fake low-difficulty header chain (anchor check at height 943,500 + minimum-work gate), but an eclipsed fresh install can still get **stuck**. If every early peer is hostile and feeds min-difficulty headers that stop just below the anchor, those headers are stored. When honest peers appear, their chain forks near genesis, and the reorg path refuses it (depth far beyond `MAX_REORG_DEPTH = 288`, and the batch-vs-stored chainwork comparison can't see the honest chain's real work from one 2,000-header batch).
+
+Block validation is already gated on minimum work (023), so headers stored while below minimum work have never been used for anything. Options:
+
+1. **Headers presync (Bitcoin Core's approach, net_processing):** download a peer's headers in a first pass that only tracks cumulative work (storing a compact commitment, not the headers), and only store them in a second pass once that chain has proven `min_chain_work`. A fake low-work chain is never stored at all. Most robust; most work.
+2. **Treat below-min-work headers as scratch:** while `!has_min_chain_work()`, lift `MAX_REORG_DEPTH` and, when a peer's headers fork from ours, replace the stored headers above the fork point (strict 2-peer cross-check still applies). Worst case is ping-pong between chains until the honest one reaches the anchor. Small change.
+3. **Wipe on anchor conflict:** when a batch conflicts with the anchor while below minimum work, delete all stored headers and restart header sync with fresh peers. Simplest; costs one re-download of headers (~75 MB) per incident.
+
+Recommendation: ship option 2 (or 3) with this ticket; consider option 1 later. This is P2P-layer logic, so libbitcoinkernel (047) doesn't cover it either way. Test with ticket 027's mock peers: hostile peer feeds a cheap chain to anchor−1, then honest peers connect, and the node must reach and activate the anchor.
+
 ## Files touched
 
 | File | Action |

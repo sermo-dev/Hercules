@@ -72,10 +72,10 @@ struct SharedNodeState: Codable, Equatable {
 /// and the widget can both call `SharedNodeStore.load()` from their
 /// respective processes without instance threading.
 enum SharedNodeStore {
-    /// App Group identifier — must match the entry in both targets'
-    /// `*.entitlements` files. Hardcoded here as the single source of
-    /// truth so a typo in one entitlements file fails loudly at runtime.
-    static let appGroupIdentifier = "group.dev.sermo.hercules.shared"
+    /// App Group identifier. Defined once as `APP_GROUP_ID` in
+    /// `Config/Shared.xcconfig`, which generates both targets' entitlements
+    /// and the `HRCAppGroupID` Info.plist key read here.
+    static let appGroupIdentifier = AppIdentifiers.appGroupID
 
     /// Filename inside the App Group container. We deliberately put this
     /// in the Caches subdirectory rather than the root: state can always

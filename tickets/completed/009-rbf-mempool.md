@@ -1,5 +1,13 @@
 # Ticket 009: Replace-By-Fee (BIP 125)
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. **Done**, including Phase B (full descendant eviction).
+
+- Full RBF (no nSequence check) in `mempool.rs`. The descendant eviction set (`collect_eviction_set`, `mempool.rs:808`) is capped at `MAX_REPLACEMENT_EVICTIONS = 100` (`mempool.rs:63`, check at `:322`).
+- Tests covering the Testing list: `rbf_replaces_with_higher_fee` (`mempool.rs:1961`), `rbf_rejects_equal_fee_rate` (`:1983`), `rbf_rejects_lower_fee_rate` (`:1999`), `rbf_rejects_insufficient_absolute_fee` (`:2014`), `rbf_evicts_descendant_chain` (`:2043`, Phase B), `rbf_multi_conflict_replacement` (`:2168`).
+- Gap: no test exercises the 100-eviction cap (`TooManyReplacements`, `mempool.rs:1318`). Phase A's "reject replacement of tx that has descendants" no longer applies because Phase B replaced it.
+
 ## Summary
 
 Add BIP 125 Replace-By-Fee support to the mempool. Currently, if a transaction spends the same inputs as an existing mempool transaction, it's rejected with `ConflictsWith`. This causes our mempool to diverge from the network — when a user RBF-bumps a transaction, every other node replaces the old tx, but we keep the stale one until a block confirms the replacement.

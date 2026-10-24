@@ -1,5 +1,14 @@
 # Ticket 005: LMDB UTXO Set Backend
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. LMDB is the only UTXO backend (`utxo.rs`, `heed = "0.20"` in `Cargo.toml:19`). It replaced SQLite outright instead of going through the trait-plus-benchmark migration described below.
+
+- **Done:** heed backend, undo sub-database, SQLite UTXO path removed.
+- **Not done (superseded):** the `UtxoBackend` trait. There is no second backend to abstract over.
+- **Won't do:** the blocks 0-200K benchmark. AssumeUTXO, not IBD from genesis, is the default path. Per-block timing is covered by 028's wake-phase instrumentation (`028…md:39-50`).
+- **→ 030:** `max_map_size` strategy and on-device mmap test. `INITIAL_MAP_SIZE` is 64 GB of virtual map (`utxo.rs:30`), unverified against iOS address-space limits.
+
 ## Summary
 
 Migrate the UTXO set storage backend from SQLite to LMDB (Lightning Memory-Mapped Database) to reduce write amplification, eliminate SQL parsing overhead, and improve sync throughput — particularly during initial block download where UTXO churn is the bottleneck.
@@ -51,13 +60,13 @@ One LMDB read-write transaction per block, matching current SQLite behavior. LMD
 
 ## Action Items
 
-- [ ] Define `UtxoBackend` trait abstracting current `UtxoSet` public interface
-- [ ] Add `heed` dependency and implement `LmdbUtxoBackend`
-- [ ] Port undo data storage to LMDB sub-database
-- [ ] Benchmark: measure blocks/sec and disk I/O for initial sync (blocks 0–200K)
-- [ ] Evaluate `max_map_size` strategy for iOS (LMDB requires pre-declared max DB size for mmap)
-- [ ] Test on-device: confirm LMDB mmap behavior is well-supported on iOS/arm64
-- [ ] Migrate or deprecate SQLite UTXO path
+- [ ] Define `UtxoBackend` trait abstracting current `UtxoSet` public interface — **Not done (superseded):** no trait exists; LMDB replaced SQLite directly, so there is nothing to abstract over
+- [x] Add `heed` dependency and implement `LmdbUtxoBackend` — `Cargo.toml:19`; `utxo.rs:131-208` (implemented as the `UtxoSet` type itself, not a separate `LmdbUtxoBackend`)
+- [x] Port undo data storage to LMDB sub-database — `undo` named DB (`utxo.rs:112,132,187-189`)
+- [ ] Benchmark: measure blocks/sec and disk I/O for initial sync (blocks 0–200K) — **Won't do** as specified (AssumeUTXO, not genesis IBD, is the default path). Per-block timing → 028 instrumentation
+- [ ] Evaluate `max_map_size` strategy for iOS (LMDB requires pre-declared max DB size for mmap) — **Deferred → ticket 030** (`030…md:27,79-81`)
+- [ ] Test on-device: confirm LMDB mmap behavior is well-supported on iOS/arm64 — **Deferred → ticket 030**
+- [x] Migrate or deprecate SQLite UTXO path — `utxo.rs` has no `rusqlite` use; SQLite remains only for headers/blocks/peers (`store.rs:7`, `block_store.rs:7`, `peer_store.rs:6`)
 
 ## Risks
 

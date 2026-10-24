@@ -112,3 +112,24 @@ The app will also be renamed. Some identifiers can change at any time; others **
 ## Roadmap position
 
 Tier 1. Fix the XcodeGen drift immediately (it's a landmine for anyone who runs `xcodegen`). Everything else must land before the first TestFlight build.
+
+## Implementation status (PR for items 1–4)
+
+**Done in this PR**
+- `project.yml` is the source of truth again: it declares the `HerculesWidget` app-extension target, including its sources (it shares `AppIdentifiers.swift`, `SharedNodeState.swift`, and `NodeActivityAttributes.swift` with the app), its Info.plist, its entitlements, and its embedding into the app (Embed Foundation Extensions). `xcodegen generate` is idempotent; running it twice gives a byte-identical pbxproj. The effective build settings (`-showBuildSettings`, both targets, Debug and Release) match the old hand-edited project except for the new identifier settings.
+- `HerculesApp/Config/Shared.xcconfig` is applied at the project level. It holds `APP_DISPLAY_NAME`, `BUNDLE_ID_PREFIX`, `APP_BUNDLE_ID`, `WIDGET_BUNDLE_ID`, `APP_GROUP_ID`, `BGTASK_CATCHUP_ID`, `SNAPSHOT_SESSION_ID`, `MARKETING_VERSION`, and `CURRENT_PROJECT_VERSION`. Every value matches what was already in use (the widget keeps `dev.sermo.hercules.app.HerculesWidget`, not the `…app.widget` proposed above).
+- Both entitlements files use `$(APP_GROUP_ID)`. Xcode expands it at signing time, so the processed entitlements still read `group.dev.sermo.hercules.shared`. `aps-environment` stays `development`.
+- The Info.plists use `$(MARKETING_VERSION)`, `$(CURRENT_PROJECT_VERSION)`, and `$(APP_DISPLAY_NAME)`. The hardcoded `1.0` is gone. The app plist gains `NSSupportsLiveActivities = YES` and the runtime keys `HRCAppGroupID`, `HRCCatchUpTaskID`, and `HRCSnapshotSessionID`. The widget plist gains `HRCAppGroupID`. `BGTaskSchedulerPermittedIdentifiers` is generated from `$(BGTASK_CATCHUP_ID)`.
+- `AppIdentifiers.swift` reads the `HRC*` keys. `SharedNodeState`, `NotificationManager` (BGTask), and `SnapshotDownloader` no longer hardcode identifiers.
+
+**Identifier freeze list** (also documented in `Shared.xcconfig`)
+- *Freeze before the first TestFlight upload:* `BUNDLE_ID_PREFIX`, `APP_BUNDLE_ID` (also the APNs topic; keep `server/template.yaml` in sync), `WIDGET_BUNDLE_ID`, `APP_GROUP_ID`, and the keychain access group (036, once it exists).
+- *Cheap (change any time, at most one in-flight item lost):* `BGTASK_CATCHUP_ID`, `SNAPSHOT_SESSION_ID`.
+- *Free:* `APP_DISPLAY_NAME`, versions, dispatch queue labels, and user-visible strings.
+
+**Still open**
+- Item 5 (Live Activity start strategy) needs on-device testing. Find out whether `Activity.request` from the silent-push wake path works now that `NSSupportsLiveActivities` is set, or whether we need foreground-only starts or push-to-start.
+- Item 6 (Release signing with team and `aps-environment = production`) is deferred to 019 and TestFlight prep.
+- CI or a pre-commit check for `xcodegen generate && git diff --exit-code` (there's no CI yet).
+- The rename-in-one-file test on a scratch branch.
+- Both the old and new projects fail to link for a `generic/platform=iOS Simulator` build unless `ARCHS=arm64` is set. `build-ios.sh` only produces an arm64 simulator slice, and the generic destination also builds x86_64.

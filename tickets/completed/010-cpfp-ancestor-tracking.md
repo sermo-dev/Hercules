@@ -1,5 +1,12 @@
 # Ticket 010: CPFP and Ancestor/Descendant Tracking
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. **Done.** Mempool chain spending, ancestor/descendant tracking and limits are in `mempool.rs`: `MAX_ANCESTORS = 25` (`:48`), `MAX_ANCESTOR_VBYTES = 101_000` (`:53`), `MAX_DESCENDANTS = 25` (`:58`), ancestor fee tracking (`:97`, `:480-600`), package eviction (`evict_lowest_package`, `:1126`).
+
+- Tests: `accept_child_spending_unconfirmed_parent` (`:1638`), `reject_child_referencing_nonexistent_vout` (`:1667`), `reject_child_double_spending_mempool_output_does_rbf_check` (`:1683`), `ancestor_closure_transitive` (`:1705`), `diamond_ancestor_not_double_counted` (`:1733`), `reject_when_ancestor_count_exceeds_limit` (`:1773`), `reject_when_descendant_count_would_exceed_limit` (`:1806`), `remove_tx_updates_descendant_ancestor_state` (`:1844`), `evict_with_descendants_cascades` (`:1886`), `remove_confirmed_keeps_descendants_with_updated_ancestors` (`:1916`).
+- Gaps: no test for the 101 kvB ancestor size limit. `select_for_block` (Mining priority) was not implemented; the ticket marks it as not needed for relay.
+
 ## Summary
 
 Add Child-Pays-For-Parent (CPFP) support and ancestor/descendant chain limits to the mempool. Currently the mempool only accepts transactions whose inputs exist in the confirmed UTXO set — it rejects any transaction spending an unconfirmed output. This prevents CPFP fee bumping and diverges from the network's mempool behavior.
