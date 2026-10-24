@@ -87,6 +87,34 @@ impl BlockStore {
         }
     }
 
+    /// Retrieve a block by its height. Used by wallet catch-up to replay
+    /// recent blocks that the wallet missed.
+    pub fn get_block_at_height(&self, height: u32) -> Result<Option<Block>, BlockStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT data FROM blocks WHERE height = ?1")
+            .map_err(|e| BlockStoreError(format!("prepare: {}", e)))?;
+
+        let mut rows = stmt
+            .query(params![height])
+            .map_err(|e| BlockStoreError(format!("query: {}", e)))?;
+
+        match rows
+            .next()
+            .map_err(|e| BlockStoreError(format!("row: {}", e)))?
+        {
+            Some(row) => {
+                let data: Vec<u8> = row
+                    .get(0)
+                    .map_err(|e| BlockStoreError(format!("get data: {}", e)))?;
+                let block: Block = deserialize(&data)
+                    .map_err(|e| BlockStoreError(format!("deserialize block: {}", e)))?;
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Check whether a block exists in the store.
     pub fn has_block(&self, hash: &BlockHash) -> Result<bool, BlockStoreError> {
         let hash_bytes = hash.as_raw_hash().to_byte_array();

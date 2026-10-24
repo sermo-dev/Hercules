@@ -19,7 +19,9 @@ mod tor;
 mod tor_v3;
 mod utxo;
 mod validation;
+mod wallet;
 mod wallet_rpc;
+mod wallet_store;
 
 use tor::TorManager;
 use wallet_rpc::WalletRpcServer;
@@ -266,6 +268,39 @@ impl From<sync::TrustInfo> for TrustInfo {
     }
 }
 
+// ── Wallet bridge types ───────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct WalletBalance {
+    pub confirmed: u64,
+    pub unconfirmed: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalletTransaction {
+    pub txid: String,
+    pub height: Option<u32>,
+    pub timestamp: Option<u32>,
+    pub timestamp_human: Option<String>,
+    pub net_value: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalletAddressInfo {
+    pub address: String,
+    pub derivation_index: u32,
+    pub is_change: bool,
+    pub used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalletInfo {
+    pub xpub: String,
+    pub balance: WalletBalance,
+    pub scan_height: u32,
+    pub address_count: u32,
+}
+
 // ── Errors ─────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -278,6 +313,8 @@ pub enum HerculesError {
     NetworkError { msg: String },
     #[error("Tor error: {msg}")]
     TorError { msg: String },
+    #[error("Wallet error: {msg}")]
+    WalletError { msg: String },
 }
 
 pub trait SyncCallback: Send + Sync {
@@ -671,6 +708,168 @@ impl HerculesNode {
         }
 
         Ok(token)
+    }
+
+    // ── In-App Wallet ────────────────────────────────────────────
+
+    /// Import a watch-only wallet from an xpub/zpub. Opens the wallet store,
+    /// derives initial addresses, performs a full UTXO scan, and attaches it
+    /// to the sync engine so new blocks are processed automatically.
+    pub fn import_wallet(&self, xpub: String) -> Result<(), HerculesError> {
+        let store_path = format!("{}/wallet-lmdb", self.data_dir);
+        let w = wallet::Wallet::open(&xpub, &store_path).map_err(|e| {
+            HerculesError::WalletError {
+                msg: format!("{}", e),
+            }
+        })?;
+
+        let w = std::sync::Arc::new(w);
+        self.syncer.attach_wallet(w).map_err(|e| {
+            HerculesError::WalletError {
+                msg: format!("{}", e),
+            }
+        })?;
+
+        Ok(())
+    }
+
+    /// Delete the wallet and its on-disk state.
+    pub fn delete_wallet(&self) -> Result<(), HerculesError> {
+        self.syncer.detach_wallet();
+        let store_path = format!("{}/wallet-lmdb", self.data_dir);
+        wallet::Wallet::delete_store(&store_path).map_err(|e| HerculesError::WalletError {
+            msg: format!("{}", e),
+        })?;
+        Ok(())
+    }
+
+    /// Check if a wallet has been imported.
+    pub fn has_wallet(&self) -> bool {
+        // Check both in-memory (syncer has wallet attached) and on-disk.
+        if self.syncer.wallet().is_some() {
+            return true;
+        }
+        let store_path = format!("{}/wallet-lmdb", self.data_dir);
+        std::path::Path::new(&store_path).exists()
+    }
+
+    /// Get summary info about the wallet.
+    pub fn get_wallet_info(&self) -> Result<WalletInfo, HerculesError> {
+        let w = self.require_wallet()?;
+        let info = w.info().map_err(|e| HerculesError::WalletError {
+            msg: format!("{}", e),
+        })?;
+        Ok(WalletInfo {
+            xpub: info.xpub,
+            balance: WalletBalance {
+                confirmed: info.balance.confirmed,
+                unconfirmed: info.balance.unconfirmed,
+            },
+            scan_height: info.scan_height,
+            address_count: info.address_count,
+        })
+    }
+
+    /// Get the wallet balance.
+    pub fn get_wallet_balance(&self) -> Result<WalletBalance, HerculesError> {
+        let w = self.require_wallet()?;
+        let bal = w.balance().map_err(|e| HerculesError::WalletError {
+            msg: format!("{}", e),
+        })?;
+        Ok(WalletBalance {
+            confirmed: bal.confirmed,
+            unconfirmed: bal.unconfirmed,
+        })
+    }
+
+    /// Get wallet transaction history, most recent first.
+    pub fn get_wallet_transactions(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<WalletTransaction>, HerculesError> {
+        let w = self.require_wallet()?;
+        let txs = w
+            .transactions(limit, offset)
+            .map_err(|e| HerculesError::WalletError {
+                msg: format!("{}", e),
+            })?;
+        Ok(txs
+            .into_iter()
+            .map(|t| WalletTransaction {
+                txid: hex::encode(t.txid),
+                height: t.height,
+                timestamp: t.timestamp,
+                timestamp_human: t.timestamp.map(chrono_format),
+                net_value: t.net_value,
+            })
+            .collect())
+    }
+
+    /// Get the next unused receive address.
+    pub fn get_receive_address(&self) -> Result<WalletAddressInfo, HerculesError> {
+        let w = self.require_wallet()?;
+        let addr = w
+            .next_receive_address()
+            .map_err(|e| HerculesError::WalletError {
+                msg: format!("{}", e),
+            })?;
+        Ok(WalletAddressInfo {
+            address: addr.address,
+            derivation_index: addr.derivation_index,
+            is_change: addr.is_change,
+            used: addr.used,
+        })
+    }
+
+    /// Get the attached wallet or try to reopen from disk.
+    fn require_wallet(&self) -> Result<std::sync::Arc<wallet::Wallet>, HerculesError> {
+        if let Some(w) = self.syncer.wallet() {
+            return Ok(w);
+        }
+
+        // Wallet store exists on disk but isn't attached (e.g. after app restart).
+        // Try to reopen and attach.
+        let store_path = format!("{}/wallet-lmdb", self.data_dir);
+        if !std::path::Path::new(&store_path).exists() {
+            return Err(HerculesError::WalletError {
+                msg: "no wallet imported".into(),
+            });
+        }
+
+        // Read the xpub from the existing store to reopen.
+        let tmp_store = wallet_store::WalletStore::open(&store_path).map_err(|e| {
+            HerculesError::WalletError {
+                msg: format!("reopen store: {}", e),
+            }
+        })?;
+        let xpub_bytes = tmp_store.get_meta("xpub").map_err(|e| {
+            HerculesError::WalletError {
+                msg: format!("read xpub: {}", e),
+            }
+        })?;
+        let xpub_str = match xpub_bytes {
+            Some(v) => String::from_utf8(v).unwrap_or_default(),
+            None => {
+                return Err(HerculesError::WalletError {
+                    msg: "wallet store has no xpub".into(),
+                })
+            }
+        };
+        drop(tmp_store);
+
+        let w = wallet::Wallet::open(&xpub_str, &store_path).map_err(|e| {
+            HerculesError::WalletError {
+                msg: format!("{}", e),
+            }
+        })?;
+        let w = std::sync::Arc::new(w);
+        self.syncer.attach_wallet(w.clone()).map_err(|e| {
+            HerculesError::WalletError {
+                msg: format!("{}", e),
+            }
+        })?;
+        Ok(w)
     }
 }
 

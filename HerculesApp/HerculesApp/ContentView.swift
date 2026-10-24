@@ -86,6 +86,14 @@ class NodeViewModel: ObservableObject {
     @Published var walletApiConnectionString: String?
     @Published var walletApiError: String?
 
+    // In-app wallet (ticket 020) — watch-only xpub wallet.
+    @Published var hasWallet = false
+    @Published var walletBalance: WalletBalance?
+    @Published var walletTransactions: [WalletTransaction] = []
+    @Published var walletReceiveAddress: WalletAddressInfo?
+    @Published var walletScanHeight: UInt32 = 0
+    @Published var isWalletScanning = false
+
     // Thread-safe access to the node: set from background thread, read from main thread
     private var _node: HerculesNode?
     private let nodeLock = NSLock()
@@ -179,10 +187,20 @@ class NodeViewModel: ObservableObject {
             let mp = node.getMempoolStatus()
             let ns = node.getNodeStatus()
             let ti = try? node.getTrustInfo()
+            let hw = node.hasWallet()
+            let wb = hw ? (try? node.getWalletBalance()) : nil
+            let wt = hw ? (try? node.getWalletTransactions(limit: 50, offset: 0)) : nil
+            let wa = hw ? (try? node.getReceiveAddress()) : nil
+            let wsh = hw ? ((try? node.getWalletInfo())?.scanHeight ?? 0) : 0
             DispatchQueue.main.async {
                 self?.mempoolStatus = mp
                 self?.nodeStatus = ns
                 self?.trustInfo = ti
+                self?.hasWallet = hw
+                self?.walletBalance = wb
+                self?.walletTransactions = wt ?? []
+                self?.walletReceiveAddress = wa
+                self?.walletScanHeight = wsh
             }
         }
     }
@@ -533,6 +551,41 @@ class NodeViewModel: ObservableObject {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("tor").path
     }
+
+    // MARK: - In-App Wallet
+
+    func importWallet(xpub: String) {
+        guard let node = node else { return }
+        isWalletScanning = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try node.importWallet(xpub: xpub)
+                DispatchQueue.main.async {
+                    self?.isWalletScanning = false
+                    self?.hasWallet = true
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.isWalletScanning = false
+                    self?.errorMessage = "Wallet import failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func deleteWallet() {
+        guard let node = node else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            try? node.deleteWallet()
+            DispatchQueue.main.async {
+                self?.hasWallet = false
+                self?.walletBalance = nil
+                self?.walletTransactions = []
+                self?.walletReceiveAddress = nil
+                self?.walletScanHeight = 0
+            }
+        }
+    }
 }
 
 class SyncProgressCallback: SyncCallback {
@@ -561,8 +614,8 @@ class SnapshotProgressCallback: SnapshotCallback {
 
 // MARK: - Main View
 
-struct ContentView: View {
-    @StateObject private var viewModel = NodeViewModel()
+struct NodeView: View {
+    @ObservedObject var viewModel: NodeViewModel
     @State private var showSettings = false
     @State private var showAbout = false
 
@@ -1806,5 +1859,5 @@ func truncateOnion(_ addr: String) -> String {
 }
 
 #Preview {
-    ContentView()
+    NodeView(viewModel: NodeViewModel())
 }

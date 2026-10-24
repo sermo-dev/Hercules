@@ -228,6 +228,33 @@ impl UtxoSet {
         }
     }
 
+    /// Iterate all UTXOs, calling `f` with (key, value) for each entry.
+    /// The callback receives raw bytes to avoid decoding overhead for the
+    /// vast majority of entries that won't match. Returns the total count
+    /// of entries visited. Used by wallet initial UTXO scan.
+    pub fn for_each_utxo<F>(&self, mut f: F) -> Result<u64, UtxoError>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool, // (key, value) -> continue?
+    {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read txn: {}", e)))?;
+        let iter = self
+            .utxos
+            .iter(&rtxn)
+            .map_err(|e| UtxoError(format!("iter utxos: {}", e)))?;
+        let mut count = 0u64;
+        for result in iter {
+            let (k, v) = result.map_err(|e| UtxoError(format!("utxo iter: {}", e)))?;
+            count += 1;
+            if !f(k, v) {
+                break;
+            }
+        }
+        Ok(count)
+    }
+
     /// Apply a validated block to the UTXO set.
     /// Removes spent outputs and adds new unspent outputs.
     /// Handles in-block spends correctly (outputs created and spent

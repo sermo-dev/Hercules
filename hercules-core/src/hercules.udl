@@ -88,6 +88,33 @@ dictionary TrustInfo {
     string? muhash;
 };
 
+dictionary WalletBalance {
+    u64 confirmed;
+    u64 unconfirmed;
+};
+
+dictionary WalletTransaction {
+    string txid;
+    u32? height;
+    u32? timestamp;
+    string? timestamp_human;
+    i64 net_value;
+};
+
+dictionary WalletAddressInfo {
+    string address;
+    u32 derivation_index;
+    boolean is_change;
+    boolean used;
+};
+
+dictionary WalletInfo {
+    string xpub;
+    WalletBalance balance;
+    u32 scan_height;
+    u32 address_count;
+};
+
 callback interface SyncCallback {
     void on_progress(SyncStatus status);
 };
@@ -138,6 +165,26 @@ interface HerculesNode {
 
     [Throws=HerculesError]
     string rotate_wallet_auth_token();
+
+    [Throws=HerculesError]
+    void import_wallet(string xpub);
+
+    [Throws=HerculesError]
+    void delete_wallet();
+
+    boolean has_wallet();
+
+    [Throws=HerculesError]
+    WalletInfo get_wallet_info();
+
+    [Throws=HerculesError]
+    WalletBalance get_wallet_balance();
+
+    [Throws=HerculesError]
+    sequence<WalletTransaction> get_wallet_transactions(u32 limit, u32 offset);
+
+    [Throws=HerculesError]
+    WalletAddressInfo get_receive_address();
 };
 
 [Error]
@@ -146,4 +193,5 @@ interface HerculesError {
     StorageError(string msg);
     NetworkError(string msg);
     TorError(string msg);
+    WalletError(string msg);
 };

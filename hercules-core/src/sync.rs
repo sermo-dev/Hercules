@@ -24,6 +24,7 @@ use crate::store::HeaderStore;
 use crate::tor::TorManager;
 use crate::utxo::{SnapshotMeta, UtxoSet};
 use crate::validation::{chainwork_for_headers, u256_gt, validate_headers};
+use crate::wallet::Wallet;
 
 /// How often to poll for new blocks after initial sync (seconds).
 const MONITOR_INTERVAL: Duration = Duration::from_secs(30);
@@ -361,6 +362,9 @@ pub struct HeaderSync {
     /// re-broadcast fires 24h after node start. The on-connect self-ad in
     /// `PeerPool::maintain` covers fresh connections in the meantime.
     last_self_ad: Mutex<Instant>,
+    /// Watch-only wallet. Present only when the user has imported an xpub.
+    /// The wallet's `process_block` is called after each validated block.
+    wallet: Mutex<Option<Arc<Wallet>>>,
 }
 
 impl HeaderSync {
@@ -449,7 +453,57 @@ impl HeaderSync {
             outbound_peer_count: AtomicU32::new(0),
             new_block_announced: AtomicBool::new(false),
             last_self_ad: Mutex::new(Instant::now()),
+            wallet: Mutex::new(None),
         })
+    }
+
+    /// Attach a wallet and catch it up to the current validated height.
+    /// If the wallet has never been scanned (scan_height == 0) or is too
+    /// far behind (gap > 288), performs a full UTXO set scan. Otherwise
+    /// replays recent blocks from the block store.
+    pub fn attach_wallet(&self, wallet: Arc<Wallet>) -> Result<(), SyncError> {
+        let validated = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        let scan_height = wallet
+            .scan_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        if scan_height == 0 || (validated > scan_height && validated - scan_height > 288) {
+            // Full UTXO set scan.
+            wallet
+                .scan_utxo_set(&self.utxo, validated)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        } else if scan_height < validated {
+            // Replay recent blocks from block_store.
+            for h in (scan_height + 1)..=validated {
+                if let Some(block) = self
+                    .block_store
+                    .get_block_at_height(h)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?
+                {
+                    wallet
+                        .process_block(&block, h)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                }
+            }
+        }
+
+        *self.wallet.lock().unwrap() = Some(wallet);
+        info!("Wallet attached to sync engine");
+        Ok(())
+    }
+
+    /// Detach the wallet from the sync engine.
+    pub fn detach_wallet(&self) {
+        *self.wallet.lock().unwrap() = None;
+        info!("Wallet detached from sync engine");
+    }
+
+    /// Get a reference to the attached wallet, if any.
+    pub fn wallet(&self) -> Option<Arc<Wallet>> {
+        self.wallet.lock().unwrap().clone()
     }
 
     /// Load a UTXO snapshot from a file path. Sets validated_height to the
@@ -1120,6 +1174,13 @@ impl HeaderSync {
                         .apply_block(&block, next_height)
                         .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
+                    // Scan block for wallet-relevant transactions.
+                    if let Some(ref w) = *self.wallet.lock().unwrap() {
+                        if let Err(e) = w.process_block(&block, next_height) {
+                            warn!("Wallet scan failed at {}: {}", next_height, e);
+                        }
+                    }
+
                     // Store block for NODE_NETWORK_LIMITED serving (last 288 blocks)
                     self.block_store
                         .store_block(&block, next_height)
@@ -1495,6 +1556,17 @@ impl HeaderSync {
                             .store
                             .validated_height()
                             .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+                        // Roll back wallet state before UTXO rollback.
+                        if current_validated > fork_at {
+                            if let Some(ref w) = *self.wallet.lock().unwrap() {
+                                for h in (fork_at + 1..=current_validated).rev() {
+                                    if let Err(e) = w.rollback_block(h) {
+                                        warn!("Wallet rollback failed at {}: {}", h, e);
+                                    }
+                                }
+                            }
+                        }
 
                         // Roll back UTXO set for validated blocks above fork point
                         if current_validated > fork_at {
@@ -2326,6 +2398,13 @@ impl HeaderSync {
                 // Remove confirmed transactions from mempool
                 self.mempool.lock().unwrap().remove_confirmed(&block);
 
+                // Update wallet if attached
+                if let Some(ref w) = *self.wallet.lock().unwrap() {
+                    if let Err(e) = w.process_block(&block, new_tip) {
+                        warn!("Wallet scan failed at {}: {}", new_tip, e);
+                    }
+                }
+
                 self.store
                     .set_validated_height(new_tip)
                     .map_err(|e| SyncError::Store(format!("{}", e)))?;
@@ -2593,6 +2672,13 @@ impl HeaderSync {
 
             // Remove confirmed transactions from mempool
             self.mempool.lock().unwrap().remove_confirmed(&block);
+
+            // Update wallet if attached
+            if let Some(ref w) = *self.wallet.lock().unwrap() {
+                if let Err(e) = w.process_block(&block, next_height) {
+                    warn!("Wallet scan failed at {}: {}", next_height, e);
+                }
+            }
 
             self.store
                 .set_validated_height(next_height)

@@ -25,6 +25,11 @@
 		DA7A00000000000000000014 /* SharedNodeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000012 /* SharedNodeState.swift */; };
 		DA7A00000000000000000016 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000015 /* NodeActivityAttributes.swift */; };
 		DA7A00000000000000000017 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA7A00000000000000000015 /* NodeActivityAttributes.swift */; };
+		E020000000000000000000A1 /* MainTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E020000000000000000000B1 /* MainTabView.swift */; };
+		E020000000000000000000A2 /* WalletView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E020000000000000000000B2 /* WalletView.swift */; };
+		E020000000000000000000A3 /* WalletImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E020000000000000000000B3 /* WalletImportView.swift */; };
+		E020000000000000000000A4 /* ReceiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E020000000000000000000B4 /* ReceiveView.swift */; };
+		E020000000000000000000A5 /* TransactionDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E020000000000000000000B5 /* TransactionDetailView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -73,6 +78,11 @@
 		DA7A00000000000000000008 /* HerculesWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesWidget.entitlements; sourceTree = "<group>"; };
 		DA7A00000000000000000012 /* SharedNodeState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedNodeState.swift; sourceTree = "<group>"; };
 		DA7A00000000000000000015 /* NodeActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeActivityAttributes.swift; sourceTree = "<group>"; };
+		E020000000000000000000B1 /* MainTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainTabView.swift; sourceTree = "<group>"; };
+		E020000000000000000000B2 /* WalletView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletView.swift; sourceTree = "<group>"; };
+		E020000000000000000000B3 /* WalletImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletImportView.swift; sourceTree = "<group>"; };
+		E020000000000000000000B4 /* ReceiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveView.swift; sourceTree = "<group>"; };
+		E020000000000000000000B5 /* TransactionDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransactionDetailView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -137,9 +147,14 @@
 				DA7A00000000000000000015 /* NodeActivityAttributes.swift */,
 				F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */,
 				369D4212C2AB889A298C77F9 /* NotificationManager.swift */,
+				E020000000000000000000B1 /* MainTabView.swift */,
+				E020000000000000000000B4 /* ReceiveView.swift */,
 				91B6627F64A7DEA672DD126A /* SettingsView.swift */,
 				DA7A00000000000000000012 /* SharedNodeState.swift */,
 				73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */,
+				E020000000000000000000B5 /* TransactionDetailView.swift */,
+				E020000000000000000000B3 /* WalletImportView.swift */,
+				E020000000000000000000B2 /* WalletView.swift */,
 			);
 			path = HerculesApp;
 			sourceTree = "<group>";
@@ -277,6 +292,11 @@
 				DA7A00000000000000000013 /* SharedNodeState.swift in Sources */,
 				57F102B1AEC3AAFB708A1D34 /* SnapshotDownloader.swift in Sources */,
 				30FE03463F60EE0268673195 /* hercules.swift in Sources */,
+				E020000000000000000000A1 /* MainTabView.swift in Sources */,
+				E020000000000000000000A2 /* WalletView.swift in Sources */,
+				E020000000000000000000A3 /* WalletImportView.swift in Sources */,
+				E020000000000000000000A4 /* ReceiveView.swift in Sources */,
+				E020000000000000000000A5 /* TransactionDetailView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

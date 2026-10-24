@@ -6,7 +6,7 @@ struct HerculesApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            MainTabView()
                 .statusBarHidden(false)
                 .preferredColorScheme(.dark)
         }
