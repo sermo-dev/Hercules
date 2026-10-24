@@ -26,7 +26,8 @@ class SnapshotDownloader: NSObject, ObservableObject {
     // Content-Length yet.
     static let expectedBytes: Int64 = 8_780_302_668
 
-    private static let backgroundSessionId = "io.hercules.snapshot-download"
+    /// `SNAPSHOT_SESSION_ID` in Config/Shared.xcconfig.
+    private static let backgroundSessionId = AppIdentifiers.snapshotSessionID
 
     enum Status: Equatable {
         case idle

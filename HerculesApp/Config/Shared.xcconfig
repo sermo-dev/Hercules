@@ -1,0 +1,47 @@
+// Shared.xcconfig — single source of truth for every app identifier.
+//
+// Applied at the project level (see project.yml `configFiles`), so both the
+// HerculesApp and HerculesWidget targets inherit these. Info.plists and
+// entitlements reference them as $(NAME); Swift reads the runtime ones via
+// AppIdentifiers.swift (Info.plist keys prefixed HRC).
+//
+// RENAME RULES (ticket 031):
+//   FROZEN once the first TestFlight build is uploaded — changing these later
+//   breaks existing installs (new app / orphaned data / new APNs topic):
+//     BUNDLE_ID_PREFIX, APP_BUNDLE_ID, WIDGET_BUNDLE_ID, APP_GROUP_ID
+//     (APNs topic == APP_BUNDLE_ID; keep server/template.yaml in sync)
+//   Cheap (change any time, one in-flight item lost at most):
+//     BGTASK_CATCHUP_ID, SNAPSHOT_SESSION_ID
+//   Free (change any time):
+//     APP_DISPLAY_NAME, MARKETING_VERSION, CURRENT_PROJECT_VERSION
+//
+// The values below MUST stay identical to what shipped so far; they are
+// spelled out (not re-derived) where the historical value doesn't follow a
+// pattern.
+
+// User-visible name (home screen label, widget gallery).
+APP_DISPLAY_NAME = Hercules
+
+// Reverse-DNS org/product prefix.
+BUNDLE_ID_PREFIX = dev.sermo.hercules
+
+// Bundle identifiers. The widget ID is the historical value
+// (dev.sermo.hercules.app.HerculesWidget) — do not "tidy" it.
+APP_BUNDLE_ID = $(BUNDLE_ID_PREFIX).app
+WIDGET_BUNDLE_ID = $(APP_BUNDLE_ID).HerculesWidget
+
+// App Group shared between the app and the widget (group.dev.sermo.hercules.shared).
+APP_GROUP_ID = group.$(BUNDLE_ID_PREFIX).shared
+
+// BGTaskScheduler identifier for accelerated catch-up (dev.sermo.hercules.catchup).
+BGTASK_CATCHUP_ID = $(BUNDLE_ID_PREFIX).catchup
+
+// Background URLSession identifier for the UTXO snapshot download. Historical
+// value uses the io.hercules namespace; changing it only orphans an in-flight
+// download once.
+SNAPSHOT_SESSION_ID = io.hercules.snapshot-download
+
+// Versions. The widget extension's version must match the app's, so both
+// targets read these and neither overrides them.
+MARKETING_VERSION = 0.1.0
+CURRENT_PROJECT_VERSION = 1
