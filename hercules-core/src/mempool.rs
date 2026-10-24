@@ -174,7 +174,64 @@ impl Mempool {
         utxo_set: &UtxoSet,
         current_height: u32,
     ) -> Result<Txid, MempoolError> {
-        self.accept_tx_internal(tx, utxo_set, current_height, false)
+        self.accept_tx_internal(tx, utxo_set, current_height, AcceptMode::Relay)
+    }
+
+    /// Accept one of the **user's own** transactions (ticket 033).
+    ///
+    /// Same consensus checks as [`Mempool::accept_tx`] (inputs, scripts,
+    /// maturity, finality, value math), and the same network-standardness
+    /// and safety checks that decide whether *other* nodes will relay it:
+    /// dust, weight, minimum relay fee, absurd-fee guard, RBF rules,
+    /// ancestor/descendant limits, mempool capacity.
+    ///
+    /// What it skips is **our local relay policy** (ticket 018): the
+    /// Knots-style filters in `relay_policy::check_relay_policy`, the
+    /// 83-byte OP_RETURN cap, and the exclusion of bare P2PK / bare
+    /// multisig outputs. Those say what we choose to relay *for others*;
+    /// they must never stop the user broadcasting a consensus-valid
+    /// transaction they signed (018 amendment). Use
+    /// [`Mempool::local_policy_violation`] to warn about them instead.
+    pub fn accept_own_tx(
+        &mut self,
+        tx: Transaction,
+        utxo_set: &UtxoSet,
+        current_height: u32,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_tx_internal(tx, utxo_set, current_height, AcceptMode::Own)
+    }
+
+    /// Why our local relay policy (018) would refuse `tx` from a peer, if
+    /// it would. Used to warn the user that an own transaction might
+    /// propagate poorly among similarly-filtering nodes; never blocks it.
+    pub fn local_policy_violation(tx: &Transaction) -> Option<String> {
+        for (i, output) in tx.output.iter().enumerate() {
+            if !is_relay_standard_script(&output.script_pubkey) {
+                return Some(format!(
+                    "output {} uses a script type this node does not relay for others \
+                     (bare P2PK/multisig, or OP_RETURN over {} bytes)",
+                    i, MAX_OP_RETURN_SIZE
+                ));
+            }
+        }
+        crate::relay_policy::check_relay_policy(tx)
+            .err()
+            .map(|r| format!("matches local relay filter: {:?}", r))
+    }
+
+    /// Mempool transactions that spend any of `tx`'s inputs (direct
+    /// conflicts only — what a replacement would evict first).
+    pub fn conflicting_txids(&self, tx: &Transaction) -> Vec<Txid> {
+        let mut out: Vec<Txid> = Vec::new();
+        for input in &tx.input {
+            let key = (input.previous_output.txid, input.previous_output.vout);
+            if let Some(c) = self.spends.get(&key) {
+                if !out.contains(c) {
+                    out.push(*c);
+                }
+            }
+        }
+        out
     }
 
     /// Test-only accept entry point that skips libbitcoinconsensus script
@@ -189,20 +246,19 @@ impl Mempool {
         utxo_set: &UtxoSet,
         current_height: u32,
     ) -> Result<Txid, MempoolError> {
-        self.accept_tx_internal(tx, utxo_set, current_height, true)
+        self.accept_tx_internal(tx, utxo_set, current_height, AcceptMode::SkipConsensus)
     }
 
-    /// Shared accept implementation. `skip_consensus` bypasses the standard
-    /// script-type check and the libbitcoinconsensus signature/script
-    /// verification — used by tests that exercise graph state with
-    /// anyone-can-spend script_pubkeys.
+    /// Shared accept implementation. See [`AcceptMode`] for what each
+    /// mode checks.
     fn accept_tx_internal(
         &mut self,
         tx: Transaction,
         utxo_set: &UtxoSet,
         current_height: u32,
-        skip_consensus: bool,
+        mode: AcceptMode,
     ) -> Result<Txid, MempoolError> {
+        let skip_consensus = matches!(mode, AcceptMode::SkipConsensus);
         let txid = tx.compute_txid();
 
         // ── Phase 0: trivial rejections ─────────────────────────────────
@@ -277,28 +333,30 @@ impl Mempool {
             }
         }
 
-        if !skip_consensus {
-            for (i, output) in tx.output.iter().enumerate() {
-                let spk = &output.script_pubkey;
-                // Bare P2PK and bare multisig are intentionally excluded:
-                // P2PK is obsolete (no modern wallet generates it), and bare
-                // multisig is the primary vector for Stamps/SRC-20 data
-                // embedding. Wrapped versions (P2SH, P2WSH) remain standard
-                // via is_p2sh() and is_witness_program().
-                let is_standard = spk.is_p2pkh()
-                    || spk.is_p2sh()
-                    || spk.is_witness_program()
-                    || (spk.is_op_return() && spk.len() <= MAX_OP_RETURN_SIZE);
+        match mode {
+            AcceptMode::Relay => {
+                for (i, output) in tx.output.iter().enumerate() {
+                    if !is_relay_standard_script(&output.script_pubkey) {
+                        return Err(MempoolError::NonStandardScript { index: i });
+                    }
+                }
 
-                if !is_standard {
-                    return Err(MempoolError::NonStandardScript { index: i });
+                // Knots-aligned relay policy: reject inscriptions, token
+                // protocols, data injection, and parasitic patterns.
+                crate::relay_policy::check_relay_policy(&tx)
+                    .map_err(MempoolError::PolicyRejection)?;
+            }
+            AcceptMode::Own => {
+                // Network standardness only: an output type other nodes
+                // won't relay would just strand the tx. Local relay
+                // policy is deliberately not applied (see accept_own_tx).
+                for (i, output) in tx.output.iter().enumerate() {
+                    if !is_network_standard_script(&output.script_pubkey) {
+                        return Err(MempoolError::NonStandardScript { index: i });
+                    }
                 }
             }
-
-            // Knots-aligned relay policy: reject inscriptions, token
-            // protocols, data injection, and parasitic patterns.
-            crate::relay_policy::check_relay_policy(&tx)
-                .map_err(MempoolError::PolicyRejection)?;
+            AcceptMode::SkipConsensus => {}
         }
 
         // ── Phase 1: conflict detection ─────────────────────────────────
@@ -1277,6 +1335,44 @@ pub struct FeeEstimates {
     pub twelve_blocks: f64,
     pub twenty_four_blocks: f64,
     pub one_forty_four_blocks: f64,
+}
+
+/// Which checks `accept_tx_internal` runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptMode {
+    /// A transaction relayed to us by a peer: consensus + standardness +
+    /// local relay policy (018).
+    Relay,
+    /// The user's own transaction (033): consensus + network standardness,
+    /// no local relay policy.
+    Own,
+    /// Test-only: skips script verification and all script-type checks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    SkipConsensus,
+}
+
+/// Output script types this node relays for others (local policy, 018).
+/// Bare P2PK and bare multisig are intentionally excluded: P2PK is
+/// obsolete (no modern wallet generates it), and bare multisig is the
+/// primary vector for Stamps/SRC-20 data embedding. Wrapped versions
+/// (P2SH, P2WSH) remain standard via is_p2sh() and is_witness_program().
+fn is_relay_standard_script(spk: &bitcoin::Script) -> bool {
+    spk.is_p2pkh()
+        || spk.is_p2sh()
+        || spk.is_witness_program()
+        || (spk.is_op_return() && spk.len() <= MAX_OP_RETURN_SIZE)
+}
+
+/// Output script types the wider network relays (Bitcoin Core v30-like
+/// standardness): adds bare P2PK, bare multisig and OP_RETURN of any size
+/// (the whole tx is still bounded by `MAX_TX_WEIGHT`). Used for own txs.
+fn is_network_standard_script(spk: &bitcoin::Script) -> bool {
+    spk.is_p2pkh()
+        || spk.is_p2sh()
+        || spk.is_witness_program()
+        || spk.is_p2pk()
+        || spk.is_multisig()
+        || spk.is_op_return()
 }
 
 /// Errors from mempool transaction validation.

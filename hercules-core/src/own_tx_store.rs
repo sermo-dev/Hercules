@@ -1,0 +1,743 @@
+//! The user's own transactions (ticket 033): submission errors, the
+//! private-broadcast hook for ticket 029, and a persisted tracker that
+//! drives rebroadcast until each transaction confirms, is replaced, is
+//! conflicted out, or expires.
+//!
+//! The tracker is a small SQLite table next to the block store. The
+//! mempool is in memory, so without it an app kill before peers fetched
+//! the transaction would lose it silently.
+
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+use bitcoin::block::Block;
+use bitcoin::consensus::deserialize;
+use bitcoin::{Transaction, Txid};
+use log::{info, warn};
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::mempool::MempoolError;
+
+/// How long an unconfirmed own transaction is rebroadcast before we give
+/// up and mark it `Expired`. Matches the mempool's 14-day expiry, which is
+/// also Bitcoin Core's default, so peers would have forgotten it by then.
+pub const PENDING_EXPIRY_SECS: u64 = 14 * 24 * 3600;
+
+/// How long a row in a terminal state (confirmed, replaced, conflicted,
+/// expired) is kept for status queries before it is deleted. Longer than
+/// the 288-block reorg window (~2 days), so a confirmation that gets
+/// reorged out can still be demoted back to pending.
+pub const TERMINAL_RETENTION_SECS: u64 = 7 * 24 * 3600;
+
+/// First rebroadcast delay after an announcement; doubles per attempt.
+pub const REBROADCAST_BASE_SECS: u64 = 60;
+
+/// Rebroadcast backoff cap. Every new foreground sync session also makes
+/// all pending transactions due immediately, whatever their backoff.
+pub const REBROADCAST_MAX_SECS: u64 = 3600;
+
+// ── Submission API types ───────────────────────────────────────────────
+
+/// Result of a successful own-transaction submission.
+#[derive(Debug, Clone)]
+pub struct OwnTxReceipt {
+    pub txid: Txid,
+    /// Non-fatal notes, e.g. "our own relay policy would filter this",
+    /// meaning similarly-filtering nodes may not relay it either.
+    pub warnings: Vec<String>,
+}
+
+/// Why an own transaction was refused. Each variant is a different thing
+/// for the user to do about it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubmitError {
+    /// Bytes don't deserialize as a transaction.
+    Decode(String),
+    /// Consensus-invalid: bad script/signature, missing or spent input,
+    /// immature coinbase, not final, outputs exceed inputs. No node will
+    /// ever accept it.
+    Consensus(String),
+    /// Consensus-valid but fails network standardness (dust, non-standard
+    /// output type, too heavy, too many unconfirmed ancestors), so peers
+    /// would not relay it.
+    NonStandard(String),
+    /// Fee rate below the relay floor (or below what a full mempool would
+    /// keep). `min` is in sat/vB.
+    FeeTooLow { fee_rate: f64, min: f64 },
+    /// Absolute fee above the safety ceiling — almost certainly a wallet bug.
+    AbsurdFee { fee: u64, limit: u64 },
+    /// Double-spends mempool transaction(s) and doesn't qualify as a
+    /// replacement (BIP 125 fee rules).
+    Conflict { conflicts: Vec<Txid>, reason: String },
+    /// Already in our mempool. Not a failure: it is now tracked as an own
+    /// transaction and was re-announced. Callers that want idempotent
+    /// "send" semantics treat this as success.
+    AlreadyKnown { txid: Txid },
+    /// Our UTXO set isn't caught up far enough to judge the inputs.
+    NotSynced { validated_height: u32, tip_height: u32 },
+    /// Local storage/lookup failure.
+    Internal(String),
+}
+
+impl SubmitError {
+    /// Map a mempool rejection of an own transaction. `lagging` is true
+    /// when the UTXO set is behind the header tip, in which case a
+    /// missing input may just be one we haven't validated yet.
+    pub fn from_mempool(
+        e: MempoolError,
+        lagging: bool,
+        validated_height: u32,
+        tip_height: u32,
+        conflicts: Vec<Txid>,
+    ) -> SubmitError {
+        use MempoolError as M;
+        let msg = e.to_string();
+        match e {
+            M::MissingInput { .. } if lagging => SubmitError::NotSynced {
+                validated_height,
+                tip_height,
+            },
+            M::CoinbaseTx
+            | M::MalformedTx
+            | M::MissingInput { .. }
+            | M::ImmatureCoinbase { .. }
+            | M::ScriptFailure { .. }
+            | M::Inflation
+            | M::MathOverflow
+            | M::NonFinal { .. } => SubmitError::Consensus(msg),
+            M::OversizedTx { .. }
+            | M::DustOutput { .. }
+            | M::NonStandardScript { .. }
+            | M::PolicyRejection(_)
+            | M::TooManyAncestors { .. }
+            | M::AncestorSetTooLarge { .. }
+            | M::TooManyDescendants { .. } => SubmitError::NonStandard(msg),
+            M::InsufficientFee { fee_rate, min_rate } => SubmitError::FeeTooLow {
+                fee_rate,
+                min: min_rate,
+            },
+            M::MempoolFull {
+                new_fee_rate,
+                min_pkg_fee_rate,
+            } => SubmitError::FeeTooLow {
+                fee_rate: new_fee_rate,
+                min: min_pkg_fee_rate,
+            },
+            M::AbsurdFee { fee, limit } => SubmitError::AbsurdFee { fee, limit },
+            M::TooManyReplacements { .. }
+            | M::ReplacementFeeTooLow { .. }
+            | M::ReplacementFeeInsufficient { .. } => SubmitError::Conflict {
+                conflicts,
+                reason: msg,
+            },
+            M::AlreadyInMempool => SubmitError::Internal(
+                "already in mempool (should be handled by caller)".into(),
+            ),
+            M::UtxoLookup(s) => SubmitError::Internal(s),
+        }
+    }
+
+    /// Short machine-readable kind, used by the 014 RPC and FFI.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SubmitError::Decode(_) => "decode",
+            SubmitError::Consensus(_) => "consensus",
+            SubmitError::NonStandard(_) => "non_standard",
+            SubmitError::FeeTooLow { .. } => "fee_too_low",
+            SubmitError::AbsurdFee { .. } => "absurd_fee",
+            SubmitError::Conflict { .. } => "conflict",
+            SubmitError::AlreadyKnown { .. } => "already_known",
+            SubmitError::NotSynced { .. } => "not_synced",
+            SubmitError::Internal(_) => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::Decode(s) => write!(f, "invalid transaction encoding: {}", s),
+            SubmitError::Consensus(s) => write!(f, "consensus-invalid: {}", s),
+            SubmitError::NonStandard(s) => {
+                write!(f, "non-standard (peers will not relay it): {}", s)
+            }
+            SubmitError::FeeTooLow { fee_rate, min } => write!(
+                f,
+                "fee rate {:.2} sat/vB too low (minimum {:.2} sat/vB)",
+                fee_rate, min
+            ),
+            SubmitError::AbsurdFee { fee, limit } => write!(
+                f,
+                "absurd fee: {} sats exceeds safety ceiling {} sats",
+                fee, limit
+            ),
+            SubmitError::Conflict { conflicts, reason } => {
+                let ids: Vec<String> = conflicts.iter().map(|t| t.to_string()).collect();
+                write!(f, "conflicts with mempool tx [{}]: {}", ids.join(", "), reason)
+            }
+            SubmitError::AlreadyKnown { txid } => write!(f, "transaction {} already known", txid),
+            SubmitError::NotSynced {
+                validated_height,
+                tip_height,
+            } => write!(
+                f,
+                "node not synced: UTXO set at height {}, headers at {}",
+                validated_height, tip_height
+            ),
+            SubmitError::Internal(s) => write!(f, "internal error: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
+/// Transport for sending own transactions over short-lived connections
+/// that are separate from our regular peers (ticket 029 "private
+/// broadcast": a few fresh Tor connections, send the tx, disconnect).
+///
+/// When one is installed with `HeaderSync::set_private_broadcast`, own
+/// transactions are handed to it *instead of* being announced on our
+/// regular connections, so our regular (possibly clearnet) connections are
+/// never the first to relay them. Without one (today's Tor-only node),
+/// own transactions are `inv`-announced to every connected peer at once.
+pub trait PrivateBroadcast: Send + Sync {
+    /// Send `tx`. Returns how many peers took it. An `Err` leaves the
+    /// transaction pending; the rebroadcast schedule retries it. It must
+    /// not silently fall back to clearnet (029).
+    fn broadcast(&self, tx: &Transaction) -> Result<usize, String>;
+}
+
+// ── Tracker ────────────────────────────────────────────────────────────
+
+/// Lifecycle of a tracked own transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnTxStatus {
+    /// Announced (or waiting to be); no peer has announced it back yet.
+    Pending,
+    /// At least one peer announced it back to us — it's on the network.
+    /// Still rebroadcast (with backoff) until it confirms.
+    Propagated,
+    Confirmed { height: u32 },
+    /// Replaced by another own transaction (RBF fee bump / cancel).
+    Replaced { by: Txid },
+    /// An input was spent by a different transaction that confirmed.
+    Conflicted { by: Txid },
+    /// Not confirmed within `PENDING_EXPIRY_SECS`; no longer rebroadcast.
+    Expired,
+}
+
+impl OwnTxStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, OwnTxStatus::Pending | OwnTxStatus::Propagated)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            OwnTxStatus::Pending => "pending",
+            OwnTxStatus::Propagated => "propagated",
+            OwnTxStatus::Confirmed { .. } => "confirmed",
+            OwnTxStatus::Replaced { .. } => "replaced",
+            OwnTxStatus::Conflicted { .. } => "conflicted",
+            OwnTxStatus::Expired => "expired",
+        }
+    }
+
+    fn to_row(&self) -> (&'static str, Option<u32>, Option<String>) {
+        match self {
+            OwnTxStatus::Confirmed { height } => (self.name(), Some(*height), None),
+            OwnTxStatus::Replaced { by } | OwnTxStatus::Conflicted { by } => {
+                (self.name(), None, Some(by.to_string()))
+            }
+            _ => (self.name(), None, None),
+        }
+    }
+
+    fn from_row(name: &str, height: Option<u32>, other: Option<String>) -> OwnTxStatus {
+        let other_txid = other.and_then(|s| s.parse::<Txid>().ok());
+        match (name, height, other_txid) {
+            ("propagated", _, _) => OwnTxStatus::Propagated,
+            ("confirmed", Some(h), _) => OwnTxStatus::Confirmed { height: h },
+            ("replaced", _, Some(by)) => OwnTxStatus::Replaced { by },
+            ("conflicted", _, Some(by)) => OwnTxStatus::Conflicted { by },
+            ("expired", _, _) => OwnTxStatus::Expired,
+            _ => OwnTxStatus::Pending,
+        }
+    }
+}
+
+/// One tracked own transaction. Times are unix seconds.
+#[derive(Debug, Clone)]
+pub struct OwnTxRecord {
+    pub txid: Txid,
+    pub raw: Vec<u8>,
+    pub first_sent_at: u64,
+    /// 0 until the first announcement.
+    pub last_sent_at: u64,
+    pub next_attempt_at: u64,
+    pub attempts: u32,
+    /// Number of `inv` announcements of this tx received from peers.
+    pub seen_from_peers: u32,
+    pub status: OwnTxStatus,
+    pub updated_at: u64,
+}
+
+impl OwnTxRecord {
+    pub fn tx(&self) -> Option<Transaction> {
+        deserialize(&self.raw).ok()
+    }
+}
+
+#[derive(Debug)]
+pub struct OwnTxStoreError(pub String);
+
+impl std::fmt::Display for OwnTxStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "own tx store: {}", self.0)
+    }
+}
+
+impl std::error::Error for OwnTxStoreError {}
+
+fn db_err(e: rusqlite::Error) -> OwnTxStoreError {
+    OwnTxStoreError(e.to_string())
+}
+
+/// Delay before the next rebroadcast after `attempts` announcements.
+pub fn rebroadcast_backoff_secs(attempts: u32) -> u64 {
+    let shift = attempts.saturating_sub(1).min(16);
+    (REBROADCAST_BASE_SECS << shift).min(REBROADCAST_MAX_SECS)
+}
+
+/// Persisted tracker of the user's own transactions.
+pub struct OwnTxStore {
+    conn: Mutex<Connection>,
+    /// Txids in an active state, cached so the per-`inv` check in the
+    /// message loop doesn't hit SQLite.
+    active: Mutex<HashSet<Txid>>,
+}
+
+const SELECT_COLS: &str = "txid, raw, first_sent_at, last_sent_at, next_attempt_at, attempts, \
+     seen_from_peers, status, status_height, status_txid, updated_at";
+
+impl OwnTxStore {
+    /// Open or create the tracker at `path` (`":memory:"` for tests).
+    pub fn open(path: &str) -> Result<OwnTxStore, OwnTxStoreError> {
+        let conn = Connection::open(path).map_err(db_err)?;
+        if path != ":memory:" {
+            conn.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
+        }
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS own_txs (
+                txid TEXT PRIMARY KEY,
+                raw BLOB NOT NULL,
+                first_sent_at INTEGER NOT NULL,
+                last_sent_at INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                seen_from_peers INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                status_height INTEGER,
+                status_txid TEXT,
+                updated_at INTEGER NOT NULL
+            );
+            ",
+        )
+        .map_err(db_err)?;
+        let store = OwnTxStore {
+            conn: Mutex::new(conn),
+            active: Mutex::new(HashSet::new()),
+        };
+        store.refresh_active()?;
+        Ok(store)
+    }
+
+    fn refresh_active(&self) -> Result<(), OwnTxStoreError> {
+        let set: HashSet<Txid> = self
+            .active_records()?
+            .into_iter()
+            .map(|r| r.txid)
+            .collect();
+        *self.active.lock().unwrap() = set;
+        Ok(())
+    }
+
+    fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<OwnTxRecord> {
+        let txid_s: String = row.get(0)?;
+        let status: String = row.get(7)?;
+        Ok(OwnTxRecord {
+            txid: txid_s.parse().map_err(|_| {
+                rusqlite::Error::InvalidColumnType(0, "txid".into(), rusqlite::types::Type::Text)
+            })?,
+            raw: row.get(1)?,
+            first_sent_at: row.get::<_, i64>(2)? as u64,
+            last_sent_at: row.get::<_, i64>(3)? as u64,
+            next_attempt_at: row.get::<_, i64>(4)? as u64,
+            attempts: row.get(5)?,
+            seen_from_peers: row.get(6)?,
+            status: OwnTxStatus::from_row(&status, row.get(8)?, row.get(9)?),
+            updated_at: row.get::<_, i64>(10)? as u64,
+        })
+    }
+
+    fn query(&self, where_sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<OwnTxRecord>, OwnTxStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!("SELECT {} FROM own_txs {}", SELECT_COLS, where_sql);
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(args, Self::row_to_record)
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Start tracking `txid` as pending and due for announcement now. If
+    /// it is already tracked: an active row is left alone (but made due);
+    /// an expired row is revived. Returns true if a new row was created.
+    pub fn track(&self, txid: Txid, raw: &[u8], now: u64) -> Result<bool, OwnTxStoreError> {
+        let inserted = {
+            let conn = self.conn.lock().unwrap();
+            let n = conn
+                .execute(
+                    "INSERT OR IGNORE INTO own_txs (txid, raw, first_sent_at, next_attempt_at, status, updated_at)
+                     VALUES (?1, ?2, ?3, ?3, 'pending', ?3)",
+                    params![txid.to_string(), raw, now as i64],
+                )
+                .map_err(db_err)?;
+            if n == 0 {
+                conn.execute(
+                    "UPDATE own_txs SET next_attempt_at = ?2,
+                        status = CASE WHEN status = 'expired' THEN 'pending' ELSE status END,
+                        first_sent_at = CASE WHEN status = 'expired' THEN ?2 ELSE first_sent_at END,
+                        updated_at = ?2
+                     WHERE txid = ?1 AND status IN ('pending', 'propagated', 'expired')",
+                    params![txid.to_string(), now as i64],
+                )
+                .map_err(db_err)?;
+            }
+            n > 0
+        };
+        self.refresh_active()?;
+        Ok(inserted)
+    }
+
+    pub fn get(&self, txid: &Txid) -> Result<Option<OwnTxRecord>, OwnTxStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!("SELECT {} FROM own_txs WHERE txid = ?1", SELECT_COLS),
+            params![txid.to_string()],
+            Self::row_to_record,
+        )
+        .optional()
+        .map_err(db_err)
+    }
+
+    /// Every tracked transaction, newest first.
+    pub fn list(&self) -> Result<Vec<OwnTxRecord>, OwnTxStoreError> {
+        self.query("ORDER BY first_sent_at DESC, txid", &[])
+    }
+
+    /// Transactions still being rebroadcast.
+    pub fn active_records(&self) -> Result<Vec<OwnTxRecord>, OwnTxStoreError> {
+        self.query("WHERE status IN ('pending', 'propagated') ORDER BY first_sent_at", &[])
+    }
+
+    /// Active transactions whose next rebroadcast is due at `now`.
+    pub fn due(&self, now: u64) -> Result<Vec<OwnTxRecord>, OwnTxStoreError> {
+        let now = now as i64;
+        self.query(
+            "WHERE status IN ('pending', 'propagated') AND next_attempt_at <= ?1 ORDER BY first_sent_at",
+            &[&now],
+        )
+    }
+
+    /// True if `txid` is tracked and still active (cheap, in-memory).
+    pub fn is_active(&self, txid: &Txid) -> bool {
+        self.active.lock().unwrap().contains(txid)
+    }
+
+    /// Record an announcement at `now` and schedule the next one.
+    pub fn record_sent(&self, txid: &Txid, now: u64) -> Result<(), OwnTxStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let attempts: Option<u32> = conn
+            .query_row(
+                "SELECT attempts FROM own_txs WHERE txid = ?1",
+                params![txid.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some(attempts) = attempts else { return Ok(()) };
+        let attempts = attempts.saturating_add(1);
+        let next = now + rebroadcast_backoff_secs(attempts);
+        conn.execute(
+            "UPDATE own_txs SET attempts = ?2, last_sent_at = ?3, next_attempt_at = ?4 WHERE txid = ?1",
+            params![txid.to_string(), attempts, now as i64, next as i64],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Make every active transaction due now (new foreground session).
+    pub fn make_all_due(&self, now: u64) -> Result<(), OwnTxStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE own_txs SET next_attempt_at = ?1 WHERE status IN ('pending', 'propagated')",
+            params![now as i64],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// A peer announced this transaction back to us.
+    pub fn record_seen(&self, txid: &Txid, now: u64) -> Result<(), OwnTxStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE own_txs SET seen_from_peers = seen_from_peers + 1,
+                status = CASE WHEN status = 'pending' THEN 'propagated' ELSE status END,
+                updated_at = ?2
+             WHERE txid = ?1 AND status IN ('pending', 'propagated')",
+            params![txid.to_string(), now as i64],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    fn set_status(&self, txid: &Txid, status: &OwnTxStatus, now: u64) -> Result<(), OwnTxStoreError> {
+        let (name, height, other) = status.to_row();
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE own_txs SET status = ?2, status_height = ?3, status_txid = ?4, updated_at = ?5
+                 WHERE txid = ?1",
+                params![txid.to_string(), name, height, other, now as i64],
+            )
+            .map_err(db_err)?;
+        }
+        self.refresh_active()
+    }
+
+    /// `old` was replaced in the mempool by the user's own `by`.
+    pub fn mark_replaced(&self, old: &Txid, by: Txid, now: u64) -> Result<(), OwnTxStoreError> {
+        if self.is_active(old) {
+            info!("Own tx {} replaced by {}", old, by);
+            self.set_status(old, &OwnTxStatus::Replaced { by }, now)?;
+        }
+        Ok(())
+    }
+
+    /// Block-connect hook: mark active own transactions in `block` as
+    /// confirmed, and those whose inputs `block` spends with a different
+    /// transaction as conflicted. Returns the number of rows changed.
+    pub fn on_block(&self, block: &Block, height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
+        if self.active.lock().unwrap().is_empty() {
+            return Ok(0);
+        }
+        let active = self.active_records()?;
+        let mut changed = 0;
+        let block_txids: Vec<Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
+        for rec in active {
+            if block_txids.contains(&rec.txid) {
+                info!("Own tx {} confirmed at height {}", rec.txid, height);
+                self.set_status(&rec.txid, &OwnTxStatus::Confirmed { height }, now)?;
+                changed += 1;
+                continue;
+            }
+            let Some(own) = rec.tx() else { continue };
+            let conflicting = block.txdata.iter().zip(&block_txids).find(|(btx, _)| {
+                btx.input.iter().any(|bi| {
+                    own.input
+                        .iter()
+                        .any(|oi| oi.previous_output == bi.previous_output)
+                })
+            });
+            if let Some((_, by)) = conflicting {
+                warn!(
+                    "Own tx {} conflicted: input spent by {} at height {}",
+                    rec.txid, by, height
+                );
+                self.set_status(&rec.txid, &OwnTxStatus::Conflicted { by: *by }, now)?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Reorg hook: confirmations above `fork_height` are undone, so those
+    /// transactions go back to pending and are due for rebroadcast.
+    pub fn demote_confirmed_above(&self, fork_height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
+        let n = {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE own_txs SET status = 'pending', status_height = NULL, next_attempt_at = ?2, updated_at = ?2
+                 WHERE status = 'confirmed' AND status_height > ?1",
+                params![fork_height, now as i64],
+            )
+            .map_err(db_err)?
+        };
+        if n > 0 {
+            info!("Reorg: {} own txs demoted to pending", n);
+            self.refresh_active()?;
+        }
+        Ok(n)
+    }
+
+    /// Expire stale pending rows and delete old terminal rows.
+    pub fn expire(&self, now: u64) -> Result<(), OwnTxStoreError> {
+        {
+            let conn = self.conn.lock().unwrap();
+            let expired = conn
+                .execute(
+                    "UPDATE own_txs SET status = 'expired', updated_at = ?1
+                     WHERE status IN ('pending', 'propagated') AND first_sent_at + ?2 <= ?1",
+                    params![now as i64, PENDING_EXPIRY_SECS as i64],
+                )
+                .map_err(db_err)?;
+            if expired > 0 {
+                warn!("{} own txs expired unconfirmed; rebroadcast stopped", expired);
+            }
+            conn.execute(
+                "DELETE FROM own_txs WHERE status NOT IN ('pending', 'propagated') AND updated_at + ?2 <= ?1",
+                params![now as i64, TERMINAL_RETENTION_SECS as i64],
+            )
+            .map_err(db_err)?;
+        }
+        self.refresh_active()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+    use tempfile::TempDir;
+
+    fn txid(b: u8) -> Txid {
+        Txid::from_byte_array([b; 32])
+    }
+
+    #[test]
+    fn tracks_and_persists_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("own_txs.sqlite3");
+        let path = path.to_str().unwrap();
+        {
+            let s = OwnTxStore::open(path).unwrap();
+            assert!(s.track(txid(1), &[1, 2, 3], 1000).unwrap());
+            assert!(!s.track(txid(1), &[1, 2, 3], 1001).unwrap(), "idempotent");
+            s.record_sent(&txid(1), 1000).unwrap();
+            s.record_seen(&txid(1), 1002).unwrap();
+        }
+        let s = OwnTxStore::open(path).unwrap();
+        assert!(s.is_active(&txid(1)), "active cache rebuilt on open");
+        let r = s.get(&txid(1)).unwrap().unwrap();
+        assert_eq!(r.raw, vec![1, 2, 3]);
+        assert_eq!(r.attempts, 1);
+        assert_eq!(r.seen_from_peers, 1);
+        assert_eq!(r.status, OwnTxStatus::Propagated);
+        assert_eq!(r.first_sent_at, 1000);
+        assert_eq!(r.last_sent_at, 1000);
+    }
+
+    #[test]
+    fn rebroadcast_schedule_backs_off_and_session_resets() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[0], 0).unwrap();
+        assert_eq!(s.due(0).unwrap().len(), 1, "new tx due immediately");
+
+        s.record_sent(&txid(1), 0).unwrap();
+        assert!(s.due(59).unwrap().is_empty());
+        assert_eq!(s.due(60).unwrap().len(), 1, "first retry after base delay");
+
+        s.record_sent(&txid(1), 60).unwrap();
+        assert!(s.due(60 + 119).unwrap().is_empty());
+        assert_eq!(s.due(60 + 120).unwrap().len(), 1, "doubles");
+
+        assert_eq!(rebroadcast_backoff_secs(1), REBROADCAST_BASE_SECS);
+        assert_eq!(rebroadcast_backoff_secs(50), REBROADCAST_MAX_SECS, "capped");
+
+        s.record_sent(&txid(1), 200).unwrap();
+        assert!(s.due(201).unwrap().is_empty());
+        s.make_all_due(201).unwrap();
+        assert_eq!(s.due(201).unwrap().len(), 1, "new session makes it due");
+    }
+
+    #[test]
+    fn replaced_and_expired_stop_rebroadcast() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[0], 0).unwrap();
+        s.track(txid(2), &[0], 0).unwrap();
+        s.mark_replaced(&txid(1), txid(3), 5).unwrap();
+        assert!(!s.is_active(&txid(1)));
+        assert_eq!(
+            s.get(&txid(1)).unwrap().unwrap().status,
+            OwnTxStatus::Replaced { by: txid(3) }
+        );
+
+        s.expire(PENDING_EXPIRY_SECS).unwrap();
+        assert_eq!(s.get(&txid(2)).unwrap().unwrap().status, OwnTxStatus::Expired);
+        assert!(s.due(PENDING_EXPIRY_SECS).unwrap().is_empty());
+
+        // Terminal rows are deleted after the retention window.
+        s.expire(PENDING_EXPIRY_SECS + TERMINAL_RETENTION_SECS).unwrap();
+        assert!(s.get(&txid(1)).unwrap().is_none());
+        assert!(s.get(&txid(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn reorg_demotes_confirmed_above_fork() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[0], 0).unwrap();
+        s.track(txid(2), &[0], 0).unwrap();
+        s.set_status(&txid(1), &OwnTxStatus::Confirmed { height: 100 }, 1).unwrap();
+        s.set_status(&txid(2), &OwnTxStatus::Confirmed { height: 90 }, 1).unwrap();
+        assert_eq!(s.demote_confirmed_above(95, 2).unwrap(), 1);
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().status, OwnTxStatus::Pending);
+        assert!(s.is_active(&txid(1)));
+        assert_eq!(
+            s.get(&txid(2)).unwrap().unwrap().status,
+            OwnTxStatus::Confirmed { height: 90 }
+        );
+    }
+
+    #[test]
+    fn classification_of_mempool_errors() {
+        let c = |e| SubmitError::from_mempool(e, false, 10, 10, vec![]);
+        assert!(matches!(c(MempoolError::Inflation), SubmitError::Consensus(_)));
+        assert!(matches!(
+            c(MempoolError::ScriptFailure { input_index: 0, error: "x".into() }),
+            SubmitError::Consensus(_)
+        ));
+        assert!(matches!(
+            c(MempoolError::DustOutput { index: 0, amount: 1 }),
+            SubmitError::NonStandard(_)
+        ));
+        assert!(matches!(
+            c(MempoolError::InsufficientFee { fee_rate: 0.5, min_rate: 1.0 }),
+            SubmitError::FeeTooLow { .. }
+        ));
+        assert!(matches!(
+            c(MempoolError::AbsurdFee { fee: 1, limit: 0 }),
+            SubmitError::AbsurdFee { .. }
+        ));
+        let r = SubmitError::from_mempool(
+            MempoolError::ReplacementFeeTooLow { replacement: 1.0, conflict: 2.0 },
+            false,
+            10,
+            10,
+            vec![txid(9)],
+        );
+        assert_eq!(r.kind(), "conflict");
+        assert!(matches!(r, SubmitError::Conflict { ref conflicts, .. } if conflicts == &vec![txid(9)]));
+
+        // A missing input while the UTXO set lags the headers is NotSynced,
+        // not a consensus verdict.
+        let missing = || MempoolError::MissingInput { txid: txid(1), vout: 0 };
+        assert!(matches!(c(missing()), SubmitError::Consensus(_)));
+        assert_eq!(
+            SubmitError::from_mempool(missing(), true, 5, 10, vec![]),
+            SubmitError::NotSynced { validated_height: 5, tip_height: 10 }
+        );
+    }
+}

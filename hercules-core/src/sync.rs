@@ -396,7 +396,10 @@ fn fetch_requested_block(
 struct RelayQueueEntry {
     txid: Txid,
     relay_at: Instant,
-    from_peer: String, // don't relay back to sender
+    /// Peer we got it from, so we don't relay it back. `None` for the
+    /// user's own transactions (ticket 033), which are announced to every
+    /// peer immediately and never attributed to a peer.
+    from_peer: Option<String>,
 }
 
 /// Counters for node serving activity.
@@ -422,6 +425,12 @@ pub struct HeaderSync {
     relay_state: Mutex<HashMap<String, PeerRelayState>>,
     /// Queue of transactions waiting to be relayed with Poisson delay.
     relay_queue: Mutex<Vec<RelayQueueEntry>>,
+    /// The user's own transactions (ticket 033): persisted tracker that
+    /// drives rebroadcast until confirmation.
+    own_txs: crate::own_tx_store::OwnTxStore,
+    /// Ticket 029 private-broadcast transport. When set, own transactions
+    /// go through it instead of being announced on our regular peers.
+    private_broadcast: Mutex<Option<Arc<dyn crate::own_tx_store::PrivateBroadcast>>>,
     /// Addresses queued by `handle_peer_message` from inbound `addr` /
     /// `addrv2` gossip. Drained into the PeerPool's AddrManager after
     /// `service_peer_messages` returns, since the message handlers run
@@ -482,6 +491,15 @@ impl HeaderSync {
         let block_store =
             BlockStore::open(&blocks_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
+        // Own-transaction tracker (ticket 033), next to the block store.
+        let own_txs_path = if db_path == ":memory:" {
+            ":memory:".to_string()
+        } else {
+            derive_sibling_path(db_path, "own_txs.sqlite3")
+        };
+        let own_txs = crate::own_tx_store::OwnTxStore::open(&own_txs_path)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
         // Derive peers DB path for persistent reputation scores and bans.
         // Skip persistence in :memory: mode (used by tests).
         let peers_db_path = if db_path == ":memory:" {
@@ -532,6 +550,8 @@ impl HeaderSync {
             tor,
             relay_state: Mutex::new(HashMap::new()),
             relay_queue: Mutex::new(Vec::new()),
+            own_txs,
+            private_broadcast: Mutex::new(None),
             pending_gossip_addrs: Mutex::new(Vec::new()),
             stats: Mutex::new(NodeStats {
                 blocks_served: 0,
@@ -910,24 +930,212 @@ impl HeaderSync {
         pool.estimate_fee_rates()
     }
 
-    /// Broadcast a raw transaction: deserialize, validate against mempool +
-    /// UTXO set, and add to the mempool. Returns the txid on success.
-    /// Relay to peers happens on the next monitor-loop tick.
-    pub fn rpc_broadcast_tx(&self, raw: &[u8]) -> Result<bitcoin::Txid, SyncError> {
-        let tx: bitcoin::Transaction = deserialize(raw)
-            .map_err(|e| SyncError::Validation(format!("invalid tx: {}", e)))?;
+    /// Submit one of the user's own transactions (ticket 033). Shared by
+    /// the 014 wallet RPC `broadcast_transaction` and the FFI (in-app
+    /// wallet, 020).
+    ///
+    /// - Validated against `validated_height` and the UTXO set (not the
+    ///   header tip, which can be ahead of the UTXO set).
+    /// - Consensus validity and network standardness are required; our
+    ///   local Knots-style relay policy (018) is not applied — it is
+    ///   reported as a warning on the receipt instead.
+    /// - Persisted in the own-tx tracker, then announced immediately (no
+    ///   Poisson trickle) to every connected peer, or handed to the 029
+    ///   private-broadcast transport when one is installed. Rebroadcast
+    ///   continues until it confirms, is replaced, conflicts, or expires.
+    ///
+    /// `SubmitError::AlreadyKnown` means it was already in the mempool: it
+    /// is still tracked and re-announced, so a retry is harmless.
+    pub fn submit_own_tx(
+        &self,
+        raw: &[u8],
+    ) -> Result<crate::own_tx_store::OwnTxReceipt, crate::own_tx_store::SubmitError> {
+        use crate::own_tx_store::{OwnTxReceipt, SubmitError};
+        let tx: bitcoin::Transaction =
+            deserialize(raw).map_err(|e| SubmitError::Decode(format!("{}", e)))?;
+        let txid = tx.compute_txid();
 
-        let tip = self
+        let validated_height = self
+            .store
+            .validated_height()
+            .map_err(|e| SubmitError::Internal(format!("{}", e)))?;
+        let tip_height = self
             .store
             .tip()
-            .map_err(|e| SyncError::Store(format!("{}", e)))?;
-        let current_height = tip.map(|(h, _, _)| h).unwrap_or(0);
+            .map_err(|e| SubmitError::Internal(format!("{}", e)))?
+            .map(|(h, _, _)| h)
+            .unwrap_or(0);
+        if validated_height == 0 {
+            // No UTXO set yet: nothing to validate inputs against.
+            return Err(SubmitError::NotSynced {
+                validated_height,
+                tip_height,
+            });
+        }
 
-        let mut pool = self.mempool.lock().unwrap();
-        let txid = pool
-            .accept_tx(tx, &self.utxo, current_height)
-            .map_err(|e| SyncError::Validation(format!("mempool reject: {}", e)))?;
-        Ok(txid)
+        let mut warnings = Vec::new();
+        if let Some(w) = Mempool::local_policy_violation(&tx) {
+            warnings.push(format!(
+                "{}; sent anyway, but nodes with similar filters may not relay it",
+                w
+            ));
+        }
+
+        let (accepted, conflicts) = {
+            let mut pool = self.mempool.lock().unwrap();
+            let conflicts = pool.conflicting_txids(&tx);
+            (
+                pool.accept_own_tx(tx.clone(), &self.utxo, validated_height),
+                conflicts,
+            )
+        };
+        let already_known = match accepted {
+            Ok(_) => false,
+            Err(crate::mempool::MempoolError::AlreadyInMempool) => true,
+            Err(e) => {
+                return Err(SubmitError::from_mempool(
+                    e,
+                    validated_height < tip_height,
+                    validated_height,
+                    tip_height,
+                    conflicts,
+                ))
+            }
+        };
+
+        let now = unix_now_u32() as u64;
+        self.own_txs
+            .track(txid, raw, now)
+            .map_err(|e| SubmitError::Internal(format!("{}", e)))?;
+        if !already_known {
+            // Accepted with conflicts == it replaced them (RBF).
+            for c in &conflicts {
+                let _ = self.own_txs.mark_replaced(c, txid, now);
+            }
+        }
+        info!(
+            "Own tx {} submitted (validated_height {}{})",
+            txid,
+            validated_height,
+            if already_known { ", already in mempool" } else { "" }
+        );
+        self.announce_own_tx(txid, &tx, now);
+
+        if already_known {
+            return Err(SubmitError::AlreadyKnown { txid });
+        }
+        Ok(OwnTxReceipt { txid, warnings })
+    }
+
+    /// Send an own transaction out now: via the 029 private-broadcast
+    /// transport if installed, else an immediate `inv` to every peer on
+    /// the next monitor-loop tick (`from_peer: None`, no Poisson delay).
+    fn announce_own_tx(&self, txid: Txid, tx: &bitcoin::Transaction, now: u64) {
+        let private = self.private_broadcast.lock().unwrap().clone();
+        if let Some(pb) = private {
+            match pb.broadcast(tx) {
+                Ok(n) => info!("Own tx {} private-broadcast to {} peers", txid, n),
+                // Stays pending; the rebroadcast schedule retries. Never
+                // fall back to our regular connections silently (029).
+                Err(e) => warn!("Own tx {} private broadcast failed: {}", txid, e),
+            }
+        } else {
+            let mut queue = self.relay_queue.lock().unwrap();
+            if !queue.iter().any(|e| e.txid == txid && e.from_peer.is_none()) {
+                queue.push(RelayQueueEntry {
+                    txid,
+                    relay_at: Instant::now(),
+                    from_peer: None,
+                });
+            }
+        }
+        let _ = self.own_txs.record_sent(&txid, now);
+    }
+
+    /// Install (or remove) the ticket 029 private-broadcast transport.
+    #[allow(dead_code)] // wired up by ticket 029
+    pub fn set_private_broadcast(
+        &self,
+        pb: Option<Arc<dyn crate::own_tx_store::PrivateBroadcast>>,
+    ) {
+        *self.private_broadcast.lock().unwrap() = pb;
+    }
+
+    /// Tracker record for an own transaction.
+    pub fn own_tx_status(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<crate::own_tx_store::OwnTxRecord>, SyncError> {
+        self.own_txs
+            .get(txid)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// All tracked own transactions, newest first.
+    pub fn list_own_txs(&self) -> Result<Vec<crate::own_tx_store::OwnTxRecord>, SyncError> {
+        self.own_txs
+            .list()
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// Start of a foreground sync session: put active own transactions
+    /// back in the (in-memory) mempool and make them all due for
+    /// rebroadcast, whatever their backoff.
+    fn begin_own_tx_session(&self) {
+        let now = unix_now_u32() as u64;
+        let _ = self.own_txs.make_all_due(now);
+        self.rebroadcast_due_own_txs(now);
+    }
+
+    /// Re-announce own transactions whose rebroadcast is due, re-adding
+    /// them to the mempool first if needed (app restart, eviction, reorg).
+    /// Called at session start and from the monitor loop's maintenance
+    /// tick.
+    fn rebroadcast_due_own_txs(&self, now: u64) {
+        let _ = self.own_txs.expire(now);
+        let due = match self.own_txs.due(now) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("own tx rebroadcast: {}", e);
+                return;
+            }
+        };
+        if due.is_empty() {
+            return;
+        }
+        let validated_height = self.store.validated_height().unwrap_or(0);
+        for rec in due {
+            let Some(tx) = rec.tx() else { continue };
+            let in_pool = {
+                let mut pool = self.mempool.lock().unwrap();
+                pool.contains(&rec.txid)
+                    || match pool.accept_own_tx(tx.clone(), &self.utxo, validated_height) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            // Inputs not validated yet, or a conflict that
+                            // a block will settle: retry on schedule.
+                            debug!("own tx {} not re-added to mempool: {}", rec.txid, e);
+                            false
+                        }
+                    }
+            };
+            if in_pool {
+                self.announce_own_tx(rec.txid, &tx, now);
+            } else {
+                // Push the schedule back so we don't retry every tick.
+                let _ = self.own_txs.record_sent(&rec.txid, now);
+            }
+        }
+    }
+
+    /// Block-connect hook shared by every path that applies a block:
+    /// drop its transactions (and their conflicts) from the mempool and
+    /// settle any own transactions it confirms or conflicts.
+    fn on_block_connected(&self, block: &bitcoin::Block, height: u32) {
+        self.mempool.lock().unwrap().remove_confirmed(block);
+        if let Err(e) = self.own_txs.on_block(block, height, unix_now_u32() as u64) {
+            warn!("own tx tracker block hook at {}: {}", height, e);
+        }
     }
 
     /// Height of the last block whose scripts were fully validated.
@@ -1174,6 +1382,9 @@ impl HeaderSync {
             pool.count(),
             peer_height,
         );
+
+        // Ticket 033: restore and re-announce pending own transactions.
+        self.begin_own_tx_session();
 
         let validated = self
             .store
@@ -1448,7 +1659,7 @@ impl HeaderSync {
                         .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
                     // Remove confirmed transactions from mempool
-                    self.mempool.lock().unwrap().remove_confirmed(&block);
+                    self.on_block_connected(&block, next_height);
 
                     self.store
                         .set_validated_height(next_height)
@@ -1605,6 +1816,7 @@ impl HeaderSync {
                     if last_maintain.elapsed() >= Duration::from_secs(30) {
                         pool.maintain();
                         self.mempool.lock().unwrap().expire_old();
+                        self.rebroadcast_due_own_txs(unix_now_u32() as u64);
                         self.update_peer_counts(&pool);
                         // Clean up relay_state: remove entries for disconnected
                         // peers. The per-peer known_txids cap is enforced at
@@ -1887,6 +2099,11 @@ impl HeaderSync {
                                 info!("Reorg: cleared {} transactions from mempool", count);
                             }
                         }
+                        // Own txs confirmed above the fork are unconfirmed
+                        // again; rebroadcast re-adds them to the mempool.
+                        let _ = self
+                            .own_txs
+                            .demote_confirmed_above(fork_at, unix_now_u32() as u64);
 
                         info!(
                             "Reorg complete: new tip at height {} ({} new headers)",
@@ -2313,6 +2530,10 @@ impl HeaderSync {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                    if self.own_txs.is_active(txid) {
+                        // A peer announcing our own tx back: it propagated.
+                        let _ = self.own_txs.record_seen(txid, unix_now_u32() as u64);
+                    }
                     if !self.mempool.lock().unwrap().contains(txid) {
                         // Record that this peer knows about this tx. The
                         // helper enforces MAX_KNOWN_TXIDS_PER_PEER on every
@@ -2370,7 +2591,7 @@ impl HeaderSync {
                 self.relay_queue.lock().unwrap().push(RelayQueueEntry {
                     txid,
                     relay_at: Instant::now() + Duration::from_secs_f64(delay),
-                    from_peer: addr.to_string(),
+                    from_peer: Some(addr.to_string()),
                 });
             }
             Err(e) => {
@@ -2458,7 +2679,7 @@ impl HeaderSync {
 
             pool.for_each_peer(|addr, _, peer| {
                 // Don't relay back to sender
-                if addr == from_peer {
+                if from_peer.as_deref() == Some(addr) {
                     return Ok(());
                 }
                 if let Some((known, feefilter)) = relay_snapshot.get(addr) {
@@ -2677,7 +2898,7 @@ impl HeaderSync {
                 }
 
                 // Remove confirmed transactions from mempool
-                self.mempool.lock().unwrap().remove_confirmed(&block);
+                self.on_block_connected(&block, new_tip);
 
                 self.store
                     .set_validated_height(new_tip)
@@ -2959,7 +3180,7 @@ impl HeaderSync {
             }
 
             // Remove confirmed transactions from mempool
-            self.mempool.lock().unwrap().remove_confirmed(&block);
+            self.on_block_connected(&block, next_height);
 
             self.store
                 .set_validated_height(next_height)
@@ -3081,6 +3302,12 @@ pub(crate) fn derive_sibling_path(db_path: &str, name: &str) -> String {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     parent.join(name).to_string_lossy().into_owned()
 }
+
+// Own-transaction broadcast tests (ticket 033) live in their own file to
+// keep this module's diff small.
+#[cfg(test)]
+#[path = "sync_own_tx_tests.rs"]
+mod own_tx_tests;
 
 #[cfg(test)]
 mod tests {
