@@ -234,6 +234,12 @@ pub enum ValidationError {
         timestamp: u32,
         max_allowed: u32,
     },
+    /// The header at the anchor height is not the compiled-in anchor block.
+    AnchorMismatch {
+        height: u32,
+        expected: String,
+        got: String,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -278,6 +284,15 @@ impl std::fmt::Display for ValidationError {
                 "block {} timestamp {} is more than 2 hours in the future (max {})",
                 height, timestamp, max_allowed
             ),
+            ValidationError::AnchorMismatch {
+                height,
+                expected,
+                got,
+            } => write!(
+                f,
+                "block {} conflicts with the chain anchor: expected {}, got {}",
+                height, expected, got
+            ),
         }
     }
 }
@@ -287,7 +302,7 @@ impl std::error::Error for ValidationError {}
 // ── U256 helpers for chainwork computation ──────────────────────────
 
 /// Add two 256-bit little-endian values.
-fn u256_add(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+pub fn u256_add(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
     let mut result = [0u8; 32];
     let mut carry: u16 = 0;
     for i in 0..32 {
@@ -413,6 +428,31 @@ pub fn chainwork_for_headers(headers: &[Header]) -> [u8; 32] {
         total = u256_add(total, work);
     }
     total
+}
+
+/// Check that a header batch whose first header sits at `start_height`
+/// doesn't conflict with the chain anchor: if the batch covers
+/// `anchor_height`, the header there must hash to `anchor_hash`. Batches
+/// entirely above or below the anchor pass trivially — linkage to a stored
+/// chain that already contains the anchor is checked by `validate_headers`.
+pub fn check_anchor(
+    headers: &[Header],
+    start_height: u32,
+    anchor_height: u32,
+    anchor_hash: &BlockHash,
+) -> Result<(), ValidationError> {
+    if anchor_height < start_height {
+        return Ok(());
+    }
+    let idx = (anchor_height - start_height) as usize;
+    match headers.get(idx) {
+        Some(h) if h.block_hash() != *anchor_hash => Err(ValidationError::AnchorMismatch {
+            height: anchor_height,
+            expected: anchor_hash.to_string(),
+            got: h.block_hash().to_string(),
+        }),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -933,6 +973,33 @@ mod tests {
     fn chainwork_empty_headers_is_zero() {
         let result = super::chainwork_for_headers(&[]);
         assert_eq!(result, [0u8; 32]);
+    }
+
+    // ── check_anchor ────────────────────────────────────────────────
+
+    #[test]
+    fn check_anchor_accepts_matching_header() {
+        let headers = [genesis_header(), block1_header()];
+        let anchor = block1_header().block_hash();
+        assert!(check_anchor(&headers, 0, 1, &anchor).is_ok());
+    }
+
+    #[test]
+    fn check_anchor_rejects_conflicting_header() {
+        let headers = [genesis_header(), block1_header()];
+        let anchor = genesis_header().block_hash();
+        let err = check_anchor(&headers, 0, 1, &anchor).unwrap_err();
+        assert!(matches!(err, ValidationError::AnchorMismatch { height: 1, .. }));
+    }
+
+    #[test]
+    fn check_anchor_ignores_batches_not_covering_anchor() {
+        let headers = [block1_header()];
+        let anchor = genesis_header().block_hash();
+        // Entirely above the anchor.
+        assert!(check_anchor(&headers, 1, 0, &anchor).is_ok());
+        // Entirely below the anchor.
+        assert!(check_anchor(&headers, 1, 5, &anchor).is_ok());
     }
 
     #[test]

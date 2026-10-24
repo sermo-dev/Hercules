@@ -384,11 +384,13 @@ impl HerculesNode {
     }
 
     /// Load a UTXO snapshot from a file. The file is verified against the
-    /// hardcoded `ASSUMEUTXO_HASH` trust anchor; mismatched files are rejected
+    /// hardcoded AssumeUTXO anchor (header height and block hash, plus
+    /// `ASSUMEUTXO_HASH` over the entries); mismatched files are rejected
     /// without modifying the database. Accepts either a raw `.hutx` file or a
     /// gzipped `.hutx.gz` (decompressed on the fly).
     ///
-    /// After loading, block validation resumes from the snapshot height.
+    /// Safe to call before header sync: block validation resumes from the
+    /// snapshot height once the header chain contains the anchor block.
     pub fn load_snapshot(
         &self,
         snapshot_path: String,
@@ -396,13 +398,9 @@ impl HerculesNode {
     ) -> Result<SnapshotInfo, HerculesError> {
         let meta = self
             .syncer
-            .load_snapshot(
-                &snapshot_path,
-                Some(&assumeutxo::ASSUMEUTXO_HASH),
-                |loaded, total| {
-                    callback.on_progress(loaded, total);
-                },
-            )
+            .load_snapshot(&snapshot_path, |loaded, total| {
+                callback.on_progress(loaded, total);
+            })
             .map_err(|e| HerculesError::StorageError {
                 msg: format!("{}", e),
             })?;
