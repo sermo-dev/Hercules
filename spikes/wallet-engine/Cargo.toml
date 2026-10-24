@@ -1,0 +1,30 @@
+[package]
+name = "wallet-engine-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Ticket 034 throwaway spike: no-BDK wallet stack (rust-bitcoin + miniscript + bip39 + Core coin-selection port)"
+
+# Standalone: not part of hercules-core's build.
+[workspace]
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+bitcoin = { version = "=0.32.8", features = ["serde"] }
+miniscript = { version = "13", optional = true }
+bip39 = { version = "2.2", optional = true }
+
+[features]
+default = ["stack"]
+# `stack` = miniscript + bip39. Turn off (--no-default-features) for the size baseline.
+stack = ["dep:miniscript", "dep:bip39"]
+
+[dev-dependencies]
+# Script verification uses the same libbitcoinconsensus (v26.0) that hercules-core links.
+bitcoinconsensus = "0.106"
+bitcoin = { version = "=0.32.8", features = ["serde"] }
+
+[patch.crates-io]
+bitcoinconsensus = { path = "../../hercules-core/patches/bitcoinconsensus" }
