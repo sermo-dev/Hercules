@@ -1,108 +1,86 @@
-# Ticket 034: Wallet Engine Selection (BDK Spike)
+# Ticket 034: Wallet Engine — Library Stack (No BDK)
+
+## Decisions (2026-10-24)
+
+- **Decided: no BDK.** The wallet is our own, built directly on the same Rust libraries BDK itself is built on. This reaffirms ticket 020's original decision (`020-in-app-wallet.md:256`).
+- **Decided: the wallet does not hand-roll cryptography or script logic.** Every money-critical primitive comes from a widely used library. The only code we write is wallet *state* (which coins are ours, labels, history) and a port of Bitcoin Core's coin selection algorithms, tested against Core's own test cases.
+- Watching / coin discovery is ticket 035 (our own scanner, same model as Bitcoin Core's built-in wallet).
 
 ## Summary
 
-Decide what code builds, signs, and tracks transactions inside the in-app wallet, before any wallet code is written. Ticket 020 decided on a hand-rolled wallet built from `bitcoin` + `miniscript` + `bip39`, not BDK (`020-in-app-wallet.md:256`). The README stack table still lists "Wallet API: BDK (future)". This ticket resolves that contradiction with a short, time-boxed spike and a written decision.
-
-The recommendation going in: **don't hand-roll the parts of a wallet that lose money when they're wrong.** Descriptor derivation, coin selection, fee/change calculation, PSBT construction, and signing are where wallet bugs become lost funds. Those should come from heavily used, independently audited libraries, whichever wallet-state model we end up with.
-
-Status: decision ticket. The output is a decision record in this file plus a throwaway prototype, not production code.
+Pin down exactly which code builds, signs, and tracks transactions in the in-app wallet, and prove the stack end-to-end on regtest before ticket 035+ build on it. The output is a short decision record in this file plus a throwaway prototype, not production code.
 
 ## Background
 
-### What BDK is
+### Why not Bitcoin Core's wallet code directly
 
-**BDK (Bitcoin Dev Kit)** is a family of Rust crates for building Bitcoin wallets:
+Bitcoin Core's wallet (coin selection, fee/change, signing) lives inside `bitcoind`'s C++ wallet module. It is **not shipped as a library**:
+- `libbitcoinconsensus` (which Hercules uses for script verification, v26.0 via patches) only verifies scripts, and it was removed from Core in v28.
+- `libbitcoinkernel`, Core's library effort, deliberately covers validation only, not the wallet.
 
-| Crate | What it does |
-|---|---|
-| `bdk_wallet` | Full wallet: descriptors → addresses, tracks UTXOs/txs, builds txs (`TxBuilder`), coin selection, change, fee calc, PSBT, signing |
-| `bdk_chain` | Lower-level: `TxGraph`, `LocalChain`, indexed script tracking. Chain-source agnostic |
-| `bdk_coin_select` | Standalone coin selection (branch-and-bound + metrics like waste) |
-| `bdk_electrum` / `bdk_esplora` / `bdk_bitcoind_rpc` | Optional chain-source adapters. **We would use none of these** |
-| `miniscript` (rust-miniscript) | Descriptor parsing, address derivation, satisfaction/signing logic. BDK depends on it |
+So Core's wallet can't be linked in. What we *can* do is port its **coin selection algorithms** (well documented, with extensive unit tests) to Rust.
 
-BDK is **chain-source agnostic**: the wallet core doesn't care where blocks come from. `bdk_wallet` exposes block-application APIs (in 1.x I believe they are `Wallet::apply_block` / `apply_block_connected_to`, plus `apply_unconfirmed_txs` for mempool txs. **Unverified: confirm the names against current docs.rs during the spike**). That means Hercules could feed BDK the blocks it has just validated, with no Electrum or Esplora server involved.
+"libbitcoin" is an unrelated C++ project, not part of Bitcoin Core. It has a much smaller user base and would need C++ FFI. Not recommended.
 
-BDK is used in production wallets. I believe Proton Wallet is built on it, but **confirm before citing publicly**. It is maintained by a team funded by Spiral and other sponsors, and it has had external review.
+### "Legacy" terminology
 
-### Why 020 rejected it, and why that should be revisited
+- **Legacy addresses** (`1…`, P2PKH): fully supported by this stack. `rust-bitcoin` computes legacy sighashes; `miniscript` handles `pkh()` descriptors. Bitcoin Core also still signs them (`pkh()` descriptors).
+- **Legacy wallets** in Core means the old BDB wallet *file format*, removed from Core in favor of descriptor wallets. Irrelevant to us; we are descriptor-based from day one.
 
-020's argument: "BDK is designed for the wallet-talks-to-remote-backend model; our wallet shares a process with the node, so BDK's `ChainSource` abstraction is fighting our actual architecture."
+The real limitation for legacy *spends* is **data, not library support**. Signing a legacy (non-segwit) input, or giving a PSBT to most hardware wallets, needs the full previous transaction. Coins found by the UTXO-set walk (035) only have `(outpoint, value, scriptPubKey, height, coinbase)`. Bitcoin Core on a pruned node has the same limitation: it can't rescan pruned blocks either. Fix, owned by 035:
+1. Going forward, the scanner stores the full funding transaction for every wallet coin it sees in a block.
+2. For pre-snapshot coins that need a parent tx, fetch that single historical block (height is in the UTXO entry) from an archival peer, verify it against our own header chain and merkle root, and extract the tx. Trustless; no server.
 
-That was true of BDK 0.x. Since 1.0, the chain source has been decoupled. The real question is no longer architecture fit. It is one specific data-model question (below).
+Native segwit (BIP84) and Taproot (BIP86) spends from our own hot wallet need only `witness_utxo` (amount + script), which the UTXO set already provides.
 
-020 also plans ~400 lines of hand-written BnB + knapsack coin selection. That is exactly the kind of code where an off-by-one in change/dust handling silently overpays fees or produces non-standard txs.
+## The stack
 
-## The spike question
+| Concern | Library | Notes |
+|---|---|---|
+| Keys, BIP32 derivation, addresses, scripts, sighash, PSBT | `bitcoin` (rust-bitcoin, already a dependency at 0.32) | Same crate Hercules already uses for consensus data |
+| ECDSA / Schnorr signing | `secp256k1` (libsecp256k1 bindings, transitive via `bitcoin`) | The same C library Bitcoin Core uses |
+| Descriptors → scripts, satisfaction, PSBT finalization | `miniscript` (rust-miniscript) | Canonical Rust descriptor implementation |
+| Mnemonics, BIP39 passphrases | `bip39` | Small, widely used |
+| Coin selection | **Our port of Bitcoin Core's algorithms** (BnB, CoinGrinder, Knapsack, SRD + waste metric) | Port Core's `coinselector_tests` cases as Rust tests; diff behavior against Core on regtest |
+| Fee / change / dust | Ours, on top of the above | Small; tested against Core regtest via `walletcreatefundedpsbt` comparisons |
+| Silent payments (043) | Evaluate `rust-silentpayments`; otherwise implement against BIP352's official test vectors | Maturity **unverified** |
 
-**Can `bdk_wallet` represent coins discovered by walking our UTXO set, without having their parent transactions?**
+## Spike plan
 
-This is the crux. Hercules starts from an AssumeUTXO snapshot (height 943,500). When a user restores a seed or imports an xpub (035), we find their coins by scanning the UTXO set. We get `(outpoint, value, scriptPubKey, height, coinbase)` per coin, **but not the full funding transaction**. That transaction was in a block we never downloaded.
-
-BDK's wallet model is transaction-graph based: a UTXO is "an output of a tx in my graph that no other tx in my graph spends." Things to test:
-
-1. Does `TxGraph::insert_txout(outpoint, txout)` (floating txouts) let those coins count toward balance and be selected for spending? Or is it only used for fee calculation of foreign inputs? I suspect the latter. **Verify.**
-2. If not, can we synthesize a minimal anchor or "virtual" tx? That would be a hack and is probably a no.
-3. Can PSBT signing work with only `witness_utxo` (no `non_witness_utxo`) for segwit inputs? Yes for segwit v0/v1 by spec. Confirm BDK doesn't require the full parent for P2WPKH/P2TR.
-
-## Proposed design: two outcomes
-
-### Outcome A: BDK can hold parentless coins
-- `bdk_wallet::Wallet` per wallet (main, each watch-only, each open passphrase wallet; see 037/038)
-- Persistence via BDK's changeset model into our wallet DB (SQLite file, separate from chain data; see 037)
-- Feed validated blocks from the single block-connect path (035)
-- Feed mempool txs via `apply_unconfirmed_txs` (040)
-- Use `TxBuilder` for sends, BDK's signer for signing (036 controls when the seed is in memory)
-
-### Outcome B: it can't
-- Our own wallet state (outpoint set, tx records, labels) in `wallet.rs` / `wallet_store.rs` as 020 planned
-- **But** use library code for everything risky:
-  - `miniscript` for descriptors → scripts/addresses
-  - `bdk_coin_select` for coin selection (no hand-written BnB)
-  - `bitcoin::psbt` + `miniscript`'s PSBT finalizer for construction and finalization
-  - `bitcoin::bip32` for derivation, `bip39` crate for mnemonics
-  - `secp256k1` (already transitive via `bitcoin 0.32`) for signing
-
-Either way, 020's line "Coin selection (~400 lines BnB+knapsack) we write ourselves" is struck.
-
-### Silent payments (for 043)
-
-BIP352 needs sender-side output derivation and receiver-side per-block scanning. Library options to evaluate (all **unverified maturity**): `rust-silentpayments` (cygnet), and any BDK-ecosystem SP work. If nothing is mature, SP derivation is small enough to implement against BIP352's official test vectors. That is the one place we may hand-roll, with test vectors as the safety net.
+1. Derive BIP84 and BIP86 addresses from the official BIP test-vector mnemonics; match byte-for-byte.
+2. Build a PSBT spending a coin known only from `(outpoint, value, scriptPubKey)` (no parent tx), sign with `secp256k1`, finalize with `miniscript`, broadcast to `bitcoind -regtest`, confirm it mines.
+3. Same for a P2PKH input with the parent tx supplied (proves the legacy path).
+4. Port BnB + one fallback algorithm from Core with a handful of Core's test cases; check selected sets match.
+5. Measure iOS static-lib size delta.
 
 ## Files touched
 
 | File | Action |
 |---|---|
-| `tickets/034-wallet-engine-selection.md` | Add "Decision" section with outcome + evidence |
+| `tickets/034-wallet-engine-selection.md` | Record spike results (crates + pinned versions, size delta, gaps) |
 | `spikes/wallet-engine/` (throwaway, not merged to main) | Prototype crate |
-| `tickets/020-in-app-wallet.md` | Update dependency section to point here (after decision) |
-| `README.md` | Stack table row (handled by 044) |
+| `tickets/020-in-app-wallet.md` | Point its engine section here |
+| `README.md` | Remove "Wallet API: BDK (future)" (handled by 044) |
 
 ## Dependencies
 
-- None. This should run **first** among the wallet tickets, because 035–040 all assume a wallet engine.
+None. Can run in parallel with the node-safety tier (023–027).
 
 ## Estimated effort
 
-3–5 days, time-boxed:
-- 1 day: read current `bdk_wallet` / `bdk_chain` API, answer the parentless-coin question on paper
-- 2 days: prototype: derive BIP84 receive/change addresses from a test mnemonic, inject a parentless coin, build + sign a spend on **regtest**, broadcast to a local `bitcoind -regtest` and confirm it mines
-- 1 day: write the decision, measure binary-size delta for the iOS static lib
+2–4 days for the spike. The production coin-selection port is roughly 1 week including test porting, and lands with the send flow (020 Phase 2).
 
 ## Verification
 
-- Prototype derives the BIP84 test-vector addresses (BIP84 spec vectors) exactly
-- Prototype spends a coin that was injected without its parent tx, and regtest `bitcoind` accepts and mines it
-- Decision section lists: chosen outcome, crates + pinned versions, binary-size delta, known limitations
+- BIP84/BIP86 test vectors match exactly
+- Regtest `bitcoind` accepts and mines the segwit spend built without a parent tx, and the legacy spend built with one
+- Ported coin-selection tests pass and agree with Core on the sampled cases
 
 ## Open questions
 
-- **Binary size / compile time.** Does `bdk_wallet` materially grow the iOS framework? Measure, don't guess.
-- **Persistence.** BDK's changesets vs. our own SQLite schema. Both fit; prefer whatever keeps wallet data in a file separate from chain data (030/037).
-- **Multi-wallet scaling.** One BDK `Wallet` per wallet, or one shared indexer with keychains per wallet? Matters for scanning cost in push wakes (035, 028).
-- **Who owns the decision if outcome is ambiguous** (e.g. parentless coins work but awkwardly)? Recommendation: prefer B over fighting BDK internals.
+- **Which Core coin-selection algorithms to port first.** Recommendation: BnB (changeless) + CoinGrinder or Knapsack fallback; SRD later.
+- **Hardware-wallet PSBTs (020 Phase 3):** confirm which signers require `non_witness_utxo` even for segwit, and therefore when the historical-block fetch above is needed.
 
 ## Roadmap position
 
-First wallet ticket. **034 → 035 → 036 (design) → 037 → …**. Can run in parallel with the Tier 0 node-safety tickets (022–027), since it touches no node code.
+First wallet ticket: **034 → 035 → 036 (design) → 037 → …**. Touches no node code.

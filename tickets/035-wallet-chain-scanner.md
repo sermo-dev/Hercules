@@ -2,8 +2,10 @@
 
 ## Decisions (2026-10-23)
 
-- **Decided:** Phase 2 (BIP158 filter serving for external wallets via ticket 014) is optional and deferred. v1 is the in-app wallet only, so only Phase 1 (direct script matching + UTXO-set walk) is in scope.
+- **Decided (2026-10-24):** the BIP158 filter-serving phase is dropped from this ticket. Its only consumer was external wallets via ticket 014's custom onion API, which no existing wallet speaks. This ticket is the in-app scanner only. If filter serving is ever wanted, it gets its own ticket.
 - **Note:** a prototype of Phase 1 already exists as uncommitted work on branch `ticket-020-in-app-wallet` (`wallet.rs`, `wallet_store.rs`, `process_block` hooks). Reuse it rather than starting fresh.
+
+- **Added (2026-10-24):** the scanner stores the full funding transaction for every wallet coin it sees in a block, and can fetch a single historical block from an archival peer (height comes from the UTXO entry; verify against our headers + merkle root) when a pre-snapshot coin needs its parent tx for a legacy or hardware-wallet spend (see 034).
 
 ## Summary
 
@@ -13,7 +15,7 @@ Build the component that answers "which coins belong to my wallets?" from data t
 2. **UTXO-set walk.** On import, restore, or passphrase-unlock, scan the LMDB UTXO set once to find current coins.
 3. **Recent-block rescan.** Re-check the last ≤288 stored blocks (e.g. when gap-limit lookahead extends).
 
-BIP158 compact filters are **Phase 2** of this ticket (for external wallets), not the in-app wallet's primary mechanism. That corrects ticket 020.
+BIP158 compact filters are **not** part of this ticket. The in-app wallet doesn't need them (see below), which corrects ticket 020. This is the same model Bitcoin Core's built-in wallet uses: the node notifies the wallet of each connected block and the wallet matches against its own script set.
 
 ## Background
 
@@ -77,14 +79,6 @@ The block store keeps the last ~288 blocks (`block_store.rs`). Rescan them when 
 - **Balance is always correct**, because the UTXO set is complete.
 - **History starts at the snapshot height** (or wallet creation, whichever is later). Coins received and spent before the snapshot are invisible. Show "History available since block 943,500" in the UI. A coin found by the walk gets a synthetic "received before history start" row.
 
-### Phase 2: BIP158 filters (external wallets)
-
-- Build basic filters (type 0x00) per BIP158 during `connect_block` from the already-resolved prevout scripts, and store them (SQLite, keyed by height). Also build filter headers.
-- Serve via `get_compact_filter` in `wallet_rpc.rs` (014) and optionally BIP157 P2P messages.
-- Filters exist only from the snapshot height forward. Document that.
-- Enables 021 option 2 (reverse lookup).
-- Verify against BIP158's official test vectors.
-
 ## Files touched
 
 | File | Action |
@@ -92,8 +86,6 @@ The block store keeps the last ~288 blocks (`block_store.rs`). Rescan them when 
 | `hercules-core/src/wallet_scan.rs` | **New**: WatchSet, block hook, UTXO walk, rescan |
 | `hercules-core/src/sync.rs` | Consolidate three validate+apply paths into `connect_block`; call hook |
 | `hercules-core/src/utxo.rs` | Expose spent-entry info from `apply_block` / `rollback_block` to hook; chunked walk iterator |
-| `hercules-core/src/block_filter.rs` | **New** (Phase 2) |
-| `hercules-core/src/wallet_rpc.rs` | Implement `get_compact_filter` (Phase 2) |
 | `hercules.udl` / `lib.rs` | Scan progress + cancel; wallet events |
 
 ## Dependencies
@@ -104,8 +96,7 @@ The block store keeps the last ~288 blocks (`block_store.rs`). Rescan them when 
 
 ## Estimated effort
 
-- Phase 1: 1.5–2 weeks (refactor 2–3 days, hook + WatchSet 3 days, walk + checkpoint + progress 3–4 days, device benchmarking 1 day)
-- Phase 2: 1 week
+- 1.5–2 weeks (refactor 2–3 days, hook + WatchSet 3 days, walk + checkpoint + progress 3–4 days, device benchmarking 1 day)
 
 ## Verification
 
@@ -115,7 +106,6 @@ The block store keeps the last ~288 blocks (`block_store.rs`). Rescan them when 
 - Mainnet: import a known xpub with a known balance → walk reports exact balance; record on-device timing (iPhone model, cold/warm)
 - Kill the app mid-walk → resumes from checkpoint
 - Push-wake budget: hook adds <50 ms to block connect with 5 wallets loaded
-- Phase 2: BIP158 test vectors pass byte-for-byte
 
 ## Open questions
 
