@@ -998,6 +998,23 @@ impl PeerPool {
         out
     }
 
+    /// Empty pool with no DNS discovery or persistence, for tests in other
+    /// modules that populate it via `add_inbound_peer`.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> PeerPool {
+        PeerPool {
+            slots: Arc::new(Mutex::new(Vec::new())),
+            addrs: AddrManager::new(MAX_KNOWN_ADDRS),
+            our_height: 0,
+            last_dns_query: Instant::now(),
+            bans: HashMap::new(),
+            tor: None,
+            store: None,
+            last_score_flush: Instant::now(),
+            last_addr_flush: Instant::now(),
+        }
+    }
+
     /// Return the "best" peer for header sync, temporarily taking it out of
     /// the pool. The caller MUST return it via `return_peer`.
     ///

@@ -18,7 +18,7 @@ use bitcoin::Txid;
 use crate::block_store::BlockStore;
 use crate::block_validation::{validate_block, validate_block_scripts};
 use crate::mempool::Mempool;
-use crate::p2p::msg_name;
+use crate::p2p::{msg_name, PeerError};
 use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
 use crate::tor::TorManager;
@@ -61,6 +61,12 @@ const HEADER_DIVERGENCE_PENALTY: u32 = 50;
 /// Lighter penalty for a 2-peer disagreement we can't break with a third
 /// opinion — both peers get this since we don't know who's lying.
 const HEADER_DISAGREEMENT_PENALTY: u32 = 10;
+
+/// Penalty for a peer that didn't deliver the block we requested (sent a
+/// different block, or nothing, within the bound/timeout). Small because an
+/// honest peer racing an announcement can trip it; the full ban weight is
+/// reserved for a matching block that fails consensus (ticket 024).
+const BLOCK_NOT_RECEIVED_PENALTY: u32 = 10;
 
 /// Cap on how many addresses we'll process from a single addr / addrv2
 /// message. Bitcoin Core's MAX_ADDR_TO_SEND is 1000; we accept the same
@@ -310,6 +316,72 @@ fn record_known_txid(state: &mut PeerRelayState, txid: Txid) {
         state.known_txids.clear();
     }
     state.known_txids.insert(txid);
+}
+
+/// Download `block_hash` for the push-wake path, trying at most two peers.
+///
+/// Returns `None` unless a block whose hash equals `block_hash` was
+/// obtained — the caller must not advance `validated_height` in that case.
+/// A peer that fails to deliver the requested block (`BlockNotReceived`, or
+/// a mismatched block slipping past `get_block`) is penalized and, if the
+/// deadline allows, the request is retried once with a different peer.
+/// Transport errors keep the previous behavior: give up and report
+/// header-only.
+fn fetch_requested_block(
+    pool: &mut PeerPool,
+    block_hash: BlockHash,
+    deadline: Instant,
+) -> Option<bitcoin::block::Block> {
+    let mut tried: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        if !tried.is_empty() && Instant::now() >= deadline {
+            info!("validate_latest_block: deadline reached, not retrying block download");
+            return None;
+        }
+        let block_peer = if tried.is_empty() {
+            pool.any_peer()
+        } else {
+            pool.peer_addr_excluding(&tried)
+                .and_then(|addr| pool.checkout_peer_by_addr(&addr))
+        };
+        let mut block_peer = block_peer?;
+        let block_peer_addr = block_peer.addr().to_string();
+        tried.push(block_peer_addr.clone());
+
+        match block_peer.get_block(block_hash) {
+            // Defense in depth: get_block already binds to the requested
+            // hash, but re-check here so a future p2p refactor can't
+            // silently reopen the substitution hole.
+            Ok(block) if block.block_hash() == block_hash => {
+                pool.return_peer(block_peer);
+                return Some(block);
+            }
+            Ok(block) => {
+                warn!(
+                    "validate_latest_block: {} sent block {}, expected {}",
+                    block_peer_addr,
+                    block.block_hash(),
+                    block_hash
+                );
+                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+            }
+            Err(e @ PeerError::BlockNotReceived { .. }) => {
+                info!(
+                    "validate_latest_block: {} from {}, trying another peer",
+                    e, block_peer_addr
+                );
+                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+            }
+            Err(e) => {
+                info!(
+                    "validate_latest_block: block download failed: {}, returning header-only result",
+                    e
+                );
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Pending transaction relay with Poisson delay.
@@ -2160,7 +2232,7 @@ impl HeaderSync {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
-        let pool = PeerPool::new(
+        let mut pool = PeerPool::new(
             our_height,
             self.tor.clone(),
             self.peers_db_path.as_deref(),
@@ -2276,16 +2348,8 @@ impl HeaderSync {
         }
 
         let block_hash = new_header.block_hash();
-        let block_peer = pool.any_peer();
-        if block_peer.is_none() {
-            return Ok(notification);
-        }
-        let mut block_peer = block_peer.unwrap();
-
-        match block_peer.get_block(block_hash) {
-            Ok(block) => {
-                pool.return_peer(block_peer);
-
+        match fetch_requested_block(&mut pool, block_hash, deadline) {
+            Some(block) => {
                 if Instant::now() >= deadline {
                     return Ok(notification);
                 }
@@ -2333,11 +2397,9 @@ impl HeaderSync {
                 notification.validated = true;
                 info!("validate_latest_block: block {} fully validated", new_tip);
             }
-            Err(e) => {
-                info!(
-                    "validate_latest_block: block download failed: {}, returning header-only result",
-                    e
-                );
+            None => {
+                // Never got the requested block: validated_height stays put
+                // and the caller gets the header-only notification.
             }
         }
 
@@ -2721,6 +2783,85 @@ mod tests {
     use bitcoin::p2p::address::{AddrV2, AddrV2Message};
     use bitcoin::p2p::ServiceFlags;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use crate::p2p::tests::{loopback_peer_pair, synthetic_block, write_message};
+
+    // ── fetch_requested_block (ticket 022 wake path) ───────────────────
+
+    /// Pool of loopback peers; returns the server halves in pool order.
+    fn loopback_pool(n: usize) -> (PeerPool, Vec<(String, std::net::TcpStream)>) {
+        let pool = PeerPool::new_for_test();
+        let mut servers = Vec::new();
+        for _ in 0..n {
+            let (peer, server) = loopback_peer_pair();
+            let addr = peer.addr().to_string();
+            assert!(pool.add_inbound_peer(peer));
+            servers.push((addr, server));
+        }
+        (pool, servers)
+    }
+
+    /// Fill the peer's 20-message bound with a block other than the one
+    /// being requested, so `get_block` ends in `BlockNotReceived`.
+    fn serve_wrong_block(server: &mut std::net::TcpStream) {
+        for _ in 0..20 {
+            write_message(server, NetworkMessage::Block(synthetic_block(2)));
+        }
+    }
+
+    #[test]
+    fn fetch_requested_block_returns_none_when_peers_serve_wrong_block() {
+        // Unit-level regression for the push-wake path: when no peer
+        // delivers the requested block, the fetch yields None, so
+        // validate_latest_block never reaches apply_block or
+        // set_validated_height. (End-to-end coverage lands with ticket 027.)
+        let (mut pool, mut servers) = loopback_pool(2);
+        for (_, server) in servers.iter_mut() {
+            serve_wrong_block(server);
+        }
+        let wanted_hash = synthetic_block(1).block_hash();
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        assert!(fetch_requested_block(&mut pool, wanted_hash, deadline).is_none());
+        for (addr, _) in &servers {
+            assert_eq!(
+                pool.get_score(addr),
+                Some(100 - BLOCK_NOT_RECEIVED_PENALTY as i32),
+                "peer {} should be penalized",
+                addr
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_requested_block_retries_with_another_peer() {
+        let (mut pool, mut servers) = loopback_pool(2);
+        let wanted = synthetic_block(1);
+        let wanted_hash = wanted.block_hash();
+        serve_wrong_block(&mut servers[0].1);
+        write_message(&mut servers[1].1, NetworkMessage::Block(wanted));
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        let got = fetch_requested_block(&mut pool, wanted_hash, deadline).expect("block");
+        assert_eq!(got.block_hash(), wanted_hash);
+        assert_eq!(
+            pool.get_score(&servers[0].0),
+            Some(100 - BLOCK_NOT_RECEIVED_PENALTY as i32)
+        );
+        assert_eq!(pool.get_score(&servers[1].0), Some(100));
+    }
+
+    #[test]
+    fn fetch_requested_block_does_not_retry_past_deadline() {
+        let (mut pool, mut servers) = loopback_pool(2);
+        serve_wrong_block(&mut servers[0].1);
+        write_message(&mut servers[1].1, NetworkMessage::Block(synthetic_block(1)));
+        let wanted_hash = synthetic_block(1).block_hash();
+
+        // Deadline already passed: the first attempt still runs (the
+        // caller checked the deadline before calling), but no retry.
+        assert!(fetch_requested_block(&mut pool, wanted_hash, Instant::now()).is_none());
+        assert_eq!(pool.get_score(&servers[1].0), Some(100));
+    }
 
     // ── is_routable ────────────────────────────────────────────────────
 
