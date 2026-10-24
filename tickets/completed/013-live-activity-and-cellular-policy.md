@@ -1,5 +1,12 @@
 # Ticket 013: Live Activity, Widget, and Cellular Data Policy
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. Cellular policy, widget and Live Activity code shipped (`NetworkPolicy.swift`, `HerculesWidget/`, `NodeActivityAttributes.swift`, `SharedNodeState.swift`).
+
+- **→ 031:** Live Activity config. `NSSupportsLiveActivities` is missing, so Live Activities probably never appear (`031…md:8,22,68`). 031 also fixes the widget target that `project.yml` would drop.
+- **Remaining new work (tracked in 046):** widget reload budget (open question below). Every shared-state write calls `WidgetCenter.shared.reloadAllTimelines()` (`SharedNodeState.swift:193`). Reloads per day have not been measured or logged.
+
 ## Summary
 
 Three coupled iOS surfaces that share a single state model and ship in three independently-shippable phases:

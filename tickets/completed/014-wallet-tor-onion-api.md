@@ -1,5 +1,14 @@
 # Ticket 014: Wallet-Facing Tor Onion API
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. v1 shipped (wallet onion service, HTTP Basic auth, JSON-RPC in `wallet_rpc.rs`, pairing UI).
+
+- **Dropped (decided in 035):** `get_compact_filter`. Still a stub returning `METHOD_NOT_FOUND` (`wallet_rpc.rs:545-551`). Ticket 046 first pointed this to 035 phase 2, but 035 (2026-10-24) dropped BIP158 filter serving because no existing wallet speaks this API (`035…md:5`). If filter serving is wanted later, it gets its own ticket.
+- **→ 033:** `broadcast_transaction` only adds to the local mempool and never announces to peers (`033…md:7`).
+- **Won't do (v1):** Tor v3 client authorization (Part 4 Layer 2) and per-wallet tokens/revoke (open question). The in-app wallet (020) is now the primary path. Revisit if external-wallet use grows.
+- **Won't do (v1):** subscriptions/SSE. Clients poll `get_tip`.
+
 ## Summary
 
 Expose Hercules to external Bitcoin wallets over a dedicated Tor hidden service so the user's wallet — Sparrow on a paired desktop, a hardware-wallet companion app, a separate phone — can use *their own* Hercules node as its backend instead of trusting a public Electrum server or block explorer. The user gets meaningful node privacy without running a separate machine.

@@ -574,7 +574,9 @@ class NotificationManager: ObservableObject {
 
     // MARK: - Background Catch-Up Task
 
-    static let catchUpTaskIdentifier = "dev.sermo.hercules.catchup"
+    /// `BGTASK_CATCHUP_ID` in Config/Shared.xcconfig (also generates the
+    /// `BGTaskSchedulerPermittedIdentifiers` entry).
+    static let catchUpTaskIdentifier = AppIdentifiers.catchUpTaskID
 
     /// Handle a BGAppRefreshTask for accelerated catch-up after a gap.
     func handleCatchUpTask(_ task: BGAppRefreshTask) {

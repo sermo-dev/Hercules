@@ -1,5 +1,9 @@
 # Ticket 046: Completed-Ticket Debt (Housekeeping)
 
+## Status (2026-10-24): Docs pass done. Ready to move to `completed/`
+
+Every completed ticket listed below now has a `## Status (2026-10-24)` section. Verified boxes are ticked with file:line evidence, and every remaining unchecked box carries a pointer (→ NNN, Won't do, Not done/superseded, or new work listed here). See **Outcomes** and **Remaining new work** below. Per convention, the move to `completed/` happens in a separate commit after merge. The small new-work items are not done in this PR.
+
 ## Summary
 
 Several tickets in `tickets/completed/` still have unchecked acceptance boxes, open questions with no recorded answer, or items explicitly deferred to "later". Some of that is done in code but never recorded. Some has been absorbed by new tickets (022-045), and some is genuinely outstanding. This ticket walks each one and assigns a disposition, so `completed/` means what it says and nothing quietly falls through.
@@ -98,6 +102,67 @@ No Status sections. 009 Phase B (full descendant eviction, `009…md:33,46`) app
 |---|---|
 | Layer 2 multi-source attestations (`017…md:126+`), blocked on finding reviewers | **→ 032** (pipeline publishes reproducible artifacts reviewers can attest to) |
 | On-device MuHash cost (`:77`, `:116`) | **New work**: measure on oldest supported iPhone; record |
+
+## Outcomes (docs pass, 2026-10-24)
+
+Verified against code on `main` at `72d9327`. Where the code disagreed with the inventory above, the outcome follows the code and the row says so.
+
+| Ticket | Item | Outcome | Evidence / note |
+|---|---|---|---|
+| 001 | 6 acceptance boxes | **Done** (ticked) | `peer_pool.rs:15` (MAX_OUTBOUND=12), `:538,:799-812` (/16), `peer_store.rs:159,178` (bans), `sync.rs:784` (cross-check; inventory said `:712`), `ContentView.swift:1592` (PeersCard). A divergent peer is penalised 50 (`sync.rs:59`) and banned at ≤20 from 100, so it's dropped on the second divergence |
+| 001 | First-hash-only cross-check | **Folded into 023** | `023…md:43,76` |
+| 001 | Parallel range download | **Won't do** | Single-peer header download is fast enough after AssumeUTXO |
+| 001 | Manual "add my own node" peer | **New work** | No code exists |
+| 004 | 6 of 8 boxes (blocks, scripts, LMDB, AssumeUTXO, real-time, catch-up) | **Done** (ticked) | `block_validation.rs:83-95,195,226`, `sync.rs:533`, `sync.rs:2412` |
+| 004 | Pruning / ~10-12 GB bound | **Partly done; bound folded into 030** | Pruning at `sync.rs:1219-1222`. Bound unverified on device |
+| 004 | UI: storage usage | **Folded into 030** | Not shown. `030…md:100` |
+| 004 | UI: UTXO set size | **New work** | `utxo_count` only in `SnapshotInfo` (`hercules.udl:39`), not displayed. Not in 030 |
+| 004 | Snapshot hosting | **Folded into 032** | |
+| 004 | ETA when >~100 behind | **New work** | No ETA in `ContentView.swift` |
+| 005 | heed backend, undo sub-DB, drop SQLite UTXO | **Done** (ticked) | `Cargo.toml:19`, `utxo.rs:131-208`, `utxo.rs:112,187` |
+| 005 | `UtxoBackend` trait | **Not done (superseded)**, left unticked | Inventory said Done. No trait exists; LMDB replaced SQLite directly |
+| 005 | Benchmark 0-200K | **Won't do** | Per-block timing via 028 wake-phase instrumentation (`028…md:39-50`) |
+| 005 | `max_map_size` + on-device mmap | **Folded into 030** | `utxo.rs:30` (64 GB), `030…md:27,79-81` |
+| 006 | Depth limit | **Done** (decision recorded) | `MAX_REORG_DEPTH = 288` (`sync.rs:46`) = prune window (`sync.rs:1219-1222`) |
+| 006 | Reorg tests | **Folded into 027 + 025** | Only unit pieces exist: `utxo.rs:1537`, `store.rs:615` |
+| 006 | UI `reorg_depth` | **Folded into 025** | No field in UDL/Swift; `025…md:106` |
+| 008 | Mempool persistence | **Won't do (v1)** | None exists. 041 removes the need |
+| 008 | Snapshot format (HUTX) | **Done**, revisit in 032 | `bin/convert_snapshot.rs` |
+| 008 | Mempool 50 vs 150 MB | **Folded into 030** | `mempool.rs:21` = 150 MB; comments `:82,:113` still say 50 MB |
+| 008 | AssumeUTXO 935,000 | **Superseded note added** | `assumeutxo.rs:12` = 943,500. Also 017, 044 |
+| 009 | Phase A + B RBF | **Done** | `mempool.rs:63,322,808`. Tests `:1961-2168`. Gap: no test for the 100-eviction cap |
+| 010 | CPFP / ancestor tracking | **Done** | `mempool.rs:48,53,58,1126`. Tests `:1638-1916`. Gaps: no 101 kvB size-limit test; `select_for_block` not built (optional) |
+| 013 | Widget reload budget | **New work** | `reloadAllTimelines` on every write (`SharedNodeState.swift:193`), not measured |
+| 013 | Live Activity config | **Folded into 031** | `031…md:8,22,68` |
+| 014 | `get_compact_filter` stub | **Dropped (decided in 035)** | Inventory said → 035 phase 2. 035 has since dropped BIP158 serving (`035…md:5`). Stub at `wallet_rpc.rs:545-551` |
+| 014 | Tor client auth, per-wallet tokens | **Won't do (v1)** | |
+| 014 | Broadcast never relayed | **Folded into 033** | `033…md:7` |
+| 014 | Subscriptions/SSE | **Won't do (v1)** | |
+| 015 | Phase 1 budgeted catch-up | **Done** | `sync.rs:2412`, `hercules.udl:54,119` |
+| 015 | Phase 2 `BGProcessingTask` | **Folded into 028** | Only `BGAppRefreshTask` (`AppDelegate.swift:43-48`, `NotificationManager.swift:400,445`); `028…md:27,76` |
+| 015 | ">~288 blocks may fail" copy | **New work** | No such copy in Swift |
+| 016 | Part 1 tip cross-check | **Done (simplified)** | Wake path `catch_up_blocks` cross-checks once per wake (`sync.rs:2500-2526`). Single witness + tiebreaker, not parallel 3-peer |
+| 016 | MAX_OUTBOUND revisit | **Folded into 028** | `peer_pool.rs:15` = 12, no instrumentation; `028…md:35,73` |
+| 016 | ASN-diverse sample | **Decision recorded: /16 is the accepted proxy** | No ASN data anywhere, and 023 doesn't add any. Cross-check witness bucket-distinctness **unverified** |
+| 017 | Layer 3 forward-validation counter | **Done** | `sync.rs:581-599`, `SettingsView.swift:100-105` |
+| 017 | Layer 1 MuHash | **Partly done** | Computed/stored/displayed (`utxo.rs:820,884,396`, `SettingsView.swift:201`). No enforced `ASSUMEUTXO_MUHASH` constant |
+| 017 | Layer 2 attestations | **Folded into 032** | `032…md:70,74` |
+| 017 | On-device MuHash cost | **New work** | Not measured |
+
+Verification: every box left unchecked in `tickets/completed/{004,005}` carries a pointer, and the other completed tickets in this list have no checkbox lists. 007, 011, 018 and 022 were outside this ticket's inventory and are untouched.
+
+## Remaining new work
+
+Small items not covered by any other ticket. Do each as its own small PR. No new tickets were created.
+
+1. **Manual trusted peer** (001): Settings field to pin a user's own node. Also useful with 029.
+2. **Catch-up ETA** (004): show an estimated time when more than ~100 blocks behind.
+3. **UTXO set size in UI** (004): surface `utxo_count` (already in `SnapshotInfo`, `hercules.udl:39`) or a live count. Not covered by 030.
+4. **Widget reload measurement** (013): log `reloadAllTimelines` calls per day on device against the ~40-70/day WidgetKit budget.
+5. **Catch-up >288 caveat** (015): one line of UI copy, unless 028 handles it.
+6. **On-device MuHash timing** (017): measure snapshot-load MuHash cost on the oldest supported iPhone and record it in 017.
+
+Test gaps found during verification (optional, small): a test for the RBF 100-eviction cap (`TooManyReplacements`) and for the 101 kvB ancestor size limit.
 
 ## Proposed process
 

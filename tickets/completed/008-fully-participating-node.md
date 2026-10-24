@@ -1,5 +1,15 @@
 # Ticket 008: Fully Participating Node (Phase 5)
 
+## Status (2026-10-24)
+
+Housekeeping pass under ticket 046. Sub-phases 5a-5d shipped (snapshot download, `mempool.rs`, relay, inbound onion). Notes on the open questions and on decisions below that drifted from code:
+
+- **Superseded: AssumeUTXO height.** The 935,000 height and hash below (5a and Resolved Decisions) are stale. The code uses `ASSUMEUTXO_HEIGHT = 943_500` (`assumeutxo.rs:12`). See ticket 017 and `assumeutxo.rs` as the source of truth; 044 removes copied heights from docs.
+- **Done: snapshot format.** Hercules-format HUTX, generated from Core `dumptxoutset` by `convert_snapshot` (`hercules-core/src/bin/convert_snapshot.rs`, `Cargo.toml:44-46`). Revisit in **032** (publishing pipeline, `032…md:38,89`).
+- **→ 032:** snapshot hosting (Open Questions). Currently a Cloudflare R2 dev URL.
+- **→ 030: mempool size.** The "50 MB" decision (5b and Resolved Decisions) is stale. Code is `DEFAULT_MAX_SIZE = 150_000_000` (`mempool.rs:21`), and doc comments at `mempool.rs:82` and `:113` still say 50 MB. 030 sets the final iOS cap and fixes the comments.
+- **Won't do (v1): mempool persistence** (`mempool.dat`, Open Questions). No persistence exists. Block-based fee estimation (041) removes the main reason for it (`041…md:25,52`).
+
 ## Summary
 
 Transform Hercules from a validating observer into a full network participant. Today we download and validate but never give anything back. A real pruned node relays blocks and transactions, responds to peer requests, and accepts inbound connections. This ticket covers the full gap.
