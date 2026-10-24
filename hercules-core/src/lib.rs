@@ -76,11 +76,25 @@ pub fn hercules_version() -> String {
 pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
     // Mirror the path-derivation logic in `HeaderSync::new`. Keep in sync.
     let utxo_dir = sync::derive_sibling_path(&db_path, "utxo-lmdb");
-    let blocks_path = db_path.replace("headers", "blocks");
-    let peers_path = db_path.replace("headers", "peers");
+    let blocks_path = sync::derive_sibling_path(&db_path, "blocks.sqlite3");
+    let peers_path = sync::derive_sibling_path(&db_path, "peers.sqlite3");
+    // Orphans from builds before the sibling-path refactor / LMDB switch
+    // (`hercules-blocks`, `hercules-peers`, `hercules-utxo`). Previously this
+    // function used `db_path.replace("headers", ...)`, which pointed at
+    // those stale names and left the live block store and peer DB behind.
+    let legacy_blocks = sync::derive_sibling_path(&db_path, "hercules-blocks.sqlite3");
+    let legacy_peers = sync::derive_sibling_path(&db_path, "hercules-peers.sqlite3");
+    let legacy_utxo = sync::derive_sibling_path(&db_path, "hercules-utxo.sqlite3");
 
     // SQLite files (headers / blocks / peers) — three sidecars each.
-    for base in [&db_path, &blocks_path, &peers_path] {
+    for base in [
+        &db_path,
+        &blocks_path,
+        &peers_path,
+        &legacy_blocks,
+        &legacy_peers,
+        &legacy_utxo,
+    ] {
         for suffix in ["", "-wal", "-shm"] {
             let p = format!("{}{}", base, suffix);
             match std::fs::remove_file(&p) {
@@ -795,6 +809,37 @@ mod tests {
         assert_eq!(status.peer_height, 0);
         assert!(!status.is_syncing);
         assert!(status.error.is_none());
+    }
+
+    #[test]
+    fn reset_database_removes_live_sibling_stores() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("hercules-headers.sqlite3");
+        let db = db_path.to_string_lossy().into_owned();
+        {
+            let _node = HerculesNode::new(db.clone(), None).unwrap();
+        }
+        // Stand-ins for the files HeaderSync opens plus pre-refactor orphans.
+        for name in ["blocks.sqlite3", "peers.sqlite3-wal", "hercules-blocks.sqlite3", "hercules-utxo.sqlite3"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // A file reset must NOT touch (wallet API secret).
+        std::fs::write(dir.path().join("wallet_auth_token"), b"t").unwrap();
+
+        reset_database(db).unwrap();
+
+        for name in [
+            "hercules-headers.sqlite3",
+            "blocks.sqlite3",
+            "peers.sqlite3",
+            "peers.sqlite3-wal",
+            "hercules-blocks.sqlite3",
+            "hercules-utxo.sqlite3",
+            "utxo-lmdb",
+        ] {
+            assert!(!dir.path().join(name).exists(), "{} survived reset", name);
+        }
+        assert!(dir.path().join("wallet_auth_token").exists());
     }
 
     #[test]

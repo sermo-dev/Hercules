@@ -34,12 +34,21 @@ enum NotificationHistory {
     }
 
     static func load() -> [BlockNotificationRecord] {
-        guard let data = try? Data(contentsOf: filePath),
-              let records = try? JSONDecoder().decode([BlockNotificationRecord].self, from: data)
-        else {
-            return []
+        loadIfReadable() ?? []
+    }
+
+    /// Like `load`, but returns nil when the file exists and can't be read
+    /// (e.g. a push wake after reboot before first unlock — the file is
+    /// `completeUntilFirstUserAuthentication`). Lets the caller avoid
+    /// overwriting real history with an empty in-memory copy (ticket 030).
+    static func loadIfReadable() -> [BlockNotificationRecord]? {
+        let data: Data
+        do {
+            data = try Data(contentsOf: filePath)
+        } catch {
+            return FileManager.default.fileExists(atPath: filePath.path) ? nil : []
         }
-        return records
+        return (try? JSONDecoder().decode([BlockNotificationRecord].self, from: data)) ?? []
     }
 
     static func save(_ records: [BlockNotificationRecord]) {

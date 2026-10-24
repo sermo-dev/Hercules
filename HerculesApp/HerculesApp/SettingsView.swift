@@ -14,6 +14,8 @@ struct SettingsView: View {
     @State private var copiedConnectionString = false
     @State private var copiedMuHash = false
     @State private var showRotateConfirm = false
+    @State private var chainDataBytes: Int64?
+    @State private var freeBytes: Int64?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -28,6 +30,7 @@ struct SettingsView: View {
                         trustCard(trust)
                     }
                     cellularDataCard
+                    storageCard
                     walletApiCard
                     notificationToggleCard
                     relayServerCard
@@ -298,6 +301,50 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    // MARK: - Storage (ticket 030)
+
+    private var storageCard: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 6) {
+                    Image(systemName: "internaldrive")
+                        .font(.system(size: 13))
+                        .foregroundStyle(isLowOnSpace ? Theme.warning : Theme.accent)
+                    Text("Storage")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+
+                trustRow(label: "Node data", value: chainDataBytes.map(StorageGuard.format) ?? "…")
+                trustRow(label: "Free on iPhone", value: freeBytes.map(StorageGuard.format) ?? "…")
+
+                if isLowOnSpace, let free = freeBytes {
+                    Text(StorageGuard.lowSpaceMessage(free: free))
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text("Headers, blocks, the UTXO set and Tor state live on this iPhone only. They're excluded from iCloud and computer backups because they can always be re-downloaded and re-verified.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .task {
+            let (used, free) = await Task.detached(priority: .utility) {
+                (StorageGuard.chainDataBytes(), StorageGuard.availableBytes())
+            }.value
+            chainDataBytes = used
+            freeBytes = free
+        }
+    }
+
+    private var isLowOnSpace: Bool {
+        guard let free = freeBytes else { return false }
+        return free < StorageGuard.pauseBelowBytes
     }
 
     private var cellularIcon: String {

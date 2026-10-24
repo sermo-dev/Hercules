@@ -86,6 +86,14 @@ class NodeViewModel: ObservableObject {
     @Published var walletApiConnectionString: String?
     @Published var walletApiError: String?
 
+    // Disk-space guard (ticket 030). `storageWarning` drives the banner on
+    // the main view; `pausedForLowDisk` records that *we* paused validation
+    // (so recovery never overrides a manual pause).
+    @Published var storageWarning: String?
+    private var pausedForLowDisk = false
+    private var lowDiskBannerShown = false
+    private var lastDiskCheck = Date.distantPast
+
     // Thread-safe access to the node: set from background thread, read from main thread
     private var _node: HerculesNode?
     private let nodeLock = NSLock()
@@ -294,7 +302,8 @@ class NodeViewModel: ObservableObject {
 
             // 5. Wipe the on-disk DBs via Rust.
             do {
-                try resetDatabase(dbPath: Self.dbPath())
+                try StoragePaths.prepareForNodeOpen()
+                try resetDatabase(dbPath: StoragePaths.headersDBPath)
             } catch {
                 DispatchQueue.main.async {
                     self.isResetting = false
@@ -331,12 +340,17 @@ class NodeViewModel: ObservableObject {
         isBootstrappingTor = true
         isSyncRunning = true
         errorMessage = nil
+        if !lowDiskBannerShown { storageWarning = nil }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let dbPath = Self.dbPath()
-                let torDir = Self.torDataDir()
-                let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
+                // Migration + protection + backup exclusion must be complete
+                // before any database is opened (ticket 030).
+                try StoragePaths.prepareForNodeOpen()
+                let node = try HerculesNode(
+                    dbPath: StoragePaths.headersDBPath,
+                    torDataDir: StoragePaths.torDataDir
+                )
 
                 // Fetch initial Tor status
                 if let status = node.getTorStatus() {
@@ -350,6 +364,7 @@ class NodeViewModel: ObservableObject {
                     }
                 }
                 self?.node = node
+                DispatchQueue.main.async { self?.checkDiskSpace(force: true) }
 
                 // Honor the user's explicit validation-mode choice. AssumeUTXO
                 // runs the download/import path on a fresh DB; Genesis skips
@@ -359,6 +374,21 @@ class NodeViewModel: ObservableObject {
                 if mode == .assumeUtxo, try node.needsSnapshot() {
                     DispatchQueue.main.async {
                         self?.isConnecting = false
+                    }
+
+                    // Free-space preflight: refuse to start an 8.8 GB download
+                    // that can't be imported. A finished download on disk is
+                    // credited against the requirement.
+                    do {
+                        try StorageGuard.snapshotPreflight(
+                            alreadyDownloaded: SnapshotDownloader.hasDownloadedFile()
+                                ? SnapshotDownloader.expectedBytes : 0
+                        )
+                    } catch {
+                        DispatchQueue.main.async {
+                            self?.storageWarning = error.localizedDescription
+                        }
+                        throw error
                     }
 
                     // Block until the file is on disk. Surfaces progress to
@@ -414,6 +444,7 @@ class NodeViewModel: ObservableObject {
                         self?.isConnecting = false
                         self?.errorMessage = status.error
                         self?.maybePublishWidgetState(from: status)
+                        self?.checkDiskSpace()
                     }
                 }
 
@@ -422,7 +453,17 @@ class NodeViewModel: ObservableObject {
 
             } catch {
                 DispatchQueue.main.async {
-                    self?.errorMessage = "\(error)"
+                    // Storage errors carry user-facing copy and the low-disk
+                    // case already has its own banner.
+                    if let storageError = error as? StorageError {
+                        if case .insufficientSpace = storageError {
+                            self?.errorMessage = nil
+                        } else {
+                            self?.errorMessage = storageError.localizedDescription
+                        }
+                    } else {
+                        self?.errorMessage = "\(error)"
+                    }
                     self?.isConnecting = false
                     self?.isSyncRunning = false
                     self?.isLoadingSnapshot = false
@@ -524,14 +565,47 @@ class NodeViewModel: ObservableObject {
         }
     }
 
-    static func dbPath() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("hercules-headers.sqlite3").path
-    }
+    // MARK: - Disk space guard (ticket 030)
 
-    static func torDataDir() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("tor").path
+    /// Ongoing low-disk guard, called at node start and from the sync
+    /// progress callback (throttled to every 30 s). Below
+    /// `StorageGuard.pauseBelowBytes` it pauses block validation — so LMDB
+    /// and SQLite never hit ENOSPC mid-transaction — and shows the banner;
+    /// above `resumeAboveBytes` it resumes, but only if the guard itself did
+    /// the pausing. Main thread only.
+    func checkDiskSpace(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastDiskCheck) >= 30 else { return }
+        lastDiskCheck = now
+        guard let free = StorageGuard.availableBytes() else { return }
+
+        if free < StorageGuard.pauseBelowBytes {
+            storageWarning = StorageGuard.lowSpaceMessage(free: free)
+            lowDiskBannerShown = true
+            if !pausedForLowDisk, let node = node {
+                pausedForLowDisk = true
+                isValidationPaused = true
+                DispatchQueue.global(qos: .userInitiated).async {
+                    node.setValidationPaused(paused: true)
+                }
+            }
+        } else if free >= StorageGuard.resumeAboveBytes {
+            if pausedForLowDisk {
+                pausedForLowDisk = false
+                isValidationPaused = false
+                if let node = node {
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        node.setValidationPaused(paused: false)
+                    }
+                }
+            }
+            // Clear the low-disk banner. (A snapshot-preflight warning is
+            // cleared when the user taps Start again.)
+            if lowDiskBannerShown {
+                lowDiskBannerShown = false
+                storageWarning = nil
+            }
+        }
     }
 }
 
@@ -674,6 +748,11 @@ struct ContentView: View {
                         // Peers card
                         if let status = viewModel.syncStatus, !status.peers.isEmpty {
                             PeersCard(status: status)
+                        }
+
+                        // Low-storage banner (ticket 030)
+                        if let warning = viewModel.storageWarning {
+                            StorageWarningCard(message: warning)
                         }
 
                         // Error card
@@ -1666,6 +1745,30 @@ struct ErrorCard: View {
                     .font(.system(size: 12, weight: .regular, design: .monospaced))
                     .foregroundStyle(Theme.textSecondary)
                     .lineLimit(4)
+            }
+        }
+    }
+}
+
+struct StorageWarningCard: View {
+    let message: String
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "externaldrive.fill.badge.exclamationmark")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.warning)
+                    Text("Low Storage")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.warning)
+                }
+
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

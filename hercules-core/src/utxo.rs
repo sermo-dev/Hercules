@@ -25,11 +25,24 @@ const SNAPSHOT_VERSION: u32 = 1;
 /// silently into fee math or hash inputs.
 const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
 
-/// Initial LMDB map size: 64 GB. LMDB's `map_size` is *virtual* address space,
-/// not on-disk reservation — actual file growth is lazy. 64 GB gives plenty of
-/// headroom over Bitcoin's ~12 GB UTXO set plus undo data, and easily fits in
-/// the 64-bit virtual address space available on iOS / macOS.
-const INITIAL_MAP_SIZE: usize = 64 * 1024 * 1024 * 1024;
+const GIB: u64 = 1 << 30;
+
+/// Minimum LMDB map size: 32 GiB. `map_size` is *virtual* address space, not
+/// an on-disk reservation (file growth is lazy; we don't use `WRITEMAP`), but
+/// it is not free on iOS: a process without the
+/// `com.apple.developer.kernel.extended-virtual-addressing` entitlement gets
+/// a per-process VA budget far below the hardware limit, and an mmap larger
+/// than that fails at open (ticket 030). The app carries that entitlement;
+/// this floor covers a fresh AssumeUTXO import (~12 GB UTXO set + undo) in a
+/// single session.
+const MIN_MAP_SIZE: u64 = 32 * GIB;
+
+/// Upper bound for the preferred map: never reserve more than this.
+const MAX_MAP_SIZE: u64 = 128 * GIB;
+
+/// Headroom over the current data file kept by the *smallest* fallback map,
+/// i.e. how much the env can grow in one session if VA is tight.
+const MIN_MAP_HEADROOM: u64 = 4 * GIB;
 
 /// Number of named DBs we open inside the env. heed requires this up-front.
 const MAX_DBS: u32 = 8;
@@ -179,13 +192,45 @@ impl UtxoSet {
         // mmap'd file isn't simultaneously opened with conflicting flags from
         // another process. We're a single-process iOS app and never share the
         // env directory across processes, so this contract holds.
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(INITIAL_MAP_SIZE)
-                .max_dbs(MAX_DBS)
-                .open(path)
+        // Map sizing (ticket 030): prefer max(32 GiB, 2 x current data file),
+        // re-evaluated on every open, so the map grows with the UTXO set
+        // across launches/wakes without a resize-while-open dance (an
+        // `MDB_MAP_FULL` mid-session surfaces as an error and the next open
+        // picks a bigger map). If the mmap can't be reserved (iOS VA limit),
+        // fall back to progressively smaller maps down to data + 4 GiB so the
+        // node still opens instead of failing outright.
+        let data_len = fs::metadata(path.join("data.mdb")).map(|m| m.len()).unwrap_or(0);
+        let mut last_err = None;
+        let mut opened = None;
+        for size in map_size_candidates(data_len) {
+            match unsafe {
+                EnvOpenOptions::new()
+                    .map_size(size as usize)
+                    .max_dbs(MAX_DBS)
+                    .open(path)
+            } {
+                Ok(env) => {
+                    opened = Some((env, size));
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "LMDB open at {} with map_size={} GiB failed: {}",
+                        path.display(),
+                        size / GIB,
+                        e
+                    );
+                    last_err = Some(e);
+                }
+            }
         }
-        .map_err(|e| UtxoError(format!("open env at {}: {}", path.display(), e)))?;
+        let (env, map_size) = opened.ok_or_else(|| {
+            UtxoError(format!(
+                "open env at {}: {}",
+                path.display(),
+                last_err.map(|e| e.to_string()).unwrap_or_default()
+            ))
+        })?;
 
         let mut wtxn = env
             .write_txn()
@@ -206,9 +251,10 @@ impl UtxoSet {
             .map_err(|e| UtxoError(format!("commit create-tx: {}", e)))?;
 
         info!(
-            "UTXO LMDB env opened at {} (map_size={} GB)",
+            "UTXO LMDB env opened at {} (map_size={} GiB, data={} MiB)",
             path.display(),
-            INITIAL_MAP_SIZE / (1 << 30)
+            map_size / GIB,
+            data_len >> 20
         );
 
         Ok(UtxoSet {
@@ -1155,6 +1201,28 @@ impl Drop for UtxoSet {
     }
 }
 
+/// Map sizes to try, largest first, for an env whose `data.mdb` is
+/// `data_len` bytes. All are whole GiB (a multiple of every page size).
+/// The first is the preferred size; the rest are fallbacks for when the
+/// address space can't be reserved, ending at data + `MIN_MAP_HEADROOM`.
+fn map_size_candidates(data_len: u64) -> Vec<u64> {
+    let round_up = |n: u64| n.div_ceil(GIB) * GIB;
+    let floor = round_up(data_len + MIN_MAP_HEADROOM);
+    let preferred = round_up(data_len.saturating_mul(2))
+        .clamp(MIN_MAP_SIZE, MAX_MAP_SIZE)
+        .max(floor);
+    let mut sizes = vec![preferred];
+    let mut next = preferred / 2;
+    while next > floor {
+        sizes.push(round_up(next));
+        next /= 2;
+    }
+    if *sizes.last().unwrap() != floor {
+        sizes.push(floor);
+    }
+    sizes
+}
+
 // ── Encoding helpers ────────────────────────────────────────────────
 
 /// Path of the "snapshot load in progress" sentinel for an LMDB env at
@@ -1484,6 +1552,43 @@ mod tests {
         )
         .unwrap();
         deserialize(&raw).unwrap()
+    }
+
+    #[test]
+    fn map_size_candidates_fresh_env_prefers_floor_of_32_gib() {
+        let c = map_size_candidates(0);
+        assert_eq!(c[0], 32 * GIB);
+        assert_eq!(*c.last().unwrap(), 4 * GIB);
+        assert!(c.windows(2).all(|w| w[0] > w[1]), "strictly decreasing: {:?}", c);
+    }
+
+    #[test]
+    fn map_size_candidates_grow_with_data_file() {
+        // Full mainnet UTXO set: ~12 GiB on disk -> 2x = 24 GiB < floor, so 32.
+        assert_eq!(map_size_candidates(12 * GIB)[0], 32 * GIB);
+        // Larger env: 2x, rounded up to whole GiB.
+        assert_eq!(map_size_candidates(20 * GIB + 1)[0], 41 * GIB);
+        // Capped at MAX_MAP_SIZE, but never below data + headroom.
+        assert_eq!(map_size_candidates(100 * GIB)[0], 128 * GIB);
+        assert_eq!(map_size_candidates(130 * GIB)[0], 134 * GIB);
+        for len in [0, GIB, 12 * GIB, 20 * GIB + 1, 100 * GIB] {
+            let c = map_size_candidates(len);
+            assert!(c.iter().all(|s| s % GIB == 0 && *s >= len + MIN_MAP_HEADROOM));
+            assert_eq!(*c.last().unwrap(), (len + MIN_MAP_HEADROOM).div_ceil(GIB) * GIB);
+        }
+    }
+
+    #[test]
+    fn reopen_with_existing_data_uses_larger_map() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("utxo-lmdb");
+        {
+            let set = UtxoSet::open(path.to_str().unwrap()).unwrap();
+            set.apply_block(&genesis_block(), 0).unwrap();
+        }
+        let set = UtxoSet::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(set.count().unwrap(), 1);
+        assert!(set.env.info().map_size >= (32 * GIB) as usize);
     }
 
     #[test]
