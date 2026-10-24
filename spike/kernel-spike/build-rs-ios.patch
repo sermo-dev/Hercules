@@ -1,0 +1,46 @@
+diff --git a/libbitcoinkernel-sys/build.rs b/libbitcoinkernel-sys/build.rs
+index c3946a6a..11a14bcc 100644
+--- a/libbitcoinkernel-sys/build.rs
++++ b/libbitcoinkernel-sys/build.rs
+@@ -79,7 +79,40 @@ fn target_config() -> TargetConfig {
+             ..Default::default()
+         },
+ 
+-        "macos" | "ios" | "tvos" | "watchos" | "visionos" => TargetConfig {
++        // Hercules spike 047: upstream passes no cross-compile flags for iOS, so
++        // cmake silently builds a *macOS* libbitcoinkernel.a. Point cmake at the
++        // right SDK/arch/deployment target.
++        "ios" => {
++            let target = env::var("TARGET").unwrap();
++            let sim = target.ends_with("-sim")
++                || env::var("CARGO_CFG_TARGET_ABI").map(|a| a == "sim").unwrap_or(false);
++            let arch = match &*env::var("CARGO_CFG_TARGET_ARCH").unwrap() {
++                "aarch64" => "arm64",
++                "x86_64" => "x86_64",
++                a => panic!("unsupported iOS arch {a}"),
++            };
++            let deploy = env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "17.0".into());
++            let mut cmake_args = vec![
++                "-DCMAKE_SYSTEM_NAME=iOS".to_string(),
++                format!("-DCMAKE_OSX_SYSROOT={}", if sim { "iphonesimulator" } else { "iphoneos" }),
++                format!("-DCMAKE_OSX_ARCHITECTURES={arch}"),
++                format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={deploy}"),
++                // Boost is header-only for Core; let cmake find the host copy.
++                "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH".into(),
++                "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH".into(),
++            ];
++            if let Ok(p) = env::var("BOOST_ROOT") {
++                cmake_args.push(format!("-DBoost_ROOT={p}"));
++                cmake_args.push(format!("-DCMAKE_PREFIX_PATH={p}"));
++            }
++            TargetConfig {
++                cmake_args,
++                link_directives: cxx_runtime("c++"),
++                rerun_env: &["IPHONEOS_DEPLOYMENT_TARGET", "BOOST_ROOT"],
++            }
++        }
++
++        "macos" | "tvos" | "watchos" | "visionos" => TargetConfig {
+             link_directives: cxx_runtime("c++"),
+             ..Default::default()
+         },

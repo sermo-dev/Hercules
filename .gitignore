@@ -21,3 +21,9 @@ screenshot.png
 *.hutx
 *.hutx.gz
 *_utxo.dat
+
+# Spike 047: third-party sources (Bitcoin Core, crates)
+spike-deps/
+spike/kernel-spike/testdata/mainnet_block_*.json
+spike/KernelSpikeHarness/build/
+spike/KernelSpikeHarness/KernelSpikeHarness.xcodeproj/

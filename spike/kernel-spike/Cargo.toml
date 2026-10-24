@@ -1,0 +1,44 @@
+# Spike 047 (branch spike/047-kernel, never merged).
+# Links Bitcoin Core's libbitcoinkernel (via the `bitcoinkernel` crate, vendored
+# into spike-deps/ with an iOS cmake patch) next to our current patched
+# libbitcoinconsensus v26, to compare script verification and to benchmark
+# kernel's chainstate. See tickets/047-libbitcoinkernel-migration.md.
+[package]
+name = "kernel-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+# spike-deps/ is gitignored; see spike/kernel-spike/README section in ticket 047
+# for how to recreate it (rust-bitcoinkernel v0.3.2 + patches/build-rs-ios.patch).
+bitcoinkernel = { path = "../../spike-deps/rust-bitcoinkernel", optional = true }
+bitcoinconsensus = { version = "0.106", optional = true }
+bitcoin = "0.32"
+hex = "0.4"
+serde_json = "1.0"
+
+[features]
+default = ["kernel"]
+kernel = ["dep:bitcoinkernel"]
+consensus = ["dep:bitcoinconsensus"]
+
+[[bin]]
+name = "kernel-bench"
+required-features = ["kernel"]
+
+[[bin]]
+name = "verify-dump"
+
+[profile.release]
+debug = false
+strip = true
+lto = "thin"
+
+[patch.crates-io]
+bitcoinconsensus = { path = "../../hercules-core/patches/bitcoinconsensus" }
+
+[workspace]

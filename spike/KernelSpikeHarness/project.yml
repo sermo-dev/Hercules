@@ -1,0 +1,27 @@
+# Spike 047 device harness (never merged). Generate with: xcodegen generate
+name: KernelSpikeHarness
+options:
+  bundleIdPrefix: dev.sermo.hercules.spike
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  KernelSpikeHarness:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: ../kernel-spike/testdata
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.sermo.hercules.spike.kernel
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/KernelSpike.h
+        OTHER_LDFLAGS: ["-lc++"]
+        DEVELOPMENT_TEAM: ""   # set your team to run on a device
+    dependencies:
+      - framework: build/KernelSpike.xcframework
+        embed: false
