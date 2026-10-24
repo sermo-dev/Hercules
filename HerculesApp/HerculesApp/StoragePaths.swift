@@ -66,19 +66,33 @@ enum StoragePaths {
     /// `-utxo` names are orphans from builds before the LMDB switch and the
     /// sibling-path refactor. They're moved (not deleted) so they stop
     /// counting against the user's backup; `reset_database` cleans them up.
-    static let legacyChainItems: [String] = {
-        var names: [String] = []
+    ///
+    /// Items are grouped: a primary plus companions that are only meaningful
+    /// next to *that* primary (SQLite `-wal`/`-shm`, the LMDB `.loading`
+    /// sentinel). A group moves or is parked as a unit, so a companion can
+    /// never end up beside a different copy of its primary — a foreign `-wal`
+    /// would be replayed onto the wrong database, and a stray `.loading`
+    /// would make the next open wipe a valid UTXO set.
+    struct ItemGroup {
+        let primary: String
+        let companions: [String]
+    }
+
+    static let legacyChainGroups: [ItemGroup] = {
+        var groups: [ItemGroup] = []
         // `own_txs.sqlite3` (ticket 033) holds the user's own raw
         // transactions; it lives next to the headers DB, so it gets the same
         // move, protection class and backup exclusion.
         for db in [headersFileName, "blocks.sqlite3", "peers.sqlite3", "own_txs.sqlite3",
                    "hercules-blocks.sqlite3", "hercules-peers.sqlite3", "hercules-utxo.sqlite3"] {
-            names += [db, db + "-wal", db + "-shm"]
+            groups.append(ItemGroup(primary: db, companions: [db + "-wal", db + "-shm"]))
         }
         // The `.loading` sentinel MUST travel with the env: without it an
         // interrupted snapshot import would be opened as a valid UTXO set.
-        names += ["utxo-lmdb", "utxo-lmdb.loading", torDirName, "wallet_auth_token"]
-        return names
+        groups.append(ItemGroup(primary: "utxo-lmdb", companions: ["utxo-lmdb.loading"]))
+        groups.append(ItemGroup(primary: torDirName, companions: []))
+        groups.append(ItemGroup(primary: "wallet_auth_token", companions: []))
+        return groups
     }()
 
     /// Directory roots. Injectable so the migration can be exercised
@@ -197,29 +211,65 @@ enum StoragePaths {
         var moved: [String] = []
         var parked: [String] = []
 
-        for name in legacyChainItems {
-            let src = layout.documents.appendingPathComponent(name)
-            // lstat-style existence (don't follow symlinks; a dangling one still moves).
-            guard (try? fm.attributesOfItem(atPath: src.path)) != nil else { continue }
+        // lstat-style existence (don't follow symlinks; a dangling one still moves).
+        func exists(_ url: URL) -> Bool { (try? fm.attributesOfItem(atPath: url.path)) != nil }
+        func rename(_ name: String, _ src: URL, _ dst: URL) throws {
+            if renamex_np(src.path, dst.path, UInt32(RENAME_EXCL)) != 0 {
+                let err = String(cString: strerror(errno))
+                log.error("migration: rename \(name, privacy: .public) failed: \(err, privacy: .public)")
+                throw StorageError.migrationFailed("\(name): \(err)")
+            }
+        }
 
-            var dst = layout.chainDir.appendingPathComponent(name)
-            if (try? fm.attributesOfItem(atPath: dst.path)) != nil {
+        for group in legacyChainGroups {
+            let names = group.companions + [group.primary]
+            let present = names.filter { exists(layout.documents.appendingPathComponent($0)) }
+            if present.isEmpty { continue }
+
+            if exists(layout.chainDir.appendingPathComponent(group.primary)) {
+                // Conflict: Chain/ already has this primary (only possible
+                // after a downgrade recreated data in Documents). Chain/ wins;
+                // park the whole Documents group together so none of its
+                // companions lands next to Chain/'s primary.
                 do {
                     try ensureDirectory(layout.conflictDir)
                 } catch {
                     throw StorageError.migrationFailed("create conflict dir: \(error.localizedDescription)")
                 }
                 let stamp = Int(Date().timeIntervalSince1970)
-                dst = layout.conflictDir.appendingPathComponent("\(name).\(stamp)")
-                parked.append(name)
-            } else {
-                moved.append(name)
+                for name in present {
+                    try rename(name,
+                               layout.documents.appendingPathComponent(name),
+                               layout.conflictDir.appendingPathComponent("\(name).\(stamp)"))
+                    parked.append(name)
+                }
+                continue
             }
 
-            if renamex_np(src.path, dst.path, UInt32(RENAME_EXCL)) != 0 {
-                let err = String(cString: strerror(errno))
-                log.error("migration: rename \(name, privacy: .public) failed: \(err, privacy: .public)")
-                throw StorageError.migrationFailed("\(name): \(err)")
+            // Normal move. Companions go first, primary last: if we crash
+            // part-way, the primary is still in Documents, so the next run
+            // takes this branch again and finishes the group (companions
+            // already in Chain/ are simply no longer present in Documents).
+            for name in present {
+                let dst = layout.chainDir.appendingPathComponent(name)
+                if name != group.primary, exists(dst) {
+                    // A companion already in Chain/ while its primary is
+                    // still in Documents: a leftover from an interrupted
+                    // migration, superseded because an older build reopened
+                    // the Documents pair and wrote a new companion. The
+                    // Documents pair is the live one; park the stale Chain/
+                    // copy (never delete) and move the live one in.
+                    do {
+                        try ensureDirectory(layout.conflictDir)
+                    } catch {
+                        throw StorageError.migrationFailed("create conflict dir: \(error.localizedDescription)")
+                    }
+                    let stamp = Int(Date().timeIntervalSince1970)
+                    try rename(name, dst, layout.conflictDir.appendingPathComponent("\(name).stale.\(stamp)"))
+                    parked.append(name)
+                }
+                try rename(name, layout.documents.appendingPathComponent(name), dst)
+                moved.append(name)
             }
         }
 
