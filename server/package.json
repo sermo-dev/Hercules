@@ -1,0 +1,10 @@
+{
+  "name": "hercules-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hercules push relay (SAM). Lambdas live in register/ and notify/; tests mock all AWS and APNs calls.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

@@ -1,8 +1,26 @@
 import ActivityKit
 import BackgroundTasks
+import CryptoKit
 import Foundation
+import Security
 import UserNotifications
 import UIKit
+
+/// Push relay configuration.
+enum RelayConfig {
+    /// PLACEHOLDER: replace with the deployed stack's `ApiBaseUrl` output
+    /// (`server/README.md`), e.g. `https://abc123.execute-api.us-east-1.amazonaws.com/Prod`.
+    /// Deployment is tracked in ticket 019; per-environment build config in 031.
+    /// The app appends `/register` and `/unregister`. Users can override this
+    /// in Settings → Relay Server.
+    static let defaultBaseURL = "https://hercules-relay.example.com"
+
+    /// Minimum gap between re-registrations of an unchanged token. The relay
+    /// expires rows 30 days after the last registration, so daily refreshes
+    /// on launch keep a live install registered indefinitely without POSTing
+    /// on every background wake.
+    static let reregisterInterval: TimeInterval = 24 * 60 * 60
+}
 
 /// Central coordinator for push notifications. Handles permission requests,
 /// device token registration with the relay server, silent push handling
@@ -18,8 +36,14 @@ class NotificationManager: ObservableObject {
     @Published var notificationHistory: [BlockNotificationRecord] = []
 
     var relayServerURL: String {
-        get { UserDefaults.standard.string(forKey: "relayServerURL") ?? "https://hercules-relay.example.com" }
+        get { UserDefaults.standard.string(forKey: "relayServerURL") ?? RelayConfig.defaultBaseURL }
         set { UserDefaults.standard.set(newValue, forKey: "relayServerURL") }
+    }
+
+    private enum Keys {
+        static let registrationFingerprint = "relayRegistrationFingerprint"
+        static let registrationDate = "relayRegistrationDate"
+        static let unregisterPending = "relayUnregisterPending"
     }
 
     private init() {
@@ -48,13 +72,82 @@ class NotificationManager: ObservableObject {
         }
     }
 
+    /// Called at every app launch (including background launches for a
+    /// silent push). If the user has opted in and permission is still
+    /// granted, ask APNs for the (possibly rotated) token; `handleDeviceToken`
+    /// then re-registers with the relay if the token changed or the last
+    /// registration is older than `RelayConfig.reregisterInterval`. This keeps
+    /// the relay's 30-day TTL from silently expiring.
+    ///
+    /// If the user turned notifications off and the relay unregister didn't
+    /// complete, fetch the token again so it can be retried.
+    func refreshRegistrationOnLaunch() {
+        if isEnabled {
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                switch settings.authorizationStatus {
+                case .authorized, .provisional, .ephemeral:
+                    DispatchQueue.main.async {
+                        UIApplication.shared.registerForRemoteNotifications()
+                    }
+                default:
+                    break
+                }
+            }
+        } else if UserDefaults.standard.bool(forKey: Keys.unregisterPending) {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
+    /// Opt in: request permission, then register with the relay once APNs
+    /// hands us a token.
+    func enableNotifications() {
+        isEnabled = true
+        UserDefaults.standard.removeObject(forKey: Keys.unregisterPending)
+        requestPermission()
+    }
+
+    /// Opt out: remove this install's row from the relay so it stops pushing
+    /// immediately instead of waiting for the 30-day TTL. Retried on next
+    /// launch if the request fails.
+    func disableNotifications() {
+        isEnabled = false
+        clearRegistrationMarker()
+        UserDefaults.standard.set(true, forKey: Keys.unregisterPending)
+        if let token = deviceToken {
+            deviceToken = nil
+            unregisterFromRelay(token: token, relayURL: relayServerURL)
+        } else {
+            // Token not known in this process yet: fetch it, and
+            // handleDeviceToken will unregister.
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
+    /// Point the app at a different relay. Unregisters from the old one and
+    /// registers with the new one when notifications are on.
+    func updateRelayURL(_ newURL: String) {
+        let trimmed = newURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let oldURL = relayServerURL
+        guard !trimmed.isEmpty, trimmed != oldURL else { return }
+        relayServerURL = trimmed
+        clearRegistrationMarker()
+        if isEnabled, let token = deviceToken {
+            unregisterFromRelay(token: token, relayURL: oldURL)
+            registerWithRelay(token: token)
+        }
+    }
+
     /// Called when APNs returns a device token.
     func handleDeviceToken(_ token: String) {
-        DispatchQueue.main.async {
-            self.deviceToken = token
-            self.registrationError = nil
+        if isEnabled {
+            DispatchQueue.main.async {
+                self.deviceToken = token
+                self.registrationError = nil
+            }
+            registerWithRelay(token: token)
+        } else if UserDefaults.standard.bool(forKey: Keys.unregisterPending) {
+            unregisterFromRelay(token: token, relayURL: relayServerURL)
         }
-        registerWithRelay(token: token)
     }
 
     /// Called when APNs registration fails (e.g., no developer account).
@@ -66,28 +159,113 @@ class NotificationManager: ObservableObject {
 
     // MARK: - Relay Registration
 
-    /// Send device token to the relay server.
+    /// Send the device token and this install's secret to the relay. Skipped
+    /// when the same token was registered with the same relay within
+    /// `RelayConfig.reregisterInterval`.
     private func registerWithRelay(token: String) {
-        guard let url = URL(string: "\(relayServerURL)/register") else { return }
+        let relayURL = relayServerURL
+        let fingerprint = Self.registrationFingerprint(token: token, relayURL: relayURL)
+        let defaults = UserDefaults.standard
+        if defaults.string(forKey: Keys.registrationFingerprint) == fingerprint,
+           Date().timeIntervalSince1970 - defaults.double(forKey: Keys.registrationDate)
+               < RelayConfig.reregisterInterval {
+            return
+        }
+
+        guard let request = Self.relayRequest(
+            relayURL: relayURL,
+            path: "register",
+            body: ["device_token": token, "platform": "ios"]
+        ) else { return }
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error = error {
+                // Not critical: retried on next launch.
+                print("Relay registration failed: \(error.localizedDescription)")
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            switch status {
+            case 200:
+                defaults.set(fingerprint, forKey: Keys.registrationFingerprint)
+                defaults.set(Date().timeIntervalSince1970, forKey: Keys.registrationDate)
+            case 403:
+                // Token is bound to a different install secret (e.g. the
+                // Keychain item was lost). The old row expires within 30 days.
+                DispatchQueue.main.async {
+                    self.registrationError = "Relay rejected this install's registration"
+                }
+            default:
+                print("Relay registration failed: HTTP \(status)")
+            }
+        }.resume()
+    }
+
+    /// Remove this install's row from the relay.
+    private func unregisterFromRelay(token: String, relayURL: String) {
+        guard let request = Self.relayRequest(
+            relayURL: relayURL,
+            path: "unregister",
+            body: ["device_token": token]
+        ) else { return }
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error = error {
+                print("Relay unregister failed: \(error.localizedDescription)")
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            // 403 means the row belongs to another secret; nothing more we can do.
+            guard status == 200 || status == 403 else {
+                print("Relay unregister failed: HTTP \(status)")
+                return
+            }
+            DispatchQueue.main.async {
+                // Only clear the retry flag if the user hasn't re-enabled in
+                // the meantime and this was the current relay.
+                if !self.isEnabled && relayURL == self.relayServerURL {
+                    UserDefaults.standard.removeObject(forKey: Keys.unregisterPending)
+                } else if self.isEnabled, relayURL == self.relayServerURL, let current = self.deviceToken {
+                    // Re-enabled while the unregister was in flight: make
+                    // sure the row exists again.
+                    self.clearRegistrationMarker()
+                    self.registerWithRelay(token: current)
+                }
+            }
+        }.resume()
+    }
+
+    /// Build a POST to `<relayURL>/<path>` carrying `body` plus the
+    /// per-install secret for that relay. Nil if the URL is invalid or the
+    /// Keychain is unavailable (e.g. before first unlock after reboot).
+    private static func relayRequest(relayURL: String, path: String, body: [String: String]) -> URLRequest? {
+        var base = relayURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let url = URL(string: "\(base)/\(path)"), let host = url.host else { return nil }
+        guard let secret = RelayInstallSecret.secret(forRelayHost: host) else {
+            print("Relay \(path) skipped: install secret unavailable")
+            return nil
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 15
+        var payload = body
+        payload["install_secret"] = secret
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        return request
+    }
 
-        let body: [String: String] = ["device_token": token, "platform": "ios"]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    /// Hash of token + relay, so UserDefaults never holds the raw token.
+    private static func registrationFingerprint(token: String, relayURL: String) -> String {
+        let digest = SHA256.hash(data: Data("\(token)|\(relayURL)".utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
 
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            if let error = error {
-                // Relay registration failed — not critical, will retry on next launch
-                print("Relay registration failed: \(error.localizedDescription)")
-                return
-            }
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                print("Relay registration successful")
-            }
-        }.resume()
+    private func clearRegistrationMarker() {
+        UserDefaults.standard.removeObject(forKey: Keys.registrationFingerprint)
+        UserDefaults.standard.removeObject(forKey: Keys.registrationDate)
     }
 
     // MARK: - Silent Push Handling
@@ -119,7 +297,7 @@ class NotificationManager: ObservableObject {
             if let push = pushBlock {
                 let record = BlockNotificationRecord(
                     id: UUID(),
-                    height: push.height,
+                    height: push.height ?? 0,
                     blockHash: push.hash,
                     timestamp: push.timestamp,
                     timestampHuman: "",
@@ -202,7 +380,7 @@ class NotificationManager: ObservableObject {
                 if let push = pushBlock {
                     let record = BlockNotificationRecord(
                         id: UUID(),
-                        height: push.height,
+                        height: push.height ?? 0,
                         blockHash: push.hash,
                         timestamp: push.timestamp,
                         timestampHuman: "",
@@ -354,10 +532,10 @@ class NotificationManager: ObservableObject {
             content.title = "Block #\(record.height) Header Verified"
             content.body = "PoW validated, full block validation pending"
         case .pushPayload:
-            content.title = "New Block #\(record.height)"
+            content.title = record.height > 0 ? "New Block #\(record.height)" : "New Block"
             content.body = "Received from relay (not yet validated)"
         case .networkPolicyPaused:
-            content.title = "Block #\(record.height) — Validation Paused"
+            content.title = "\(record.displayTitle) — Validation Paused"
             content.body = "Skipped to save cellular data. Connect to Wi-Fi or enable Use Cellular Data."
         }
 
@@ -365,7 +543,7 @@ class NotificationManager: ObservableObject {
         content.userInfo = ["height": record.height, "hash": record.blockHash]
 
         let request = UNNotificationRequest(
-            identifier: "block-\(record.height)",
+            identifier: record.height > 0 ? "block-\(record.height)" : "block-\(record.blockHash)",
             content: content,
             trigger: nil // Deliver immediately
         )
@@ -376,20 +554,22 @@ class NotificationManager: ObservableObject {
     // MARK: - Push Payload Parsing
 
     private struct PushBlockInfo {
-        let height: UInt32
+        /// Nil when the relay didn't know the height. Older relays sent 0
+        /// for unknown, which is treated the same way.
+        let height: UInt32?
         let hash: String
         let timestamp: UInt32
     }
 
     private func parsePushPayload(_ userInfo: [AnyHashable: Any]) -> PushBlockInfo? {
         guard let block = userInfo["block"] as? [String: Any],
-              let height = (block["height"] as? NSNumber)?.uint32Value,
-              let hash = block["hash"] as? String,
-              let timestamp = (block["timestamp"] as? NSNumber)?.uint32Value
+              let hash = block["hash"] as? String
         else {
             return nil
         }
-        return PushBlockInfo(height: height, hash: hash, timestamp: timestamp)
+        let rawHeight = (block["height"] as? NSNumber)?.uint32Value ?? 0
+        let timestamp = (block["timestamp"] as? NSNumber)?.uint32Value ?? 0
+        return PushBlockInfo(height: rawHeight > 0 ? rawHeight : nil, hash: hash, timestamp: timestamp)
     }
 
     // MARK: - Background Catch-Up Task
@@ -461,6 +641,63 @@ class NotificationManager: ObservableObject {
     private static func torDataDir() -> String {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         return docs.appendingPathComponent("tor").path
+    }
+}
+
+// MARK: - Display
+
+extension BlockNotificationRecord {
+    /// "Block #N", or "New Block" when the height is unknown (0), e.g. a
+    /// push from a relay whose blocknotify script didn't include height.
+    var displayTitle: String {
+        height > 0 ? "Block #\(height)" : "New Block"
+    }
+}
+
+// MARK: - Relay install secret (Keychain)
+
+/// Random per-install secret sent with relay registration so only this
+/// install can update or unregister its row. One secret per relay host, so a
+/// relay never learns a secret that works against another relay. Stored in
+/// the Keychain with `AfterFirstUnlockThisDeviceOnly`: readable during
+/// background wakes, never synced or migrated to another device.
+enum RelayInstallSecret {
+    private static let service = "dev.sermo.hercules.relay-install-secret"
+
+    /// Returns the existing secret, creating one if none exists. Nil if the
+    /// Keychain can't be read (e.g. before first unlock); never overwrites an
+    /// existing item it failed to read.
+    static func secret(forRelayHost host: String) -> String? {
+        let account = host.lowercased()
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecSuccess,
+           let data = item as? Data,
+           let existing = String(data: data, encoding: .utf8) {
+            return existing
+        }
+        guard status == errSecItemNotFound else { return nil }
+
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            return nil
+        }
+        let secret = bytes.map { String(format: "%02x", $0) }.joined()
+        let add: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String: Data(secret.utf8),
+        ]
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess ? secret : nil
     }
 }
 

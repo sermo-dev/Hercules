@@ -463,9 +463,10 @@ struct SettingsView: View {
                 Toggle("", isOn: Binding(
                     get: { notificationManager.isEnabled },
                     set: { newValue in
-                        notificationManager.isEnabled = newValue
                         if newValue {
-                            notificationManager.requestPermission()
+                            notificationManager.enableNotifications()
+                        } else {
+                            notificationManager.disableNotifications()
                         }
                     }
                 ))
@@ -494,7 +495,7 @@ struct SettingsView: View {
                     .background(Color.white.opacity(0.05))
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .onSubmit {
-                        notificationManager.relayServerURL = relayURL
+                        notificationManager.updateRelayURL(relayURL)
                     }
 
                 Text("Your relay server sends push notifications when new blocks arrive. Anyone can run one.")
@@ -630,7 +631,7 @@ struct SettingsView: View {
                             .frame(width: 20)
 
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Block #\(record.height)")
+                            Text(record.displayTitle)
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundStyle(Theme.textPrimary)
                             Text(record.receivedAt, style: .relative)

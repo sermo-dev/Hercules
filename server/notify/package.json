@@ -1,0 +1,9 @@
+{
+  "name": "hercules-relay-notify",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hercules push relay notify Lambda. No runtime dependencies: uses Node built-ins plus the AWS SDK v3 bundled in the nodejs20.x runtime.",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "dependencies": {}
+}

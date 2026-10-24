@@ -5,17 +5,19 @@ Description: Hercules Push Notification Relay
 Parameters:
   ApnsKeyId:
     Type: String
-    Description: APNs Key ID from Apple Developer account
+    Description: APNs Key ID from Apple Developer account (10 characters)
     Default: ""
   ApnsTeamId:
     Type: String
     Description: Apple Developer Team ID
     Default: ""
-  ApnsKeyBase64:
+  ApnsKeyParameterName:
     Type: String
-    Description: Base64-encoded APNs .p8 private key
-    NoEcho: true
-    Default: ""
+    Description: >-
+      Name of an SSM SecureString parameter holding the APNs .p8 private key
+      (PEM text). Create it out of band before deploying; see README.md.
+    Default: /hercules/apns/p8
+    AllowedPattern: ^/[A-Za-z0-9_.\-/]+$
   ApnsTopic:
     Type: String
     Description: App bundle ID
@@ -27,9 +29,18 @@ Parameters:
     AllowedValues:
       - api.sandbox.push.apple.com
       - api.push.apple.com
+  ApiRateLimit:
+    Type: Number
+    Description: Stage-wide steady-state request rate (req/s) for /register and /unregister
+    Default: 5
+  ApiBurstLimit:
+    Type: Number
+    Description: Stage-wide burst limit for /register and /unregister
+    Default: 10
 
 Resources:
-  # DynamoDB table for device tokens
+  # DynamoDB table for device tokens. Rows hold only: device_token,
+  # platform, secret_hash, created_at, updated_at, ttl.
   DevicesTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -45,18 +56,62 @@ Resources:
         AttributeName: ttl
         Enabled: true
 
+  # Per-block idempotency claims so an SQS redelivery never re-pushes
+  # every device for the same block. Rows expire after a day.
+  PushLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: hercules-push-log
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: block_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: block_hash
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Messages the notify Lambda failed on before fan-out started, after
+  # 3 receives. Inspect/redrive manually; stale messages are dropped by
+  # the Lambda (MAX_MESSAGE_AGE_SECONDS) so a late redrive can't wake phones.
+  BlockDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: hercules-new-blocks-dlq
+      MessageRetentionPeriod: 1209600
+
   # SQS queue for block notifications (from Bitcoin Core blocknotify)
   BlockQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: hercules-new-blocks
-      VisibilityTimeout: 60
+      # >= 6x the NotifyFunction timeout, per AWS guidance for SQS triggers.
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 3600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BlockDeadLetterQueue.Arn
+        maxReceiveCount: 3
 
-  # Lambda: device registration endpoint
+  # API Gateway with stage-level throttling. The registration endpoints are
+  # unauthenticated by design (no accounts), so throttling bounds abuse.
+  RelayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          ThrottlingRateLimit: !Ref ApiRateLimit
+          ThrottlingBurstLimit: !Ref ApiBurstLimit
+
+  # Lambda: device registration / unregistration endpoints
   RegisterFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Handler: register/index.handler
+      CodeUri: register/
+      Handler: index.handler
       Runtime: nodejs20.x
       MemorySize: 128
       Timeout: 10
@@ -64,34 +119,61 @@ Resources:
         Variables:
           DEVICES_TABLE: !Ref DevicesTable
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref DevicesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt DevicesTable.Arn
       Events:
-        Api:
+        Register:
           Type: Api
           Properties:
+            RestApiId: !Ref RelayApi
             Path: /register
+            Method: post
+        Unregister:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RelayApi
+            Path: /unregister
             Method: post
 
   # Lambda: send APNs pushes (triggered by SQS)
   NotifyFunction:
     Type: AWS::Serverless::Function
     Properties:
-      Handler: notify/index.handler
+      CodeUri: notify/
+      Handler: index.handler
       Runtime: nodejs20.x
       MemorySize: 256
-      Timeout: 30
+      Timeout: 60
       Environment:
         Variables:
           DEVICES_TABLE: !Ref DevicesTable
+          PUSH_LOG_TABLE: !Ref PushLogTable
           APNS_KEY_ID: !Ref ApnsKeyId
           APNS_TEAM_ID: !Ref ApnsTeamId
-          APNS_KEY_BASE64: !Ref ApnsKeyBase64
+          APNS_KEY_PARAM: !Ref ApnsKeyParameterName
           APNS_TOPIC: !Ref ApnsTopic
           APNS_HOST: !Ref ApnsHost
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref DevicesTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+                - dynamodb:DeleteItem
+              Resource: !GetAtt DevicesTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt PushLogTable.Arn
+            # SecureString encrypted with the AWS-managed aws/ssm key needs
+            # no explicit kms:Decrypt grant. A customer-managed key does.
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ApnsKeyParameterName}"
       Events:
         SQS:
           Type: SQS
@@ -100,12 +182,18 @@ Resources:
             BatchSize: 1
 
 Outputs:
+  ApiBaseUrl:
+    Description: Relay base URL for the iOS app (it appends /register and /unregister)
+    Value: !Sub "https://${RelayApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
   ApiEndpoint:
     Description: Registration API endpoint
-    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/register"
+    Value: !Sub "https://${RelayApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/register"
   QueueUrl:
     Description: SQS queue URL for blocknotify script
     Value: !Ref BlockQueue
   QueueArn:
     Description: SQS queue ARN (for IAM policy on Bitcoin node)
     Value: !GetAtt BlockQueue.Arn
+  DeadLetterQueueUrl:
+    Description: Dead-letter queue for block messages the notify Lambda could not process
+    Value: !Ref BlockDeadLetterQueue
