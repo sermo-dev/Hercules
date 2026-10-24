@@ -8,6 +8,7 @@ use bitcoin::consensus::deserialize;
 mod assumeutxo;
 mod block_store;
 mod block_validation;
+mod chain_params;
 mod mempool;
 mod p2p;
 mod peer_pool;
@@ -15,6 +16,8 @@ mod relay_policy;
 mod peer_store;
 mod store;
 mod sync;
+#[cfg(test)]
+mod testkit;
 mod tor;
 mod tor_v3;
 mod utxo;

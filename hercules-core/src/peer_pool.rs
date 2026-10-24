@@ -4,6 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{info, warn};
 
+use crate::chain_params::ChainParams;
 use crate::p2p::{Peer, PeerError};
 use crate::peer_store::{AddrRecord, PeerStore};
 use crate::tor::TorManager;
@@ -564,6 +565,40 @@ fn subnet_bucket(addr: &str) -> Option<String> {
     None
 }
 
+/// `subnet_bucket`, or `None` (no bucket, so no diversity limit) when the
+/// chain doesn't enforce netgroup diversity. Only regtest turns it off:
+/// every mock peer in the test harness lives on 127.0.0.1.
+fn netgroup(addr: &str, enforce_diversity: bool) -> Option<String> {
+    if enforce_diversity {
+        subnet_bucket(addr)
+    } else {
+        None
+    }
+}
+
+/// Where a pool gets addresses when its address book runs low.
+#[derive(Debug, Clone)]
+pub enum PeerSource {
+    /// DNS seeds (clearnet) or onion seeds (Tor). The only production source.
+    Discover,
+    /// A fixed address list: the sync integration harness's loopback mock
+    /// peers (ticket 027). Never touches DNS or Tor.
+    #[cfg(test)]
+    Static(Vec<String>),
+}
+
+/// Bootstrap / fallback addresses for `source`.
+fn seed_addrs(source: &PeerSource, tor: Option<&Arc<TorManager>>) -> Vec<String> {
+    match source {
+        PeerSource::Discover => match tor {
+            Some(tor) => Peer::discover_peers_tor(tor),
+            None => Peer::discover_peers(),
+        },
+        #[cfg(test)]
+        PeerSource::Static(addrs) => addrs.clone(),
+    }
+}
+
 /// Thread-safe pool of Bitcoin peer connections.
 pub struct PeerPool {
     slots: Arc<Mutex<Vec<PeerSlot>>>,
@@ -585,6 +620,10 @@ pub struct PeerPool {
     /// Last time we flushed dirty AddrManager entries to the store. Same
     /// rate-limiting purpose as `last_score_flush` — gossip can be chatty.
     last_addr_flush: Instant,
+    /// Chain parameters: handshake magic and netgroup-diversity policy.
+    params: &'static ChainParams,
+    /// Where bootstrap / fallback addresses come from.
+    source: PeerSource,
 }
 
 impl PeerPool {
@@ -594,10 +633,15 @@ impl PeerPool {
     /// If `peers_db_path` is provided, scores and bans are loaded from that
     /// SQLite file at startup and persisted across changes. Pass `None` for
     /// ephemeral test pools.
+    ///
+    /// `params` selects the network magic and netgroup policy; `source`
+    /// says where bootstrap addresses come from (production: DNS/onion seeds).
     pub fn new(
         our_height: u32,
         tor: Option<Arc<TorManager>>,
         peers_db_path: Option<&str>,
+        params: &'static ChainParams,
+        source: PeerSource,
     ) -> Result<PeerPool, PeerError> {
         // Open the persistence store and hydrate any existing bans + known
         // addresses. Failures are logged but non-fatal — the pool still works
@@ -643,11 +687,7 @@ impl PeerPool {
         // a populated peers.sqlite skip DNS entirely and start cold-syncing
         // against known-good peers.
         if addrs.candidate_count() < DNS_FALLBACK_THRESHOLD {
-            let seeds = if let Some(ref tor) = tor {
-                Peer::discover_peers_tor(tor)
-            } else {
-                Peer::discover_peers()
-            };
+            let seeds = seed_addrs(&source, tor.as_ref());
             if seeds.is_empty() && addrs.len() == 0 {
                 return Err(PeerError::Connection(
                     "no peers discovered via DNS and no addresses on disk".into(),
@@ -677,6 +717,8 @@ impl PeerPool {
             store,
             last_score_flush: Instant::now(),
             last_addr_flush: Instant::now(),
+            params,
+            source,
         };
 
         pool.maintain();
@@ -769,11 +811,7 @@ impl PeerPool {
             && self.last_dns_query.elapsed() >= DNS_REDISCOVERY_INTERVAL
         {
             self.last_dns_query = Instant::now();
-            let fresh = if let Some(ref tor) = self.tor {
-                Peer::discover_peers_tor(tor)
-            } else {
-                Peer::discover_peers()
-            };
+            let fresh = seed_addrs(&self.source, self.tor.as_ref());
             if !fresh.is_empty() {
                 let added = self.addrs.insert_many(fresh, AddrSource::Dns);
                 info!(
@@ -787,6 +825,8 @@ impl PeerPool {
         let needed = MAX_OUTBOUND - current;
         let refill_started = Instant::now();
 
+        let diversity = self.params.enforce_netgroup_diversity;
+
         // Snapshot the current outbound buckets and connected addresses so
         // we can filter candidates without holding the slots lock for the
         // duration of the connection attempt.
@@ -796,7 +836,7 @@ impl PeerPool {
             let buckets = slots
                 .iter()
                 .filter(|s| !s.inbound)
-                .filter_map(|s| subnet_bucket(&s.addr))
+                .filter_map(|s| netgroup(&s.addr, diversity))
                 .collect();
             (connected, buckets)
         };
@@ -809,7 +849,7 @@ impl PeerPool {
             if already_connected.contains(addr) {
                 return true;
             }
-            if let Some(bucket) = subnet_bucket(addr) {
+            if let Some(bucket) = netgroup(addr, diversity) {
                 if used_buckets.contains(&bucket) {
                     return true;
                 }
@@ -859,16 +899,17 @@ impl PeerPool {
 
             // Re-check the bucket against this pass's claims (the snapshot
             // above only reflects buckets occupied at the start of refill).
-            if let Some(bucket) = subnet_bucket(&addr) {
+            if let Some(bucket) = netgroup(&addr, diversity) {
                 if claimed_buckets.contains(&bucket) {
                     continue;
                 }
             }
 
+            let magic = self.params.magic;
             let result = if let Some(ref tor) = self.tor {
-                Peer::connect_tor(tor, &addr, self.our_height as i32)
+                Peer::connect_tor(tor, &addr, self.our_height as i32, magic)
             } else {
-                Peer::connect(&addr, self.our_height as i32)
+                Peer::connect(&addr, self.our_height as i32, magic)
             };
 
             match result {
@@ -902,7 +943,7 @@ impl PeerPool {
                         .and_then(|s| s.load_score(&addr).ok().flatten())
                         .unwrap_or(SCORE_DEFAULT);
 
-                    if let Some(bucket) = subnet_bucket(&addr) {
+                    if let Some(bucket) = netgroup(&addr, diversity) {
                         claimed_buckets.insert(bucket);
                     }
 
@@ -1012,6 +1053,8 @@ impl PeerPool {
             store: None,
             last_score_flush: Instant::now(),
             last_addr_flush: Instant::now(),
+            params: ChainParams::mainnet(),
+            source: PeerSource::Discover,
         }
     }
 
@@ -1498,6 +1541,8 @@ mod tests {
             store: None,
             last_score_flush: Instant::now(),
             last_addr_flush: Instant::now(),
+            params: ChainParams::mainnet(),
+            source: PeerSource::Discover,
         }
     }
 
@@ -1514,6 +1559,8 @@ mod tests {
             store: Some(Arc::new(PeerStore::open(":memory:").unwrap())),
             last_score_flush: Instant::now(),
             last_addr_flush: Instant::now(),
+            params: ChainParams::mainnet(),
+            source: PeerSource::Discover,
         }
     }
 
@@ -1919,6 +1966,17 @@ mod tests {
     // ── Subnet diversity tests ───────────────────────────────────────
 
     #[test]
+    fn netgroup_diversity_only_relaxed_when_params_say_so() {
+        // Mainnet enforces /16 buckets — loopback mock peers would share one.
+        assert!(ChainParams::mainnet().enforce_netgroup_diversity);
+        assert_eq!(netgroup("127.0.0.1:18444", true), Some("v4:127.0".to_string()));
+        assert_eq!(netgroup("127.0.0.1:18445", true), netgroup("127.0.0.1:18444", true));
+        // Regtest (test-only) disables the bucket entirely.
+        assert!(!ChainParams::regtest().enforce_netgroup_diversity);
+        assert_eq!(netgroup("127.0.0.1:18444", false), None);
+    }
+
+    #[test]
     fn subnet_bucket_ipv4() {
         assert_eq!(subnet_bucket("1.2.3.4:8333"), Some("v4:1.2".to_string()));
         assert_eq!(subnet_bucket("1.2.99.99:8333"), Some("v4:1.2".to_string()));
@@ -2300,6 +2358,8 @@ mod tests {
             store: Some(store.clone()),
             last_score_flush: Instant::now(),
             last_addr_flush: Instant::now(),
+            params: ChainParams::mainnet(),
+            source: PeerSource::Discover,
         };
 
         pool.ingest_gossip_addrs(vec!["a:8333".to_string(), "b:8333".to_string()]);

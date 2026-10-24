@@ -15,12 +15,13 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::Txid;
 
-use crate::assumeutxo::{SnapshotAnchor, MAINNET_ANCHOR, MIN_CHAIN_WORK};
+use crate::assumeutxo::SnapshotAnchor;
 use crate::block_store::BlockStore;
 use crate::block_validation::{validate_block, validate_block_scripts};
+use crate::chain_params::ChainParams;
 use crate::mempool::Mempool;
 use crate::p2p::{msg_name, PeerError};
-use crate::peer_pool::{PeerInfo, PeerPool};
+use crate::peer_pool::{PeerInfo, PeerPool, PeerSource};
 use crate::store::HeaderStore;
 use crate::tor::TorManager;
 use crate::utxo::{SnapshotMeta, UtxoSet};
@@ -214,15 +215,30 @@ fn is_routable(sock: &std::net::SocketAddr) -> bool {
     }
 }
 
-/// Genesis block header (block 0).
+/// Mainnet genesis header, for the unit tests below.
+#[cfg(test)]
 fn genesis_header() -> Header {
-    let raw = hex::decode(
-        "0100000000000000000000000000000000000000000000000000000000000000\
-         000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa\
-         4b1e5e4a29ab5f49ffff001d1dac2b7c",
-    )
-    .unwrap();
-    deserialize(&raw).unwrap()
+    ChainParams::mainnet().genesis_header()
+}
+
+/// Stand-in anchor for chains without one (regtest): a height no header
+/// chain reaches, so every anchor check passes trivially and no snapshot
+/// file can match it.
+const NO_ANCHOR: SnapshotAnchor = SnapshotAnchor {
+    height: u32::MAX,
+    block_hash: [0u8; 32],
+    utxo_hash: [0u8; 32],
+};
+
+/// How to construct a `HeaderSync`. Production goes through
+/// `HeaderSync::new`: mainnet params and DNS/onion peer discovery. The sync
+/// integration harness (ticket 027) uses regtest params and a static list
+/// of loopback mock peers.
+pub struct SyncConfig {
+    pub db_path: String,
+    pub tor: Option<Arc<TorManager>>,
+    pub params: &'static ChainParams,
+    pub peers: PeerSource,
 }
 
 /// Current sync status reported to the UI.
@@ -454,10 +470,33 @@ pub struct HeaderSync {
     /// headers added since its last call. Invalidated by any reorg below
     /// the cached height (the hash at that height no longer matches).
     chainwork_cache: Mutex<Option<(u32, BlockHash, [u8; 32])>>,
+    /// Chain parameters (mainnet in production; regtest in the harness).
+    params: &'static ChainParams,
+    /// Where each session's `PeerPool` gets its addresses.
+    peer_source: PeerSource,
 }
 
 impl HeaderSync {
     pub fn new(db_path: &str, tor: Option<Arc<TorManager>>) -> Result<HeaderSync, SyncError> {
+        HeaderSync::with_config(SyncConfig {
+            db_path: db_path.to_string(),
+            tor,
+            params: ChainParams::mainnet(),
+            peers: PeerSource::Discover,
+        })
+    }
+
+    /// Build a `HeaderSync` from an explicit config. Production code only
+    /// ever passes mainnet + `PeerSource::Discover` (via `new`); regtest
+    /// params and static peers exist only in test builds.
+    pub fn with_config(config: SyncConfig) -> Result<HeaderSync, SyncError> {
+        let SyncConfig {
+            db_path,
+            tor,
+            params,
+            peers: peer_source,
+        } = config;
+        let db_path = db_path.as_str();
         let store =
             HeaderStore::open(db_path).map_err(|e| SyncError::Store(format!("{}", e)))?;
 
@@ -492,7 +531,7 @@ impl HeaderSync {
 
         // Ensure genesis header is stored
         if store.count().map_err(|e| SyncError::Store(format!("{}", e)))? == 0 {
-            let genesis = genesis_header();
+            let genesis = params.genesis_header();
             store
                 .store_headers(&[genesis], 0)
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
@@ -526,7 +565,7 @@ impl HeaderSync {
             utxo,
             block_store,
             peers_db_path,
-            mempool: Mutex::new(Mempool::new()),
+            mempool: Mutex::new(Mempool::with_params(params)),
             validation_paused: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             tor,
@@ -542,9 +581,11 @@ impl HeaderSync {
             outbound_peer_count: AtomicU32::new(0),
             new_block_announced: AtomicBool::new(false),
             last_self_ad: Mutex::new(Instant::now()),
-            anchor: MAINNET_ANCHOR,
-            min_chain_work: MIN_CHAIN_WORK,
+            anchor: params.anchor.unwrap_or(NO_ANCHOR),
+            min_chain_work: params.min_chain_work,
             chainwork_cache: Mutex::new(None),
+            params,
+            peer_source,
         })
     }
 
@@ -937,6 +978,25 @@ impl HeaderSync {
             .map_err(|e| SyncError::Store(format!("{}", e)))
     }
 
+    /// Open a fresh `PeerPool` for one sync session, using this node's chain
+    /// params and peer source.
+    fn open_pool(&self, our_height: u32) -> Result<PeerPool, SyncError> {
+        PeerPool::new(
+            our_height,
+            self.tor.clone(),
+            self.peers_db_path.as_deref(),
+            self.params,
+            self.peer_source.clone(),
+        )
+        .map_err(|e| {
+            if format!("{}", e).contains("no peers discovered") {
+                SyncError::NoPeers
+            } else {
+                SyncError::Peer(format!("{}", e))
+            }
+        })
+    }
+
     /// Update cached peer counts from the pool (called from monitor loop).
     fn update_peer_counts(&self, pool: &PeerPool) {
         self.inbound_peer_count
@@ -1147,18 +1207,7 @@ impl HeaderSync {
             .saturating_sub(1);
 
         // Create the peer pool
-        let mut pool = PeerPool::new(
-            our_height,
-            self.tor.clone(),
-            self.peers_db_path.as_deref(),
-        )
-        .map_err(|e| {
-            if format!("{}", e).contains("no peers discovered") {
-                SyncError::NoPeers
-            } else {
-                SyncError::Peer(format!("{}", e))
-            }
-        })?;
+        let mut pool = self.open_pool(our_height)?;
 
         let peer_height = pool
             .peer_info()
@@ -1430,11 +1479,11 @@ impl HeaderSync {
                     }
 
                     // Structural validation
-                    validate_block(&block, next_height)
+                    validate_block(&block, next_height, self.params)
                         .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
                     // Script validation + UTXO verification
-                    validate_block_scripts(&block, next_height, &self.utxo)
+                    validate_block_scripts(&block, next_height, &self.utxo, self.params)
                         .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
                     // Update UTXO set with this block's changes
@@ -1576,7 +1625,7 @@ impl HeaderSync {
                             };
                             accepted_this_tick += 1;
                             let peer_stream = crate::p2p::PeerStream::Tor(inbound_stream);
-                            match crate::p2p::Peer::accept(peer_stream, tip_height as i32) {
+                            match crate::p2p::Peer::accept(peer_stream, tip_height as i32, self.params.magic) {
                                 Ok(peer) => {
                                     if !pool.add_inbound_peer(peer) {
                                         info!("Inbound peer rejected: at capacity");
@@ -1818,6 +1867,7 @@ impl HeaderSync {
                             continue;
                         }
                         if let Err(e) = validate_headers(
+                            self.params,
                             new_headers,
                             fork_hash,
                             fork_at,
@@ -1931,6 +1981,7 @@ impl HeaderSync {
             }
 
             validate_headers(
+                self.params,
                 &headers,
                 tip_hash,
                 tip_height,
@@ -2513,18 +2564,7 @@ impl HeaderSync {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
-        let mut pool = PeerPool::new(
-            our_height,
-            self.tor.clone(),
-            self.peers_db_path.as_deref(),
-        )
-        .map_err(|e| {
-            if format!("{}", e).contains("no peers discovered") {
-                SyncError::NoPeers
-            } else {
-                SyncError::Peer(format!("{}", e))
-            }
-        })?;
+        let mut pool = self.open_pool(our_height)?;
 
         // Get headers from best peer
         if Instant::now() >= deadline {
@@ -2578,6 +2618,7 @@ impl HeaderSync {
             .map_err(SyncError::Validation)?;
 
         validate_headers(
+            self.params,
             &headers,
             tip_hash,
             tip_height,
@@ -2644,14 +2685,14 @@ impl HeaderSync {
                 }
 
                 // Structural validation
-                if let Err(e) = validate_block(&block, new_tip) {
+                if let Err(e) = validate_block(&block, new_tip, self.params) {
                     notification.validation_error =
                         Some(format!("structural: {}", e));
                     return Ok(notification);
                 }
 
                 // Script validation
-                if let Err(e) = validate_block_scripts(&block, new_tip, &self.utxo) {
+                if let Err(e) = validate_block_scripts(&block, new_tip, &self.utxo, self.params) {
                     notification.validation_error =
                         Some(format!("scripts: {}", e));
                     return Ok(notification);
@@ -2738,18 +2779,7 @@ impl HeaderSync {
             ));
         }
 
-        let mut pool = PeerPool::new(
-            our_height,
-            self.tor.clone(),
-            self.peers_db_path.as_deref(),
-        )
-        .map_err(|e| {
-            if format!("{}", e).contains("no peers discovered") {
-                SyncError::NoPeers
-            } else {
-                SyncError::Peer(format!("{}", e))
-            }
-        })?;
+        let mut pool = self.open_pool(our_height)?;
 
         // Sync headers to tip
         if Instant::now() >= deadline {
@@ -2836,6 +2866,7 @@ impl HeaderSync {
                 .map_err(SyncError::Validation)?;
 
             validate_headers(
+                self.params,
                 &headers,
                 tip_hash,
                 tip_height,
@@ -2938,11 +2969,11 @@ impl HeaderSync {
             }
 
             // Structural validation
-            validate_block(&block, next_height)
+            validate_block(&block, next_height, self.params)
                 .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
             // Script validation + UTXO verification
-            validate_block_scripts(&block, next_height, &self.utxo)
+            validate_block_scripts(&block, next_height, &self.utxo, self.params)
                 .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
             // Update UTXO set
@@ -3461,6 +3492,7 @@ mod tests {
 
     // ── Chain anchoring (ticket 023) ───────────────────────────────────
 
+    use crate::assumeutxo::MIN_CHAIN_WORK;
     use crate::utxo::UtxoEntry;
     use bitcoin::pow::CompactTarget;
     use tempfile::TempDir;
@@ -3701,3 +3733,7 @@ mod tests {
         assert!(!hs.reorg_crosses_anchor(a - 1, a - 3));
     }
 }
+
+#[cfg(test)]
+#[path = "testkit/sync_integration.rs"]
+mod integration_tests;

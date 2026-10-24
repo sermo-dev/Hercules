@@ -5,19 +5,11 @@ use bitcoin::consensus::serialize;
 use bitcoin::script::Instruction;
 use bitcoin::{Amount, Txid};
 
+use crate::chain_params::ChainParams;
 use crate::utxo::UtxoSet;
 
 /// Maximum block weight (BIP-141 consensus rule).
 const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
-
-/// BIP-34 activation height (coinbase must encode block height).
-const BIP34_HEIGHT: u32 = 227_931;
-
-/// SegWit activation height (witness commitment required).
-const SEGWIT_HEIGHT: u32 = 481_824;
-
-/// Halving interval in blocks.
-const SUBSIDY_HALVING_INTERVAL: u32 = 210_000;
 
 /// Initial block subsidy in satoshis (50 BTC).
 const INITIAL_SUBSIDY: u64 = 50 * 100_000_000;
@@ -59,7 +51,12 @@ fn count_script_sigops(script: &bitcoin::Script) -> u64 {
 
 /// Validate the structural properties of a full block.
 /// This does NOT validate scripts or UTXO spends (Phase 2b/2c).
-pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationError> {
+/// BIP-34 and SegWit activation heights come from `params`.
+pub fn validate_block(
+    block: &Block,
+    height: u32,
+    params: &ChainParams,
+) -> Result<(), BlockValidationError> {
     // 1. Block must have at least one transaction (the coinbase)
     if block.txdata.is_empty() {
         return Err(BlockValidationError::EmptyBlock { height });
@@ -169,7 +166,7 @@ pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationE
     }
 
     // 9. BIP-34: coinbase must encode block height (after activation)
-    if height >= BIP34_HEIGHT {
+    if height >= params.bip34_height {
         match block.bip34_block_height() {
             Ok(encoded_height) => {
                 if encoded_height != height as u64 {
@@ -189,7 +186,7 @@ pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationE
     }
 
     // 10. Witness commitment (post-SegWit)
-    if height >= SEGWIT_HEIGHT {
+    if height >= params.segwit_height {
         // check_witness_commitment returns true if commitment is valid
         // OR if the block has no witness data (pre-segwit txs only)
         if !block.check_witness_commitment() {
@@ -204,8 +201,8 @@ pub fn validate_block(block: &Block, height: u32) -> Result<(), BlockValidationE
 const COINBASE_MATURITY: u32 = 100;
 
 /// Calculate the block subsidy at a given height.
-pub fn block_subsidy(height: u32) -> Amount {
-    let halvings = height / SUBSIDY_HALVING_INTERVAL;
+pub fn block_subsidy(height: u32, params: &ChainParams) -> Amount {
+    let halvings = height / params.subsidy_halving_interval;
     if halvings >= 64 {
         return Amount::ZERO;
     }
@@ -222,8 +219,9 @@ pub fn validate_block_scripts(
     block: &Block,
     height: u32,
     utxo_set: &UtxoSet,
+    params: &ChainParams,
 ) -> Result<(), BlockValidationError> {
-    let flags = bitcoinconsensus::height_to_flags(height);
+    let flags = params.script_flags(height);
 
     // Track outputs created within this block for in-block spend resolution.
     // Maps (txid, vout) -> (amount, script_pubkey_bytes, is_coinbase).
@@ -393,7 +391,7 @@ pub fn validate_block_scripts(
     }
 
     // Exact coinbase reward check (subsidy + actual fees)
-    let subsidy = block_subsidy(height);
+    let subsidy = block_subsidy(height, params);
     let coinbase_total: u64 = block.txdata[0]
         .output
         .iter()
@@ -639,35 +637,35 @@ mod tests {
 
     #[test]
     fn subsidy_at_genesis() {
-        assert_eq!(block_subsidy(0).to_sat(), 50 * 100_000_000);
+        assert_eq!(block_subsidy(0, ChainParams::mainnet()).to_sat(), 50 * 100_000_000);
     }
 
     #[test]
     fn subsidy_first_halving() {
-        assert_eq!(block_subsidy(210_000).to_sat(), 25 * 100_000_000);
+        assert_eq!(block_subsidy(210_000, ChainParams::mainnet()).to_sat(), 25 * 100_000_000);
     }
 
     #[test]
     fn subsidy_second_halving() {
-        assert_eq!(block_subsidy(420_000).to_sat(), 1_250_000_000);
+        assert_eq!(block_subsidy(420_000, ChainParams::mainnet()).to_sat(), 1_250_000_000);
     }
 
     #[test]
     fn subsidy_current_era() {
         // After 4th halving (height 840,000): 3.125 BTC = 312,500,000 sats
-        assert_eq!(block_subsidy(840_000).to_sat(), 312_500_000);
+        assert_eq!(block_subsidy(840_000, ChainParams::mainnet()).to_sat(), 312_500_000);
     }
 
     #[test]
     fn subsidy_eventually_zero() {
         // After 64 halvings, subsidy is 0
-        assert_eq!(block_subsidy(210_000 * 64).to_sat(), 0);
+        assert_eq!(block_subsidy(210_000 * 64, ChainParams::mainnet()).to_sat(), 0);
     }
 
     #[test]
     fn subsidy_just_before_halving() {
         // Block 209,999 is still first era
-        assert_eq!(block_subsidy(209_999).to_sat(), 50 * 100_000_000);
+        assert_eq!(block_subsidy(209_999, ChainParams::mainnet()).to_sat(), 50 * 100_000_000);
     }
 
     #[test]
@@ -740,7 +738,7 @@ mod tests {
     /// Value of the prevout being spent, in satoshis.
     const TAPROOT_FIXTURE_PREV_VALUE: u64 = 88_480;
     /// Block height containing the spending tx (must satisfy `> 709632` so
-    /// that `bitcoinconsensus::height_to_flags` enables VERIFY_TAPROOT).
+    /// that the mainnet script-flag table enables VERIFY_TAPROOT).
     const TAPROOT_FIXTURE_HEIGHT: u32 = 709_635;
 
     /// Build the (serialized_tx, prev_spk, prev_amount, flags) tuple shared by
@@ -749,18 +747,18 @@ mod tests {
         let tx_bytes = hex::decode(TAPROOT_FIXTURE_TX_HEX).expect("fixture tx hex parses");
         let prev_spk =
             hex::decode(TAPROOT_FIXTURE_PREV_SPK_HEX).expect("fixture prev spk hex parses");
-        let flags = bitcoinconsensus::height_to_flags(TAPROOT_FIXTURE_HEIGHT);
+        let flags = ChainParams::mainnet().script_flags(TAPROOT_FIXTURE_HEIGHT);
         (tx_bytes, prev_spk, TAPROOT_FIXTURE_PREV_VALUE, flags)
     }
 
     #[test]
     fn taproot_activation_flag_is_set_post_709632() {
         // Sanity-check the precondition that the rest of the taproot tests
-        // implicitly rely on: at the fixture block height, libbitcoinconsensus
-        // returns flags that include VERIFY_TAPROOT. If this ever changes
-        // upstream, the script-validation tests below would silently start
-        // covering only pre-taproot rules and miss the whole point.
-        let flags = bitcoinconsensus::height_to_flags(TAPROOT_FIXTURE_HEIGHT);
+        // implicitly rely on: at the fixture block height, the mainnet
+        // script-flag table includes VERIFY_TAPROOT. If this ever changes,
+        // the script-validation tests below would silently start covering
+        // only pre-taproot rules and miss the whole point.
+        let flags = ChainParams::mainnet().script_flags(TAPROOT_FIXTURE_HEIGHT);
         assert!(
             flags & bitcoinconsensus::VERIFY_TAPROOT != 0,
             "expected VERIFY_TAPROOT in flags for height {}, got {:#x}",
@@ -941,7 +939,7 @@ mod tests {
     #[test]
     fn rejects_empty_block() {
         let block = wrap_block(vec![]);
-        let err = validate_block(&block, 1).unwrap_err();
+        let err = validate_block(&block, 1, ChainParams::mainnet()).unwrap_err();
         assert!(
             matches!(err, BlockValidationError::EmptyBlock { height: 1 }),
             "expected EmptyBlock at height 1, got {:?}",
@@ -953,7 +951,7 @@ mod tests {
     fn rejects_block_whose_first_tx_is_not_coinbase() {
         // A single non-coinbase tx — the very first tx must be a coinbase.
         let block = wrap_block(vec![synth_noncoinbase(1)]);
-        let err = validate_block(&block, 1).unwrap_err();
+        let err = validate_block(&block, 1, ChainParams::mainnet()).unwrap_err();
         assert!(
             matches!(err, BlockValidationError::NoCoinbase { height: 1 }),
             "expected NoCoinbase at height 1, got {:?}",
@@ -966,7 +964,7 @@ mod tests {
         // Two valid coinbases back-to-back. Bitcoin allows exactly one;
         // the second must be flagged at index 1.
         let block = wrap_block(vec![synth_coinbase(50), synth_coinbase(50)]);
-        let err = validate_block(&block, 1).unwrap_err();
+        let err = validate_block(&block, 1, ChainParams::mainnet()).unwrap_err();
         match err {
             BlockValidationError::MultipleCoinbase { height, index } => {
                 assert_eq!(height, 1);
@@ -984,7 +982,7 @@ mod tests {
         block.header.merkle_root = bitcoin::TxMerkleNode::from_raw_hash(
             bitcoin::hashes::sha256d::Hash::from_byte_array([0xff; 32]),
         );
-        let err = validate_block(&block, 1).unwrap_err();
+        let err = validate_block(&block, 1, ChainParams::mainnet()).unwrap_err();
         assert!(
             matches!(err, BlockValidationError::BadMerkleRoot { height: 1 }),
             "expected BadMerkleRoot at height 1, got {:?}",
@@ -1000,7 +998,7 @@ mod tests {
         // non-coinbase txs to target the DuplicateTx path (rule 7) directly.
         let dup = synth_noncoinbase(7);
         let block = wrap_block(vec![synth_coinbase(50), dup.clone(), dup]);
-        let err = validate_block(&block, 1).unwrap_err();
+        let err = validate_block(&block, 1, ChainParams::mainnet()).unwrap_err();
         match err {
             BlockValidationError::DuplicateTx { height, txid: _ } => {
                 assert_eq!(height, 1);
@@ -1016,7 +1014,7 @@ mod tests {
         // we know the actual subsidy + fees.
         let huge = MAX_MONEY + 1;
         let block = wrap_block(vec![synth_coinbase(huge)]);
-        let err = validate_block(&block, 1).unwrap_err();
+        let err = validate_block(&block, 1, ChainParams::mainnet()).unwrap_err();
         // The output_value > MAX_MONEY check (rule 6) catches this first
         // since it runs per-output before the coinbase-total check. Either
         // is a correct rejection of overpayment, but we assert which one
@@ -1064,7 +1062,7 @@ mod tests {
             }],
         };
         let block = wrap_block(vec![coinbase]);
-        let err = validate_block(&block, 1).unwrap_err();
+        let err = validate_block(&block, 1, ChainParams::mainnet()).unwrap_err();
         match err {
             BlockValidationError::ExcessiveWeight {
                 height,
@@ -1091,6 +1089,6 @@ mod tests {
         // This guards the helpers from silently regressing under the
         // negative tests above.
         let block = wrap_block(vec![synth_coinbase(50)]);
-        validate_block(&block, 1).expect("minimal coinbase block should validate");
+        validate_block(&block, 1, ChainParams::mainnet()).expect("minimal coinbase block should validate");
     }
 }
