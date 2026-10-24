@@ -2099,8 +2099,8 @@ impl HeaderSync {
                                 info!("Reorg: cleared {} transactions from mempool", count);
                             }
                         }
-                        // Own txs confirmed above the fork are unconfirmed
-                        // again; rebroadcast re-adds them to the mempool.
+                        // Own txs confirmed or conflicted above the fork
+                        // are unsettled again; rebroadcast re-adds them.
                         let _ = self
                             .own_txs
                             .demote_confirmed_above(fork_at, unix_now_u32() as u64);

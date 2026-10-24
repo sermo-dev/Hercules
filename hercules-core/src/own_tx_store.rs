@@ -504,6 +504,18 @@ impl OwnTxStore {
         Ok(())
     }
 
+    /// Record the block height at which a terminal status was reached, for
+    /// statuses whose enum variant doesn't carry it (conflicted).
+    fn set_status_height(&self, txid: &Txid, height: u32) -> Result<(), OwnTxStoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE own_txs SET status_height = ?2 WHERE txid = ?1",
+            params![txid.to_string(), height],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     fn set_status(&self, txid: &Txid, status: &OwnTxStatus, now: u64) -> Result<(), OwnTxStoreError> {
         let (name, height, other) = status.to_row();
         {
@@ -558,20 +570,26 @@ impl OwnTxStore {
                     rec.txid, by, height
                 );
                 self.set_status(&rec.txid, &OwnTxStatus::Conflicted { by: *by }, now)?;
+                // Remember where, so a reorg that removes this block can
+                // demote it back to pending (see demote_confirmed_above).
+                self.set_status_height(&rec.txid, height)?;
                 changed += 1;
             }
         }
         Ok(changed)
     }
 
-    /// Reorg hook: confirmations above `fork_height` are undone, so those
-    /// transactions go back to pending and are due for rebroadcast.
+    /// Reorg hook: confirmations and conflicts recorded above `fork_height`
+    /// are undone, so those transactions go back to pending and are due for
+    /// rebroadcast (a re-add that still conflicts is settled again by the
+    /// next block).
     pub fn demote_confirmed_above(&self, fork_height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
         let n = {
             let conn = self.conn.lock().unwrap();
             conn.execute(
-                "UPDATE own_txs SET status = 'pending', status_height = NULL, next_attempt_at = ?2, updated_at = ?2
-                 WHERE status = 'confirmed' AND status_height > ?1",
+                "UPDATE own_txs SET status = 'pending', status_height = NULL, status_txid = NULL,
+                        next_attempt_at = ?2, updated_at = ?2
+                 WHERE status IN ('confirmed', 'conflicted') AND status_height > ?1",
                 params![fork_height, now as i64],
             )
             .map_err(db_err)?
@@ -683,6 +701,27 @@ mod tests {
         s.expire(PENDING_EXPIRY_SECS + TERMINAL_RETENTION_SECS).unwrap();
         assert!(s.get(&txid(1)).unwrap().is_none());
         assert!(s.get(&txid(2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn reorg_demotes_conflicted_above_fork() {
+        // A block that conflicted our tx is reorged out: the conflict may no
+        // longer exist, so the tx must become pending again (and be retried),
+        // while a conflict below the fork stays terminal.
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[0], 0).unwrap();
+        s.track(txid(2), &[0], 0).unwrap();
+        s.set_status(&txid(1), &OwnTxStatus::Conflicted { by: txid(9) }, 1).unwrap();
+        s.set_status_height(&txid(1), 100).unwrap();
+        s.set_status(&txid(2), &OwnTxStatus::Conflicted { by: txid(8) }, 1).unwrap();
+        s.set_status_height(&txid(2), 90).unwrap();
+        assert_eq!(s.demote_confirmed_above(95, 2).unwrap(), 1);
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().status, OwnTxStatus::Pending);
+        assert!(s.is_active(&txid(1)));
+        assert_eq!(
+            s.get(&txid(2)).unwrap().unwrap().status,
+            OwnTxStatus::Conflicted { by: txid(8) }
+        );
     }
 
     #[test]
