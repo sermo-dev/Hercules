@@ -60,6 +60,10 @@ const DEADLINE_MARGIN_MS = 3000;
 // Push log rows expire after a day; long enough to dedupe any redelivery.
 const PUSH_LOG_TTL_SECONDS = 86400;
 const HASH_RE = /^[0-9a-f]{64}$/;
+// Per-request ceiling. A session that went silently dead while the Lambda
+// was frozen between blocks would otherwise hang every stream until the
+// invocation times out — after the block is claimed, so nobody gets pushed.
+const APNS_REQUEST_TIMEOUT_MS = 10000;
 
 function positiveInt(value, fallback) {
     const n = Number.parseInt(value, 10);
@@ -117,10 +121,11 @@ function signApnsJwt({ keyPem, keyId, teamId, issuedAt }) {
 // MARK: - APNs HTTP/2 client (one session, many streams)
 
 class ApnsClient {
-    constructor({ host, topic, connect = http2.connect }) {
+    constructor({ host, topic, connect = http2.connect, requestTimeoutMs = APNS_REQUEST_TIMEOUT_MS }) {
         this.origin = `https://${host}`;
         this.topic = topic;
         this.connect = connect;
+        this.requestTimeoutMs = requestTimeoutMs;
         this.session = null;
     }
 
@@ -165,6 +170,20 @@ class ApnsClient {
                 reject(err);
                 return;
             }
+            const session = this.session;
+            let settled = false;
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                fn(value);
+            };
+            req.setTimeout(this.requestTimeoutMs, () => {
+                // Treat the whole session as dead: destroy it so in-flight
+                // streams fail fast and the retry opens a fresh connection.
+                if (this.session === session) this.session = null;
+                session.destroy();
+                finish(reject, new Error("APNs request timed out"));
+            });
             req.setEncoding("utf8");
             let status = 0;
             let data = "";
@@ -175,9 +194,9 @@ class ApnsClient {
                 if (data) {
                     try { reason = JSON.parse(data).reason; } catch { /* non-JSON body */ }
                 }
-                resolve({ status, reason });
+                finish(resolve, { status, reason });
             });
-            req.on("error", reject);
+            req.on("error", (err) => finish(reject, err));
             req.end(payload);
         });
     }
@@ -403,8 +422,15 @@ function createHandler(deps = {}) {
     return async function handler(event, context) {
         if (!store) store = defaultStore(cfg);
         if (!apns) apns = new ApnsClient({ host: cfg.apnsHost, topic: cfg.apnsTopic });
-        for (const record of event.Records || []) {
-            await processRecord(record, context);
+        try {
+            for (const record of event.Records || []) {
+                await processRecord(record, context);
+            }
+        } finally {
+            // Blocks are ~10 min apart and Lambda freezes between invocations,
+            // so a kept-alive session is likely dead by the next block. One TLS
+            // handshake per block is cheap; a hung session is not.
+            if (apns.close) apns.close();
         }
     };
 }

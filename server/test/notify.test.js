@@ -279,3 +279,50 @@ test("default DynamoDB store paginates, projects, and claims conditionally", asy
     await store.deleteToken(token(9));
     assert.deepEqual(sdk.sent.at(-1).input, { TableName: "dev", Key: { device_token: { S: token(9) } } });
 });
+
+test("ApnsClient times out a hung request and reconnects on retry", async (t) => {
+    // First connection accepts streams but never answers (a session that died
+    // silently while the Lambda was frozen); the second answers normally.
+    let connects = 0;
+    const servers = [];
+    const listen = async (respond) => {
+        const server = http2.createServer();
+        server.on("stream", (stream) => {
+            stream.on("error", () => {});
+            stream.on("data", () => {});
+            stream.on("end", () => { if (respond) { stream.respond({ ":status": 200 }); stream.end(); } });
+        });
+        await new Promise((r) => server.listen(0, "127.0.0.1", r));
+        servers.push(server);
+        return server.address().port;
+    };
+    const hungPort = await listen(false);
+    const goodPort = await listen(true);
+    t.after(() => servers.forEach((s) => s.close()));
+
+    const client = new ApnsClient({
+        host: "unused",
+        topic: "dev.sermo.hercules.app",
+        requestTimeoutMs: 200,
+        connect: () => http2.connect(`http://127.0.0.1:${connects++ === 0 ? hungPort : goodPort}`),
+    });
+    await assert.rejects(client.send(token(1), "{}", "jwt"), /timed out/);
+    const res = await client.send(token(1), "{}", "jwt");
+    client.close();
+    assert.equal(res.status, 200);
+    assert.equal(connects, 2);
+});
+
+test("handler closes the APNs session after each invocation", async () => {
+    let closed = 0;
+    const apns = { send: async () => ({ status: 200 }), close: () => { closed++; } };
+    const store = {
+        scanPage: async () => ({ tokens: [token(1)], lastEvaluatedKey: undefined }),
+        deleteToken: async () => {},
+        claimBlock: async () => true,
+        releaseBlock: async () => {},
+    };
+    const handler = createHandler({ store, apns, loadKey: async () => PEM });
+    await handler({ Records: [{ body: JSON.stringify({ hash: "ab".repeat(32) }), attributes: {} }] }, {});
+    assert.equal(closed, 1);
+});
