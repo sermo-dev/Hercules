@@ -1,9 +1,22 @@
 name: HerculesApp
+
+# Source of truth for HerculesApp.xcodeproj. After editing, run
+# `xcodegen generate` from this directory and commit the regenerated
+# project.pbxproj together with the generated Info.plist / .entitlements
+# files. Never hand-edit project.pbxproj.
+#
+# Every identifier (bundle IDs, App Group, BGTask ID, background URLSession
+# ID, display name, versions) lives in Config/Shared.xcconfig. Nothing below
+# should hardcode one — reference the build setting instead.
+
 options:
-  bundleIdPrefix: dev.sermo.hercules
   deploymentTarget:
     iOS: "17.0"
   xcodeVersion: "16.0"
+
+configFiles:
+  Debug: Config/Shared.xcconfig
+  Release: Config/Shared.xcconfig
 
 targets:
   HerculesApp:
@@ -14,26 +27,73 @@ targets:
       - path: ../build/hercules.swift
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.sermo.hercules.app
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID)
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_GENERATION_MODE: GeneratedByXcode
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: "5.0"
         DEVELOPMENT_TEAM: ""
         CODE_SIGNING_ALLOWED: "NO"
-        CODE_SIGN_ENTITLEMENTS: HerculesApp/HerculesApp.entitlements
         OTHER_LDFLAGS: ["-lc++"]
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
     info:
       path: HerculesApp/Info.plist
       properties:
+        CFBundleDisplayName: $(APP_DISPLAY_NAME)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UIBackgroundModes:
           - remote-notification
           - fetch
         BGTaskSchedulerPermittedIdentifiers:
-          - dev.sermo.hercules.catchup
+          - $(BGTASK_CATCHUP_ID)
+        NSSupportsLiveActivities: true
+        # Runtime identifiers read by AppIdentifiers.swift.
+        HRCAppGroupID: $(APP_GROUP_ID)
+        HRCCatchUpTaskID: $(BGTASK_CATCHUP_ID)
+        HRCSnapshotSessionID: $(SNAPSHOT_SESSION_ID)
+    entitlements:
+      path: HerculesApp/HerculesApp.entitlements
+      properties:
+        aps-environment: development
+        com.apple.security.application-groups:
+          - $(APP_GROUP_ID)
     dependencies:
       - framework: ../build/herculesFFI.xcframework
         embed: false
+      - target: HerculesWidget
+
+  HerculesWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: HerculesWidget
+      # Shared with the app target (widget state + Live Activity attributes).
+      - path: HerculesApp/AppIdentifiers.swift
+      - path: HerculesApp/SharedNodeState.swift
+      - path: HerculesApp/NodeActivityAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(WIDGET_BUNDLE_ID)
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.0"
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGN_IDENTITY: "iPhone Developer"
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: HerculesWidget/Info.plist
+      properties:
+        CFBundleDisplayName: $(APP_DISPLAY_NAME)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        # Runtime identifiers read by AppIdentifiers.swift.
+        HRCAppGroupID: $(APP_GROUP_ID)
+    entitlements:
+      path: HerculesWidget/HerculesWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - $(APP_GROUP_ID)
