@@ -4,6 +4,7 @@
 
 - **Decided:** the tabs are **Wallet / Node / People**.
 - **Decided:** a single "Watch-only" entry in the Wallet tab opens the list of all watch-only wallets. By default it is gated by the same device authentication as the main wallet. The user can optionally add their own passcode/password on top to unlock that view.
+- **Decided:** new wallets default to **native SegWit (BIP84, `bc1q…`)**. Matches ticket 021's pubkey-hiding stance and is payable by every sender. Whether to also offer Taproot (BIP86) as an option is an open question.
 - **Decided:** v1 is multi-wallet (main + watch-only + passphrase entry point).
 
 ## Summary

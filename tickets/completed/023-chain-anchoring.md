@@ -1,5 +1,9 @@
 # Ticket 023: Chain Anchoring — Bind the Snapshot to the Chain, Add a Minimum-Work Floor
 
+## Status
+
+**Complete**: merged in PR #19 (2026-10-24). Snapshot header height/block hash bound to the compiled anchor; header chain must contain the anchor block; minimum-work gate on block validation (`MIN_CHAIN_WORK` = chainwork at 943,500, method cross-checked against Core v31.1's `nMinimumChainWork`); anchor-conflicting peers banned; reorgs across the anchor refused; strict two-peer cross-check during initial sync. Snapshot activation is deferred ("pending") when the app loads the snapshot before headers reach the anchor. Deferred: v2 snapshot format → 032; recovery from a stored fake low-work header chain → 024; end-to-end eclipse tests → 027.
+
 ## Summary
 
 Hercules has two trust anchors, and neither is fully connected to the chain it actually follows:
