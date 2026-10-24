@@ -1,5 +1,9 @@
 # Ticket 022: Bind Every Fetched Block to Its Requested Header
 
+## Status
+
+**Complete** — merged in PR #15 (2026-10-23). Beyond the original spec, review added `MAX_UNREQUESTED_BLOCKS = 2` in `receive_block` so a hostile peer can't force ~20 × 4 MB of junk downloads per request. End-to-end wake-path test deferred to ticket 027; penalize-and-retry for the main loop / catch-up deferred to ticket 024.
+
 ## Summary
 
 The push-wake validation path accepts whatever block a peer sends back, without checking that it is the block we asked for. A peer can answer with a fabricated block that has a valid-looking structure. Hercules then applies that block to the UTXO set and advances `validated_height`. The fix is small: check `block.block_hash() == requested` inside `Peer::get_block` itself, so every caller is protected. Unsolicited blocks get skipped instead of returned.

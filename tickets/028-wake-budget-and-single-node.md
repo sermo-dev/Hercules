@@ -79,6 +79,10 @@ Use `BGProcessingTask` for large backlogs, as 015 Phase 2 intended (with `requir
 - Ticket 029 (clearnet default) takes Tor bootstrap off the critical path for most users. This ticket must still be correct for Tor-mode users.
 - For Tor mode, Arti's state and cache must persist between wakes and be readable while the phone is locked. That's a file-protection class issue in ticket 030. A cold Arti directory fetch is the slow case.
 
+### Follow-up from ticket 022 review
+
+`Peer::get_block` sets a per-read timeout of 120 s (clearnet) / 300 s (Tor) and `receive_block` reads up to 20 messages, so a slow-drip peer can hold one block request far past the ~30 s push window. Since 022, `fetch_requested_block` (sync.rs) may also retry a second peer. Make block download deadline-aware: pass the wake deadline down and clamp the read timeout to `min(download_timeout, deadline - now)`.
+
 ## Files touched
 
 | File | Action |
