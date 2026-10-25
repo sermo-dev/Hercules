@@ -7,6 +7,7 @@ enum NotificationSource: String, Codable {
     case pushPayload        // Info from push relay only, not verified
     case catchUpProgress    // Multi-block catch-up (some blocks validated, more remain)
     case tipDisagreement    // Header cross-check detected peer disagreement (possible eclipse)
+    case invalidChain       // A wake rejected a consensus-invalid block from the network (ticket 024)
     case networkPolicyPaused // Validation skipped: metered network without opt-in
     // Ticket 028 wake outcomes
     case foregroundActive   // App on screen and syncing: the wake left it to foreground
