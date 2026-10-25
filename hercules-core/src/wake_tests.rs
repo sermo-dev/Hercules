@@ -527,6 +527,28 @@ fn wake_reports_tip_disagreement_not_timed_out() {
 }
 
 #[test]
+fn tip_disagreement_survives_a_tiebreaker_deadline() {
+    // The liar is active; the witness contradicts it after 1.5 s; the
+    // tiebreaker would answer 1.5 s later, past the deadline. The
+    // divergence was seen before the deadline, so the alert must stand.
+    let mut honest = FixtureChain::new();
+    honest.mine(10);
+    let mut fork = FixtureChain::new().fork_at(0);
+    fork.mine(12);
+    let liar = MockPeer::spawn(&fork, vec![]);
+    let slow = Behavior::DelayResponses(Duration::from_millis(1_500));
+    let a = MockPeer::spawn(&honest, vec![slow.clone()]);
+    let b = MockPeer::spawn(&honest, vec![slow]);
+    let n = node_with(&[&liar, &a, &b], None);
+
+    let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(2_500)), 50, 0);
+    let s = r.status.expect("status");
+    assert!(s.tip_disagreement, "{:?}", s);
+    assert!(!s.caught_up);
+    assert_eq!(n.validated(), 0, "nothing from the fork applied");
+}
+
+#[test]
 fn header_phase_is_bounded_by_the_budget() {
     // Peers answer getheaders far too late. Unbounded, the request waits
     // out the read timeout; bounded, the wake ends at its deadline as
@@ -608,6 +630,25 @@ fn tor_dir_claim_waits_for_the_previous_client() {
     // ...and gives up if its node closes meanwhile.
     let _held = TorDirClaim::wait_take(dir.path(), || false).unwrap();
     assert!(TorDirClaim::wait_take(dir.path(), || true).is_none());
+}
+
+#[test]
+fn tor_dir_claim_key_is_stable_before_the_dir_exists() {
+    // Arti creates the dir only after the claim, and the parent may be a
+    // symlink (iOS /var -> /private/var). Claimed before it exists via the
+    // link, the dir must still be taken when reached by its real path.
+    let root = TempDir::new().unwrap();
+    let real = root.path().canonicalize().unwrap().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let _first = TorDirClaim::wait_take(&link.join("tor"), || false).unwrap();
+    std::fs::create_dir(real.join("tor")).unwrap();
+    assert!(
+        TorDirClaim::wait_take(&real.join("tor"), || true).is_none(),
+        "second Arti allowed once the dir exists"
+    );
 }
 
 #[test]

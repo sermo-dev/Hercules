@@ -476,9 +476,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Registry key for a path: the parent directory canonicalized (the file
 /// itself may not exist yet), as the UTXO env registry does, so two
-/// spellings of one database are one claim.
-fn claim_key(path: &str) -> PathBuf {
-    let p = std::path::Path::new(path);
+/// spellings of one database are one claim. Stable whether or not the
+/// path itself exists yet.
+fn claim_key(path: impl AsRef<std::path::Path>) -> PathBuf {
+    let p = path.as_ref();
     match (p.parent(), p.file_name()) {
         (Some(parent), Some(name)) => {
             let parent = if parent.as_os_str().is_empty() {
@@ -547,7 +548,9 @@ struct TorDirClaim(PathBuf);
 impl TorDirClaim {
     /// Wait until `dir` is free, then claim it. None if `cancelled` first.
     fn wait_take(dir: &std::path::Path, cancelled: impl Fn() -> bool) -> Option<TorDirClaim> {
-        let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        // Not `dir.canonicalize()`: that fails until Arti creates the
+        // directory, so the key would change spelling once it exists.
+        let key = claim_key(dir);
         let mut logged = false;
         loop {
             {
@@ -690,6 +693,7 @@ impl HerculesNode {
             // must not keep the stores open (reset_database needs them
             // closed).
             let weak_syncer = Arc::downgrade(&syncer);
+            let weak_claim = Arc::downgrade(&claim);
             let closed = Arc::clone(&closed);
             let gate = Arc::new(TorGate::new(move || {
                 let is_closed = || closed.load(Ordering::SeqCst);
@@ -722,8 +726,13 @@ impl HerculesNode {
                 }
 
                 let manager = Arc::new(manager);
-                if let Some(syncer) = weak_syncer.upgrade() {
-                    syncer.attach_tor(Arc::clone(&manager));
+                // Hold the path claim across the syncer use: if the node
+                // drops meanwhile, the stores close with our syncer ref
+                // before the path is released.
+                if let Some(_claim) = weak_claim.upgrade() {
+                    if let Some(syncer) = weak_syncer.upgrade() {
+                        syncer.attach_tor(Arc::clone(&manager));
+                    }
                 }
                 Ok(manager)
             }));

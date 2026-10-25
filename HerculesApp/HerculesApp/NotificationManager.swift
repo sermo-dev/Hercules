@@ -541,9 +541,11 @@ class NotificationManager: ObservableObject {
                 switch report.outcome {
                 case .completed, .cancelled, .timedOut:
                     // A status counts only if headers were checked against
-                    // peers (completed) or blocks were actually validated;
+                    // peers (completed), blocks were actually validated, or
+                    // peers disagreed (the eclipse alert survives a cancel);
                     // otherwise it is just the local tip.
-                    if let status = report.status, report.outcome == .completed || status.blocksValidated > 0 {
+                    if let status = report.status,
+                       report.outcome == .completed || status.blocksValidated > 0 || status.tipDisagreement {
                         var record = Self.makeRecord(from: status, receivedAt: receivedAt)
                         record.wakeTimings = timings
                         return WakeRun(

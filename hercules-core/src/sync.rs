@@ -89,6 +89,19 @@ enum HeaderCrossCheck {
     Accept,
     /// Active peer's headers were contradicted by majority — reject the batch.
     Reject,
+    /// The wake budget ran out (deadline or cancellation) before any peer
+    /// contradicted the active one: nothing was learned, nobody is
+    /// penalized. Only with a budget (ticket 028).
+    Inconclusive,
+}
+
+/// What `fetch_first_header_hash` got from one peer.
+enum FirstHeader {
+    Hash(BlockHash),
+    /// Network failure, empty response, or peer gone.
+    Failed,
+    /// Our wake budget ended the exchange: not the peer's fault.
+    OutOfBudget,
 }
 
 /// Format a legacy v1 `Address` from `addr` gossip into the `host:port`
@@ -1461,6 +1474,10 @@ impl HeaderSync {
     /// fresh node only stores headers that two distinct peers agree on. The
     /// caller retries on the next iteration. Steady-state behavior is
     /// unchanged.
+    ///
+    /// `budget` (wake paths): if it runs out before any divergence is seen
+    /// the result is `Inconclusive`. A divergence already seen stays a
+    /// `Reject` even when the tiebreaker then runs out of time.
     fn cross_check_headers(
         &self,
         pool: &mut PeerPool,
@@ -1468,7 +1485,7 @@ impl HeaderSync {
         active_addr: &str,
         active_first_hash: BlockHash,
         strict: bool,
-        deadline: Option<Instant>,
+        budget: Option<&WakeBudget>,
     ) -> HeaderCrossCheck {
         // Step 1: pick an independent witness peer.
         let witness_addr = match pool.peer_addr_other_than(active_addr) {
@@ -1489,9 +1506,13 @@ impl HeaderSync {
             }
         };
 
-        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator, deadline) {
-            Some(h) => h,
-            None if strict => {
+        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator, budget) {
+            FirstHeader::Hash(h) => h,
+            FirstHeader::OutOfBudget => {
+                debug!("cross-check: budget spent before witness {} answered", witness_addr);
+                return HeaderCrossCheck::Inconclusive;
+            }
+            FirstHeader::Failed if strict => {
                 // Same "can't conclude" case, but during initial sync we
                 // fail closed. No penalty for the active peer.
                 debug!(
@@ -1500,7 +1521,7 @@ impl HeaderSync {
                 );
                 return HeaderCrossCheck::Reject;
             }
-            None => {
+            FirstHeader::Failed => {
                 // Witness peer failed to respond — we can't conclude anything.
                 // Don't penalize the active peer over a network failure.
                 debug!(
@@ -1528,7 +1549,11 @@ impl HeaderSync {
         let tiebreaker_addr = pool.peer_addr_excluding(&exclude);
 
         if let Some(tb_addr) = tiebreaker_addr {
-            if let Some(tb_first) = self.fetch_first_header_hash(pool, &tb_addr, locator, deadline) {
+            // A tiebreaker that runs out of budget falls through to the
+            // 2-peer case: the divergence stands.
+            if let FirstHeader::Hash(tb_first) =
+                self.fetch_first_header_hash(pool, &tb_addr, locator, budget)
+            {
                 if tb_first == active_first_hash {
                     // Active + tiebreaker agree → witness is the liar.
                     warn!(
@@ -1568,29 +1593,44 @@ impl HeaderSync {
     }
 
     /// Send a `getheaders` to a specific peer and return the first header
-    /// hash from its response, or `None` on any failure (network, empty
-    /// response, peer no longer in pool). This wraps the peer checkout/return
-    /// dance so the cross-check helper stays readable. `deadline` bounds the
-    /// whole exchange (wake budgets, ticket 028).
+    /// hash from its response. This wraps the peer checkout/return dance so
+    /// the cross-check helper stays readable. `budget` bounds the whole
+    /// exchange (wake budgets, ticket 028); running out of it is
+    /// `OutOfBudget` and never counts against the peer.
     fn fetch_first_header_hash(
         &self,
         pool: &mut PeerPool,
         addr: &str,
         locator: &[BlockHash],
-        deadline: Option<Instant>,
-    ) -> Option<BlockHash> {
-        let mut peer = pool.checkout_peer_by_addr(addr)?;
-        let limit = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        budget: Option<&WakeBudget>,
+    ) -> FirstHeader {
+        if budget.is_some_and(|b| b.should_stop()) {
+            return FirstHeader::OutOfBudget;
+        }
+        let Some(mut peer) = pool.checkout_peer_by_addr(addr) else {
+            return FirstHeader::Failed;
+        };
+        let limit = budget.map(|b| b.remaining());
         let result = peer.get_headers_within(locator.to_vec(), BlockHash::all_zeros(), limit);
         match result {
             Ok(headers) => {
                 pool.return_peer(peer);
-                headers.first().map(|h| h.block_hash())
+                match headers.first() {
+                    Some(h) => FirstHeader::Hash(h.block_hash()),
+                    None => FirstHeader::Failed,
+                }
+            }
+            Err(PeerError::DeadlineReached) => {
+                // Our deadline, not the peer's fault: keep it in the pool.
+                // A late reply may still be in flight, but the wake is over
+                // and drops the pool with it.
+                pool.return_peer(peer);
+                FirstHeader::OutOfBudget
             }
             Err(e) => {
                 warn!("cross-check: peer {} failed to respond: {}", addr, e);
                 pool.remove_peer(addr);
-                None
+                FirstHeader::Failed
             }
         }
     }
@@ -2170,7 +2210,8 @@ impl HeaderSync {
                 None,
             ) {
                 HeaderCrossCheck::Accept => {}
-                HeaderCrossCheck::Reject => {
+                // Inconclusive needs a budget; the main loop has none.
+                HeaderCrossCheck::Reject | HeaderCrossCheck::Inconclusive => {
                     // The cross-check helper has already applied the
                     // appropriate misbehavior penalty. Drop the batch and
                     // try again on the next iteration.
@@ -3334,17 +3375,18 @@ impl HeaderSync {
                 &peer_addr,
                 active_first_hash,
                 strict,
-                Some(budget.deadline()),
+                Some(budget),
             ) {
                 HeaderCrossCheck::Accept => {}
-                // The witness ran into our deadline: inconclusive, not an
+                // The budget ran out before any peer disagreed: not an
                 // eclipse signal. Headers stay unchecked.
-                HeaderCrossCheck::Reject if budget.should_stop() => {
+                HeaderCrossCheck::Inconclusive => {
                     info!("catch_up_blocks: budget spent during header cross-check");
                     return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
                 }
                 HeaderCrossCheck::Reject => {
-                    // Headers were checked: peers disagree (possible eclipse).
+                    // Headers were checked: peers disagree (possible eclipse),
+                    // even if the budget ran out after the divergence.
                     budget.mark(WakePhase::HeadersChecked);
                     warn!("catch_up_blocks: header cross-check rejected batch from {}", peer_addr);
                     let mut status = self.make_catchup_status(
@@ -3741,6 +3783,66 @@ mod tests {
         // caller checked the deadline before calling), but no retry.
         assert!(fetch_requested_block(&mut pool, wanted_hash, Instant::now()).is_none());
         assert_eq!(pool.get_score(&servers[1].0), Some(100));
+    }
+
+    // ── cross_check_headers under a wake budget (ticket 028) ─────────────
+
+    /// Three loopback peers: active, tiebreaker, witness. The witness gets
+    /// a reward so it is picked first.
+    fn cross_check_pool() -> (PeerPool, Vec<(String, std::net::TcpStream)>, tempfile::TempDir, HeaderSync) {
+        let (pool, servers) = loopback_pool(3);
+        pool.reward(&servers[2].0, 5);
+        let dir = tempfile::TempDir::new().unwrap();
+        let syncer = HeaderSync::new(dir.path().join("headers.sqlite3").to_str().unwrap(), None).unwrap();
+        (pool, servers, dir, syncer)
+    }
+
+    #[test]
+    fn cross_check_divergence_survives_a_tiebreaker_deadline() {
+        // The witness contradicts the active peer, then the tiebreaker
+        // runs into our deadline. The divergence was seen: Reject (the
+        // wake reports tip_disagreement), and the tiebreaker isn't blamed.
+        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+        let (active, tiebreaker, witness) = (servers[0].0.clone(), servers[1].0.clone(), servers[2].0.clone());
+        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![synthetic_block(2).header]));
+        let budget = WakeBudget::new(300);
+
+        let start = Instant::now();
+        let r = syncer.cross_check_headers(&mut pool, &[], &active, synthetic_block(1).block_hash(), false, Some(&budget));
+        assert!(matches!(r, HeaderCrossCheck::Reject));
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(pool.get_score(&tiebreaker), Some(100), "deadline counted against tiebreaker");
+        assert_eq!(pool.count(), 3, "tiebreaker removed over our deadline");
+        assert_eq!(pool.get_score(&active), Some(100 - HEADER_DISAGREEMENT_PENALTY as i32));
+        assert_eq!(pool.get_score(&witness), Some(105 - HEADER_DISAGREEMENT_PENALTY as i32));
+    }
+
+    #[test]
+    fn cross_check_deadline_before_any_answer_is_inconclusive() {
+        // Silent witness: the budget ends before anyone disagrees. Not an
+        // eclipse signal, and no peer pays for our deadline.
+        for strict in [false, true] {
+            let (mut pool, servers, _dir, syncer) = cross_check_pool();
+            let budget = WakeBudget::new(200);
+            let r = syncer.cross_check_headers(&mut pool, &[], &servers[0].0, synthetic_block(1).block_hash(), strict, Some(&budget));
+            assert!(matches!(r, HeaderCrossCheck::Inconclusive), "strict {}", strict);
+            assert_eq!(pool.count(), 3, "witness removed over our deadline");
+            assert_eq!(pool.get_score(&servers[0].0), Some(100));
+            assert_eq!(pool.get_score(&servers[1].0), Some(100));
+            assert_eq!(pool.get_score(&servers[2].0), Some(105));
+        }
+    }
+
+    #[test]
+    fn cross_check_cancelled_before_the_witness_is_inconclusive() {
+        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+        // The witness would contradict, but we never ask it.
+        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![synthetic_block(2).header]));
+        let budget = WakeBudget::new(10_000);
+        budget.cancel();
+        let r = syncer.cross_check_headers(&mut pool, &[], &servers[0].0, synthetic_block(1).block_hash(), false, Some(&budget));
+        assert!(matches!(r, HeaderCrossCheck::Inconclusive));
+        assert_eq!(pool.get_score(&servers[0].0), Some(100));
     }
 
     // ── is_routable ────────────────────────────────────────────────────

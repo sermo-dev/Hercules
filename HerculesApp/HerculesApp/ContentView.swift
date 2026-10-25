@@ -247,13 +247,22 @@ class NodeViewModel: ObservableObject {
 
     /// Block the calling background thread until the snapshot download
     /// completes (or fails). Returns the local file URL on success.
-    private func awaitSnapshotDownload() throws -> URL {
+    /// Nil if `token`'s session is over before the download starts.
+    private func awaitSnapshotDownload(for token: SyncSessionToken) throws -> URL? {
         let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<URL, Error> = .failure(NSError(
+        var result: Result<URL, Error>? = .failure(NSError(
             domain: "Hercules", code: -1,
             userInfo: [NSLocalizedDescriptionKey: "Download did not complete"]
         ))
         DispatchQueue.main.async {
+            // Checked on main, where a reset retires the session: a
+            // retired session never starts a download the reset's cancel
+            // has already run past.
+            if token.isOver {
+                result = nil
+                semaphore.signal()
+                return
+            }
             self.downloadWaiter = { r in
                 result = r
                 semaphore.signal()
@@ -262,6 +271,7 @@ class NodeViewModel: ObservableObject {
         }
         semaphore.wait()
         switch result {
+        case .none: return nil
         case .success(let url): return url
         case .failure(let err): throw err
         }
@@ -298,17 +308,18 @@ class NodeViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            // 1. Cancel any in-flight download (clears resume data + .gz file).
-            SnapshotDownloader.shared.cancel()
-            SnapshotDownloader.deleteDownloadedFile()
-
-            // 2. Retire the current sync session: its callbacks stop
+            // 1. Retire the current sync session: its callbacks stop
             // touching the UI, a snapshot import it runs cancels at its next
-            // progress tick, and a wake preemption won't restart it.
+            // progress tick, and a wake preemption won't restart it. First,
+            // so it can't start a fresh download after step 2's cancel.
             DispatchQueue.main.sync {
                 self.retireActiveSession()
                 self.resumeSyncWhenActive = false
             }
+
+            // 2. Cancel any in-flight download (clears resume data + .gz file).
+            SnapshotDownloader.shared.cancel()
+            SnapshotDownloader.deleteDownloadedFile()
 
             // 3. Drop our handle, then have NodeHost close the node and wipe
             // the on-disk DBs (ticket 028). NodeHost refuses to reopen the
@@ -527,7 +538,7 @@ class NodeViewModel: ObservableObject {
             // Block until the file is on disk. Surfaces progress to
             // the UI via the SnapshotDownloader subscriptions set up
             // in init().
-            let snapshotURL = try awaitSnapshotDownload()
+            guard let snapshotURL = try awaitSnapshotDownload(for: token) else { return }
             if token.isOver { return }
 
             onMain(token) { vm in
