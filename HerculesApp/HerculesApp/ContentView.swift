@@ -444,6 +444,10 @@ class NodeViewModel: ObservableObject {
         nodeLock.unlock()
         activeSession = nil
         syncGeneration += 1
+        // A Start deferred behind the retired session belongs to the old
+        // node: a successful reset starts sync itself, a failed one leaves
+        // it stopped.
+        startWhenSessionEnds = false
     }
 
     /// The foreground session, on its background thread. Returns early
@@ -651,7 +655,16 @@ class NodeViewModel: ObservableObject {
         }
         if startWhenSessionEnds {
             startWhenSessionEnds = false
-            startSync()
+            // `startSync` set `isSyncRunning` when it deferred this start,
+            // and only the active session's cleanup above clears it. A
+            // session a reset retired never is, so without this the
+            // deferred start would hit `startSync`'s guard and nothing
+            // would run until relaunch (ticket 051). Skip it if a restart
+            // above already launched a session.
+            if !sessionInFlight {
+                isSyncRunning = false
+                startSync()
+            }
         }
     }
 
