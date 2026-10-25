@@ -714,7 +714,7 @@ mod tests {
         "5120339ce7e165e67d93adb3fef88a6d4beed33f01fa876f05a225242b82a631abc0";
     /// Value of the prevout being spent, in satoshis.
     const TAPROOT_FIXTURE_PREV_VALUE: u64 = 88_480;
-    /// Block height containing the spending tx (must satisfy `> 709632` so
+    /// Block height containing the spending tx (must satisfy `>= 709632` so
     /// that the mainnet script-flag table enables VERIFY_TAPROOT).
     const TAPROOT_FIXTURE_HEIGHT: u32 = 709_635;
 

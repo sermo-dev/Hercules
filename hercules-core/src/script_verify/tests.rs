@@ -1,7 +1,7 @@
 //! Script backend tests (ticket 047).
 //!
 //! Every test runs each backend compiled in (`Backend::ENABLED`). With both
-//! features on (`cargo test --features script-consensus-legacy`) the
+//! backends on (`cargo test --features script-differential`) the
 //! `differential_*` tests also compare the two input by input, and every
 //! other test in the crate that verifies a script goes through
 //! `verify_differential` too.
@@ -228,15 +228,40 @@ fn precheck_refuses_bad_flags_and_spent_outputs() {
                 error: ScriptVerifyError::SpentOutputsMismatch { inputs: 1, spent: 0 },
             })
         );
+        // No inputs: refused up front (the libraries disagree on it).
+        let mut empty = c.tx.clone();
+        empty.input.clear();
+        assert_eq!(
+            backend.verify_transaction(&empty, &[], c.flags),
+            Err(ScriptVerifyFailure { input_index: 0, error: ScriptVerifyError::NoInputs })
+        );
         // No flags at all is a valid request (pre-BIP16 rules).
         assert!(backend.verify_transaction(&c.tx, &c.spent, SCRIPT_VERIFY_NONE).is_ok());
     }
 }
 
+/// What the precheck protects against: the raw libraries really do
+/// disagree on a zero-input tx, so it must never reach either.
+#[cfg(feature = "script-differential")]
+#[test]
+fn differential_raw_libraries_disagree_on_zero_input_tx() {
+    let mut tx = fixture_chain_cases()[0].tx.clone();
+    tx.input.clear();
+    let bytes = serialize(&tx);
+    let kernel = Backend::Kernel.verify_inputs(&bytes, &[], SCRIPT_VERIFY_NONE, false);
+    let legacy = Backend::ConsensusLegacy.verify_inputs(&bytes, &[], SCRIPT_VERIFY_NONE, false);
+    assert_ne!(kernel, legacy);
+    // Through the public entry point both agree (and nothing aborts).
+    assert_eq!(
+        verify_transaction(&tx, &[], SCRIPT_VERIFY_NONE),
+        Err(ScriptVerifyFailure { input_index: 0, error: ScriptVerifyError::NoInputs })
+    );
+}
+
 /// Differential mode over every Core vector, the Taproot fixture eras and
 /// the regtest fixture chain: the two backends must agree on every input,
 /// including cases where Core's expected result doesn't apply.
-#[cfg(all(feature = "script-kernel", feature = "script-consensus-legacy"))]
+#[cfg(feature = "script-differential")]
 #[test]
 fn differential_backends_agree_on_every_case() {
     let cases: Vec<Case> = vector_cases().into_iter().chain(fixture_chain_cases()).collect();
@@ -261,7 +286,7 @@ fn differential_backends_agree_on_every_case() {
 /// `python3 -I tools/fetch_mainnet_block.py tip-6 <dir>`, then:
 ///
 /// ```text
-/// HERCULES_BENCH_BLOCKS=<dir> cargo test --release --features script-consensus-legacy \
+/// HERCULES_BENCH_BLOCKS=<dir> cargo test --release --features script-differential \
 ///     --lib bench_mainnet_block_script_verify -- --ignored --nocapture
 /// ```
 #[test]

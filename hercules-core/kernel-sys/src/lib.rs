@@ -93,7 +93,9 @@ extern "C" {
     pub static hercules_btck_status_spent_outputs_required: u8;
 }
 
-/// Bitcoin Core release the linked library was built from (e.g. "v32.0").
-pub const CORE_TAG: &str = env!("HERCULES_BITCOIN_CORE_TAG");
+/// Bitcoin Core release the linked library was built from (e.g. "v32.0"),
+/// or "(unverified source)" when built from a `HERCULES_BITCOIN_CORE_SRC`
+/// that isn't a clean checkout of the pinned commit (see build.rs).
+pub const CORE_LABEL: &str = env!("HERCULES_BITCOIN_CORE_LABEL");
 /// "libbitcoinkernel <release>", for logs and error messages.
-pub const LIBRARY_NAME: &str = concat!("libbitcoinkernel ", env!("HERCULES_BITCOIN_CORE_TAG"));
+pub const LIBRARY_NAME: &str = concat!("libbitcoinkernel ", env!("HERCULES_BITCOIN_CORE_LABEL"));

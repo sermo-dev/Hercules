@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `script-kernel` (default) | libbitcoinkernel from a pinned Bitcoin Core release (`kernel-sys/`) |
 //! | `--no-default-features --features script-consensus-legacy` | the frozen, patched libbitcoinconsensus v26 (`patches/bitcoinconsensus/`) |
-//! | `--features script-consensus-legacy` (both) | differential: every check runs through both and aborts if they disagree |
+//! | `--features script-differential` | differential: every check runs through both and aborts if they disagree |
 //!
 //! To switch back to the legacy library, build with `--no-default-features
 //! --features script-consensus-legacy` (for the app: `HERCULES_SCRIPT_BACKEND=legacy
@@ -17,16 +17,35 @@
 //! backend-independent.
 //!
 //! Differential mode exists to prove the backends equivalent (`cargo test
-//! --features script-consensus-legacy` runs the whole suite through it);
-//! it is not meant to ship. Linking both is safe only because the legacy
-//! build seals its symbols (see `patches/bitcoinconsensus/build.rs`).
+//! --features script-differential` runs the whole suite through it) and
+//! cannot ship: a release build of the library with it is a compile error,
+//! as is enabling both backends without asking for differential mode.
+//! Linking both is safe only because the legacy build seals its symbols
+//! (see `patches/bitcoinconsensus/build.rs`).
 //!
 //! Both libraries take the same seven consensus flags with the same bit
 //! values; `chain_params::SCRIPT_VERIFY_*` is the source of truth and the
 //! tests below check it against each library's own constants.
 
 #[cfg(not(any(feature = "script-kernel", feature = "script-consensus-legacy")))]
-compile_error!("enable a script verification backend: `script-kernel` and/or `script-consensus-legacy`");
+compile_error!("enable a script verification backend: `script-kernel` or `script-consensus-legacy`");
+
+#[cfg(all(
+    feature = "script-kernel",
+    feature = "script-consensus-legacy",
+    not(feature = "script-differential")
+))]
+compile_error!(
+    "`script-kernel` and `script-consensus-legacy` are exclusive; for the legacy backend use \
+     `--no-default-features --features script-consensus-legacy`, to compare both use \
+     `--features script-differential` (tests only)"
+);
+
+#[cfg(all(feature = "script-differential", not(test), not(debug_assertions)))]
+compile_error!(
+    "`script-differential` is a test-only mode (it aborts the process on any backend \
+     disagreement and links two script libraries); it must not be built for release"
+);
 
 use std::fmt;
 
@@ -72,6 +91,10 @@ pub enum ScriptVerifyError {
     InvalidFlags(u32),
     /// `spent` must have exactly one entry per input (BIP 341 commits to all).
     SpentOutputsMismatch { inputs: usize, spent: usize },
+    /// A transaction with no inputs has nothing to authorize. Its
+    /// serialization is ambiguous with the segwit marker, so the libraries
+    /// disagree on it (kernel: unparsable; v26: nothing to check, Ok).
+    NoInputs,
     /// The library could not parse the transaction.
     TxDeserialize,
     /// Any other refusal by the library (should not happen with checked inputs).
@@ -86,6 +109,7 @@ impl fmt::Display for ScriptVerifyError {
             Self::SpentOutputsMismatch { inputs, spent } => {
                 write!(f, "{} spent outputs for {} inputs", spent, inputs)
             }
+            Self::NoInputs => write!(f, "transaction has no inputs"),
             Self::TxDeserialize => write!(f, "transaction did not deserialize"),
             Self::Library(msg) => write!(f, "script library error: {}", msg),
         }
@@ -123,7 +147,7 @@ impl Backend {
         Backend::ConsensusLegacy,
     ];
 
-    #[cfg_attr(not(all(feature = "script-kernel", feature = "script-consensus-legacy")), allow(dead_code))]
+    #[cfg_attr(not(feature = "script-differential"), allow(dead_code))]
     pub fn name(self) -> &'static str {
         match self {
             #[cfg(feature = "script-kernel")]
@@ -154,7 +178,7 @@ impl Backend {
     }
 
     /// Verify every input of `tx` with this backend only.
-    #[cfg_attr(all(feature = "script-kernel", feature = "script-consensus-legacy"), allow(dead_code))]
+    #[cfg_attr(feature = "script-differential", allow(dead_code))]
     pub fn verify_transaction(
         self,
         tx: &Transaction,
@@ -175,11 +199,11 @@ pub fn verify_transaction(
     spent: &[SpentOutput],
     flags: u32,
 ) -> Result<(), ScriptVerifyFailure> {
-    #[cfg(all(feature = "script-kernel", feature = "script-consensus-legacy"))]
+    #[cfg(feature = "script-differential")]
     {
         verify_differential(tx, spent, flags)
     }
-    #[cfg(all(feature = "script-kernel", not(feature = "script-consensus-legacy")))]
+    #[cfg(all(feature = "script-kernel", not(feature = "script-differential")))]
     {
         Backend::Kernel.verify_transaction(tx, spent, flags)
     }
@@ -191,9 +215,13 @@ pub fn verify_transaction(
 
 /// Checks both libraries need but would handle differently (kernel aborts
 /// on bad flags or a short spent-output list; v26 aborts on WITNESS without
-/// P2SH), done once here so both see only well-formed requests.
+/// P2SH; they disagree on a tx with no inputs), done once here so both see
+/// only well-formed requests.
 fn precheck(tx: &Transaction, spent: &[SpentOutput], flags: u32) -> Result<(), ScriptVerifyFailure> {
     let fail = |error| Err(ScriptVerifyFailure { input_index: 0, error });
+    if tx.input.is_empty() {
+        return fail(ScriptVerifyError::NoInputs);
+    }
     if flags & !SCRIPT_VERIFY_ALL_CONSENSUS != 0
         || (flags & SCRIPT_VERIFY_WITNESS != 0 && flags & SCRIPT_VERIFY_P2SH == 0)
     {
@@ -222,7 +250,7 @@ fn first_failure(
 /// exit, so later inputs are compared too) and abort on any disagreement.
 /// Abort rather than panic: verification also runs on sync worker threads,
 /// where a panic could be caught and look like an ordinary invalid block.
-#[cfg(all(feature = "script-kernel", feature = "script-consensus-legacy"))]
+#[cfg(feature = "script-differential")]
 fn verify_differential(
     tx: &Transaction,
     spent: &[SpentOutput],

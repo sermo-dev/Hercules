@@ -125,7 +125,7 @@ Script verification now runs on **libbitcoinkernel from Bitcoin Core v32.0** (ta
 | Piece | What it does |
 |---|---|
 | `hercules-core/src/script_verify/` | The only module that calls a script library. `verify_transaction(tx, spent, flags)` is used by `block_validation::validate_block_scripts` and `Mempool::accept_tx`. A `Backend` enum (`Kernel`, `ConsensusLegacy`) has one arm per compiled-in library, in `kernel.rs` and `legacy.rs`. A shared `precheck` refuses unknown flag bits, WITNESS without P2SH, and a spent-output count that doesn't match the input count, before either library sees the request. Both libraries would `assert`/abort on those. |
-| `hercules-core/kernel-sys/` | New `-sys` crate. `build.rs` takes the pinned Core source from `$HERCULES_BITCOIN_CORE_SRC`, or on the first build shallow-fetches it by commit hash into gitignored `kernel-sys/bitcoin-core-v32.0/` and checks `HEAD` against the pin. It then runs cmake for the host, iOS device or iOS simulator, with the spike's iOS flags built in instead of a patch to someone else's crate. `src/lib.rs` declares the 10 script-verify functions we call. `src/flags.c` exports the header's own `btck_ScriptVerificationFlags_*` / status macros as data symbols, so tests compare against the compiled header rather than a transcription. |
+| `hercules-core/kernel-sys/` | New `-sys` crate. `build.rs` shallow-fetches the pinned commit into gitignored `kernel-sys/bitcoin-core-v32.0/` on the first build. It keeps `.git`, and on every build it re-verifies `HEAD` = `CORE_COMMIT`, `HEAD^{tree}` = `CORE_TREE` (`cbf24820…`), a clean working tree, and the `.fetched` marker. A tampered, stale or half-fetched copy is removed and refetched. `$HERCULES_BITCOIN_CORE_REPO` can point the fetch at a mirror; the result is verified the same way. `$HERCULES_BITCOIN_CORE_SRC` overrides the source: a clean checkout of the pin is labelled `v32.0`, and anything else builds with a loud `cargo:warning` banner and the library label "libbitcoinkernel (unverified source)". It then runs cmake for the host, iOS device or iOS simulator, with the spike's iOS flags built in instead of a patch to someone else's crate. `src/lib.rs` declares the 10 script-verify functions we call. `src/flags.c` exports the header's own `btck_ScriptVerificationFlags_*` / status macros as data symbols, so tests compare against the compiled header rather than a transcription. |
 | `hercules-core/patches/bitcoinconsensus/` | Unchanged sources. On Apple targets `build.rs` now **seals** the library: it prelinks `libbitcoinconsensus.a` and `libsecp256k1.a` into one object where everything except `bitcoinconsensus_*` is local (`clang -r -Wl,-exported_symbols_list`). This removes the ODR conflict the spike found: 307 shared global symbols before sealing, 0 after. Each library binds only to its own SHA256, secp256k1 and interpreter, which makes linking both safe (the test binary has one local and one global `CSHA256::Write`, for example). |
 | `chain_params.rs` | Still the source of truth for flag bits and activation heights. `script_flag_bits_match_libbitcoinkernel_abi` checks all 7 bits, plus `NONE` and `ALL`, against v32.0's header. The legacy ABI test and `height_to_flags` boundary sweep still run when the legacy feature is on. |
 
@@ -135,11 +135,13 @@ Script verification now runs on **libbitcoinkernel from Bitcoin Core v32.0** (ta
 |---|---|
 | default (`script-kernel`) | libbitcoinkernel v32.0 |
 | `cargo … --no-default-features --features script-consensus-legacy` / `HERCULES_SCRIPT_BACKEND=legacy ./build-ios.sh` | libbitcoinconsensus v26 |
-| `cargo test --features script-consensus-legacy` (both) | **Differential:** every input of every check runs through both, and the process aborts with both results and the tx hex on any disagreement. It aborts rather than panics because a panic on a sync thread could look like an ordinary invalid block. This mode is for tests only. |
+| `cargo test --features script-differential` | **Differential:** every input of every check runs through both, and the process aborts with both results and the tx hex on any disagreement. It aborts rather than panics because a panic on a sync thread could look like an ordinary invalid block. |
 
-Callers, flags and error types don't depend on the backend. To bump Core, change `CORE_TAG` / `CORE_COMMIT` in `kernel-sys/build.rs`, recheck `kernel-sys/src/lib.rs` against the new header, and rerun the differential suite.
+Differential mode cannot ship. Building the library in release outside `cfg(test)` with `script-differential` is a `compile_error!`; the benchmark uses `cargo test --release --lib`, which is allowed. Enabling `script-kernel` and `script-consensus-legacy` together without `script-differential` is also a `compile_error!` that names the right flags.
 
-Build requirements: `brew install cmake boost`, plus network on the first kernel build (about 15 MB shallow fetch). A cmake configure and build takes about 1.5 min per target and profile on the M2, then runs incrementally. `build-ios.sh` now exports `IPHONEOS_DEPLOYMENT_TARGET=17.0`, the app's own target.
+Callers, flags and error types don't depend on the backend. To bump Core, change `CORE_TAG` / `CORE_COMMIT` / `CORE_TREE` in `kernel-sys/build.rs`, recheck `kernel-sys/src/lib.rs` against the new header, and rerun the differential suite.
+
+Build requirements: `brew install cmake boost`, plus network on the first kernel build (about 15 MB shallow fetch; or `HERCULES_BITCOIN_CORE_REPO=<mirror>`). A cmake configure and build takes about 1.5 min per target and profile on the M2, then runs incrementally. `build-ios.sh` now exports `IPHONEOS_DEPLOYMENT_TARGET=17.0`, the app's own target.
 
 ### Tests
 
@@ -147,7 +149,7 @@ Build requirements: `brew install cmake boost`, plus network on the first kernel
 |---|---|
 | `cargo test` (kernel) | lib 408 passed / 8 ignored, integration 2 passed. Main was 404 / 7: −2 legacy-only `chain_params` tests, +1 kernel ABI test, +5 `script_verify` tests, and +1 ignored benchmark. |
 | `cargo test --no-default-features --features script-consensus-legacy` | 409 passed / 8 ignored, integration 2 passed |
-| `cargo test --features script-consensus-legacy` (differential) | 411 passed / 8 ignored, integration 2 passed. The whole suite runs differentially, including the ticket 027 sync-integration scenarios and the mempool tests. |
+| `cargo test --features script-differential` | 412 passed / 8 ignored (incl. the zero-input differential test), integration 2 passed. The whole suite runs differentially, including the ticket 027 sync-integration scenarios and the mempool tests. |
 | Warnings | Same as main in all three configurations: lib 14, lib test 11 |
 
 The differential test `differential_backends_agree_on_every_case` covers **1,465 cases / 1,538 inputs with 0 mismatches**:
@@ -161,7 +163,7 @@ Each backend also matches Core's expected result on all 446 cases where that res
 
 ### Benchmark (host, Apple M2, release, both backends in one binary, runs interleaved, median of 7)
 
-Single-threaded script verify per full mainnet block, with the tx already serialized. Blocks come from `tools/fetch_mainnet_block.py`. Reproduce with `HERCULES_BENCH_BLOCKS=<dir> cargo test --release --features script-consensus-legacy --lib bench_mainnet_block_script_verify -- --ignored --nocapture`.
+Single-threaded script verify per full mainnet block, with the tx already serialized. Blocks come from `tools/fetch_mainnet_block.py`. Reproduce with `HERCULES_BENCH_BLOCKS=<dir> cargo test --release --features script-differential --lib bench_mainnet_block_script_verify -- --ignored --nocapture`.
 
 | Block | Inputs | libbitcoinkernel v32.0 | libbitcoinconsensus v26 | Change |
 |---|---|---|---|---|
@@ -178,10 +180,37 @@ These agree with the spike's cross-process numbers.
 | `libhercules_core.a`, aarch64-apple-ios-sim release | 87.87 MB | 94.53 MB | +6.66 MB |
 | Linked `HerculesApp` executable, Release, simulator arm64 | 22.64 MB | 22.82 MB | **+0.18 MB** |
 
+### Review follow-ups (2026-10-25)
+
+- **Zero-input tx.** `precheck` refuses it (`ScriptVerifyError::NoInputs`). Before this, kernel said "doesn't deserialize", legacy said Ok (it had no input to check), and differential mode aborted. A differential test shows the raw libraries do disagree, and that the public entry point no longer does.
+- **Taproot flag off by one.** Our table enabled TAPROOT at 709_633, copied from the old `height_to_flags` (`> 709632`). Core enforces Taproot from block **709_632** inclusive. Evidence in the v32.0 tree: `MinBIP9WarningHeight = 711648; // taproot activation height + miner confirmation window` (711648 − 2016 = 709632), and the 0.21.1 release notes say "as of block 709632". The table and its boundary tests are fixed. The legacy comparison now allows exactly this one intended difference.
+  - **Why it never mattered:** Hercules validates only blocks above the AssumeUTXO anchor (943,500).
+- **Flag scheme vs Core v32.** Core's `GetBlockScriptFlags` sets P2SH|WITNESS|TAPROOT on every block from genesis, except two `script_flag_exceptions` (BIP16 block 170060 gets no flags; Taproot block 692261 gets P2SH|WITNESS). DERSIG, CLTV, CSV and NULLDUMMY come from buried heights, which match ours. The two schemes differ only below 709,632. Above the anchor both give 0x20e15, so they are equivalent for every block we validate (documented in `chain_params.rs`).
+  - Ticket 003 (cooperative historical validation) should adopt Core's scheme (flags always on, plus the two exception hashes) to match Core bit for bit on old blocks.
+
+### Open question: mempool policy script flags
+
+libbitcoinkernel's script API accepts only the 7 consensus flags (`btck_ScriptVerificationFlags_ALL`), and it aborts on any other bit. libbitcoinconsensus had the same limit, so nothing regressed: our mempool has never run Core's policy-only script checks (STRICTENC, LOW_S, NULLFAIL, MINIMALDATA, CLEANSTACK, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE, DISCOURAGE_UPGRADABLE_NOPS / _WITNESS_PROGRAM / _TAPROOT_VERSION / _OP_SUCCESS / _PUBKEYTYPE, …). Mempool acceptance verifies consensus validity, plus our own output-type rules in `relay_policy` / `is_relay_standard_script`.
+
+Is that acceptable given the Knots-like relay policy? It matters for relay hygiene, not for consensus safety: a tx that passes consensus scripts but fails a policy flag can't harm us, but we may relay it where Core and Knots wouldn't.
+
+Options:
+
+1. **Accept and document.** Policy-violating spends of standard outputs are rare, and Core and Knots peers will drop them anyway. This costs nothing.
+2. **Local kernel patch.** Widen `btck_script_pubkey_verify`'s flag mask in our pinned Core build to accept Core's `STANDARD_SCRIPT_VERIFY_FLAGS`, and call it twice (consensus flags, then standard flags), as Core's `AcceptToMemoryPool` does. That is exact Core policy, but we would carry a patch on an unstable API and rebase it on every bump.
+3. **Upstream.** Propose a policy-flags parameter or a `btck_` policy-verify function to Core. This is the best long-term option but is slow and uncertain.
+4. **Rust-side policy checks.** Implement the cheap checks ourselves on parsed witnesses and scripts: LOW_S and STRICTENC on signatures, the DISCOURAGE_* rules on witness versions, leaf versions and OP_SUCCESS. This is partial and duplicates interpreter logic, but needs no C changes.
+5. **Use the legacy build for policy.** Not viable. v26 has the same 7-flag limit, and linking both libraries is test-only.
+
+Recommendation: option 1 now, option 2 or 3 when relay policy work (ticket 018 follow-ups) needs it.
+
 ### Not verified
 
 - The app was not run on an iPhone. Builds were checked for device (`cargo build --target aarch64-apple-ios`, `build-ios.sh`) and the simulator (`xcodebuild … iphonesimulator`). The kernel archive is checked to be `platform 2` (iOS), `minos 17.0`.
 - There was no full mainnet replay beyond the two blocks above.
+- **2026-10-25 re-run caveat:** this Mac had run out of IPv4 loopback ports (about 17.5k stuck TIME_WAIT sockets), and github.com was unreachable.
+  - The test runs above used the p2p and mock-peer test listeners temporarily pointed at `[::1]` (not committed).
+  - The fetch path was exercised against a local mirror made from the verified tree plus the exact commit object. Its hash reproduced `465dde27…` exactly.
 - Sealing is implemented for Apple targets only. On other targets the legacy build links as before, so differential mode there would hit the ODR problem.
 
 ## Spike results (2026-10-24)

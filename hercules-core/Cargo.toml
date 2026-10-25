@@ -39,10 +39,12 @@ default = ["script-kernel"]
 # libbitcoinkernel from a pinned Bitcoin Core release (kernel-sys/build.rs).
 script-kernel = ["dep:hercules-kernel-sys"]
 # The frozen, patched libbitcoinconsensus v26 (patches/bitcoinconsensus).
-# Alone (`--no-default-features --features script-consensus-legacy`) it is
-# the verifier; together with `script-kernel` every script check runs
-# through both and aborts if they disagree (differential mode, tests only).
+# Use instead of the kernel: `--no-default-features --features
+# script-consensus-legacy`. Enabling both backends alone is a compile error.
 script-consensus-legacy = ["dep:bitcoinconsensus"]
+# Test-only: every script check runs through both backends and the process
+# aborts if they disagree. Compile error in release (non-test) builds.
+script-differential = ["script-kernel", "script-consensus-legacy"]
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

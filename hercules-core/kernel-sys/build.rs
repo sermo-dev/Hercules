@@ -1,9 +1,12 @@
 //! Builds Bitcoin Core's libbitcoinkernel as a static library (ticket 047).
 //!
 //! 1. Source: a pinned Bitcoin Core release (`CORE_TAG` / `CORE_COMMIT`).
-//!    Taken from `$HERCULES_BITCOIN_CORE_SRC` if set (offline builds, or a
-//!    checkout you are bumping), otherwise shallow-fetched once by commit
-//!    hash into `kernel-sys/bitcoin-core-<tag>/` (gitignored) and verified.
+//!    Shallow-fetched once by commit hash into `kernel-sys/bitcoin-core-<tag>/`
+//!    (gitignored), keeping `.git` so every build re-verifies the commit, its
+//!    tree and a clean working tree; a stale or partial copy is refetched.
+//!    `$HERCULES_BITCOIN_CORE_SRC` overrides it (offline builds, or a
+//!    checkout you are bumping); an override that doesn't verify builds with
+//!    a loud warning and an "unverified" library label.
 //! 2. cmake configure + build + install into `OUT_DIR`, with the iOS
 //!    cross-compile flags the upstream `libbitcoinkernel-sys` build.rs lacks
 //!    (without them cmake silently produces a macOS archive for iOS targets;
@@ -21,10 +24,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Pinned Bitcoin Core release. Bumping it is a deliberate project: the
-/// kernel C API is unversioned and breaks between releases. Update both
-/// lines, rebuild, and rerun the differential tests (see ticket 047).
+/// kernel C API is unversioned and breaks between releases. Update all
+/// three (`git rev-parse <commit>^{tree}` gives the tree), rebuild, and
+/// rerun the differential tests (see ticket 047).
 const CORE_TAG: &str = "v32.0";
 const CORE_COMMIT: &str = "465dde277447e2f11e01bea09d2a094d7fb6ef45";
+/// Tree hash of `CORE_COMMIT`, checked against the checkout on every build.
+const CORE_TREE: &str = "cbf24820b3e51bf8a6a00b0a54d394d16dcf3b7d";
 const CORE_REPO: &str = "https://github.com/bitcoin/bitcoin.git";
 
 const BUILD_CONFIG: &str = "Release";
@@ -57,6 +63,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/flags.c");
     for var in [
         "HERCULES_BITCOIN_CORE_SRC",
+        "HERCULES_BITCOIN_CORE_REPO",
         "IPHONEOS_DEPLOYMENT_TARGET",
         "MACOSX_DEPLOYMENT_TARGET",
         "BOOST_ROOT",
@@ -64,10 +71,22 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
-    let src = core_source();
+    let (src, label) = core_source();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let build_dir = out.join("build");
     let install_dir = out.join("install");
+
+    // cmake refuses a build dir configured for another source tree (e.g.
+    // after switching to or from HERCULES_BITCOIN_CORE_SRC): start fresh.
+    let cache = std::fs::read_to_string(build_dir.join("CMakeCache.txt")).unwrap_or_default();
+    let configured_src = cache
+        .lines()
+        .find_map(|l| l.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="))
+        .map(PathBuf::from);
+    if configured_src.is_some_and(|s| s != src) {
+        let _ = std::fs::remove_dir_all(&build_dir);
+        let _ = std::fs::remove_dir_all(&install_dir);
+    }
 
     let mut configure = Command::new("cmake");
     configure
@@ -132,54 +151,130 @@ fn main() {
     // libbitcoinkernel is C++ (Apple targets: libc++).
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:include={}", include_dir.display());
-    println!("cargo:rustc-env=HERCULES_BITCOIN_CORE_TAG={CORE_TAG}");
+    println!("cargo:rustc-env=HERCULES_BITCOIN_CORE_LABEL={label}");
 }
 
-/// Path of a Bitcoin Core source tree at `CORE_COMMIT`.
-fn core_source() -> PathBuf {
+/// The Core source tree to build, and the label the library reports: the
+/// pinned `CORE_TAG` only when the tree is verified to be exactly
+/// `CORE_COMMIT`, otherwise an "unverified" label.
+fn core_source() -> (PathBuf, String) {
     if let Ok(dir) = env::var("HERCULES_BITCOIN_CORE_SRC") {
-        let dir = PathBuf::from(dir);
-        assert!(
-            dir.join("src/kernel/bitcoinkernel.h").exists(),
-            "HERCULES_BITCOIN_CORE_SRC={} is not a Bitcoin Core source tree",
-            dir.display()
-        );
-        return dir;
+        return override_source(PathBuf::from(dir));
     }
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let dir = manifest.join(format!("bitcoin-core-{CORE_TAG}"));
-    if dir.join(".fetched").exists() {
-        return dir;
+    let marker = format!("{CORE_TAG} {CORE_COMMIT}\n");
+    // Re-verify if someone touches the fetched tree's checkout state.
+    println!("cargo:rerun-if-changed={}", dir.join(".fetched").display());
+    println!("cargo:rerun-if-changed={}", dir.join(".git/HEAD").display());
+    println!("cargo:rerun-if-changed={}", dir.join(".git/index").display());
+
+    if dir.exists() {
+        let marker_ok = std::fs::read_to_string(dir.join(".fetched")).ok().as_deref() == Some(&marker);
+        match verify_checkout(&dir) {
+            Ok(()) if marker_ok => return (dir, CORE_TAG.into()),
+            Ok(()) => println!("cargo:warning={} has a stale or missing .fetched marker; refetching", dir.display()),
+            Err(e) => println!("cargo:warning={} is not the pinned Bitcoin Core {CORE_TAG}: {e}; refetching", dir.display()),
+        }
+        // Only ever delete the directory this script owns (an interrupted
+        // or stale fetch), never an override.
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("removing stale {}: {e}", dir.display()));
     }
 
     // Fetch into a private temp dir and rename into place, so concurrent
     // build scripts (host + iOS, debug + release) never see a half tree.
+    // `.git` is kept so the tree stays verifiable on later builds.
     let tmp = manifest.join(format!(".bitcoin-core-fetch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let git = |args: &[&str], what: &str| run(Command::new("git").arg("-C").arg(&tmp).args(args), what);
     git(&["init", "-q"], "git init");
-    git(&["fetch", "-q", "--depth", "1", CORE_REPO, CORE_COMMIT], "git fetch Bitcoin Core");
+    // `$HERCULES_BITCOIN_CORE_REPO` may point at a mirror (e.g. a local
+    // clone, for offline machines); safe because the result is verified
+    // against CORE_COMMIT and CORE_TREE either way.
+    let repo = env::var("HERCULES_BITCOIN_CORE_REPO").unwrap_or_else(|_| CORE_REPO.into());
+    git(&["fetch", "-q", "--depth", "1", &repo, CORE_COMMIT], "git fetch Bitcoin Core");
     git(&["checkout", "-q", "FETCH_HEAD"], "git checkout");
-    let head = Command::new("git")
-        .arg("-C")
-        .arg(&tmp)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("git rev-parse");
-    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    assert_eq!(head, CORE_COMMIT, "fetched Bitcoin Core commit does not match the pin");
-    // Only the source tree is needed; drop the object store.
-    let _ = std::fs::remove_dir_all(tmp.join(".git"));
-    std::fs::write(tmp.join(".fetched"), format!("{CORE_TAG} {CORE_COMMIT}\n")).unwrap();
-
+    std::fs::write(tmp.join(".fetched"), &marker).unwrap();
+    if let Err(e) = verify_checkout(&tmp) {
+        panic!("fetched Bitcoin Core does not match the pin: {e}");
+    }
     if std::fs::rename(&tmp, &dir).is_err() {
-        // Another build script won the race; use its copy.
+        // Another build script won the race; use (and verify) its copy.
         let _ = std::fs::remove_dir_all(&tmp);
     }
-    assert!(dir.join(".fetched").exists(), "Bitcoin Core source missing at {}", dir.display());
-    dir
+    if let Err(e) = verify_checkout(&dir) {
+        panic!("Bitcoin Core source at {} does not match the pin: {e}", dir.display());
+    }
+    (dir, CORE_TAG.into())
+}
+
+/// `$HERCULES_BITCOIN_CORE_SRC`: used as given (offline builds, or a checkout
+/// you are bumping), but labelled `CORE_TAG` only if it verifies.
+fn override_source(dir: PathBuf) -> (PathBuf, String) {
+    assert!(
+        dir.join("src/kernel/bitcoinkernel.h").exists(),
+        "HERCULES_BITCOIN_CORE_SRC={} is not a Bitcoin Core source tree",
+        dir.display()
+    );
+    // Rebuild when the tree or its checked-out commit changes.
+    println!("cargo:rerun-if-changed={}", dir.display());
+    println!("cargo:rerun-if-changed={}", dir.join(".git/HEAD").display());
+    match verify_checkout(&dir) {
+        Ok(()) => (dir, CORE_TAG.into()),
+        Err(e) => {
+            for line in [
+                "**************************************************************".to_string(),
+                format!("UNVERIFIED Bitcoin Core source: HERCULES_BITCOIN_CORE_SRC={}", dir.display()),
+                format!("is not a clean checkout of the pinned {CORE_TAG} ({CORE_COMMIT}): {e}"),
+                "libbitcoinkernel is labelled \"unverified\"; do not ship this build.".to_string(),
+                "**************************************************************".to_string(),
+            ] {
+                println!("cargo:warning={line}");
+            }
+            (dir, "(unverified source)".into())
+        }
+    }
+}
+
+/// Ok if `dir` is its own git checkout of `CORE_COMMIT` (tree `CORE_TREE`)
+/// with no modified, deleted or untracked files (the `.fetched` marker
+/// aside).
+fn verify_checkout(dir: &Path) -> Result<(), String> {
+    if !dir.join(".git").exists() {
+        return Err("not a git checkout (no .git), so its contents can't be verified".into());
+    }
+    // GIT_DIR pins git to this checkout, so a non-repo dir inside another
+    // repo (e.g. Hercules itself) can't be mistaken for it.
+    let git = |args: &[&str]| -> Result<String, String> {
+        let out = Command::new("git")
+            .env("GIT_DIR", dir.join(".git"))
+            .env("GIT_WORK_TREE", dir)
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let head = git(&["rev-parse", "HEAD"])?;
+    if head != CORE_COMMIT {
+        return Err(format!("HEAD is {head}"));
+    }
+    let tree = git(&["rev-parse", "HEAD^{tree}"])?;
+    if tree != CORE_TREE {
+        return Err(format!("HEAD's tree is {tree}, expected {CORE_TREE}"));
+    }
+    let status = git(&["status", "--porcelain", "--untracked-files=all", "--", ".", ":!.fetched"])?;
+    if !status.is_empty() {
+        let first: Vec<&str> = status.lines().take(5).collect();
+        return Err(format!("working tree differs from the commit: {}", first.join("; ")));
+    }
+    Ok(())
 }
 
 /// Per-target cmake flags. The host build needs none; iOS needs the SDK,
