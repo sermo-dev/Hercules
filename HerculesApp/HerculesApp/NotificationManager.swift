@@ -48,8 +48,16 @@ class NotificationManager: ObservableObject {
 
     private init() {
         isEnabled = UserDefaults.standard.bool(forKey: "notificationsEnabled")
-        notificationHistory = NotificationHistory.load()
+        if let loaded = NotificationHistory.loadIfReadable() {
+            notificationHistory = loaded
+            historyLoaded = true
+        }
     }
+
+    /// False if the history file couldn't be read at init (locked since
+    /// reboot). `appendRecord` retries the load before saving so the real
+    /// history is never replaced by an empty in-memory copy.
+    private var historyLoaded = false
 
     // MARK: - Permission & Registration
 
@@ -316,6 +324,28 @@ class NotificationManager: ObservableObject {
             return
         }
 
+        // Low storage (ticket 030): don't let a wake push LMDB/SQLite into
+        // ENOSPC. Record a visible skip instead.
+        if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
+            if let push = pushBlock {
+                let record = BlockNotificationRecord(
+                    id: UUID(),
+                    height: push.height ?? 0,
+                    blockHash: push.hash,
+                    timestamp: push.timestamp,
+                    timestampHuman: "",
+                    validated: false,
+                    headerValidated: false,
+                    receivedAt: Date(),
+                    source: .pushPayload,
+                    validationError: "Validation skipped: storage almost full (\(StorageGuard.format(free)) free)"
+                )
+                appendRecord(record)
+            }
+            completionHandler(.noData)
+            return
+        }
+
         // Mark the wake start so the widget can flip to its "awake" dot.
         // Cleared in every exit path below (success, failure, paused).
         SharedNodeStore.markAwake(true)
@@ -337,9 +367,11 @@ class NotificationManager: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let dbPath = Self.dbPath()
-                let torDir = Self.torDataDir()
-                let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
+                try StoragePaths.prepareForNodeOpen()
+                let node = try HerculesNode(
+                    dbPath: StoragePaths.headersDBPath,
+                    torDataDir: StoragePaths.torDataDir
+                )
 
                 // 25 seconds, up to 7 blocks — leaving 5s margin within the 30s iOS window
                 let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
@@ -370,6 +402,23 @@ class NotificationManager: ObservableObject {
 
                 completionHandler(.newData)
 
+            } catch StorageError.protectedDataUnavailable {
+                // Locked since reboot (ticket 030): chain data is
+                // completeUntilFirstUserAuthentication, so nothing can be
+                // opened until the user unlocks once. Detected by the open(2)
+                // probe in prepareForNodeOpen before any database is touched.
+                // Deliberately NOT gated on UIApplication.isProtectedDataAvailable:
+                // that tracks the `complete` class and goes false ~10 s after
+                // every passcode lock, so it would skip every pocketed wake.
+                // markAwake is best-effort here (the App Group is unreadable
+                // too, so the write usually fails).
+                SharedNodeStore.markAwake(false)
+                activityController.finishFailure(
+                    height: initialHeight,
+                    peerCount: initialState.peerCount
+                )
+                Self.recordLockedSinceReboot(pushBlock: pushBlock)
+                completionHandler(.noData)
             } catch {
                 SharedNodeStore.markAwake(false)
                 activityController.finishFailure(
@@ -419,9 +468,11 @@ class NotificationManager: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let dbPath = Self.dbPath()
-                let torDir = Self.torDataDir()
-                let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
+                try StoragePaths.prepareForNodeOpen()
+                let node = try HerculesNode(
+                    dbPath: StoragePaths.headersDBPath,
+                    torDataDir: StoragePaths.torDataDir
+                )
 
                 let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
                 let record = Self.makeRecord(from: status)
@@ -501,6 +552,18 @@ class NotificationManager: ObservableObject {
     // MARK: - History
 
     private func appendRecord(_ record: BlockNotificationRecord) {
+        if !historyLoaded {
+            guard let loaded = NotificationHistory.loadIfReadable() else {
+                // Still unreadable: keep it in memory only, don't clobber the file.
+                notificationHistory.insert(record, at: 0)
+                return
+            }
+            // In-memory records arrived after the file was last written
+            // (appended while it was unreadable), so they are newer: keep them first
+            // so the prefix cap below drops the oldest, not the newest.
+            notificationHistory = notificationHistory + loaded
+            historyLoaded = true
+        }
         notificationHistory.insert(record, at: 0)
         if notificationHistory.count > NotificationHistory.maxRecords {
             notificationHistory = Array(notificationHistory.prefix(NotificationHistory.maxRecords))
@@ -588,11 +651,21 @@ class NotificationManager: ObservableObject {
 
         task.expirationHandler = { /* Rust respects budget_secs */ }
 
+        if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
+            task.setTaskCompleted(success: true)
+            return
+        }
+
         DispatchQueue.global(qos: .userInitiated).async {
             do {
+                // Throws protectedDataUnavailable when locked since reboot
+                // (detected with an open(2) probe; this handler runs off the
+                // main thread) — completes the task below without opening
+                // anything.
+                try StoragePaths.prepareForNodeOpen()
                 let node = try HerculesNode(
-                    dbPath: Self.dbPath(),
-                    torDataDir: Self.torDataDir()
+                    dbPath: StoragePaths.headersDBPath,
+                    torDataDir: StoragePaths.torDataDir
                 )
                 let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
 
@@ -633,16 +706,25 @@ class NotificationManager: ObservableObject {
         }
     }
 
-    // MARK: - Paths
+    // MARK: - Locked since reboot
 
-    private static func dbPath() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("hercules-headers.sqlite3").path
-    }
-
-    private static func torDataDir() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("tor").path
+    /// Record a wake that arrived after a reboot but before the first
+    /// unlock. Nothing on disk is writable in this state (history JSON,
+    /// App Group, chain data), so the record is a log line plus one local
+    /// notification with a fixed identifier: repeated wakes replace it
+    /// rather than stacking, and it disappears from relevance once the user
+    /// unlocks and the next wake validates normally.
+    private static func recordLockedSinceReboot(pushBlock: PushBlockInfo?) {
+        StoragePaths.log.notice("wake skipped: device locked since reboot (height \(pushBlock?.height ?? 0))")
+        let content = UNMutableNotificationContent()
+        content.title = pushBlock?.height.map { "Block #\($0) — Not Validated" } ?? "New Block — Not Validated"
+        content.body = "iPhone locked since restart. Unlock once and Hercules will validate on the next block."
+        let request = UNNotificationRequest(
+            identifier: "locked-since-reboot",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
     }
 }
 

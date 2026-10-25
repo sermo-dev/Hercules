@@ -1789,6 +1789,7 @@ dependencies = [
  "flate2",
  "heed",
  "hex",
+ "libc",
  "log",
  "rusqlite",
  "safelog",

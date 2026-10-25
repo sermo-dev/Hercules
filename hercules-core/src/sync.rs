@@ -15,7 +15,7 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::Txid;
 
-use crate::assumeutxo::{SnapshotAnchor, MAINNET_ANCHOR, MIN_CHAIN_WORK};
+use crate::assumeutxo::{SnapshotAnchor, MAINNET_ANCHOR, MIN_CHAIN_WORK, SNAPSHOT_MAP_REQUIRED_BYTES};
 use crate::block_store::BlockStore;
 use crate::block_validation::{validate_block, validate_block_scripts};
 use crate::mempool::Mempool;
@@ -23,7 +23,7 @@ use crate::p2p::{msg_name, PeerError};
 use crate::peer_pool::{PeerInfo, PeerPool};
 use crate::store::HeaderStore;
 use crate::tor::TorManager;
-use crate::utxo::{SnapshotMeta, UtxoSet};
+use crate::utxo::{SnapshotLoadError, SnapshotMeta, UtxoSet};
 use crate::validation::{
     check_anchor, chainwork_for_headers, u256_add, u256_gt, validate_headers,
 };
@@ -618,13 +618,18 @@ impl HeaderSync {
     /// is loaded but `validated_height` is left alone; the snapshot stays
     /// *pending* until header sync stores the anchor block and
     /// `activate_pending_snapshot` advances `validated_height` to it.
+    ///
+    /// `on_progress` returning `false` cancels the load. Errors caused by
+    /// the file itself come back as `SyncError::SnapshotInvalid`; anything
+    /// else (map or disk full, cancelled, LMDB) leaves the file worth
+    /// keeping for a retry.
     pub fn load_snapshot<F>(
         &self,
         snapshot_path: &str,
         on_progress: F,
     ) -> Result<SnapshotMeta, SyncError>
     where
-        F: Fn(u64, u64),
+        F: Fn(u64, u64) -> bool,
     {
         if let Some(hash) = self
             .store
@@ -644,15 +649,19 @@ impl HeaderSync {
         let file = std::fs::File::open(snapshot_path)
             .map_err(|e| SyncError::Store(format!("open snapshot: {}", e)))?;
 
+        let to_sync = |e: SnapshotLoadError| match e {
+            SnapshotLoadError::Invalid(_) => SyncError::SnapshotInvalid(format!("{}", e)),
+            SnapshotLoadError::Storage(_) => SyncError::Store(format!("{}", e)),
+        };
         let meta = if snapshot_path.ends_with(".gz") {
             let decoder = flate2::read::GzDecoder::new(file);
             self.utxo
                 .load_snapshot(decoder, Some(&self.anchor), on_progress)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?
+                .map_err(to_sync)?
         } else {
             self.utxo
                 .load_snapshot(file, Some(&self.anchor), on_progress)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?
+                .map_err(to_sync)?
         };
 
         info!(
@@ -668,6 +677,15 @@ impl HeaderSync {
         }
 
         Ok(meta)
+    }
+
+    /// Fail fast if the UTXO env can't be mapped large enough to hold the
+    /// AssumeUTXO set (ticket 030): grows the map now if it can, otherwise
+    /// errors so the app doesn't start a ~9 GB download it can't import.
+    pub fn ensure_snapshot_map_capacity(&self) -> Result<(), SyncError> {
+        self.utxo
+            .ensure_map_capacity(SNAPSHOT_MAP_REQUIRED_BYTES)
+            .map_err(|e| SyncError::Store(e.0))
     }
 
     /// If a loaded snapshot is still pending (`validated_height` below the
@@ -3416,6 +3434,8 @@ pub enum SyncError {
     Peer(String),
     Validation(String),
     Store(String),
+    /// The snapshot file itself is corrupt or doesn't match the anchor.
+    SnapshotInvalid(String),
 }
 
 impl std::fmt::Display for SyncError {
@@ -3425,6 +3445,7 @@ impl std::fmt::Display for SyncError {
             SyncError::Peer(s) => write!(f, "peer error: {}", s),
             SyncError::Validation(s) => write!(f, "validation error: {}", s),
             SyncError::Store(s) => write!(f, "store error: {}", s),
+            SyncError::SnapshotInvalid(s) => write!(f, "snapshot rejected: {}", s),
         }
     }
 }
@@ -3923,7 +3944,7 @@ mod tests {
         let (_dir, hs, path) = anchored_fixture(&chain);
         hs.store.store_headers(&chain, 1).unwrap();
 
-        let meta = hs.load_snapshot(&path, |_, _| {}).unwrap();
+        let meta = hs.load_snapshot(&path, |_, _| true).unwrap();
         assert_eq!(meta.height, TEST_ANCHOR_HEIGHT);
         assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
         assert_eq!(hs.utxo.count().unwrap(), 1);
@@ -3937,7 +3958,7 @@ mod tests {
         let (_dir, hs, path) = anchored_fixture(&chain);
         hs.store.store_headers(&chain[..3], 1).unwrap();
 
-        hs.load_snapshot(&path, |_, _| {}).unwrap();
+        hs.load_snapshot(&path, |_, _| true).unwrap();
         assert_eq!(hs.utxo.count().unwrap(), 1);
         assert_eq!(hs.store.validated_height().unwrap(), 0, "must stay pending");
         assert!(!hs.ready_to_validate_blocks().unwrap());
@@ -3956,7 +3977,7 @@ mod tests {
         let (_dir, hs, path) = anchored_fixture(&chain);
         hs.store.store_headers(&cheap_chain(10, 1), 1).unwrap();
 
-        let err = hs.load_snapshot(&path, |_, _| {}).unwrap_err();
+        let err = hs.load_snapshot(&path, |_, _| true).unwrap_err();
         assert!(format!("{}", err).contains("expected anchor"), "got: {}", err);
         assert_eq!(hs.utxo.count().unwrap(), 0, "UTXO db must be untouched");
         assert_eq!(hs.utxo.assume_valid_floor().unwrap(), 0);
@@ -3980,7 +4001,7 @@ mod tests {
             };
             hs.store.store_headers(&chain, 1).unwrap();
 
-            let err = hs.load_snapshot(&path, |_, _| {}).unwrap_err();
+            let err = hs.load_snapshot(&path, |_, _| true).unwrap_err();
             assert!(format!("{}", err).contains("mismatch"), "got: {}", err);
             assert_eq!(hs.utxo.count().unwrap(), 0);
             assert_eq!(hs.store.validated_height().unwrap(), 0);

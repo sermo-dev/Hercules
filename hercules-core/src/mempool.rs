@@ -9,16 +9,22 @@ use log::{debug, info};
 
 use crate::utxo::{UtxoEntry, UtxoSet};
 
-/// Default maximum mempool size in bytes (150 MB).
+/// Default maximum mempool size: 50 MB of *serialized* transaction bytes.
 ///
-/// Halfway between Bitcoin Core's 300 MB default and our previous 50 MB cap.
-/// 150 MB covers the entire historical "normal" mempool occupancy range
-/// (typical mainnet sits at 5–30 MB; mild congestion 50–150 MB) without
-/// adding meaningful iOS memory pressure. During severe fee events the
-/// mempool will still hit the cap and start fee-rate evicting, but those
-/// events are rare and we'd rather pay the eviction cost than risk an iOS
-/// background-kill from a 300 MB resident allocation.
-const DEFAULT_MAX_SIZE: usize = 150_000_000;
+/// The cap counts raw tx bytes (`MempoolEntry::size`), not resident memory.
+/// Deserialized `Transaction`s plus the per-entry ancestor/descendant
+/// `HashSet`s and the `spends` index cost roughly 2–3x that on the heap, so
+/// 50 MB serialized is ~100–150 MB resident. That is about the most an iOS
+/// app can hold without becoming a jetsam target, especially once
+/// backgrounded: jetsam kills suspended apps largest-footprint-first, and
+/// the foreground node keeps its mempool alive while suspended (background
+/// wakes open a fresh node and never build one). Ticket 030 lowered this
+/// from 150 MB.
+///
+/// 50 MB still covers typical mainnet occupancy (5–30 MB); under congestion
+/// the pool fills and fee-rate evicts the cheapest packages, which only
+/// affects what we relay at the low end, not block validation.
+const DEFAULT_MAX_SIZE: usize = 50_000_000;
 
 /// Minimum relay fee rate in sat/vB.
 const MIN_RELAY_FEE_RATE: f64 = 1.0;
@@ -79,7 +85,7 @@ const ABSURD_FEE_THRESHOLD: u64 = 10_000_000;
 ///
 /// Two distinct sizes are tracked because they serve different purposes:
 /// `size` is the raw serialized byte length and drives memory accounting
-/// (`Mempool::total_size`, the 50 MB cap). `vsize` is the virtual size
+/// (`Mempool::total_size`, capped at `DEFAULT_MAX_SIZE`). `vsize` is the virtual size
 /// (weight / 4, rounded up) and drives every fee-rate / policy decision
 /// (BIP 125, ancestor / descendant limits, package eviction ordering).
 /// Mixing the two — comparing a sat/vB rate against a sat/raw-byte rate —
@@ -110,7 +116,7 @@ pub struct Mempool {
 }
 
 impl Mempool {
-    /// Create a new mempool with the default 50 MB size cap.
+    /// Create a new mempool with the default size cap (`DEFAULT_MAX_SIZE`).
     pub fn new() -> Mempool {
         Mempool {
             txs: HashMap::new(),
