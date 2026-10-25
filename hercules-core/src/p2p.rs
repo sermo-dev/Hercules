@@ -18,8 +18,16 @@ use crate::tor::{TorManager, TorStream};
 const PROTOCOL_VERSION: u32 = 70016;
 const USER_AGENT: &str = "/Hercules:0.1.0/";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
 const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Test builds shrink the direct-TCP timeouts so mock-peer scenarios that
+/// withhold or delay data (ticket 027) resolve in seconds, not minutes.
+#[cfg(test)]
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+pub(crate) const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Timeouts used when connecting through Tor (higher latency).
 const TOR_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -108,6 +116,8 @@ impl Write for PeerStream {
 pub struct Peer {
     stream: PeerStream,
     addr: String,
+    /// Network magic for every message we send (`ChainParams::magic`).
+    magic: Magic,
     their_version: Option<VersionMessage>,
     /// True if this peer connected to us (inbound), false if we connected to them.
     pub inbound: bool,
@@ -168,7 +178,7 @@ impl Peer {
     }
 
     /// Connect to a peer over direct TCP and complete the version handshake.
-    pub fn connect(addr: &str, our_height: i32) -> Result<Peer, PeerError> {
+    pub fn connect(addr: &str, our_height: i32, magic: Magic) -> Result<Peer, PeerError> {
         info!("Connecting to peer {}", addr);
 
         let sock_addr: SocketAddr = addr
@@ -185,6 +195,7 @@ impl Peer {
         let mut peer = Peer {
             stream: PeerStream::Direct(stream),
             addr: addr.to_string(),
+            magic,
             their_version: None,
             inbound: false,
             wants_addrv2: false,
@@ -202,7 +213,12 @@ impl Peer {
 
     /// Connect to a peer through Tor and complete the version handshake.
     /// The address can be an IP:port, hostname:port, or .onion:port.
-    pub fn connect_tor(tor: &TorManager, addr: &str, our_height: i32) -> Result<Peer, PeerError> {
+    pub fn connect_tor(
+        tor: &TorManager,
+        addr: &str,
+        our_height: i32,
+        magic: Magic,
+    ) -> Result<Peer, PeerError> {
         info!("Connecting to peer {} via Tor", addr);
 
         let tor_stream = tor
@@ -212,6 +228,7 @@ impl Peer {
         let mut peer = Peer {
             stream: PeerStream::Tor(tor_stream),
             addr: addr.to_string(),
+            magic,
             their_version: None,
             inbound: false,
             wants_addrv2: false,
@@ -227,10 +244,11 @@ impl Peer {
 
     /// Accept an inbound connection: run the version handshake as responder.
     /// (Wait for their version first, then send ours + verack.)
-    pub fn accept(stream: PeerStream, our_height: i32) -> Result<Peer, PeerError> {
+    pub fn accept(stream: PeerStream, our_height: i32, magic: Magic) -> Result<Peer, PeerError> {
         let mut peer = Peer {
             stream,
             addr: String::new(), // filled after receiving their version
+            magic,
             their_version: None,
             inbound: true,
             wants_addrv2: false,
@@ -425,7 +443,7 @@ impl Peer {
 
     /// Send a Bitcoin P2P message.
     pub fn send(&mut self, msg: NetworkMessage) -> Result<(), PeerError> {
-        let raw = RawNetworkMessage::new(Magic::BITCOIN, msg);
+        let raw = RawNetworkMessage::new(self.magic, msg);
         // bitcoin's consensus_encode requires bitcoin::io::Write, not std::io::Write.
         // We match on the variant to get the concrete type which bitcoin_io knows about.
         match &mut self.stream {
@@ -874,6 +892,7 @@ pub(crate) mod tests {
         let peer = Peer {
             stream: PeerStream::Direct(client),
             addr: addr.to_string(),
+            magic: Magic::BITCOIN,
             their_version: None,
             inbound: false,
             wants_addrv2: false,

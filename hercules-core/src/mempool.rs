@@ -7,6 +7,7 @@ use bitcoin::{Transaction, Txid};
 
 use log::{debug, info};
 
+use crate::chain_params::ChainParams;
 use crate::utxo::{UtxoEntry, UtxoSet};
 
 /// Default maximum mempool size: 50 MB of *serialized* transaction bytes.
@@ -113,16 +114,26 @@ pub struct Mempool {
     total_size: usize,
     /// Maximum total size in bytes.
     max_size: usize,
+    /// Chain whose script-flag schedule applies to accepted transactions.
+    params: &'static ChainParams,
 }
 
 impl Mempool {
-    /// Create a new mempool with the default size cap (`DEFAULT_MAX_SIZE`).
+    /// Create a new mainnet mempool with the default 50 MB size cap.
+    /// Test-only — production builds go through [`Mempool::with_params`].
+    #[cfg(test)]
     pub fn new() -> Mempool {
+        Mempool::with_params(ChainParams::mainnet())
+    }
+
+    /// Create a mempool for `params` with the default 50 MB size cap.
+    pub fn with_params(params: &'static ChainParams) -> Mempool {
         Mempool {
             txs: HashMap::new(),
             spends: HashMap::new(),
             total_size: 0,
             max_size: DEFAULT_MAX_SIZE,
+            params,
         }
     }
 
@@ -135,6 +146,7 @@ impl Mempool {
             spends: HashMap::new(),
             total_size: 0,
             max_size,
+            params: ChainParams::mainnet(),
         }
     }
 
@@ -402,7 +414,7 @@ impl Mempool {
         // up-front (BIP 341 sighash commits to every spent output, not just
         // the one being verified).
         let serialized_tx = serialize(&tx);
-        let flags = bitcoinconsensus::height_to_flags(current_height);
+        let flags = self.params.script_flags(current_height);
         let mut input_sum: u64 = 0;
         let mut parents: HashSet<Txid> = HashSet::new();
         let mut spent: Vec<(u64, Vec<u8>)> = Vec::with_capacity(tx.input.len());

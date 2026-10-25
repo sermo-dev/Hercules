@@ -2,11 +2,10 @@ use bitcoin::block::Header;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::BlockHash;
 
+use crate::chain_params::ChainParams;
+
 /// Target time for one difficulty epoch (2016 blocks): 2 weeks.
 const TARGET_TIMESPAN: i64 = 14 * 24 * 60 * 60;
-
-/// Maximum target (minimum difficulty), same as genesis block.
-const MAX_TARGET_BITS: u32 = 0x1d00ffff;
 
 /// Validate a sequence of headers against a known previous header.
 /// Returns Ok(()) if all headers are valid, or an error describing the first invalid header.
@@ -14,7 +13,9 @@ const MAX_TARGET_BITS: u32 = 0x1d00ffff;
 /// `prev_bits` is the compact target of the block at `prev_height`.
 /// `epoch_start_time` looks up the timestamp of a header at a given height from the store,
 /// used to fetch the first block of a difficulty epoch for retarget calculations.
+/// `params` supplies the PoW limit and whether the chain retargets at all.
 pub fn validate_headers(
+    params: &ChainParams,
     headers: &[Header],
     prev_hash: BlockHash,
     prev_height: u32,
@@ -38,7 +39,7 @@ pub fn validate_headers(
         }
 
         // 2. Check difficulty target
-        if height % 2016 == 0 && height > 0 {
+        if !params.no_retargeting && height % 2016 == 0 && height > 0 {
             // Retarget boundary: verify the new target is correctly calculated
             let epoch_start_height = height - 2016;
             let epoch_start_ts = epoch_start_time(epoch_start_height).map_err(|e| {
@@ -56,7 +57,8 @@ pub fn validate_headers(
             })?;
 
             let actual_timespan = prev_time as i64 - epoch_start_ts as i64;
-            let expected_bits = calculate_next_target(current_bits, actual_timespan);
+            let expected_bits =
+                calculate_next_target(current_bits, actual_timespan, params.pow_limit_bits);
 
             if header.bits != expected_bits {
                 return Err(ValidationError::BadDifficulty {
@@ -66,7 +68,8 @@ pub fn validate_headers(
                 });
             }
         } else if height > 0 {
-            // Between retargets: difficulty must not change
+            // Between retargets (or on a no-retargeting chain): difficulty
+            // must not change
             if header.bits != current_bits {
                 return Err(ValidationError::BadDifficulty {
                     height,
@@ -127,7 +130,12 @@ pub fn validate_headers(
 ///
 /// `prev_bits` is the compact target of the last block in the previous epoch.
 /// `actual_timespan` is the elapsed seconds for the previous 2016-block epoch.
-fn calculate_next_target(prev_bits: CompactTarget, actual_timespan: i64) -> CompactTarget {
+/// `pow_limit_bits` is the chain's maximum target (compact form).
+fn calculate_next_target(
+    prev_bits: CompactTarget,
+    actual_timespan: i64,
+    pow_limit_bits: u32,
+) -> CompactTarget {
     // Clamp actual timespan to [target_timespan/4, target_timespan*4]
     let clamped = actual_timespan
         .max(TARGET_TIMESPAN / 4)
@@ -142,7 +150,7 @@ fn calculate_next_target(prev_bits: CompactTarget, actual_timespan: i64) -> Comp
     let new_target = Target::from_le_bytes(divided);
 
     // Cap at maximum target (genesis difficulty)
-    let max_target = Target::from_compact(CompactTarget::from_consensus(MAX_TARGET_BITS));
+    let max_target = Target::from_compact(CompactTarget::from_consensus(pow_limit_bits));
     let final_target = if new_target > max_target {
         max_target
     } else {
@@ -461,6 +469,8 @@ mod tests {
     use bitcoin::consensus::deserialize;
     use bitcoin::hashes::Hash;
 
+    const MAINNET_POW_LIMIT: u32 = 0x1d00ffff;
+
     /// Real mainnet genesis block header.
     fn genesis_header() -> bitcoin::block::Header {
         let raw = hex::decode(
@@ -553,14 +563,14 @@ mod tests {
     #[test]
     fn retarget_exact_two_weeks_no_change() {
         let bits = CompactTarget::from_consensus(0x1d00ffff);
-        let result = calculate_next_target(bits, TARGET_TIMESPAN);
+        let result = calculate_next_target(bits, TARGET_TIMESPAN, MAINNET_POW_LIMIT);
         assert_eq!(result.to_consensus(), bits.to_consensus());
     }
 
     #[test]
     fn retarget_faster_increases_difficulty() {
         let bits = CompactTarget::from_consensus(0x1d00ffff);
-        let result = calculate_next_target(bits, TARGET_TIMESPAN / 2);
+        let result = calculate_next_target(bits, TARGET_TIMESPAN / 2, MAINNET_POW_LIMIT);
         let original = Target::from_compact(bits);
         let adjusted = Target::from_compact(result);
         // Faster mining → lower target → harder difficulty
@@ -570,7 +580,7 @@ mod tests {
     #[test]
     fn retarget_slower_decreases_difficulty() {
         let bits = CompactTarget::from_consensus(0x1d00ffff);
-        let result = calculate_next_target(bits, TARGET_TIMESPAN * 2);
+        let result = calculate_next_target(bits, TARGET_TIMESPAN * 2, MAINNET_POW_LIMIT);
         let original = Target::from_compact(bits);
         let adjusted = Target::from_compact(result);
         // Slower mining → higher target → easier difficulty
@@ -582,8 +592,8 @@ mod tests {
     fn retarget_clamps_at_4x_increase() {
         // Use a harder difficulty so we have room to increase
         let bits = CompactTarget::from_consensus(0x1c00ffff);
-        let result_8x = calculate_next_target(bits, TARGET_TIMESPAN * 8);
-        let result_4x = calculate_next_target(bits, TARGET_TIMESPAN * 4);
+        let result_8x = calculate_next_target(bits, TARGET_TIMESPAN * 8, MAINNET_POW_LIMIT);
+        let result_4x = calculate_next_target(bits, TARGET_TIMESPAN * 4, MAINNET_POW_LIMIT);
         // 8x should be clamped to same as 4x
         assert_eq!(result_8x.to_consensus(), result_4x.to_consensus());
     }
@@ -591,8 +601,8 @@ mod tests {
     #[test]
     fn retarget_clamps_at_quarter_decrease() {
         let bits = CompactTarget::from_consensus(0x1d00ffff);
-        let result_8th = calculate_next_target(bits, TARGET_TIMESPAN / 8);
-        let result_4th = calculate_next_target(bits, TARGET_TIMESPAN / 4);
+        let result_8th = calculate_next_target(bits, TARGET_TIMESPAN / 8, MAINNET_POW_LIMIT);
+        let result_4th = calculate_next_target(bits, TARGET_TIMESPAN / 4, MAINNET_POW_LIMIT);
         // 1/8th should be clamped to same as 1/4th
         assert_eq!(result_8th.to_consensus(), result_4th.to_consensus());
     }
@@ -600,9 +610,9 @@ mod tests {
     #[test]
     fn retarget_caps_at_max_target() {
         // Start at max target, double the timespan → should stay at max
-        let bits = CompactTarget::from_consensus(MAX_TARGET_BITS);
-        let result = calculate_next_target(bits, TARGET_TIMESPAN * 2);
-        assert_eq!(result.to_consensus(), MAX_TARGET_BITS);
+        let bits = CompactTarget::from_consensus(MAINNET_POW_LIMIT);
+        let result = calculate_next_target(bits, TARGET_TIMESPAN * 2, MAINNET_POW_LIMIT);
+        assert_eq!(result.to_consensus(), MAINNET_POW_LIMIT);
     }
 
     // ── Full header validation ──────────────────────────────────────
@@ -619,6 +629,7 @@ mod tests {
         );
 
         let result = validate_headers(
+            ChainParams::mainnet(),
             &[block1],
             genesis.block_hash(),
             0,
@@ -634,6 +645,7 @@ mod tests {
         let block1 = block1_header();
 
         let result = validate_headers(
+            ChainParams::mainnet(),
             &[block1],
             BlockHash::all_zeros(),
             0,
@@ -653,6 +665,7 @@ mod tests {
         let wrong_bits = CompactTarget::from_consensus(0x1c00ffff);
 
         let result = validate_headers(
+            ChainParams::mainnet(),
             &[block1],
             genesis.block_hash(),
             0,
@@ -681,6 +694,7 @@ mod tests {
         let bad_header: bitcoin::block::Header = deserialize(&raw).unwrap();
 
         let result = validate_headers(
+            ChainParams::mainnet(),
             &[bad_header],
             genesis.block_hash(),
             0,
@@ -760,6 +774,7 @@ mod tests {
         let future_timestamps: Vec<u32> = (0..11).map(|i| 1231469665 + 1000 + i).collect();
 
         let result = validate_headers(
+            ChainParams::mainnet(),
             &[block1],
             genesis.block_hash(),
             11, // pretend we're at height 11 so the median check activates
@@ -1022,6 +1037,7 @@ mod tests {
         let timestamps = vec![genesis.time, genesis.time + 1];
 
         let result = validate_headers(
+            ChainParams::mainnet(),
             &[block1],
             genesis.block_hash(),
             0,
@@ -1030,5 +1046,70 @@ mod tests {
             &|_| Err("unused".into()),
         );
         assert!(result.is_ok(), "should pass with < 11 timestamps: {:?}", result);
+    }
+
+    // ── Chain params (ticket 027) ─────────────────────────────────
+
+    /// A regtest-difficulty header on `prev`, mined until its PoW is valid.
+    fn mined_regtest_header(prev: &Header) -> Header {
+        let mut h = Header {
+            version: bitcoin::block::Version::from_consensus(0x2000_0000),
+            prev_blockhash: prev.block_hash(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: prev.time + 600,
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        };
+        while h.validate_pow(h.target()).is_err() {
+            h.nonce += 1;
+        }
+        h
+    }
+
+    #[test]
+    fn regtest_does_not_retarget_at_epoch_boundary() {
+        let prev = ChainParams::regtest().genesis_header();
+        let next = mined_regtest_header(&prev);
+        // Height 2016 is a retarget boundary on mainnet. Regtest keeps the
+        // parent's bits and never consults the epoch-start lookup.
+        let result = validate_headers(
+            ChainParams::regtest(),
+            &[next],
+            prev.block_hash(),
+            2015,
+            &[prev.time],
+            prev.bits,
+            &|_| Err("must not be called".into()),
+        );
+        assert!(result.is_ok(), "{:?}", result);
+
+        // Same input under mainnet rules is a retarget and must be checked.
+        let result = validate_headers(
+            ChainParams::mainnet(),
+            &[next],
+            prev.block_hash(),
+            2015,
+            &[prev.time],
+            prev.bits,
+            &|_| Err("no epoch start".into()),
+        );
+        assert!(matches!(result, Err(ValidationError::BadDifficulty { .. })), "{:?}", result);
+    }
+
+    #[test]
+    fn regtest_rejects_bits_change() {
+        let prev = ChainParams::regtest().genesis_header();
+        let mut next = mined_regtest_header(&prev);
+        next.bits = CompactTarget::from_consensus(0x2007ffff);
+        let result = validate_headers(
+            ChainParams::regtest(),
+            &[next],
+            prev.block_hash(),
+            2015,
+            &[prev.time],
+            prev.bits,
+            &|_| Err("unused".into()),
+        );
+        assert!(matches!(result, Err(ValidationError::BadDifficulty { .. })), "{:?}", result);
     }
 }
