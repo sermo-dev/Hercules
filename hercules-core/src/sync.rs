@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bitcoin::block::Header;
@@ -25,6 +25,7 @@ use crate::peer_pool::{PeerInfo, PeerPool, PeerSource};
 use crate::store::HeaderStore;
 use crate::tor::TorManager;
 use crate::utxo::{SnapshotLoadError, SnapshotMeta, UtxoSet};
+use crate::wake::{WakeBudget, WakePhase};
 use crate::validation::{
     check_anchor, chainwork_for_headers, u256_add, u256_gt, validate_headers,
 };
@@ -88,6 +89,19 @@ enum HeaderCrossCheck {
     Accept,
     /// Active peer's headers were contradicted by majority — reject the batch.
     Reject,
+    /// The wake budget ran out (deadline or cancellation) before any peer
+    /// contradicted the active one: nothing was learned, nobody is
+    /// penalized. Only with a budget (ticket 028).
+    Inconclusive,
+}
+
+/// What `fetch_first_header_hash` got from one peer.
+enum FirstHeader {
+    Hash(BlockHash),
+    /// Network failure, empty response, or peer gone.
+    Failed,
+    /// Our wake budget ended the exchange: not the peer's fault.
+    OutOfBudget,
 }
 
 /// Format a legacy v1 `Address` from `addr` gossip into the `host:port`
@@ -380,7 +394,8 @@ fn fetch_requested_block(
         let block_peer_addr = block_peer.addr().to_string();
         tried.push(block_peer_addr.clone());
 
-        match block_peer.get_block(block_hash) {
+        let limit = deadline.saturating_duration_since(Instant::now());
+        match block_peer.get_block_within(block_hash, Some(limit)) {
             // Defense in depth: get_block already binds to the requested
             // hash, but re-check here so a future p2p refactor can't
             // silently reopen the substitution hole.
@@ -443,8 +458,17 @@ pub struct HeaderSync {
     peers_db_path: Option<String>,
     mempool: Mutex<Mempool>,
     validation_paused: Arc<AtomicBool>,
+    /// Stop flag for `sync()` / `stop_sync()` (tests). The app's sessions
+    /// pass their own token to `run_sync` (ticket 028).
+    #[cfg(test)]
     shutdown_requested: Arc<AtomicBool>,
-    tor: Option<Arc<TorManager>>,
+    /// The Tor client, once it is up. Set at construction, or later by
+    /// `attach_tor` when the node opened without waiting for bootstrap
+    /// (ticket 028).
+    tor: OnceLock<Arc<TorManager>>,
+    /// Tor mode was configured: peer sessions must not start until `tor`
+    /// is set, so a node still bootstrapping never falls back to clearnet.
+    tor_required: bool,
     /// True when our regular peer connections go over Tor (`tor` is set).
     /// Without Tor they are clearnet, and an own tx announced on them
     /// first ties it to our IP, so it waits for the 029 private-broadcast
@@ -595,7 +619,9 @@ impl HeaderSync {
         // idempotent, and the crash-recovery path re-runs it). Every path
         // runs the hook after the UTXO apply and before
         // `set_validated_height`, so once no block is mid-apply (true here,
-        // before any sync starts) a settled row with status_height above
+        // before any sync starts, as long as no other HeaderSync in the
+        // process has these files open: the app's `NodeHost` keeps it to
+        // one node, ticket 028) a settled row with status_height above
         // validated_height can only be such a leftover. Not repeated at
         // session start: a push-wake `validate_latest_block` could be
         // mid-apply then. Skipped with no UTXO set (height 0): there is
@@ -612,6 +638,11 @@ impl HeaderSync {
         if tor.is_some() {
             info!("HeaderSync: Tor enabled — all connections routed through Tor");
         }
+        let tor_required = tor.is_some();
+        let tor = match tor {
+            Some(t) => OnceLock::from(t),
+            None => OnceLock::new(),
+        };
 
         Ok(HeaderSync {
             store,
@@ -620,9 +651,11 @@ impl HeaderSync {
             peers_db_path,
             mempool: Mutex::new(Mempool::with_params(params)),
             validation_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             shutdown_requested: Arc::new(AtomicBool::new(false)),
-            regular_peers_over_tor: tor.is_some(),
+            regular_peers_over_tor: tor_required,
             tor,
+            tor_required,
             relay_state: Mutex::new(HashMap::new()),
             relay_queue: Mutex::new(Vec::new()),
             own_txs,
@@ -1351,12 +1384,26 @@ impl HeaderSync {
     /// Open a fresh `PeerPool` for one sync session, using this node's chain
     /// params and peer source.
     fn open_pool(&self, our_height: u32) -> Result<PeerPool, SyncError> {
-        PeerPool::new(
+        self.open_pool_until(our_height, None)
+    }
+
+    /// `open_pool` that stops dialing new peers at `connect_deadline`
+    /// (wake paths, ticket 028).
+    fn open_pool_until(
+        &self,
+        our_height: u32,
+        connect_deadline: Option<Instant>,
+    ) -> Result<PeerPool, SyncError> {
+        if self.tor_required && self.tor().is_none() {
+            return Err(SyncError::Peer("Tor transport not ready".into()));
+        }
+        PeerPool::new_until(
             our_height,
-            self.tor.clone(),
+            self.tor().cloned(),
             self.peers_db_path.as_deref(),
             self.params,
             self.peer_source.clone(),
+            connect_deadline,
         )
         .map_err(|e| {
             if format!("{}", e).contains("no peers discovered") {
@@ -1377,9 +1424,29 @@ impl HeaderSync {
 
     /// Request the sync loop to stop. The loop will exit cleanly on its
     /// next iteration, returning Ok(()) from `sync()`.
+    #[cfg(test)]
     pub fn stop_sync(&self) {
         self.shutdown_requested.store(true, Ordering::Relaxed);
         info!("Sync stop requested");
+    }
+
+    /// Tor mode with the client still bootstrapping: peer sessions are
+    /// refused until `attach_tor` (ticket 028).
+    pub fn require_tor(&mut self) {
+        self.tor_required = true;
+        self.regular_peers_over_tor = true;
+    }
+
+    /// Hand over the Tor client once it has bootstrapped. Later calls are
+    /// ignored: a node keeps one Tor client for its lifetime.
+    pub fn attach_tor(&self, tor: Arc<TorManager>) {
+        if self.tor.set(tor).is_ok() {
+            info!("HeaderSync: Tor attached — all connections routed through Tor");
+        }
+    }
+
+    fn tor(&self) -> Option<&Arc<TorManager>> {
+        self.tor.get()
     }
 
     /// Cross-check a freshly fetched header batch against one or two
@@ -1407,6 +1474,10 @@ impl HeaderSync {
     /// fresh node only stores headers that two distinct peers agree on. The
     /// caller retries on the next iteration. Steady-state behavior is
     /// unchanged.
+    ///
+    /// `budget` (wake paths): if it runs out before any divergence is seen
+    /// the result is `Inconclusive`. A divergence already seen stays a
+    /// `Reject` even when the tiebreaker then runs out of time.
     fn cross_check_headers(
         &self,
         pool: &mut PeerPool,
@@ -1414,6 +1485,7 @@ impl HeaderSync {
         active_addr: &str,
         active_first_hash: BlockHash,
         strict: bool,
+        budget: Option<&WakeBudget>,
     ) -> HeaderCrossCheck {
         // Step 1: pick an independent witness peer.
         let witness_addr = match pool.peer_addr_other_than(active_addr) {
@@ -1434,9 +1506,13 @@ impl HeaderSync {
             }
         };
 
-        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator) {
-            Some(h) => h,
-            None if strict => {
+        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator, budget) {
+            FirstHeader::Hash(h) => h,
+            FirstHeader::OutOfBudget => {
+                debug!("cross-check: budget spent before witness {} answered", witness_addr);
+                return HeaderCrossCheck::Inconclusive;
+            }
+            FirstHeader::Failed if strict => {
                 // Same "can't conclude" case, but during initial sync we
                 // fail closed. No penalty for the active peer.
                 debug!(
@@ -1445,7 +1521,7 @@ impl HeaderSync {
                 );
                 return HeaderCrossCheck::Reject;
             }
-            None => {
+            FirstHeader::Failed => {
                 // Witness peer failed to respond — we can't conclude anything.
                 // Don't penalize the active peer over a network failure.
                 debug!(
@@ -1473,7 +1549,11 @@ impl HeaderSync {
         let tiebreaker_addr = pool.peer_addr_excluding(&exclude);
 
         if let Some(tb_addr) = tiebreaker_addr {
-            if let Some(tb_first) = self.fetch_first_header_hash(pool, &tb_addr, locator) {
+            // A tiebreaker that runs out of budget falls through to the
+            // 2-peer case: the divergence stands.
+            if let FirstHeader::Hash(tb_first) =
+                self.fetch_first_header_hash(pool, &tb_addr, locator, budget)
+            {
                 if tb_first == active_first_hash {
                     // Active + tiebreaker agree → witness is the liar.
                     warn!(
@@ -1513,26 +1593,44 @@ impl HeaderSync {
     }
 
     /// Send a `getheaders` to a specific peer and return the first header
-    /// hash from its response, or `None` on any failure (network, empty
-    /// response, peer no longer in pool). This wraps the peer checkout/return
-    /// dance so the cross-check helper stays readable.
+    /// hash from its response. This wraps the peer checkout/return dance so
+    /// the cross-check helper stays readable. `budget` bounds the whole
+    /// exchange (wake budgets, ticket 028); running out of it is
+    /// `OutOfBudget` and never counts against the peer.
     fn fetch_first_header_hash(
         &self,
         pool: &mut PeerPool,
         addr: &str,
         locator: &[BlockHash],
-    ) -> Option<BlockHash> {
-        let mut peer = pool.checkout_peer_by_addr(addr)?;
-        let result = peer.get_headers(locator.to_vec(), BlockHash::all_zeros());
+        budget: Option<&WakeBudget>,
+    ) -> FirstHeader {
+        if budget.is_some_and(|b| b.should_stop()) {
+            return FirstHeader::OutOfBudget;
+        }
+        let Some(mut peer) = pool.checkout_peer_by_addr(addr) else {
+            return FirstHeader::Failed;
+        };
+        let limit = budget.map(|b| b.remaining());
+        let result = peer.get_headers_within(locator.to_vec(), BlockHash::all_zeros(), limit);
         match result {
             Ok(headers) => {
                 pool.return_peer(peer);
-                headers.first().map(|h| h.block_hash())
+                match headers.first() {
+                    Some(h) => FirstHeader::Hash(h.block_hash()),
+                    None => FirstHeader::Failed,
+                }
+            }
+            Err(PeerError::DeadlineReached) => {
+                // Our deadline, not the peer's fault: keep it in the pool.
+                // A late reply may still be in flight, but the wake is over
+                // and drops the pool with it.
+                pool.return_peer(peer);
+                FirstHeader::OutOfBudget
             }
             Err(e) => {
                 warn!("cross-check: peer {} failed to respond: {}", addr, e);
                 pool.remove_peer(addr);
-                None
+                FirstHeader::Failed
             }
         }
     }
@@ -1562,13 +1660,26 @@ impl HeaderSync {
     /// Run header sync continuously. Calls `on_progress` with status updates.
     /// This is a blocking call that syncs to the chain tip and then monitors
     /// for new blocks every 30 seconds. It only returns on unrecoverable errors.
+    /// The app goes through `run_sync` (via `HerculesNode::start_header_sync`).
+    #[cfg(test)]
     pub fn sync<F>(&self, on_progress: F) -> Result<(), SyncError>
     where
         F: Fn(SyncStatus),
     {
         // Reset shutdown flag so sync can be restarted after a stop
         self.shutdown_requested.store(false, Ordering::Relaxed);
+        self.run_sync(&self.shutdown_requested, on_progress)
+    }
 
+    /// `sync`, stopped by `stop` instead of the shared `stop_sync` flag.
+    /// The FFI gives every foreground session its own token (ticket 028):
+    /// a stop aimed at one session can't leak into the next, and a stop
+    /// issued while the session waits for transport or the node's session
+    /// lock still counts.
+    pub fn run_sync<F>(&self, stop: &AtomicBool, on_progress: F) -> Result<(), SyncError>
+    where
+        F: Fn(SyncStatus),
+    {
         // Get our current height to report to peers
         let our_height = self
             .store
@@ -1617,7 +1728,7 @@ impl HeaderSync {
 
         loop {
             // Check for shutdown request
-            if self.shutdown_requested.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
                 info!("Sync shutting down cleanly");
                 return Ok(());
             }
@@ -1941,7 +2052,7 @@ impl HeaderSync {
                 self.new_block_announced.store(false, Ordering::Relaxed);
 
                 while monitor_start.elapsed() < MONITOR_INTERVAL {
-                    if self.shutdown_requested.load(Ordering::Relaxed) {
+                    if stop.load(Ordering::Relaxed) {
                         break;
                     }
 
@@ -1993,7 +2104,7 @@ impl HeaderSync {
                     // visibly stall progress. Anything beyond the cap
                     // waits for the next monitor-loop pass.
                     const MAX_INBOUND_ACCEPTS_PER_TICK: usize = 10;
-                    if let Some(ref tor) = self.tor {
+                    if let Some(tor) = self.tor() {
                         let mut accepted_this_tick = 0;
                         while accepted_this_tick < MAX_INBOUND_ACCEPTS_PER_TICK {
                             let Some(inbound_stream) = tor.accept_inbound() else {
@@ -2096,9 +2207,11 @@ impl HeaderSync {
                 &active_addr,
                 active_first_hash,
                 strict,
+                None,
             ) {
                 HeaderCrossCheck::Accept => {}
-                HeaderCrossCheck::Reject => {
+                // Inconclusive needs a budget; the main loop has none.
+                HeaderCrossCheck::Reject | HeaderCrossCheck::Inconclusive => {
                     // The cross-check helper has already applied the
                     // appropriate misbehavior penalty. Drop the batch and
                     // try again on the next iteration.
@@ -2488,10 +2601,7 @@ impl HeaderSync {
                 // Sample up to 999 addresses from the AddrManager, leaving one
                 // slot in the 1000-entry budget for our own self-advertisement.
                 let sample = pool.sample_addresses(999);
-                let our_pubkey = self
-                    .tor
-                    .as_ref()
-                    .and_then(|t| t.our_onion_pubkey());
+                let our_pubkey = self.tor().and_then(|t| t.our_onion_pubkey());
 
                 if peer.wants_addrv2() {
                     let mut entries: Vec<bitcoin::p2p::address::AddrV2Message> = sample
@@ -2792,7 +2902,7 @@ impl HeaderSync {
     /// out. No-op if we have no onion service yet (still bootstrapping Tor)
     /// or no peers connected.
     fn rebroadcast_self_ad(&self, pool: &PeerPool) {
-        let Some(pubkey) = self.tor.as_ref().and_then(|t| t.our_onion_pubkey()) else {
+        let Some(pubkey) = self.tor().and_then(|t| t.our_onion_pubkey()) else {
             return;
         };
         let mut sent = 0usize;
@@ -2924,11 +3034,22 @@ impl HeaderSync {
     /// Returns a `BlockNotification` with whatever validation was achieved
     /// before the deadline. This is designed for iOS's ~30-second background
     /// execution window (call with timeout_secs=25 to leave margin).
+    #[cfg(test)]
     pub fn validate_latest_block(
         &self,
         timeout_secs: u32,
     ) -> Result<BlockNotification, SyncError> {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+        self.validate_latest_block_in(&WakeBudget::new(timeout_secs.saturating_mul(1000)))
+    }
+
+    /// `validate_latest_block` against a wake budget (ticket 028): stops
+    /// between steps once the budget is spent or cancelled, and records
+    /// phase timings on it.
+    pub fn validate_latest_block_in(
+        &self,
+        budget: &WakeBudget,
+    ) -> Result<BlockNotification, SyncError> {
+        let deadline = budget.deadline();
 
         // Get our current tip
         let (tip_height, tip_hash, tip_header) = self
@@ -2944,19 +3065,21 @@ impl HeaderSync {
             .saturating_sub(1);
 
         info!(
-            "validate_latest_block: tip at {}, timeout {}s",
-            tip_height, timeout_secs
+            "validate_latest_block: tip at {}, {} ms left",
+            tip_height,
+            budget.remaining_ms()
         );
 
         // Connect to one peer
-        if Instant::now() >= deadline {
+        if budget.should_stop() {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
-        let mut pool = self.open_pool(our_height)?;
+        let mut pool = self.open_pool_until(our_height, Some(budget.deadline()))?;
+        budget.mark(WakePhase::PeersReady);
 
         // Get headers from best peer
-        if Instant::now() >= deadline {
+        if budget.should_stop() {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
@@ -2967,10 +3090,18 @@ impl HeaderSync {
         let mut peer = peer.unwrap();
         let peer_addr = peer.addr().to_string();
 
-        let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
+        let headers = match peer.get_headers_within(
+            vec![tip_hash],
+            BlockHash::all_zeros(),
+            Some(budget.remaining()),
+        ) {
             Ok(h) => {
                 pool.return_peer(peer);
                 h
+            }
+            // Out of budget waiting for headers: nothing learned.
+            Err(_) if budget.should_stop() => {
+                return Ok(BlockNotification::no_update(tip_height, &tip_header));
             }
             Err(e) => {
                 return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
@@ -2978,6 +3109,7 @@ impl HeaderSync {
         };
 
         if headers.is_empty() {
+            budget.mark(WakePhase::HeadersChecked);
             info!("validate_latest_block: no new headers, chain is current");
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
@@ -3025,6 +3157,7 @@ impl HeaderSync {
         let new_tip = tip_height + headers.len() as u32;
         let new_header = &headers[headers.len() - 1];
 
+        budget.mark(WakePhase::HeadersChecked);
         info!(
             "validate_latest_block: synced headers {}-{} (PoW validated)",
             new_start, new_tip
@@ -3042,8 +3175,8 @@ impl HeaderSync {
         };
 
         // If time remains, try full block validation
-        if Instant::now() >= deadline {
-            info!("validate_latest_block: deadline reached after header sync");
+        if budget.should_stop() {
+            info!("validate_latest_block: deadline reached or cancelled after header sync");
             return Ok(notification);
         }
 
@@ -3069,7 +3202,8 @@ impl HeaderSync {
         let block_hash = new_header.block_hash();
         match fetch_requested_block(&mut pool, block_hash, deadline) {
             Some(block) => {
-                if Instant::now() >= deadline {
+                budget.mark(WakePhase::BlockDownloaded);
+                if budget.should_stop() {
                     return Ok(notification);
                 }
 
@@ -3114,6 +3248,7 @@ impl HeaderSync {
                     .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
                 notification.validated = true;
+                budget.mark(WakePhase::Validated);
                 info!("validate_latest_block: block {} fully validated", new_tip);
             }
             None => {
@@ -3128,12 +3263,25 @@ impl HeaderSync {
     /// Validate multiple blocks within a time budget. Preferred over
     /// `validate_latest_block` for push wakes when the node may be
     /// multiple blocks behind.
+    #[cfg(test)]
     pub fn catch_up_blocks(
         &self,
         max_blocks: u32,
         budget_secs: u32,
     ) -> Result<CatchUpStatus, SyncError> {
-        let deadline = Instant::now() + Duration::from_secs(budget_secs as u64);
+        self.catch_up_blocks_in(max_blocks, &WakeBudget::new(budget_secs.saturating_mul(1000)))
+    }
+
+    /// `catch_up_blocks` against a wake budget (ticket 028). The budget's
+    /// deadline was set at wake receipt, so time spent before this call
+    /// (node open, transport) is already counted. Checks for cancellation
+    /// between steps and returns partial progress, records phase timings,
+    /// and clamps block downloads to the time left.
+    pub fn catch_up_blocks_in(
+        &self,
+        max_blocks: u32,
+        budget: &WakeBudget,
+    ) -> Result<CatchUpStatus, SyncError> {
 
         // Read current state
         let (tip_height, tip_hash, tip_header) = self
@@ -3154,30 +3302,27 @@ impl HeaderSync {
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
         info!(
-            "catch_up_blocks: tip {}, validated {}, max_blocks {}, budget {}s",
-            tip_height, validated_height, max_blocks, budget_secs
+            "catch_up_blocks: tip {}, validated {}, max_blocks {}, {} ms left",
+            tip_height,
+            validated_height,
+            max_blocks,
+            budget.remaining_ms()
         );
 
-        // Connect to peers
-        if Instant::now() >= deadline {
-            return Ok(self.make_catchup_status(
-                validated_height >= tip_height,
-                0,
-                validated_height,
-                tip_height,
-            ));
+        // Connect to peers. Until headers have been checked against peers
+        // the local tip says nothing about the network's, so the early
+        // returns below never report caught_up.
+        if budget.should_stop() {
+            return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
         }
 
-        let mut pool = self.open_pool(our_height)?;
+        // Stop dialing new peers at the deadline (ticket 028).
+        let mut pool = self.open_pool_until(our_height, Some(budget.deadline()))?;
+        budget.mark(WakePhase::PeersReady);
 
         // Sync headers to tip
-        if Instant::now() >= deadline {
-            return Ok(self.make_catchup_status(
-                validated_height >= tip_height,
-                0,
-                validated_height,
-                tip_height,
-            ));
+        if budget.should_stop() {
+            return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
         }
 
         let mut peer = pool
@@ -3185,10 +3330,18 @@ impl HeaderSync {
             .ok_or_else(|| SyncError::Peer("no peers available".into()))?;
         let peer_addr = peer.addr().to_string();
 
-        let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
+        let headers = match peer.get_headers_within(
+            vec![tip_hash],
+            BlockHash::all_zeros(),
+            Some(budget.remaining()),
+        ) {
             Ok(h) => {
                 pool.return_peer(peer);
                 h
+            }
+            // Out of budget waiting for headers: headers stay unchecked.
+            Err(_) if budget.should_stop() => {
+                return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
             }
             Err(e) => {
                 return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
@@ -3222,9 +3375,19 @@ impl HeaderSync {
                 &peer_addr,
                 active_first_hash,
                 strict,
+                Some(budget),
             ) {
                 HeaderCrossCheck::Accept => {}
+                // The budget ran out before any peer disagreed: not an
+                // eclipse signal. Headers stay unchecked.
+                HeaderCrossCheck::Inconclusive => {
+                    info!("catch_up_blocks: budget spent during header cross-check");
+                    return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
+                }
                 HeaderCrossCheck::Reject => {
+                    // Headers were checked: peers disagree (possible eclipse),
+                    // even if the budget ran out after the divergence.
+                    budget.mark(WakePhase::HeadersChecked);
                     warn!("catch_up_blocks: header cross-check rejected batch from {}", peer_addr);
                     let mut status = self.make_catchup_status(
                         false,
@@ -3276,6 +3439,7 @@ impl HeaderSync {
                 new_start, new_tip
             );
         }
+        budget.mark(WakePhase::HeadersChecked);
 
         // No block validation until the chain has minimum work and any
         // pending snapshot is bound to it (may advance validated_height).
@@ -3293,7 +3457,7 @@ impl HeaderSync {
 
         while validated_height < new_tip
             && blocks_validated < max_blocks
-            && Instant::now() < deadline
+            && !budget.should_stop()
         {
             let next_height = validated_height + 1;
 
@@ -3315,10 +3479,17 @@ impl HeaderSync {
                 }
             };
 
-            let block = match block_peer.get_block(block_hash) {
+            let block = match block_peer.get_block_within(block_hash, Some(budget.remaining())) {
                 Ok(b) => {
                     pool.return_peer(block_peer);
+                    budget.mark(WakePhase::BlockDownloaded);
                     b
+                }
+                // The read timeout was clamped to the budget: running out
+                // of it is partial progress, not a peer error.
+                Err(e) if budget.should_stop() => {
+                    info!("catch_up_blocks: budget spent downloading {}: {}", next_height, e);
+                    break;
                 }
                 Err(e) => {
                     return Ok(CatchUpStatus {
@@ -3390,6 +3561,7 @@ impl HeaderSync {
 
             validated_height = next_height;
             blocks_validated += 1;
+            budget.mark(WakePhase::Validated);
 
             info!(
                 "catch_up_blocks: validated block {} ({}/{})",
@@ -3588,6 +3760,19 @@ mod tests {
     }
 
     #[test]
+    fn fetch_requested_block_does_not_penalize_a_peer_our_deadline_cut_off() {
+        // A silent peer and a 200 ms budget: our deadline ends the request,
+        // which says nothing about the peer (ticket 028).
+        let (mut pool, servers) = loopback_pool(1);
+        let wanted_hash = synthetic_block(1).block_hash();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(200);
+        assert!(fetch_requested_block(&mut pool, wanted_hash, deadline).is_none());
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(pool.get_score(&servers[0].0), Some(100));
+    }
+
+    #[test]
     fn fetch_requested_block_does_not_retry_past_deadline() {
         let (mut pool, mut servers) = loopback_pool(2);
         serve_wrong_block(&mut servers[0].1);
@@ -3598,6 +3783,66 @@ mod tests {
         // caller checked the deadline before calling), but no retry.
         assert!(fetch_requested_block(&mut pool, wanted_hash, Instant::now()).is_none());
         assert_eq!(pool.get_score(&servers[1].0), Some(100));
+    }
+
+    // ── cross_check_headers under a wake budget (ticket 028) ─────────────
+
+    /// Three loopback peers: active, tiebreaker, witness. The witness gets
+    /// a reward so it is picked first.
+    fn cross_check_pool() -> (PeerPool, Vec<(String, std::net::TcpStream)>, tempfile::TempDir, HeaderSync) {
+        let (pool, servers) = loopback_pool(3);
+        pool.reward(&servers[2].0, 5);
+        let dir = tempfile::TempDir::new().unwrap();
+        let syncer = HeaderSync::new(dir.path().join("headers.sqlite3").to_str().unwrap(), None).unwrap();
+        (pool, servers, dir, syncer)
+    }
+
+    #[test]
+    fn cross_check_divergence_survives_a_tiebreaker_deadline() {
+        // The witness contradicts the active peer, then the tiebreaker
+        // runs into our deadline. The divergence was seen: Reject (the
+        // wake reports tip_disagreement), and the tiebreaker isn't blamed.
+        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+        let (active, tiebreaker, witness) = (servers[0].0.clone(), servers[1].0.clone(), servers[2].0.clone());
+        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![synthetic_block(2).header]));
+        let budget = WakeBudget::new(300);
+
+        let start = Instant::now();
+        let r = syncer.cross_check_headers(&mut pool, &[], &active, synthetic_block(1).block_hash(), false, Some(&budget));
+        assert!(matches!(r, HeaderCrossCheck::Reject));
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(pool.get_score(&tiebreaker), Some(100), "deadline counted against tiebreaker");
+        assert_eq!(pool.count(), 3, "tiebreaker removed over our deadline");
+        assert_eq!(pool.get_score(&active), Some(100 - HEADER_DISAGREEMENT_PENALTY as i32));
+        assert_eq!(pool.get_score(&witness), Some(105 - HEADER_DISAGREEMENT_PENALTY as i32));
+    }
+
+    #[test]
+    fn cross_check_deadline_before_any_answer_is_inconclusive() {
+        // Silent witness: the budget ends before anyone disagrees. Not an
+        // eclipse signal, and no peer pays for our deadline.
+        for strict in [false, true] {
+            let (mut pool, servers, _dir, syncer) = cross_check_pool();
+            let budget = WakeBudget::new(200);
+            let r = syncer.cross_check_headers(&mut pool, &[], &servers[0].0, synthetic_block(1).block_hash(), strict, Some(&budget));
+            assert!(matches!(r, HeaderCrossCheck::Inconclusive), "strict {}", strict);
+            assert_eq!(pool.count(), 3, "witness removed over our deadline");
+            assert_eq!(pool.get_score(&servers[0].0), Some(100));
+            assert_eq!(pool.get_score(&servers[1].0), Some(100));
+            assert_eq!(pool.get_score(&servers[2].0), Some(105));
+        }
+    }
+
+    #[test]
+    fn cross_check_cancelled_before_the_witness_is_inconclusive() {
+        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+        // The witness would contradict, but we never ask it.
+        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![synthetic_block(2).header]));
+        let budget = WakeBudget::new(10_000);
+        budget.cancel();
+        let r = syncer.cross_check_headers(&mut pool, &[], &servers[0].0, synthetic_block(1).block_hash(), false, Some(&budget));
+        assert!(matches!(r, HeaderCrossCheck::Inconclusive));
+        assert_eq!(pool.get_score(&servers[0].0), Some(100));
     }
 
     // ── is_routable ────────────────────────────────────────────────────

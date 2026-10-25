@@ -15,10 +15,12 @@
 		5DCCBD033FCAC94054F52860 /* AppIdentifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41A3C4F8176070EC1047DA1B /* AppIdentifiers.swift */; };
 		5EDE5A815A9EBFDB673C9944 /* herculesFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 23538480402D68A26C4B93B3 /* herculesFFI.xcframework */; };
 		6E11490B9C8FBFC3B743B3B1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 314CE09F95D9CE2AEFB5822D /* ContentView.swift */; };
+		7278C10C3CC2424F1099807B /* NodeHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */; };
 		8FCF4BC9300EA0B5AE98A0B7 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */; };
 		916E16D86ED9743267AE8804 /* SharedNodeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AC4E7AF001C5D6258259379 /* SharedNodeState.swift */; };
 		9E9C169F7571AD37D2B73530 /* HerculesWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC2415BD33A7DBAD601ACFF /* HerculesWidget.swift */; };
 		A128B0A9D11BC0123589A67B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F6A2BE5D8836DC97A10384A /* AppDelegate.swift */; };
+		AA3A717247168C156786CE85 /* WakeCoordination.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80ECE0624FEAEF806943E691 /* WakeCoordination.swift */; };
 		AAE2B41435A592373EFD3166 /* HerculesWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 2B38B13EB04B0700E9F9264E /* HerculesWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		B3EF5D8882B4179A23DF8B64 /* NotificationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */; };
 		BC2233A312C88F1BCD98652D /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91B6627F64A7DEA672DD126A /* SettingsView.swift */; };
@@ -71,11 +73,13 @@
 		5DF36E0E80A83078F748A223 /* HerculesApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesApp.entitlements; sourceTree = "<group>"; };
 		71E16302A07901026D4D7245 /* StoragePaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoragePaths.swift; sourceTree = "<group>"; };
 		73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotDownloader.swift; sourceTree = "<group>"; };
+		80ECE0624FEAEF806943E691 /* WakeCoordination.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeCoordination.swift; sourceTree = "<group>"; };
 		878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeActivityAttributes.swift; sourceTree = "<group>"; };
 		8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerculesApp.swift; sourceTree = "<group>"; };
 		91B6627F64A7DEA672DD126A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		A1D43EA3963B18DAD924BE53 /* HerculesWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesWidget.entitlements; sourceTree = "<group>"; };
 		A39D7E95A1FE6D2B01A6BF53 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeHost.swift; sourceTree = "<group>"; };
 		BCC2415BD33A7DBAD601ACFF /* HerculesWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerculesWidget.swift; sourceTree = "<group>"; };
 		D447B442663275E674A34B07 /* hercules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = hercules.swift; sourceTree = "<group>"; };
 		F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationHistory.swift; sourceTree = "<group>"; };
@@ -144,12 +148,14 @@
 				4CB3647C90E7FDE042B14BD4 /* Info.plist */,
 				04EA95902151C9A47F19E41C /* NetworkPolicy.swift */,
 				878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */,
+				A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */,
 				F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */,
 				369D4212C2AB889A298C77F9 /* NotificationManager.swift */,
 				91B6627F64A7DEA672DD126A /* SettingsView.swift */,
 				4AC4E7AF001C5D6258259379 /* SharedNodeState.swift */,
 				73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */,
 				71E16302A07901026D4D7245 /* StoragePaths.swift */,
+				80ECE0624FEAEF806943E691 /* WakeCoordination.swift */,
 			);
 			path = HerculesApp;
 			sourceTree = "<group>";
@@ -273,12 +279,14 @@
 				207BCB9D380A6282E1252A39 /* HerculesApp.swift in Sources */,
 				CFECBEFA458FD23C2B457AF9 /* NetworkPolicy.swift in Sources */,
 				EC9ABB59AA6F7ADCACF891B3 /* NodeActivityAttributes.swift in Sources */,
+				7278C10C3CC2424F1099807B /* NodeHost.swift in Sources */,
 				B3EF5D8882B4179A23DF8B64 /* NotificationHistory.swift in Sources */,
 				FEA13ADA8F49AAA14C5EB73F /* NotificationManager.swift in Sources */,
 				BC2233A312C88F1BCD98652D /* SettingsView.swift in Sources */,
 				916E16D86ED9743267AE8804 /* SharedNodeState.swift in Sources */,
 				57F102B1AEC3AAFB708A1D34 /* SnapshotDownloader.swift in Sources */,
 				3DB679FA6EDB8024379C44D5 /* StoragePaths.swift in Sources */,
+				AA3A717247168C156786CE85 /* WakeCoordination.swift in Sources */,
 				30FE03463F60EE0268673195 /* hercules.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
