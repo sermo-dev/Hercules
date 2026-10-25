@@ -10,6 +10,7 @@ mod block_store;
 mod block_validation;
 mod chain_params;
 mod mempool;
+mod own_tx_store;
 mod p2p;
 mod peer_pool;
 mod relay_policy;
@@ -73,17 +74,32 @@ pub fn hercules_version() -> String {
 /// Wipe all on-disk state for a Hercules node so the next launch starts from a
 /// clean genesis. Deletes the headers DB plus the derived block-store and
 /// peers SQLite files (and their -wal/-shm sidecars), and recursively removes
-/// the LMDB UTXO directory. The caller MUST drop any live `HerculesNode` for
+/// the LMDB UTXO directory and the app's `migration-conflicts/` directory of
+/// parked pre-migration copies. The caller MUST drop any live `HerculesNode` for
 /// this `db_path` before calling this — open file handles will silently keep
 /// the inodes alive on POSIX, leaving stale state behind.
 pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
     // Mirror the path-derivation logic in `HeaderSync::new`. Keep in sync.
     let utxo_dir = sync::derive_sibling_path(&db_path, "utxo-lmdb");
-    let blocks_path = db_path.replace("headers", "blocks");
-    let peers_path = db_path.replace("headers", "peers");
+    let blocks_path = sync::derive_sibling_path(&db_path, "blocks.sqlite3");
+    let peers_path = sync::derive_sibling_path(&db_path, "peers.sqlite3");
+    // Orphans from builds before the sibling-path refactor / LMDB switch
+    // (`hercules-blocks`, `hercules-peers`, `hercules-utxo`). Previously this
+    // function used `db_path.replace("headers", ...)`, which pointed at
+    // those stale names and left the live block store and peer DB behind.
+    let legacy_blocks = sync::derive_sibling_path(&db_path, "hercules-blocks.sqlite3");
+    let legacy_peers = sync::derive_sibling_path(&db_path, "hercules-peers.sqlite3");
+    let legacy_utxo = sync::derive_sibling_path(&db_path, "hercules-utxo.sqlite3");
 
     // SQLite files (headers / blocks / peers) — three sidecars each.
-    for base in [&db_path, &blocks_path, &peers_path] {
+    for base in [
+        &db_path,
+        &blocks_path,
+        &peers_path,
+        &legacy_blocks,
+        &legacy_peers,
+        &legacy_utxo,
+    ] {
         for suffix in ["", "-wal", "-shm"] {
             let p = format!("{}{}", base, suffix);
             match std::fs::remove_file(&p) {
@@ -98,14 +114,19 @@ pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
         }
     }
 
-    // LMDB env: a directory of mmapped files. Recursive removal.
-    match std::fs::remove_dir_all(&utxo_dir) {
-        Ok(_) => log::info!("reset_database: removed {}", utxo_dir),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(HerculesError::StorageError {
-                msg: format!("failed to remove {}: {}", utxo_dir, e),
-            });
+    // LMDB env: a directory of mmapped files. Recursive removal. Also the
+    // app's `migration-conflicts/` (ticket 030): copies parked by the
+    // Documents -> Chain/ migration are dead weight once the node is reset.
+    let conflicts_dir = sync::derive_sibling_path(&db_path, "migration-conflicts");
+    for dir in [&utxo_dir, &conflicts_dir] {
+        match std::fs::remove_dir_all(dir) {
+            Ok(_) => log::info!("reset_database: removed {}", dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(HerculesError::StorageError {
+                    msg: format!("failed to remove {}: {}", dir, e),
+                });
+            }
         }
     }
 
@@ -281,6 +302,8 @@ pub enum HerculesError {
     NetworkError { msg: String },
     #[error("Tor error: {msg}")]
     TorError { msg: String },
+    #[error("Snapshot rejected: {msg}")]
+    SnapshotInvalid { msg: String },
 }
 
 pub trait SyncCallback: Send + Sync {
@@ -374,6 +397,7 @@ impl HerculesNode {
                 sync::SyncError::Peer(s) => HerculesError::NetworkError { msg: s },
                 sync::SyncError::Validation(s) => HerculesError::SyncFailed { msg: s },
                 sync::SyncError::Store(s) => HerculesError::StorageError { msg: s },
+                sync::SyncError::SnapshotInvalid(s) => HerculesError::SnapshotInvalid { msg: s },
             })
     }
 
@@ -386,6 +410,20 @@ impl HerculesNode {
             })
     }
 
+    /// Fail fast, before the AssumeUTXO download, if this device can't map
+    /// the UTXO env large enough to hold the snapshot (ticket 030). Grows
+    /// the map now when it can.
+    pub fn check_snapshot_capacity(&self) -> Result<(), HerculesError> {
+        self.syncer
+            .ensure_snapshot_map_capacity()
+            .map_err(|e| HerculesError::StorageError {
+                msg: match e {
+                    sync::SyncError::Store(s) => s,
+                    e => format!("{}", e),
+                },
+            })
+    }
+
     /// Load a UTXO snapshot from a file. The file is verified against the
     /// hardcoded AssumeUTXO anchor (header height and block hash, plus
     /// `ASSUMEUTXO_HASH` over the entries); mismatched files are rejected
@@ -394,6 +432,11 @@ impl HerculesNode {
     ///
     /// Safe to call before header sync: block validation resumes from the
     /// snapshot height once the header chain contains the anchor block.
+    ///
+    /// `callback.on_progress` returning `false` cancels the load. A bad file
+    /// (corrupt, truncated, wrong anchor or hash) fails with
+    /// `SnapshotInvalid` and should be deleted; any other error (map or disk
+    /// full, cancelled) leaves the file usable for a retry.
     pub fn load_snapshot(
         &self,
         snapshot_path: String,
@@ -402,10 +445,13 @@ impl HerculesNode {
         let meta = self
             .syncer
             .load_snapshot(&snapshot_path, |loaded, total| {
-                callback.on_progress(loaded, total);
+                callback.on_progress(loaded, total)
             })
-            .map_err(|e| HerculesError::StorageError {
-                msg: format!("{}", e),
+            .map_err(|e| match e {
+                sync::SyncError::SnapshotInvalid(msg) => HerculesError::SnapshotInvalid { msg },
+                e => HerculesError::StorageError {
+                    msg: format!("{}", e),
+                },
             })?;
 
         Ok(SnapshotInfo {
@@ -442,6 +488,7 @@ impl HerculesNode {
                 sync::SyncError::Peer(s) => HerculesError::NetworkError { msg: s },
                 sync::SyncError::Validation(s) => HerculesError::SyncFailed { msg: s },
                 sync::SyncError::Store(s) => HerculesError::StorageError { msg: s },
+                sync::SyncError::SnapshotInvalid(s) => HerculesError::SnapshotInvalid { msg: s },
             })
     }
 
@@ -463,6 +510,7 @@ impl HerculesNode {
                 sync::SyncError::Peer(s) => HerculesError::NetworkError { msg: s },
                 sync::SyncError::Validation(s) => HerculesError::SyncFailed { msg: s },
                 sync::SyncError::Store(s) => HerculesError::StorageError { msg: s },
+                sync::SyncError::SnapshotInvalid(s) => HerculesError::SnapshotInvalid { msg: s },
             })
     }
 
@@ -673,11 +721,145 @@ impl HerculesNode {
 
         Ok(token)
     }
+
+    // ── Own transactions (ticket 033) ─────────────────────────────
+
+    /// Submit one of the user's own signed transactions (raw hex). It is
+    /// validated (consensus + network standardness; local relay policy
+    /// is only a warning), persisted, announced immediately and
+    /// rebroadcast until it confirms. `AlreadyKnown` means it was already
+    /// in the mempool; it is tracked and re-announced anyway.
+    pub fn submit_own_tx(&self, raw_tx_hex: String) -> Result<OwnTxReceipt, BroadcastError> {
+        let raw = hex::decode(raw_tx_hex.trim()).map_err(|e| BroadcastError::Invalid {
+            msg: format!("bad hex: {}", e),
+        })?;
+        self.syncer
+            .submit_own_tx(&raw)
+            .map(|r| OwnTxReceipt {
+                txid: r.txid.to_string(),
+                warnings: r.warnings,
+            })
+            .map_err(Into::into)
+    }
+
+    /// Tracker status of an own transaction, or None if not tracked.
+    pub fn own_tx_status(&self, txid: String) -> Result<Option<OwnTxInfo>, HerculesError> {
+        let txid = txid.parse::<bitcoin::Txid>().map_err(|e| HerculesError::SyncFailed {
+            msg: format!("bad txid: {}", e),
+        })?;
+        self.syncer
+            .own_tx_status(&txid)
+            .map(|o| o.map(Into::into))
+            .map_err(|e| HerculesError::StorageError { msg: format!("{}", e) })
+    }
+
+    /// All tracked own transactions, newest first.
+    pub fn list_own_txs(&self) -> Result<Vec<OwnTxInfo>, HerculesError> {
+        self.syncer
+            .list_own_txs()
+            .map(|v| v.into_iter().map(Into::into).collect())
+            .map_err(|e| HerculesError::StorageError { msg: format!("{}", e) })
+    }
+}
+
+/// Successful own-transaction submission.
+#[derive(Debug, Clone)]
+pub struct OwnTxReceipt {
+    pub txid: String,
+    pub warnings: Vec<String>,
+}
+
+/// Tracker state of an own transaction. `status` is one of pending,
+/// propagated, confirmed, replaced, conflicted, expired. Times are unix
+/// seconds.
+#[derive(Debug, Clone)]
+pub struct OwnTxInfo {
+    pub txid: String,
+    pub status: String,
+    pub confirmed_height: Option<u32>,
+    /// Replacing / conflicting txid for replaced / conflicted.
+    pub related_txid: Option<String>,
+    pub first_sent_at: u64,
+    pub last_sent_at: u64,
+    pub next_attempt_at: u64,
+    pub attempts: u32,
+    pub seen_from_peers: u32,
+    pub updated_at: u64,
+}
+
+impl From<own_tx_store::OwnTxRecord> for OwnTxInfo {
+    fn from(r: own_tx_store::OwnTxRecord) -> Self {
+        use own_tx_store::OwnTxStatus;
+        let (confirmed_height, related_txid) = match &r.status {
+            OwnTxStatus::Confirmed { height } => (Some(*height), None),
+            OwnTxStatus::Replaced { by } | OwnTxStatus::Conflicted { by } => {
+                (None, Some(by.to_string()))
+            }
+            _ => (None, None),
+        };
+        OwnTxInfo {
+            txid: r.txid.to_string(),
+            status: r.status.name().to_string(),
+            confirmed_height,
+            related_txid,
+            first_sent_at: r.first_sent_at,
+            last_sent_at: r.last_sent_at,
+            next_attempt_at: r.next_attempt_at,
+            attempts: r.attempts,
+            seen_from_peers: r.seen_from_peers,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+/// Why an own transaction was refused (FFI mirror of
+/// `own_tx_store::SubmitError`).
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastError {
+    #[error("Invalid transaction: {msg}")]
+    Invalid { msg: String },
+    #[error("Consensus-invalid: {msg}")]
+    Consensus { msg: String },
+    #[error("Non-standard: {msg}")]
+    NonStandard { msg: String },
+    #[error("Fee too low: {msg}")]
+    FeeTooLow { msg: String },
+    #[error("Absurd fee: {msg}")]
+    AbsurdFee { msg: String },
+    #[error("Conflict: {msg}")]
+    Conflict { msg: String },
+    #[error("Already known: {txid}")]
+    AlreadyKnown { txid: String },
+    #[error("Not synced: {msg}")]
+    NotSynced { msg: String },
+    #[error("Internal error: {msg}")]
+    Internal { msg: String },
+}
+
+impl From<own_tx_store::SubmitError> for BroadcastError {
+    fn from(e: own_tx_store::SubmitError) -> Self {
+        use own_tx_store::SubmitError as S;
+        let msg = e.to_string();
+        match e {
+            S::Decode(_) => BroadcastError::Invalid { msg },
+            S::Consensus(_) => BroadcastError::Consensus { msg },
+            S::NonStandard(_) => BroadcastError::NonStandard { msg },
+            S::FeeTooLow { .. } => BroadcastError::FeeTooLow { msg },
+            S::AbsurdFee { .. } => BroadcastError::AbsurdFee { msg },
+            S::Conflict { .. } => BroadcastError::Conflict { msg },
+            S::AlreadyKnown { txid } => BroadcastError::AlreadyKnown {
+                txid: txid.to_string(),
+            },
+            S::NotSynced { .. } => BroadcastError::NotSynced { msg },
+            S::Internal(_) => BroadcastError::Internal { msg },
+        }
+    }
 }
 
 /// Callback for snapshot loading progress.
 pub trait SnapshotCallback: Send + Sync {
-    fn on_progress(&self, loaded: u64, total: u64);
+    /// Return `false` to cancel the load.
+    fn on_progress(&self, loaded: u64, total: u64) -> bool;
 }
 
 /// Information about a loaded UTXO snapshot.
@@ -798,6 +980,41 @@ mod tests {
         assert_eq!(status.peer_height, 0);
         assert!(!status.is_syncing);
         assert!(status.error.is_none());
+    }
+
+    #[test]
+    fn reset_database_removes_live_sibling_stores() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("hercules-headers.sqlite3");
+        let db = db_path.to_string_lossy().into_owned();
+        {
+            let _node = HerculesNode::new(db.clone(), None).unwrap();
+        }
+        // Stand-ins for the files HeaderSync opens plus pre-refactor orphans.
+        for name in ["blocks.sqlite3", "peers.sqlite3-wal", "hercules-blocks.sqlite3", "hercules-utxo.sqlite3"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // Parked migration copies (ticket 030) go too.
+        std::fs::create_dir(dir.path().join("migration-conflicts")).unwrap();
+        std::fs::write(dir.path().join("migration-conflicts/peers.sqlite3.1700000000"), b"p").unwrap();
+        // A file reset must NOT touch (wallet API secret).
+        std::fs::write(dir.path().join("wallet_auth_token"), b"t").unwrap();
+
+        reset_database(db).unwrap();
+
+        for name in [
+            "hercules-headers.sqlite3",
+            "blocks.sqlite3",
+            "peers.sqlite3",
+            "peers.sqlite3-wal",
+            "hercules-blocks.sqlite3",
+            "hercules-utxo.sqlite3",
+            "utxo-lmdb",
+            "migration-conflicts",
+        ] {
+            assert!(!dir.path().join(name).exists(), "{} survived reset", name);
+        }
+        assert!(dir.path().join("wallet_auth_token").exists());
     }
 
     #[test]

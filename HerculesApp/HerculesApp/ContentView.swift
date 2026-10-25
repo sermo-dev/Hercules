@@ -86,6 +86,14 @@ class NodeViewModel: ObservableObject {
     @Published var walletApiConnectionString: String?
     @Published var walletApiError: String?
 
+    // Disk-space guard (ticket 030). `storageWarning` drives the banner on
+    // the main view; `pausedForLowDisk` records that *we* paused validation
+    // (so recovery never overrides a manual pause).
+    @Published var storageWarning: String?
+    private var pausedForLowDisk = false
+    private var lowDiskBannerShown = false
+    private var lastDiskCheck = Date.distantPast
+
     // Thread-safe access to the node: set from background thread, read from main thread
     private var _node: HerculesNode?
     private let nodeLock = NSLock()
@@ -294,7 +302,8 @@ class NodeViewModel: ObservableObject {
 
             // 5. Wipe the on-disk DBs via Rust.
             do {
-                try resetDatabase(dbPath: Self.dbPath())
+                try StoragePaths.prepareForNodeOpen()
+                try resetDatabase(dbPath: StoragePaths.headersDBPath)
             } catch {
                 DispatchQueue.main.async {
                     self.isResetting = false
@@ -331,12 +340,17 @@ class NodeViewModel: ObservableObject {
         isBootstrappingTor = true
         isSyncRunning = true
         errorMessage = nil
+        if !lowDiskBannerShown { storageWarning = nil }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let dbPath = Self.dbPath()
-                let torDir = Self.torDataDir()
-                let node = try HerculesNode(dbPath: dbPath, torDataDir: torDir)
+                // Migration + protection + backup exclusion must be complete
+                // before any database is opened (ticket 030).
+                try StoragePaths.prepareForNodeOpen()
+                let node = try HerculesNode(
+                    dbPath: StoragePaths.headersDBPath,
+                    torDataDir: StoragePaths.torDataDir
+                )
 
                 // Fetch initial Tor status
                 if let status = node.getTorStatus() {
@@ -350,6 +364,15 @@ class NodeViewModel: ObservableObject {
                     }
                 }
                 self?.node = node
+                DispatchQueue.main.async {
+                    // A fresh HerculesNode starts unpaused: drop any pause
+                    // state that belonged to the previous node so the UI
+                    // matches it, and so the forced check below re-pauses
+                    // this node if space is still low.
+                    self?.pausedForLowDisk = false
+                    self?.isValidationPaused = false
+                    self?.checkDiskSpace(force: true)
+                }
 
                 // Honor the user's explicit validation-mode choice. AssumeUTXO
                 // runs the download/import path on a fresh DB; Genesis skips
@@ -359,6 +382,34 @@ class NodeViewModel: ObservableObject {
                 if mode == .assumeUtxo, try node.needsSnapshot() {
                     DispatchQueue.main.async {
                         self?.isConnecting = false
+                    }
+
+                    // Map-capacity check (ticket 030): if the UTXO env can't
+                    // be mapped big enough for the snapshot (iOS VA limit
+                    // forced a small fallback map), say so now rather than
+                    // after an 8.8 GB download.
+                    do {
+                        try node.checkSnapshotCapacity()
+                    } catch HerculesError.StorageError(let msg) {
+                        throw StorageError.cannotMapUtxoSet(msg)
+                    }
+
+                    // Free-space preflight: refuse to start an 8.8 GB download
+                    // that can't be imported. A finished download on disk is
+                    // credited against the requirement, as are pages a
+                    // previous (aborted) import left in the LMDB file, which
+                    // the next import reuses.
+                    do {
+                        try StorageGuard.snapshotPreflight(
+                            alreadyDownloaded: SnapshotDownloader.hasDownloadedFile()
+                                ? SnapshotDownloader.expectedBytes : 0,
+                            reusable: StorageGuard.utxoEnvFileBytes()
+                        )
+                    } catch {
+                        DispatchQueue.main.async {
+                            self?.storageWarning = error.localizedDescription
+                        }
+                        throw error
                     }
 
                     // Block until the file is on disk. Surfaces progress to
@@ -376,17 +427,24 @@ class NodeViewModel: ObservableObject {
                         self?.isLoadingSnapshot = true
                     }
 
+                    // The import writes ~12 GB; watch free space while it
+                    // runs (ticket 030) and cancel cleanly below the pause
+                    // threshold rather than letting LMDB hit ENOSPC.
+                    let spaceWatch = SnapshotSpaceWatch()
                     let snapCallback = SnapshotProgressCallback { loaded, total in
                         DispatchQueue.main.async {
                             self?.snapshotProgress = total > 0
                                 ? Double(loaded) / Double(total) : 0
                         }
+                        return spaceWatch.shouldContinue()
                     }
 
-                    // Always delete the cached .gz after the import attempt:
-                    // on success it's redundant (UTXOs are now in SQLite); on
-                    // failure it prevents an infinite hash-mismatch retry loop
-                    // against the same bad bytes.
+                    // Delete the cached .gz after a successful import (it's
+                    // redundant) or when the file itself was rejected
+                    // (corrupt, truncated, hash mismatch), so we don't retry
+                    // the same bad bytes forever. Keep it for any other
+                    // failure (map or disk full, cancelled): it's fine, and a
+                    // retry shouldn't re-download 8.8 GB.
                     do {
                         let _ = try node.loadSnapshot(
                             snapshotPath: snapshotURL.path,
@@ -394,7 +452,18 @@ class NodeViewModel: ObservableObject {
                         )
                         SnapshotDownloader.deleteDownloadedFile()
                     } catch {
-                        SnapshotDownloader.deleteDownloadedFile()
+                        if case HerculesError.SnapshotInvalid = error {
+                            SnapshotDownloader.deleteDownloadedFile()
+                        }
+                        if let free = spaceWatch.abortedAtFreeBytes {
+                            let lowSpace = StorageError.insufficientSpace(
+                                message: StorageGuard.snapshotImportLowSpaceMessage(free: free)
+                            )
+                            DispatchQueue.main.async {
+                                self?.storageWarning = lowSpace.localizedDescription
+                            }
+                            throw lowSpace
+                        }
                         throw error
                     }
 
@@ -414,6 +483,7 @@ class NodeViewModel: ObservableObject {
                         self?.isConnecting = false
                         self?.errorMessage = status.error
                         self?.maybePublishWidgetState(from: status)
+                        self?.checkDiskSpace()
                     }
                 }
 
@@ -422,7 +492,17 @@ class NodeViewModel: ObservableObject {
 
             } catch {
                 DispatchQueue.main.async {
-                    self?.errorMessage = "\(error)"
+                    // Storage errors carry user-facing copy and the low-disk
+                    // case already has its own banner.
+                    if let storageError = error as? StorageError {
+                        if case .insufficientSpace = storageError {
+                            self?.errorMessage = nil
+                        } else {
+                            self?.errorMessage = storageError.localizedDescription
+                        }
+                    } else {
+                        self?.errorMessage = "\(error)"
+                    }
                     self?.isConnecting = false
                     self?.isSyncRunning = false
                     self?.isLoadingSnapshot = false
@@ -519,19 +599,57 @@ class NodeViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             node.setValidationPaused(paused: newState)
             DispatchQueue.main.async {
+                // A manual toggle takes the pause back from the low-disk
+                // guard; if space is still low its next check re-pauses.
+                self?.pausedForLowDisk = false
                 self?.isValidationPaused = newState
             }
         }
     }
 
-    static func dbPath() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("hercules-headers.sqlite3").path
-    }
+    // MARK: - Disk space guard (ticket 030)
 
-    static func torDataDir() -> String {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("tor").path
+    /// Ongoing low-disk guard, called at node start and from the sync
+    /// progress callback (throttled to every 30 s). Below
+    /// `StorageGuard.pauseBelowBytes` it pauses block validation — so LMDB
+    /// and SQLite never hit ENOSPC mid-transaction — and shows the banner;
+    /// above `resumeAboveBytes` it resumes, but only if the guard itself did
+    /// the pausing. Main thread only.
+    func checkDiskSpace(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastDiskCheck) >= 30 else { return }
+        lastDiskCheck = now
+        guard let free = StorageGuard.availableBytes() else { return }
+
+        if free < StorageGuard.pauseBelowBytes {
+            storageWarning = StorageGuard.lowSpaceMessage(free: free)
+            lowDiskBannerShown = true
+            // Take ownership only if validation is running: a manual pause
+            // stays the user's, so recovery below never resumes it.
+            if !pausedForLowDisk, !isValidationPaused, let node = node {
+                pausedForLowDisk = true
+                isValidationPaused = true
+                DispatchQueue.global(qos: .userInitiated).async {
+                    node.setValidationPaused(paused: true)
+                }
+            }
+        } else if free >= StorageGuard.resumeAboveBytes {
+            if pausedForLowDisk {
+                pausedForLowDisk = false
+                isValidationPaused = false
+                if let node = node {
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        node.setValidationPaused(paused: false)
+                    }
+                }
+            }
+            // Clear the low-disk banner. (A snapshot-preflight warning is
+            // cleared when the user taps Start again.)
+            if lowDiskBannerShown {
+                lowDiskBannerShown = false
+                storageWarning = nil
+            }
+        }
     }
 }
 
@@ -548,14 +666,44 @@ class SyncProgressCallback: SyncCallback {
 }
 
 class SnapshotProgressCallback: SnapshotCallback {
-    let handler: (UInt64, UInt64) -> Void
+    /// Returns false to cancel the import.
+    let handler: (UInt64, UInt64) -> Bool
 
-    init(handler: @escaping (UInt64, UInt64) -> Void) {
+    init(handler: @escaping (UInt64, UInt64) -> Bool) {
         self.handler = handler
     }
 
-    func onProgress(loaded: UInt64, total: UInt64) {
+    func onProgress(loaded: UInt64, total: UInt64) -> Bool {
         handler(loaded, total)
+    }
+}
+
+/// Free-space watch for the snapshot import (ticket 030), polled from the
+/// Rust progress callback (on the import thread, roughly every 100k
+/// entries). Checks at most every 5 s; below `StorageGuard.pauseBelowBytes`
+/// it records the free space and tells the import to stop.
+final class SnapshotSpaceWatch {
+    private let lock = NSLock()
+    private var lastCheck = Date.distantPast
+    private var abortedAt: Int64?
+
+    /// Free bytes when the import was cancelled for low space, else nil.
+    var abortedAtFreeBytes: Int64? {
+        lock.lock(); defer { lock.unlock() }
+        return abortedAt
+    }
+
+    func shouldContinue() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if abortedAt != nil { return false }
+        let now = Date()
+        guard now.timeIntervalSince(lastCheck) >= 5 else { return true }
+        lastCheck = now
+        if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
+            abortedAt = free
+            return false
+        }
+        return true
     }
 }
 
@@ -674,6 +822,11 @@ struct ContentView: View {
                         // Peers card
                         if let status = viewModel.syncStatus, !status.peers.isEmpty {
                             PeersCard(status: status)
+                        }
+
+                        // Low-storage banner (ticket 030)
+                        if let warning = viewModel.storageWarning {
+                            StorageWarningCard(message: warning)
                         }
 
                         // Error card
@@ -1666,6 +1819,30 @@ struct ErrorCard: View {
                     .font(.system(size: 12, weight: .regular, design: .monospaced))
                     .foregroundStyle(Theme.textSecondary)
                     .lineLimit(4)
+            }
+        }
+    }
+}
+
+struct StorageWarningCard: View {
+    let message: String
+
+    var body: some View {
+        CardContainer {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "externaldrive.fill.badge.exclamationmark")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Theme.warning)
+                    Text("Low Storage")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.warning)
+                }
+
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

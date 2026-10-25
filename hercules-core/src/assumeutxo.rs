@@ -83,6 +83,13 @@ pub const SNAPSHOT_DOWNLOAD_URL: &str =
 /// Approximate compressed download size in bytes (for UI progress estimates).
 pub const SNAPSHOT_DOWNLOAD_SIZE: u64 = 8_780_302_668;
 
+/// LMDB map the AssumeUTXO set needs once imported: the env is ~12 GB at
+/// this anchor, plus headroom for block validation in the same session.
+/// Checked before the download starts (ticket 030) so a device whose
+/// address space can't hold the map fails fast instead of after ~9 GB.
+/// Bump with the anchor if the set grows.
+pub const SNAPSHOT_MAP_REQUIRED_BYTES: u64 = 16 << 30;
+
 #[cfg(test)]
 mod tests {
     use super::*;

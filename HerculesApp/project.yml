@@ -58,6 +58,11 @@ targets:
         aps-environment: development
         com.apple.security.application-groups:
           - $(APP_GROUP_ID)
+        # Ticket 030: lifts iOS's per-process virtual-address cap so the
+        # UTXO LMDB env can mmap its 32+ GiB map. Requires the "Extended
+        # Virtual Address Space" capability on the App ID in the developer
+        # portal before signed builds will provision.
+        com.apple.developer.kernel.extended-virtual-addressing: true
     dependencies:
       - framework: ../build/herculesFFI.xcframework
         embed: false

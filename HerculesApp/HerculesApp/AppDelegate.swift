@@ -17,6 +17,14 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
 
+        // Ticket 030: move chain data out of Documents (one-time), and
+        // re-assert backup exclusion + protection classes. Runs before any
+        // HerculesNode can exist in this process; every node open also
+        // calls prepareForNodeOpen(), which waits on the same lock. Safe in
+        // a background (push) launch: renames only. Deferred automatically
+        // if the device is locked since reboot.
+        StoragePaths.prepareAtLaunch()
+
         // Touch NetworkPolicy.shared early so its NWPathMonitor starts
         // before any wake or download attempt; bridge its published
         // metered/blocked state into the App Group container so the

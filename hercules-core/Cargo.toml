@@ -17,6 +17,7 @@ sha3 = "0.10"
 flate2 = "1.0"
 rusqlite = { version = "0.36", features = ["bundled"] }
 heed = "0.20"
+libc = "0.2"
 log = "0.4"
 thiserror = "1.0"
 arti-client = { version = "0.41", default-features = false, features = [

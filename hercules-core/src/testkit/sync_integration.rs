@@ -367,7 +367,7 @@ fn pending_snapshot_activates_when_headers_reach_anchor() {
     node.hs.anchor = SnapshotAnchor { height: ANCHOR, block_hash, utxo_hash: meta.utxo_hash };
 
     // Loaded before any headers: pending, validated_height untouched.
-    node.hs.load_snapshot(path.to_str().unwrap(), |_, _| {}).unwrap();
+    node.hs.load_snapshot(path.to_str().unwrap(), |_, _| true).unwrap();
     assert_eq!(node.validated(), 0, "snapshot must stay pending without headers");
 
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&chain));

@@ -903,7 +903,7 @@ pub(crate) mod tests {
     /// Read one full P2P message off `stream` and parse it via the same
     /// `RawNetworkMessage` codec the production receive path uses, so the
     /// tests catch any framing drift between sender and receiver.
-    fn read_one_message(stream: &mut TcpStream) -> NetworkMessage {
+    pub(crate) fn read_one_message(stream: &mut TcpStream) -> NetworkMessage {
         let mut header = [0u8; 24];
         stream.read_exact(&mut header).expect("read header");
         let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;

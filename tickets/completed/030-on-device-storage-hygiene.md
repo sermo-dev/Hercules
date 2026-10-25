@@ -74,12 +74,16 @@ On first launch after upgrade, if `Documents/hercules-headers.sqlite3` exists:
 
 Apply classes explicitly (`FileManager` attributes / `Data.write(options:)`) rather than relying on defaults, and add an assertion test that checks them.
 
-**After a reboot, before first unlock:** all `completeUntilFirstUserAuthentication` files are unreadable. A wake in that state must detect it (`UIApplication.isProtectedDataAvailable` or an open failure), record "device locked since reboot — skipped", and complete immediately rather than erroring or retrying.
+**After a reboot, before first unlock:** all `completeUntilFirstUserAuthentication` files are unreadable. A wake in that state must detect it (an `open(2)` failure on one of our own files), record "device locked since reboot — skipped", and complete immediately rather than erroring or retrying.
+
+> **Note: don't use `UIApplication.isProtectedDataAvailable` for this.** An earlier draft suggested it. It reflects the `complete` protection class, so it goes false about 10 s after *every* passcode lock, not just before first unlock. Gating wakes on it would skip every push that arrives while the phone is in a pocket. Our files are `completeUntilFirstUserAuthentication`, so the only reliable check is to try opening one: `StoragePaths.protectedDataReadable` probes with `open(2)`, which fails (EPERM/EACCES) only between reboot and first unlock. It's a plain syscall, so it's also safe off the main thread.
 
 ### 4. LMDB map size on iOS
 - Measure on device: open the env with the 64 GB map on the oldest supported iPhone (iOS 17), on both a fresh and a full UTXO set.
 - If it fails or is marginal, either add the `extended-virtual-addressing` entitlement (verify it needs no special Apple approval) or use a smaller initial map (e.g. 16 GB) and grow-and-reopen when `MDB_MAP_FULL` occurs.
 - Record the result in ticket 005 and check off its action items.
+
+> **As implemented:** the map grows in place (`Env::resize`) instead of grow-and-reopen. Every txn holds a per-env gate shared and a resize takes it exclusively, so no txn in the process is open during the remap; address space is probed with a `PROT_NONE` mmap first, because LMDB drops the old map before mapping the new one. `apply_block`/`rollback_block` retry after `MDB_MAP_FULL`; the snapshot import grows between batches. The map size is pinned per env path within a process, because heed's global env cache rejects a second open of a live path with different options. Before the snapshot download, `check_snapshot_capacity` fails fast if the map can't reach `SNAPSHOT_MAP_REQUIRED_BYTES` (16 GiB).
 
 ### 5. Mempool memory
 - Lower the foreground cap to about 50 MB on iOS, or make it device-memory-aware. Fix the stale doc comments.
