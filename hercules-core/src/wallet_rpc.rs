@@ -325,6 +325,7 @@ fn dispatch(syncer: &HeaderSync, request: &RpcRequest) -> RpcResponse {
         "get_mempool_entry" => handle_get_mempool_entry(syncer, &request.params, id),
         "get_fee_estimates" => handle_get_fee_estimates(syncer, id),
         "broadcast_transaction" => handle_broadcast_transaction(syncer, &request.params, id),
+        "get_broadcast_status" => handle_get_broadcast_status(syncer, &request.params, id),
         "get_compact_filter" => handle_get_compact_filter(id),
         "get_node_info" => handle_get_node_info(syncer, id),
         _ => RpcResponse::err(id, METHOD_NOT_FOUND, format!("unknown method: {}", request.method)),
@@ -536,10 +537,82 @@ fn handle_broadcast_transaction(
         Ok(r) => r,
         Err(e) => return RpcResponse::err(id, INVALID_PARAMS, format!("bad hex: {}", e)),
     };
-    match syncer.rpc_broadcast_tx(&raw) {
-        Ok(txid) => RpcResponse::ok(id, serde_json::json!({"txid": txid.to_string()})),
-        Err(e) => RpcResponse::err(id, TX_REJECTED, format!("{}", e)),
+    broadcast_response(syncer.submit_own_tx(&raw), id)
+}
+
+/// Map an own-tx submission (ticket 033) to a JSON-RPC response.
+///
+/// Success keeps the 014 shape (`{"txid": ...}`) and adds `warnings`.
+/// `AlreadyKnown` is reported as success with `"already_known": true`:
+/// the tx is in our mempool, tracked and re-announced, which is what a
+/// wallet retrying a send wants (Bitcoin Core's `sendrawtransaction`
+/// behaves the same). Rejections use `TX_REJECTED` with
+/// `"<kind>: <message>"` so clients can tell a consensus failure from a
+/// standardness/fee problem or an unsynced node.
+fn broadcast_response(
+    result: Result<crate::own_tx_store::OwnTxReceipt, crate::own_tx_store::SubmitError>,
+    id: serde_json::Value,
+) -> RpcResponse {
+    use crate::own_tx_store::SubmitError;
+    match result {
+        Ok(receipt) => RpcResponse::ok(
+            id,
+            serde_json::json!({
+                "txid": receipt.txid.to_string(),
+                "already_known": false,
+                "warnings": receipt.warnings,
+            }),
+        ),
+        Err(SubmitError::AlreadyKnown { txid }) => RpcResponse::ok(
+            id,
+            serde_json::json!({
+                "txid": txid.to_string(),
+                "already_known": true,
+                "warnings": Vec::<String>::new(),
+            }),
+        ),
+        Err(e) => RpcResponse::err(id, TX_REJECTED, format!("{}: {}", e.kind(), e)),
     }
+}
+
+fn handle_get_broadcast_status(
+    syncer: &HeaderSync,
+    params: &serde_json::Value,
+    id: serde_json::Value,
+) -> RpcResponse {
+    let txid = match params
+        .get("txid")
+        .and_then(|v| v.as_str())
+        .map(|t| t.parse::<bitcoin::Txid>())
+    {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => return RpcResponse::err(id, INVALID_PARAMS, format!("bad txid: {}", e)),
+        None => return RpcResponse::err(id, INVALID_PARAMS, "expected {\"txid\": \"hex\"}".into()),
+    };
+    match syncer.own_tx_status(&txid) {
+        Ok(Some(rec)) => RpcResponse::ok(id, own_tx_json(&rec)),
+        Ok(None) => RpcResponse::ok(id, serde_json::Value::Null),
+        Err(e) => RpcResponse::err(id, INTERNAL_ERROR, format!("{}", e)),
+    }
+}
+
+fn own_tx_json(rec: &crate::own_tx_store::OwnTxRecord) -> serde_json::Value {
+    use crate::own_tx_store::OwnTxStatus;
+    let (height, related) = match &rec.status {
+        OwnTxStatus::Confirmed { height } => (Some(*height), None),
+        OwnTxStatus::Replaced { by } | OwnTxStatus::Conflicted { by } => (None, Some(by.to_string())),
+        _ => (None, None),
+    };
+    serde_json::json!({
+        "txid": rec.txid.to_string(),
+        "status": rec.status.name(),
+        "confirmed_height": height,
+        "related_txid": related,
+        "first_sent_at": rec.first_sent_at,
+        "last_sent_at": rec.last_sent_at,
+        "attempts": rec.attempts,
+        "seen_from_peers": rec.seen_from_peers,
+    })
 }
 
 fn handle_get_compact_filter(id: serde_json::Value) -> RpcResponse {
@@ -733,6 +806,34 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broadcast_response_shapes() {
+        use crate::own_tx_store::{OwnTxReceipt, SubmitError};
+        use bitcoin::hashes::Hash;
+        let txid = bitcoin::Txid::from_byte_array([3; 32]);
+
+        let ok = broadcast_response(
+            Ok(OwnTxReceipt { txid, warnings: vec!["w".into()] }),
+            serde_json::json!(1),
+        );
+        let json = serde_json::to_value(&ok).unwrap();
+        assert_eq!(json["result"]["txid"], txid.to_string());
+        assert_eq!(json["result"]["already_known"], false);
+
+        let known = broadcast_response(Err(SubmitError::AlreadyKnown { txid }), serde_json::json!(1));
+        let json = serde_json::to_value(&known).unwrap();
+        assert_eq!(json["result"]["already_known"], true);
+        assert!(json.get("error").is_none());
+
+        let rej = broadcast_response(
+            Err(SubmitError::Consensus("bad sig".into())),
+            serde_json::json!(1),
+        );
+        let json = serde_json::to_value(&rej).unwrap();
+        assert_eq!(json["error"]["code"], TX_REJECTED);
+        assert!(json["error"]["message"].as_str().unwrap().starts_with("consensus: "));
+    }
 
     #[test]
     fn base64_roundtrip() {
