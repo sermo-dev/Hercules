@@ -156,6 +156,10 @@ pub struct Peer {
     wants_addrv2: bool,
 }
 
+/// Source of inbound peers' pool addresses (`inbound#N`), unique for the
+/// process lifetime.
+static NEXT_INBOUND_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Peer {
     /// Discover peer addresses from DNS seeds (clearnet).
     pub fn discover_peers() -> Vec<String> {
@@ -270,6 +274,13 @@ impl Peer {
         Ok(peer)
     }
 
+    /// Re-label a test peer, so a pool slot can pose as any address.
+    #[cfg(test)]
+    pub(crate) fn set_addr_for_test(&mut self, addr: &str, inbound: bool) {
+        self.addr = addr.to_string();
+        self.inbound = inbound;
+    }
+
     /// Accept an inbound connection: run the version handshake as responder.
     /// (Wait for their version first, then send ours + verack.)
     pub fn accept(stream: PeerStream, our_height: i32, magic: Magic) -> Result<Peer, PeerError> {
@@ -293,7 +304,13 @@ impl Peer {
                             "inbound peer version {} too old (min 70015)", v.version
                         )));
                     }
-                    peer.addr = format!("inbound-{}", v.nonce);
+                    // Keyed by a connection id, not anything the peer
+                    // chose (its version nonce): a peer must not be able
+                    // to pick, collide with, or reuse a pool identity.
+                    peer.addr = format!(
+                        "inbound#{}",
+                        NEXT_INBOUND_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    );
                     peer.their_version = Some(v);
                     got_version = true;
                     break;

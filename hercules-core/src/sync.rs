@@ -60,13 +60,14 @@ const MAX_REORG_DEPTH: u32 = 288;
 /// the dedup is best-effort and a coarse reset is acceptable.
 const MAX_KNOWN_TXIDS_PER_PEER: usize = 10_000;
 
-/// Penalty applied to a peer that produced a divergent header batch when
-/// cross-checked against the majority. Two strikes ban it (2 * 50 = 100,
-/// score drops to 0).
+/// Score cost for a peer outvoted 2-to-1 in the header cross-check. Applied
+/// with `PeerPool::deprioritize`, so it never bans: two colluding witnesses
+/// can outvote an honest peer, and divergence alone proves nothing.
 const HEADER_DIVERGENCE_PENALTY: u32 = 50;
 
-/// Lighter penalty for a 2-peer disagreement we can't break with a third
-/// opinion — both peers get this since we don't know who's lying.
+/// Lighter cost for a 2-peer disagreement we can't break with a third
+/// opinion — both peers get this since we don't know who's lying. Also
+/// `deprioritize`, never a ban.
 const HEADER_DISAGREEMENT_PENALTY: u32 = 10;
 
 /// Penalty for a peer that didn't deliver the block we requested (sent a
@@ -146,10 +147,12 @@ enum HeaderCrossCheck {
     Inconclusive,
 }
 
-/// What `fetch_first_header_hash` got from one peer.
+/// What `fetch_witness_headers` got from one peer.
 enum FirstHeader {
-    Hash(BlockHash),
-    /// Network failure, empty response, or peer gone.
+    /// A batch that connects to our locator and passes header validation:
+    /// its first hash, and every hash in it.
+    Hash(BlockHash, Vec<BlockHash>),
+    /// Network failure, empty or invalid response, or peer gone.
     Failed,
     /// Our wake budget ended the exchange: not the peer's fault.
     OutOfBudget,
@@ -2019,18 +2022,29 @@ impl HeaderSync {
     /// honest second peer responding to the same locator will return a
     /// different first header hash, and we can detect the lie.
     ///
+    /// Witness and tiebreaker are outbound peers in netgroups distinct from
+    /// each other and from the active peer (`PeerPool::cross_check_peer`):
+    /// inbound connections, or several addresses in one netgroup, are cheap
+    /// for one attacker to multiply. A witness's answer only counts if it
+    /// connects to our locator and passes header validation
+    /// (`fetch_witness_headers`); an invalid one costs the witness and is
+    /// no opinion.
+    ///
     /// Strategy:
-    /// 1. Pick a single independent peer (different addr, not banned). Send
-    ///    the same `getheaders` locator. Compare the first hash.
+    /// 1. Pick a witness. Send the same `getheaders` locator. It agrees if
+    ///    its batch contains the active peer's first header.
     /// 2. If they agree → accept. Both peers earn a small reward.
-    /// 3. If they disagree → query a third peer to break the tie.
-    ///    - If 2-of-3 agree, the divergent peer takes
+    /// 3. If they disagree → query a tiebreaker.
+    ///    - If 2-of-3 agree, the divergent peer is deprioritized by
     ///      `HEADER_DIVERGENCE_PENALTY`. Accept iff active peer is in the
     ///      majority; reject otherwise.
     ///    - If we have no third peer, we can't tell who is lying. Apply a
     ///      lighter `HEADER_DISAGREEMENT_PENALTY` to both and reject the
     ///      batch — refusing to commit dubious headers is the safer default.
-    /// 4. If only one peer in the pool → best-effort accept (we logged a
+    ///    Divergence never bans (`PeerPool::deprioritize`): outvoting proves
+    ///    nothing on its own, and colluding witnesses must not be able to
+    ///    get honest peers banned. Invalid headers, once validated, do.
+    /// 4. If no witness is available → best-effort accept (we logged a
     ///    warning at sync start; this is a degraded mode).
     ///
     /// `strict` (initial sync, chain below minimum work): a missing or
@@ -2060,7 +2074,7 @@ impl HeaderSync {
         let strict = strict || disputed;
 
         // Step 1: pick an independent witness peer.
-        let witness_addr = match pool.peer_addr_other_than(active_addr) {
+        let witness_addr = match pool.cross_check_peer(&[active_addr.to_string()]) {
             Some(a) => a,
             None if strict => {
                 debug!(
@@ -2071,40 +2085,41 @@ impl HeaderSync {
             }
             None => {
                 debug!(
-                    "cross-check skipped: only active peer {} available",
+                    "cross-check skipped: no independent witness for active peer {}",
                     active_addr
                 );
                 return HeaderCrossCheck::Accept;
             }
         };
 
-        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator, budget) {
-            FirstHeader::Hash(h) => h,
-            FirstHeader::OutOfBudget => {
-                debug!("cross-check: budget spent before witness {} answered", witness_addr);
-                return HeaderCrossCheck::Inconclusive;
-            }
-            FirstHeader::Failed if strict => {
-                // Same "can't conclude" case, but during initial sync we
-                // fail closed. No penalty for the active peer.
-                debug!(
-                    "cross-check witness {} failed (initial sync or disputed); rejecting batch",
-                    witness_addr
-                );
-                return HeaderCrossCheck::Reject;
-            }
-            FirstHeader::Failed => {
-                // Witness peer failed to respond — we can't conclude anything.
-                // Don't penalize the active peer over a network failure.
-                debug!(
-                    "cross-check witness {} failed; accepting active peer's headers",
-                    witness_addr
-                );
-                return HeaderCrossCheck::Accept;
-            }
-        };
+        let (witness_first, witness_hashes) =
+            match self.fetch_witness_headers(pool, &witness_addr, locator, budget) {
+                FirstHeader::Hash(h, all) => (h, all),
+                FirstHeader::OutOfBudget => {
+                    debug!("cross-check: budget spent before witness {} answered", witness_addr);
+                    return HeaderCrossCheck::Inconclusive;
+                }
+                FirstHeader::Failed if strict => {
+                    // Same "can't conclude" case, but during initial sync we
+                    // fail closed. No penalty for the active peer.
+                    debug!(
+                        "cross-check witness {} failed (initial sync or disputed); rejecting batch",
+                        witness_addr
+                    );
+                    return HeaderCrossCheck::Reject;
+                }
+                FirstHeader::Failed => {
+                    // No usable answer — we can't conclude anything. Don't
+                    // penalize the active peer over the witness's failure.
+                    debug!(
+                        "cross-check witness {} failed; accepting active peer's headers",
+                        witness_addr
+                    );
+                    return HeaderCrossCheck::Accept;
+                }
+            };
 
-        if witness_first == active_first_hash {
+        if witness_hashes.contains(&active_first_hash) {
             // Two independent peers agree on the first header — accept.
             pool.reward(active_addr, 1);
             pool.reward(&witness_addr, 1);
@@ -2120,64 +2135,71 @@ impl HeaderSync {
         );
 
         // Step 3: try to break the tie with a third peer.
-        let exclude = [active_addr.to_string(), witness_addr.clone()];
-        let tiebreaker_addr = pool.peer_addr_excluding(&exclude);
+        let others = [active_addr.to_string(), witness_addr.clone()];
+        let tiebreaker_addr = pool.cross_check_peer(&others);
 
         if let Some(tb_addr) = tiebreaker_addr {
-            // A tiebreaker that runs out of budget falls through to the
-            // 2-peer case: the divergence stands.
-            if let FirstHeader::Hash(tb_first) =
-                self.fetch_first_header_hash(pool, &tb_addr, locator, budget)
+            // A tiebreaker that runs out of budget (or answers with nothing
+            // valid) falls through to the 2-peer case: the divergence stands.
+            if let FirstHeader::Hash(tb_first, tb_hashes) =
+                self.fetch_witness_headers(pool, &tb_addr, locator, budget)
             {
-                if tb_first == active_first_hash {
-                    // Active + tiebreaker agree → witness is the liar.
+                if tb_hashes.contains(&active_first_hash) {
+                    // Active + tiebreaker agree → witness is outvoted.
                     warn!(
-                        "Header cross-check: penalizing divergent witness {}",
+                        "Header cross-check: deprioritizing divergent witness {}",
                         witness_addr
                     );
-                    pool.misbehaving(&witness_addr, HEADER_DIVERGENCE_PENALTY);
+                    pool.deprioritize(&witness_addr, HEADER_DIVERGENCE_PENALTY);
                     self.disputed_peers.lock().unwrap().remove(active_addr);
                     return HeaderCrossCheck::Accept;
                 } else if tb_first == witness_first {
-                    // Witness + tiebreaker agree → active is the liar.
+                    // Witness + tiebreaker agree → active is outvoted.
                     warn!(
-                        "Header cross-check: penalizing divergent active peer {}",
+                        "Header cross-check: deprioritizing divergent active peer {}",
                         active_addr
                     );
-                    pool.misbehaving(active_addr, HEADER_DIVERGENCE_PENALTY);
+                    pool.deprioritize(active_addr, HEADER_DIVERGENCE_PENALTY);
                     self.disputed_peers.lock().unwrap().remove(&witness_addr);
                     return HeaderCrossCheck::Reject;
                 } else {
-                    // All three peers disagree — pathological case. Penalize
-                    // active (it's our default trust target) and reject.
+                    // All three peers disagree — pathological case.
+                    // Deprioritize active (it's our default trust target)
+                    // and reject.
                     warn!(
                         "Header cross-check: 3-way disagreement, rejecting batch from {}",
                         active_addr
                     );
-                    pool.misbehaving(active_addr, HEADER_DISAGREEMENT_PENALTY);
+                    pool.deprioritize(active_addr, HEADER_DISAGREEMENT_PENALTY);
                     return HeaderCrossCheck::Reject;
                 }
             }
         }
 
-        // Step 4: only two peers in the pool and they disagree.
+        // Step 4: no usable tiebreaker and the two disagree.
         warn!(
             "Header cross-check: 2-peer disagreement with no tiebreaker available; rejecting batch"
         );
-        pool.misbehaving(active_addr, HEADER_DISAGREEMENT_PENALTY);
-        pool.misbehaving(&witness_addr, HEADER_DISAGREEMENT_PENALTY);
+        pool.deprioritize(active_addr, HEADER_DISAGREEMENT_PENALTY);
+        pool.deprioritize(&witness_addr, HEADER_DISAGREEMENT_PENALTY);
         let mut disputed = self.disputed_peers.lock().unwrap();
         disputed.insert(active_addr.to_string());
         disputed.insert(witness_addr);
         HeaderCrossCheck::Reject
     }
 
-    /// Send a `getheaders` to a specific peer and return the first header
-    /// hash from its response. This wraps the peer checkout/return dance so
-    /// the cross-check helper stays readable. `budget` bounds the whole
-    /// exchange (wake budgets, ticket 028); running out of it is
-    /// `OutOfBudget` and never counts against the peer.
-    fn fetch_first_header_hash(
+    /// Send a `getheaders` to a specific cross-check peer and return its
+    /// answer if it is usable as evidence. This wraps the peer
+    /// checkout/return dance so the cross-check helper stays readable.
+    /// `budget` bounds the whole exchange (wake budgets, ticket 028);
+    /// running out of it is `OutOfBudget` and never counts against the
+    /// peer.
+    ///
+    /// An answer that doesn't build on our locator, or fails header
+    /// validation, is proof against the peer that sent it (it costs
+    /// `INVALID_HEADERS_PENALTY`) and is no opinion about anyone else:
+    /// `Failed`.
+    fn fetch_witness_headers(
         &self,
         pool: &mut PeerPool,
         addr: &str,
@@ -2210,9 +2232,19 @@ impl HeaderSync {
                     Ok(None) => {}
                     Err(e) => warn!("cross-check: failed-block lookup: {}", e),
                 }
-                match headers.first() {
-                    Some(h) => FirstHeader::Hash(h.block_hash()),
-                    None => FirstHeader::Failed,
+                let Some(first) = headers.first() else {
+                    return FirstHeader::Failed;
+                };
+                match self.check_witness_headers(&headers, locator) {
+                    Ok(()) => FirstHeader::Hash(
+                        first.block_hash(),
+                        headers.iter().map(|h| h.block_hash()).collect(),
+                    ),
+                    Err(e) => {
+                        warn!("cross-check: peer {} sent unusable headers: {}", addr, e);
+                        pool.misbehaving(addr, INVALID_HEADERS_PENALTY);
+                        FirstHeader::Failed
+                    }
                 }
             }
             Err(PeerError::DeadlineReached) => {
@@ -2231,6 +2263,50 @@ impl HeaderSync {
                 FirstHeader::Failed
             }
         }
+    }
+
+    /// Whether a cross-check peer's `headers` are evidence at all: they must
+    /// build on a block in the `locator` we sent (any honest answer does)
+    /// that is on our header chain, respect the chain anchor, and pass the
+    /// same header validation as a batch we would store (proof-of-work at
+    /// the contextually required difficulty, timestamps, linkage).
+    fn check_witness_headers(&self, headers: &[Header], locator: &[BlockHash]) -> Result<(), String> {
+        let prev = headers[0].prev_blockhash;
+        if !locator.contains(&prev) {
+            return Err(format!("first header builds on {}, not on our locator", prev));
+        }
+        let height = self
+            .store
+            .find_height_of_hash(prev)
+            .map_err(|e| format!("{}", e))?
+            .ok_or_else(|| format!("{} is not on our header chain", prev))?;
+        let (_, prev_header) = self
+            .store
+            .get_header_at_height(height)
+            .map_err(|e| format!("{}", e))?
+            .ok_or_else(|| format!("no header at height {}", height))?;
+        let timestamps = self
+            .store
+            .timestamps_up_to(height, 11)
+            .map_err(|e| format!("{}", e))?;
+        self.check_batch_anchor(headers, height + 1)?;
+        let store = &self.store;
+        let epoch_lookup = |h: u32| -> Result<u32, String> {
+            store
+                .get_timestamp_at(h)
+                .map_err(|e| format!("{}", e))?
+                .ok_or_else(|| format!("no header at height {}", h))
+        };
+        validate_headers(
+            self.params,
+            headers,
+            prev,
+            height,
+            &timestamps,
+            prev_header.bits,
+            &epoch_lookup,
+        )
+        .map_err(|e| format!("{}", e))
     }
 
     /// Build a SyncStatus snapshot from the pool and current state.
@@ -4617,14 +4693,16 @@ mod tests {
 
     // ── fetch_requested_block (ticket 022 wake path) ───────────────────
 
-    /// Pool of loopback peers; returns the server halves in pool order.
+    /// Pool of outbound loopback peers (regtest: no netgroup diversity,
+    /// so each counts as independent); returns the server halves in pool
+    /// order.
     fn loopback_pool(n: usize) -> (PeerPool, Vec<(String, std::net::TcpStream)>) {
-        let pool = PeerPool::new_for_test();
+        let pool = PeerPool::new_for_test_with(ChainParams::regtest());
         let mut servers = Vec::new();
         for _ in 0..n {
             let (peer, server) = loopback_peer_pair();
             let addr = peer.addr().to_string();
-            assert!(pool.add_inbound_peer(peer));
+            pool.add_outbound_peer_for_test(peer);
             servers.push((addr, server));
         }
         (pool, servers)
@@ -4711,13 +4789,139 @@ mod tests {
     // ── cross_check_headers under a wake budget (ticket 028) ─────────────
 
     /// Three loopback peers: active, tiebreaker, witness. The witness gets
-    /// a reward so it is picked first.
+    /// a reward so it is picked first. The syncer is a regtest node at
+    /// genesis, so cross-check answers can carry valid headers.
     fn cross_check_pool() -> (PeerPool, Vec<(String, std::net::TcpStream)>, tempfile::TempDir, HeaderSync) {
         let (pool, servers) = loopback_pool(3);
         pool.reward(&servers[2].0, 5);
         let dir = tempfile::TempDir::new().unwrap();
-        let syncer = HeaderSync::new(dir.path().join("headers.sqlite3").to_str().unwrap(), None).unwrap();
+        let syncer = regtest_syncer(&dir);
         (pool, servers, dir, syncer)
+    }
+
+    fn regtest_syncer(dir: &tempfile::TempDir) -> HeaderSync {
+        HeaderSync::with_config(SyncConfig {
+            db_path: dir.path().join("headers.sqlite3").to_str().unwrap().to_string(),
+            tor: None,
+            params: ChainParams::regtest(),
+            peers: PeerSource::Static(vec![]),
+        })
+        .unwrap()
+    }
+
+    /// The locator a regtest node at genesis sends.
+    fn genesis_locator() -> Vec<BlockHash> {
+        vec![crate::testkit::FixtureChain::new().hash_at(0)]
+    }
+
+    /// A valid regtest header on genesis; different `salt`s give
+    /// different (competing) headers.
+    fn valid_header(salt: u32) -> Header {
+        let mut chain = crate::testkit::FixtureChain::new().fork_at(0);
+        for _ in 0..salt {
+            chain = chain.fork_at(0);
+        }
+        chain.mine(1);
+        chain.block(1).header
+    }
+
+    /// PR #24 review: two colluding witnesses answering with the same junk
+    /// (headers that don't build on our locator) used to outvote the
+    /// active peer until it was banned. Junk is now no opinion: it costs
+    /// the peers that sent it, and the active peer nothing.
+    #[test]
+    fn colluding_junk_witnesses_cannot_get_the_active_peer_banned() {
+        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+        let active = servers[0].0.clone();
+        let junk = synthetic_block(2).header;
+        for round in 0..4 {
+            for (addr, server) in servers.iter_mut().skip(1) {
+                if pool.get_score(addr).is_some() {
+                    write_message(server, NetworkMessage::Headers(vec![junk]));
+                }
+            }
+            let r = syncer.cross_check_headers(
+                &mut pool,
+                &genesis_locator(),
+                &active,
+                valid_header(0).block_hash(),
+                false,
+                None,
+            );
+            assert!(matches!(r, HeaderCrossCheck::Accept), "round {}", round);
+        }
+        assert_eq!(pool.get_score(&active), Some(100), "active peer paid for junk");
+        assert!(!pool.is_banned(&active));
+        assert!(pool.is_banned(&servers[1].0), "junk sender not banned");
+        assert!(pool.is_banned(&servers[2].0), "junk sender not banned");
+    }
+
+    /// Even valid headers from colluding witnesses (a real competing
+    /// chain) only deprioritize the outvoted active peer: divergence is
+    /// never proof, so it can't get an honest peer banned.
+    #[test]
+    fn outvoted_active_peer_is_deprioritized_never_banned() {
+        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+        let active = servers[0].0.clone();
+        for round in 0..6 {
+            for (_, server) in servers.iter_mut().skip(1) {
+                write_message(server, NetworkMessage::Headers(vec![valid_header(0)]));
+            }
+            let r = syncer.cross_check_headers(
+                &mut pool,
+                &genesis_locator(),
+                &active,
+                valid_header(1).block_hash(),
+                false,
+                None,
+            );
+            assert!(matches!(r, HeaderCrossCheck::Reject), "round {}", round);
+        }
+        assert!(!pool.is_banned(&active), "divergence alone banned the active peer");
+        assert_eq!(pool.count(), 3);
+        let score = pool.get_score(&active).unwrap();
+        assert!(score < 100 && score > 20, "score {}", score);
+    }
+
+    /// Inbound peers are never witnesses or tiebreakers, whatever they'd
+    /// answer: with only inbound peers besides the active one there is no
+    /// cross-check (best-effort accept), and nobody is penalized.
+    #[test]
+    fn inbound_peers_are_never_cross_check_witnesses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let syncer = regtest_syncer(&dir);
+        let (mut pool, servers) = loopback_pool(1);
+        let active = servers[0].0.clone();
+        let mut inbound_servers = Vec::new();
+        for i in 0..2 {
+            let (mut peer, mut server) = loopback_peer_pair();
+            peer.set_addr_for_test(&format!("inbound#{}", i), true);
+            write_message(&mut server, NetworkMessage::Headers(vec![valid_header(0)]));
+            assert!(pool.add_inbound_peer(peer));
+            inbound_servers.push(server);
+        }
+        let r = syncer.cross_check_headers(
+            &mut pool,
+            &genesis_locator(),
+            &active,
+            valid_header(1).block_hash(),
+            false,
+            None,
+        );
+        assert!(matches!(r, HeaderCrossCheck::Accept));
+        assert_eq!(pool.get_score(&active), Some(100));
+        // Strict mode fails closed instead: still no inbound witness.
+        let r = syncer.cross_check_headers(
+            &mut pool,
+            &genesis_locator(),
+            &active,
+            valid_header(1).block_hash(),
+            true,
+            None,
+        );
+        assert!(matches!(r, HeaderCrossCheck::Reject));
+        assert_eq!(pool.get_score(&active), Some(100));
+        assert_eq!(pool.count(), 3);
     }
 
     #[test]
@@ -4727,11 +4931,11 @@ mod tests {
         // wake reports tip_disagreement), and the tiebreaker isn't blamed.
         let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
         let (active, tiebreaker, witness) = (servers[0].0.clone(), servers[1].0.clone(), servers[2].0.clone());
-        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![synthetic_block(2).header]));
+        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![valid_header(0)]));
         let budget = WakeBudget::new(300);
 
         let start = Instant::now();
-        let r = syncer.cross_check_headers(&mut pool, &[], &active, synthetic_block(1).block_hash(), false, Some(&budget));
+        let r = syncer.cross_check_headers(&mut pool, &genesis_locator(), &active, synthetic_block(1).block_hash(), false, Some(&budget));
         assert!(matches!(r, HeaderCrossCheck::Reject));
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
         assert_eq!(pool.get_score(&tiebreaker), Some(100), "deadline counted against tiebreaker");
@@ -4747,7 +4951,7 @@ mod tests {
         for strict in [false, true] {
             let (mut pool, servers, _dir, syncer) = cross_check_pool();
             let budget = WakeBudget::new(200);
-            let r = syncer.cross_check_headers(&mut pool, &[], &servers[0].0, synthetic_block(1).block_hash(), strict, Some(&budget));
+            let r = syncer.cross_check_headers(&mut pool, &genesis_locator(), &servers[0].0, synthetic_block(1).block_hash(), strict, Some(&budget));
             assert!(matches!(r, HeaderCrossCheck::Inconclusive), "strict {}", strict);
             assert_eq!(pool.count(), 3, "witness removed over our deadline");
             assert_eq!(pool.get_score(&servers[0].0), Some(100));
@@ -4760,10 +4964,10 @@ mod tests {
     fn cross_check_cancelled_before_the_witness_is_inconclusive() {
         let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
         // The witness would contradict, but we never ask it.
-        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![synthetic_block(2).header]));
+        write_message(&mut servers[2].1, NetworkMessage::Headers(vec![valid_header(0)]));
         let budget = WakeBudget::new(10_000);
         budget.cancel();
-        let r = syncer.cross_check_headers(&mut pool, &[], &servers[0].0, synthetic_block(1).block_hash(), false, Some(&budget));
+        let r = syncer.cross_check_headers(&mut pool, &genesis_locator(), &servers[0].0, synthetic_block(1).block_hash(), false, Some(&budget));
         assert!(matches!(r, HeaderCrossCheck::Inconclusive));
         assert_eq!(pool.get_score(&servers[0].0), Some(100));
     }

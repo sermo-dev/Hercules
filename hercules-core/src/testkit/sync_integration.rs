@@ -570,11 +570,10 @@ fn scratch_replacement_requires_a_stall_without_progress() {
 // ── Header cross-check ───────────────────────────────────────────────
 
 /// Two peers on disjoint chains and no third opinion: every batch is
-/// rejected and both peers take `HEADER_DISAGREEMENT_PENALTY`. The active
-/// peer is also rewarded +1 for answering `getheaders` before the
-/// cross-check runs, so the witness reaches the ban threshold first. Its
-/// ban settles nothing (ticket 024): the survivor stays disputed, and its
-/// headers are refused until a fresh witness agrees with it.
+/// rejected and both peers are deprioritized by
+/// `HEADER_DISAGREEMENT_PENALTY`, but never banned (PR #24 review:
+/// divergence alone proves nothing). Both stay disputed, and the active
+/// peer's headers are refused until a fresh witness agrees with it.
 #[test]
 fn cross_check_two_peer_disagreement_needs_fresh_witness() {
     let mut a_chain = FixtureChain::new();
@@ -586,19 +585,16 @@ fn cross_check_two_peer_disagreement_needs_fresh_witness() {
     let b = MockPeer::spawn(&b_chain, vec![]);
     let mut node = Node::new(&[&a, &b]);
 
-    let (banned, res) = node.run_sync(|_| {
-        let start = Instant::now();
-        while start.elapsed() < SYNC_TIMEOUT && !node.is_banned(&a.addr()) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Give the survivor several unopposed rounds.
-        std::thread::sleep(Duration::from_secs(3));
-        node.is_banned(&a.addr())
-    });
-    assert!(banned, "witness not banned by repeated disagreement: {:?}", res);
-    assert_eq!(node.tip().0, 0, "survivor's headers accepted without a witness");
-    let b_score = node.score(&b.addr());
-    assert!(b_score.map_or(false, |s| s < FRESH_SCORE), "active peer not penalized: {:?}", b_score);
+    // Long enough for the scores to reach their floor several times over.
+    let (_, res) = node.run_sync(|_| std::thread::sleep(Duration::from_secs(4)));
+    assert!(res.is_ok(), "{:?}", res);
+    assert!(!node.is_banned(&a.addr()), "witness banned over a disagreement");
+    assert!(!node.is_banned(&b.addr()), "active peer banned over a disagreement");
+    assert_eq!(node.tip().0, 0, "disputed headers accepted without a witness");
+    for p in [&a, &b] {
+        let score = node.score(&p.addr());
+        assert!(score.map_or(false, |s| s < FRESH_SCORE), "{} not deprioritized: {:?}", p.addr(), score);
+    }
 
     // A fresh peer that agrees with the survivor settles it.
     let c = MockPeer::spawn(&b_chain, vec![]);

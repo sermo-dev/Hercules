@@ -576,6 +576,24 @@ fn netgroup(addr: &str, enforce_diversity: bool) -> Option<String> {
     }
 }
 
+/// Group used to keep header cross-check peers independent of each other
+/// (and of the peer being checked): the outbound diversity bucket (/16
+/// IPv4, /32 IPv6), and otherwise the host itself, so each onion address
+/// (or unparseable host) is its own group. With diversity off (regtest,
+/// where every mock peer is on 127.0.0.1) each address is its own group.
+fn cross_check_group(addr: &str, enforce_diversity: bool) -> String {
+    if !enforce_diversity {
+        return addr.to_string();
+    }
+    subnet_bucket(addr).unwrap_or_else(|| {
+        let host = match addr.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            _ => addr,
+        };
+        format!("host:{}", host)
+    })
+}
+
 /// Where a pool gets addresses when its address book runs low.
 #[derive(Debug, Clone)]
 pub enum PeerSource {
@@ -1066,6 +1084,13 @@ impl PeerPool {
     /// modules that populate it via `add_inbound_peer`.
     #[cfg(test)]
     pub(crate) fn new_for_test() -> PeerPool {
+        PeerPool::new_for_test_with(ChainParams::mainnet())
+    }
+
+    /// `new_for_test` with the given chain parameters (regtest: no
+    /// netgroup diversity, so loopback peers count as independent).
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with(params: &'static ChainParams) -> PeerPool {
         PeerPool {
             slots: Arc::new(Mutex::new(Vec::new())),
             addrs: AddrManager::new(MAX_KNOWN_ADDRS),
@@ -1076,7 +1101,7 @@ impl PeerPool {
             store: None,
             last_score_flush: Instant::now(),
             last_addr_flush: Instant::now(),
-            params: ChainParams::mainnet(),
+            params,
             source: PeerSource::Discover,
         }
     }
@@ -1090,6 +1115,10 @@ impl PeerPool {
     /// sketchy peer (score 30) at the literal tip — the whole point of the
     /// graduated reputation system. New peers default to `SCORE_DEFAULT` so
     /// they get fair selection until they prove themselves either way.
+    ///
+    /// Outbound peers only: an inbound peer chose its own claimed height
+    /// and, being keyed by a connection id, can't be banned in any way
+    /// that sticks, so it never drives header sync.
     pub fn best_peer(&self) -> Option<Peer> {
         let mut slots = self.slots.lock().unwrap();
         if slots.is_empty() {
@@ -1101,7 +1130,7 @@ impl PeerPool {
         let best_idx = slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.peer.is_some())
+            .filter(|(_, s)| s.peer.is_some() && !s.inbound)
             .max_by(|(_, a), (_, b)| {
                 let wa = a.height as f64 * (a.score as f64 / SCORE_DEFAULT as f64);
                 let wb = b.height as f64 * (b.score as f64 / SCORE_DEFAULT as f64);
@@ -1113,12 +1142,13 @@ impl PeerPool {
         slots[best_idx].peer.take()
     }
 
-    /// Return any available connected peer, temporarily taking it out of the
-    /// pool. The caller MUST return it via `return_peer`.
+    /// Return any available outbound peer, temporarily taking it out of the
+    /// pool. The caller MUST return it via `return_peer`. Used for block
+    /// downloads; inbound peers are left out like in `best_peer`.
     pub fn any_peer(&self) -> Option<Peer> {
         let mut slots = self.slots.lock().unwrap();
         for slot in slots.iter_mut() {
-            if slot.peer.is_some() {
+            if slot.peer.is_some() && !slot.inbound {
                 slot.checked_out_at = Some(Instant::now());
                 return slot.peer.take();
             }
@@ -1168,7 +1198,15 @@ impl PeerPool {
     /// Ban a peer address. Removes it from the pool and prevents reconnection.
     /// Persists the ban to disk if a store is configured so the peer stays
     /// banned across app restarts.
+    ///
+    /// An inbound peer is only disconnected: its address is a per-connection
+    /// id (see `Peer::accept`), so a ban on it would never match again.
     pub fn ban_peer(&mut self, addr: &str) {
+        if self.is_inbound(addr) {
+            self.remove_peer(addr);
+            info!("PeerPool: disconnected inbound peer {} (not bannable)", addr);
+            return;
+        }
         let expiry = Instant::now() + BAN_DURATION;
         self.bans.insert(addr.to_string(), expiry);
         self.remove_peer(addr);
@@ -1190,7 +1228,12 @@ impl PeerPool {
         };
         let entries: Vec<(String, i32)> = {
             let slots = self.slots.lock().unwrap();
-            slots.iter().map(|s| (s.addr.clone(), s.score)).collect()
+            // Inbound addresses are per-connection ids: nothing to keep.
+            slots
+                .iter()
+                .filter(|s| !s.inbound)
+                .map(|s| (s.addr.clone(), s.score))
+                .collect()
         };
         if let Err(e) = store.save_scores_bulk(&entries) {
             warn!("PeerPool: failed to flush scores: {}", e);
@@ -1311,14 +1354,40 @@ impl PeerPool {
     /// `maintain` doesn't reconnect it straight away. For peers that relay
     /// something bad they probably didn't originate (ticket 024).
     pub fn disconnect_and_deprioritize(&mut self, addr: &str, penalty: u32) {
-        self.misbehaving(addr, penalty);
-        if let (Some(store), Some(score)) = (self.store.as_ref(), self.get_score(addr)) {
+        self.deprioritize(addr, penalty);
+        let score = if self.is_inbound(addr) { None } else { self.get_score(addr) };
+        if let (Some(store), Some(score)) = (self.store.as_ref(), score) {
             if let Err(e) = store.save_score(addr, score) {
                 warn!("PeerPool: failed to persist score for {}: {}", addr, e);
             }
         }
         self.addrs.record_failure(addr);
         self.remove_peer(addr);
+    }
+
+    /// Lower a peer's score by `penalty`, but never to the ban threshold:
+    /// for evidence that a peer is wrong or unhelpful that falls short of
+    /// proof it sent invalid data (ticket 024, header cross-check
+    /// divergence). Repeated, it leaves the peer just above the threshold,
+    /// unattractive to `best_peer` and as a cross-check witness, but
+    /// connected. Only proven-invalid data (`misbehaving`) bans.
+    pub fn deprioritize(&mut self, addr: &str, penalty: u32) {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+            let floor = (BAN_LOW_THRESHOLD + 1).min(slot.score);
+            let new_score = (slot.score as i64 - penalty as i64).max(floor as i64);
+            slot.score = new_score as i32;
+            warn!(
+                "PeerPool: peer {} deprioritized (-{}), score now {}",
+                addr, penalty, slot.score
+            );
+        }
+    }
+
+    /// True if `addr` is a connected inbound peer.
+    pub fn is_inbound(&self, addr: &str) -> bool {
+        let slots = self.slots.lock().unwrap();
+        slots.iter().any(|s| s.addr == addr && s.inbound)
     }
 
     /// Cap a peer's claimed height at `height`, e.g. once it has shown it has
@@ -1341,29 +1410,49 @@ impl PeerPool {
         self.slots.lock().unwrap().len()
     }
 
-    /// Pick the address of any connected peer that is not `excluded`. Used by
-    /// header cross-validation to find an independent witness peer. Returns
-    /// `None` if no such peer exists. Prefers peers with higher reputation
-    /// scores so the witness is also a "good citizen" rather than the most
-    /// suspect peer in the pool.
-    pub fn peer_addr_other_than(&self, excluded: &str) -> Option<String> {
+    /// Pick an independent peer for the header cross-check (a witness, or
+    /// a tiebreaker): an available outbound peer in a different netgroup
+    /// (`cross_check_group`) from every peer in `others` (the peer being
+    /// checked, and the witness when picking a tiebreaker). Inbound peers
+    /// never qualify: whoever connects to us chooses to, and two inbound
+    /// connections from one attacker could otherwise outvote an honest
+    /// outbound peer. Highest score wins, the earliest slot on a tie, so
+    /// the choice is deterministic.
+    pub fn cross_check_peer(&self, others: &[String]) -> Option<String> {
+        let diversity = self.params.enforce_netgroup_diversity;
+        let taken: HashSet<String> =
+            others.iter().map(|a| cross_check_group(a, diversity)).collect();
         let slots = self.slots.lock().unwrap();
-        slots
-            .iter()
-            .filter(|s| s.addr != excluded && s.peer.is_some())
-            .max_by_key(|s| s.score)
-            .map(|s| s.addr.clone())
+        let mut best: Option<&PeerSlot> = None;
+        for s in slots.iter() {
+            if s.inbound
+                || s.peer.is_none()
+                || others.iter().any(|o| o == &s.addr)
+                || taken.contains(&cross_check_group(&s.addr, diversity))
+            {
+                continue;
+            }
+            if best.map_or(true, |b| s.score > b.score) {
+                best = Some(s);
+            }
+        }
+        best.map(|s| s.addr.clone())
     }
 
-    /// Pick a peer address that's not in `excluded`. Used to find a third
-    /// "tiebreaker" peer when the first two cross-check peers disagree.
+    /// Pick an available outbound peer not in `excluded`, highest score
+    /// first: a block download retried after `excluded` served bad copies.
     pub fn peer_addr_excluding(&self, excluded: &[String]) -> Option<String> {
         let slots = self.slots.lock().unwrap();
-        slots
-            .iter()
-            .filter(|s| !excluded.iter().any(|e| e == &s.addr) && s.peer.is_some())
-            .max_by_key(|s| s.score)
-            .map(|s| s.addr.clone())
+        let mut best: Option<&PeerSlot> = None;
+        for s in slots.iter() {
+            if s.inbound || s.peer.is_none() || excluded.iter().any(|e| e == &s.addr) {
+                continue;
+            }
+            if best.map_or(true, |b| s.score > b.score) {
+                best = Some(s);
+            }
+        }
+        best.map(|s| s.addr.clone())
     }
 
     /// Take a specific peer out of the pool by address. Returns `None` if the
@@ -1387,6 +1476,7 @@ impl PeerPool {
         let slots = self.slots.lock().unwrap();
         slots
             .iter()
+            .filter(|s| !s.inbound)
             .max_by(|a, b| {
                 let wa = a.height as f64 * (a.score as f64 / SCORE_DEFAULT as f64);
                 let wb = b.height as f64 * (b.score as f64 / SCORE_DEFAULT as f64);
@@ -1419,24 +1509,34 @@ impl PeerPool {
 
         info!("PeerPool: accepted inbound peer {} ({}) at height {}", addr, user_agent, height);
 
-        // Restore any persisted score for this peer (e.g. a long-lived
-        // inbound peer that briefly disconnected and reconnected).
-        let score = self
-            .store
-            .as_ref()
-            .and_then(|s| s.load_score(&addr).ok().flatten())
-            .unwrap_or(SCORE_DEFAULT);
-
+        // No persisted score to restore: the address is a per-connection
+        // id (see `Peer::accept`), not an identity.
         slots.push(PeerSlot {
             peer: Some(peer),
             addr,
             user_agent,
             height,
-            score,
+            score: SCORE_DEFAULT,
             inbound: true,
             checked_out_at: None,
         });
         true
+    }
+
+    /// Add an already-connected peer as an outbound slot, for tests that
+    /// drive the pool with loopback peers.
+    #[cfg(test)]
+    pub(crate) fn add_outbound_peer_for_test(&self, peer: Peer) {
+        let addr = peer.addr().to_string();
+        self.slots.lock().unwrap().push(PeerSlot {
+            peer: Some(peer),
+            addr,
+            user_agent: "/test/".to_string(),
+            height: 0,
+            score: SCORE_DEFAULT,
+            inbound: false,
+            checked_out_at: None,
+        });
     }
 
     /// Number of inbound peers.
@@ -2037,6 +2137,137 @@ mod tests {
     }
 
     // ── Subnet diversity tests ───────────────────────────────────────
+
+    // ── Inbound peers and cross-check peer selection (PR #24 review) ──
+
+    /// A slot holding a live loopback connection under `addr`. Returns the
+    /// server half, which must outlive the test's use of the slot.
+    fn add_live_slot(
+        pool: &PeerPool,
+        addr: &str,
+        height: u32,
+        score: i32,
+        inbound: bool,
+    ) -> std::net::TcpStream {
+        let (mut peer, server) = crate::p2p::tests::loopback_peer_pair();
+        peer.set_addr_for_test(addr, inbound);
+        pool.slots.lock().unwrap().push(PeerSlot {
+            peer: Some(peer),
+            addr: addr.to_string(),
+            user_agent: "/test/".to_string(),
+            height,
+            score,
+            inbound,
+            checked_out_at: None,
+        });
+        server
+    }
+
+    #[test]
+    fn inbound_peers_are_never_best_peer_witness_or_block_source() {
+        let pool = test_pool();
+        // The inbound peer claims a far higher tip and has the top score.
+        let _a = add_live_slot(&pool, "inbound#1", 2_000_000, SCORE_MAX, true);
+        let _b = add_live_slot(&pool, "1.2.3.4:8333", 850_000, SCORE_DEFAULT, false);
+        let _c = add_live_slot(&pool, "5.6.7.8:8333", 850_000, SCORE_DEFAULT, false);
+
+        assert_eq!(pool.best_peer_addr().as_deref(), Some("5.6.7.8:8333"));
+        let best = pool.best_peer().expect("an outbound peer");
+        assert!(!best.inbound);
+        pool.return_peer(best);
+        let any = pool.any_peer().expect("an outbound peer");
+        assert!(!any.inbound);
+        pool.return_peer(any);
+        assert_ne!(pool.peer_addr_excluding(&[]).as_deref(), Some("inbound#1"));
+
+        let witness = pool.cross_check_peer(&["1.2.3.4:8333".to_string()]);
+        assert_eq!(witness.as_deref(), Some("5.6.7.8:8333"));
+        let tiebreaker =
+            pool.cross_check_peer(&["1.2.3.4:8333".to_string(), "5.6.7.8:8333".to_string()]);
+        assert_eq!(tiebreaker, None, "only the inbound peer is left: no tiebreaker");
+    }
+
+    #[test]
+    fn only_inbound_peers_means_no_header_peer() {
+        let pool = test_pool();
+        let _a = add_live_slot(&pool, "inbound#1", 900_000, SCORE_DEFAULT, true);
+        let _b = add_live_slot(&pool, "inbound#2", 900_000, SCORE_DEFAULT, true);
+        assert!(pool.best_peer().is_none());
+        assert!(pool.any_peer().is_none());
+        assert_eq!(pool.best_peer_addr(), None);
+        assert_eq!(pool.cross_check_peer(&[]), None);
+    }
+
+    #[test]
+    fn cross_check_peers_come_from_distinct_netgroups() {
+        let pool = test_pool();
+        let _a = add_live_slot(&pool, "1.2.3.4:8333", 850_000, SCORE_DEFAULT, false);
+        // Same /16 as the active peer, best score: still not a witness.
+        let _b = add_live_slot(&pool, "1.2.9.9:8333", 850_000, SCORE_MAX, false);
+        let _c = add_live_slot(&pool, "5.6.7.8:8333", 850_000, SCORE_DEFAULT, false);
+        // Same /16 as the witness: not a tiebreaker.
+        let _d = add_live_slot(&pool, "5.6.1.1:8333", 850_000, SCORE_MAX, false);
+        let _e = add_live_slot(&pool, "[2001:db8::1]:8333", 850_000, SCORE_DEFAULT, false);
+        let _f = add_live_slot(&pool, "[2001:db8::2]:8333", 850_000, SCORE_MAX, false);
+
+        let active = "1.2.3.4:8333".to_string();
+        // Highest score outside the active /16: 5.6.1.1 (SCORE_MAX), ahead
+        // of the equal-scored [2001:db8::2] by slot order.
+        let witness = pool.cross_check_peer(&[active.clone()]).unwrap();
+        assert_eq!(witness, "5.6.1.1:8333");
+        let tiebreaker = pool.cross_check_peer(&[active.clone(), witness.clone()]).unwrap();
+        assert_eq!(tiebreaker, "[2001:db8::2]:8333");
+        // With the IPv6 /32 taken as well, nothing independent is left.
+        assert_eq!(
+            pool.cross_check_peer(&[active, witness, "[2001:db8::1]:8333".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_check_peer_counts_onions_per_address_and_breaks_ties_by_slot_order() {
+        let pool = test_pool();
+        let _a = add_live_slot(&pool, "aaaa.onion:8333", 0, SCORE_DEFAULT, false);
+        let _b = add_live_slot(&pool, "bbbb.onion:8333", 0, SCORE_DEFAULT, false);
+        let _c = add_live_slot(&pool, "cccc.onion:8333", 0, SCORE_DEFAULT, false);
+        let others = ["aaaa.onion:8333".to_string()];
+        assert_eq!(pool.cross_check_peer(&others).as_deref(), Some("bbbb.onion:8333"));
+        // The same onion on another port is the same group.
+        assert_eq!(
+            cross_check_group("bbbb.onion:8333", true),
+            cross_check_group("bbbb.onion:18333", true)
+        );
+        assert_ne!(
+            cross_check_group("bbbb.onion:8333", true),
+            cross_check_group("cccc.onion:8333", true)
+        );
+    }
+
+    #[test]
+    fn deprioritize_never_bans() {
+        let mut pool = test_pool();
+        add_slot(&pool, "1.2.3.4:8333", 100);
+        for _ in 0..10 {
+            pool.deprioritize("1.2.3.4:8333", 50);
+        }
+        assert!(!pool.is_banned("1.2.3.4:8333"));
+        assert_eq!(pool.get_score("1.2.3.4:8333"), Some(BAN_LOW_THRESHOLD + 1));
+        assert_eq!(pool.count(), 1);
+        // Proven misbehavior still bans.
+        pool.misbehaving("1.2.3.4:8333", 1);
+        assert!(pool.is_banned("1.2.3.4:8333"));
+    }
+
+    #[test]
+    fn banning_an_inbound_peer_only_disconnects_it() {
+        let mut pool = test_pool_with_store();
+        let _a = add_live_slot(&pool, "inbound#7", 0, SCORE_DEFAULT, true);
+        pool.ban_peer("inbound#7");
+        assert_eq!(pool.count(), 0);
+        assert!(!pool.is_banned("inbound#7"));
+        let store = pool.store.as_ref().unwrap();
+        assert!(!store.load_active_bans().unwrap().contains_key("inbound#7"));
+    }
 
     #[test]
     fn netgroup_diversity_only_relaxed_when_params_say_so() {
