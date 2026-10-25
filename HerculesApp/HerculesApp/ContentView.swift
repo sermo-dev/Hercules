@@ -535,6 +535,11 @@ class NodeViewModel: ObservableObject {
             // Don't start an 8.8 GB download for a session that's over.
             if token.isOver { return }
 
+            // The downloader refuses to start while the network policy
+            // reads "offline", which it does until the monitor's first
+            // path (ticket 051). Normally long since known by now.
+            NetworkPolicy.shared.waitForFirstPath()
+
             // Block until the file is on disk. Surfaces progress to
             // the UI via the SnapshotDownloader subscriptions set up
             // in init().

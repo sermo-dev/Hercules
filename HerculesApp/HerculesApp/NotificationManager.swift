@@ -298,6 +298,24 @@ class NotificationManager: ObservableObject {
         let budget = WakeBudget(budgetMs: WakeConfig.budgetMs)
         let receivedAt = Date()
 
+        // On a cold launch the network monitor hasn't reported its first
+        // path yet, and `shouldValidate` would read "offline" (ticket 051).
+        // Wait for it, bounded; inline when the process is warm.
+        NetworkPolicy.shared.afterFirstPath {
+            self.runSilentPush(
+                userInfo: userInfo, budget: budget, receivedAt: receivedAt,
+                completionHandler: completionHandler
+            )
+        }
+    }
+
+    /// `handleSilentPush` once the network path is known. Main thread.
+    private func runSilentPush(
+        userInfo: [AnyHashable: Any],
+        budget: WakeBudget,
+        receivedAt: Date,
+        completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
         // Parse block info from push payload (used as fallback if validation fails)
         let pushBlock = parsePushPayload(userInfo)
 
@@ -913,7 +931,10 @@ class NotificationManager: ObservableObject {
             Self.requestFollowUpWake()
         }
 
-        // Respect the same network policy gate as silent push wakes.
+        // Respect the same network policy gate as silent push wakes, once
+        // the monitor has reported (this handler can be the cold launch's
+        // first code, on a background queue; ticket 051).
+        NetworkPolicy.shared.waitForFirstPath()
         guard NetworkPolicy.shared.shouldValidate else {
             gate.fire { task.setTaskCompleted(success: true) }
             return
