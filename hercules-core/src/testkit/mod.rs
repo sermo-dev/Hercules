@@ -9,16 +9,14 @@ pub mod mock_peer;
 pub use fixture_chain::{FixtureChain, Invalid};
 pub use mock_peer::{Behavior, MockPeer};
 
-/// Address (`ip:0`) that loopback test listeners bind to: mock peers and
-/// the p2p unit tests' socket pairs. `127.0.0.1` unless the
-/// `HERCULES_TEST_LOOPBACK` env var names another loopback IP, e.g.
-/// `HERCULES_TEST_LOOPBACK=::1` on a host whose IPv4 ephemeral ports are
-/// exhausted (long-uptime macOS can stop expiring TIME_WAIT sockets, after
-/// which every connect to 127.0.0.1 fails with EADDRNOTAVAIL).
-pub fn loopback_bind_addr() -> std::net::SocketAddr {
-    let ip: std::net::IpAddr = std::env::var("HERCULES_TEST_LOOPBACK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    std::net::SocketAddr::new(ip, 0)
+/// Address test listeners bind to: `HERCULES_TEST_LOOPBACK` (e.g. `::1`
+/// when a host has run out of IPv4 loopback ports), default 127.0.0.1.
+/// Returns a `host:0` string for `TcpListener::bind`.
+pub fn loopback_bind() -> String {
+    let host = std::env::var("HERCULES_TEST_LOOPBACK").unwrap_or_else(|_| "127.0.0.1".into());
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:0", host)
+    } else {
+        format!("{}:0", host)
+    }
 }

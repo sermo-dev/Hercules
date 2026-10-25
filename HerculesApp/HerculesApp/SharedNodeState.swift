@@ -114,6 +114,11 @@ enum SharedNodeStore {
         return decoded
     }
 
+    /// Serializes this process's load-modify-writes (a wake thread marking
+    /// awake while the main thread marks paused), so neither update is
+    /// lost. Recursive: the mark functions call `write` while holding it.
+    private static let stateLock = NSRecursiveLock()
+
     /// Convenience writer for the "we just validated a fresh block" case.
     /// Replaces the entire stored state — height, hash, peer count, and
     /// `lastBlockTime` all advance together. Clears `isAwake` and
@@ -135,6 +140,7 @@ enum SharedNodeStore {
     /// keeps showing the most recent block we *have* validated, plus the
     /// red "paused" indicator on top.
     static func markPaused(_ paused: Bool) {
+        stateLock.lock(); defer { stateLock.unlock() }
         var state = load()
         // Don't republish if nothing's actually changing — saves a
         // WidgetKit reload budget tick.
@@ -155,6 +161,7 @@ enum SharedNodeStore {
     /// silent-push handler so the widget can render the awake dot during
     /// the brief window the node is actually doing work.
     static func markAwake(_ awake: Bool) {
+        stateLock.lock(); defer { stateLock.unlock() }
         var state = load()
         if state.isAwake == awake { return }
         state = SharedNodeState(
@@ -175,6 +182,7 @@ enum SharedNodeStore {
     /// best-effort; WidgetKit will simply ignore us once we've burned
     /// through the daily budget.
     static func write(_ state: SharedNodeState) {
+        stateLock.lock(); defer { stateLock.unlock() }
         guard let url = fileURL() else {
             // Entitlement missing or container unavailable — silently no-op.
             // Logged once at app startup by the main app's diagnostic code.

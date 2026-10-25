@@ -63,6 +63,45 @@ dictionary CatchUpStatus {
     boolean invalid_chain_detected;
 };
 
+// Ticket 028: background wakes.
+
+enum WakeOutcome {
+    "Completed",
+    "TransportSlow",
+    "Busy",
+    "Cancelled",
+    "TimedOut",
+    "Failed",
+};
+
+// Milliseconds since wake receipt.
+dictionary WakePhaseTimings {
+    u64? transport_ready_ms;
+    u64? peers_ready_ms;
+    u64? headers_checked_ms;
+    u64? blocks_downloaded_ms;
+    u64? validated_ms;
+};
+
+dictionary WakeReport {
+    WakeOutcome outcome;
+    CatchUpStatus? status;
+    WakePhaseTimings timings;
+    boolean preempted_sync;
+    string? error;
+    u64 elapsed_ms;
+};
+
+// Deadline + cancellation token for one wake. Create it the moment the
+// wake arrives; cancel() is safe from any thread, at any time.
+interface WakeBudget {
+    constructor(u32 budget_ms);
+    void cancel();
+    boolean is_cancelled();
+    u64 elapsed_ms();
+    u64 remaining_ms();
+};
+
 dictionary TorStatus {
     boolean is_bootstrapped;
     u8 bootstrap_progress;
@@ -119,6 +158,19 @@ callback interface SnapshotCallback {
 interface HerculesNode {
     [Throws=HerculesError]
     constructor(string db_path, string? tor_data_dir);
+
+    // Doesn't wait for Tor: bootstrap runs in the background (ticket 028).
+    [Name=open, Throws=HerculesError]
+    constructor(string db_path, string? tor_data_dir);
+
+    [Throws=HerculesError]
+    boolean wait_for_transport(u32 timeout_ms);
+
+    WakeReport wake_catch_up(WakeBudget budget, u32 max_blocks, u32 min_block_ms);
+
+    // Shut down for good (before a reset). True if the running session
+    // ended within the timeout.
+    boolean close(u32 timeout_ms);
 
     [Throws=HerculesError]
     SyncStatus get_status();
@@ -182,6 +234,7 @@ interface HerculesError {
     NetworkError(string msg);
     TorError(string msg);
     SnapshotInvalid(string msg);
+    NodeOpen(string msg);
 };
 
 [Error]
