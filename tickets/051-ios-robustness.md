@@ -48,7 +48,7 @@ A connectivity error with no fresh resume data also deleted the *previous* blob.
 **Fix.** Kept small and local to the error path, so it merges cleanly with PR #27 (per-snapshot file names, `deleteLegacyFiles`, `isCurrent` guards):
 - `cancel()` records which task the user cancelled. Only that task's `NSURLErrorCancelled` is ignored.
 - Any other failure saves resume data when the error carries it, and always moves `status` to `.failed`, which releases the waiter.
-- With no fresh resume data, the old blob is kept for pure connectivity errors (`notConnectedToInternet`, `networkConnectionLost`, `timedOut`, `cannotConnectToHost`, `cannotFindHost`, `dnsLookupFailed`, `internationalRoamingOff`, `dataNotAllowed`). It is deleted otherwise, for example when the blob itself was stale.
+- With no fresh resume data, the old blob is kept for connectivity errors (`notConnectedToInternet`, `networkConnectionLost`, `timedOut`, `cannotConnectToHost`, `cannotFindHost`, `dnsLookupFailed`, `internationalRoamingOff`, `dataNotAllowed`) and for a system cancel. It is deleted otherwise, for example when the blob itself was stale.
 - Resume data is still discarded on user cancel (`cancel()`), on a bad HTTP status (`didFinishDownloadingTo`; PR #27 also deletes resume data there), and when the import rejects the file (`deleteDownloadedFile`).
 
 ### 4. Snapshot import has no idle-timer or background-task cover
