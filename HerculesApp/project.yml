@@ -36,6 +36,8 @@ targets:
         OTHER_LDFLAGS: ["-lc++"]
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # iPhone only (ticket 051): the product is a node on your phone.
+        TARGETED_DEVICE_FAMILY: "1"
     info:
       path: HerculesApp/Info.plist
       properties:
@@ -86,7 +88,7 @@ targets:
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGN_IDENTITY: "iPhone Developer"
         SKIP_INSTALL: YES
-        TARGETED_DEVICE_FAMILY: "1,2"
+        TARGETED_DEVICE_FAMILY: "1"
     info:
       path: HerculesWidget/Info.plist
       properties:
