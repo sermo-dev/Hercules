@@ -9,6 +9,7 @@ mod assumeutxo;
 mod block_store;
 mod block_validation;
 mod mempool;
+mod own_tx_store;
 mod p2p;
 mod peer_pool;
 mod relay_policy;
@@ -716,6 +717,139 @@ impl HerculesNode {
         }
 
         Ok(token)
+    }
+
+    // ── Own transactions (ticket 033) ─────────────────────────────
+
+    /// Submit one of the user's own signed transactions (raw hex). It is
+    /// validated (consensus + network standardness; local relay policy
+    /// is only a warning), persisted, announced immediately and
+    /// rebroadcast until it confirms. `AlreadyKnown` means it was already
+    /// in the mempool; it is tracked and re-announced anyway.
+    pub fn submit_own_tx(&self, raw_tx_hex: String) -> Result<OwnTxReceipt, BroadcastError> {
+        let raw = hex::decode(raw_tx_hex.trim()).map_err(|e| BroadcastError::Invalid {
+            msg: format!("bad hex: {}", e),
+        })?;
+        self.syncer
+            .submit_own_tx(&raw)
+            .map(|r| OwnTxReceipt {
+                txid: r.txid.to_string(),
+                warnings: r.warnings,
+            })
+            .map_err(Into::into)
+    }
+
+    /// Tracker status of an own transaction, or None if not tracked.
+    pub fn own_tx_status(&self, txid: String) -> Result<Option<OwnTxInfo>, HerculesError> {
+        let txid = txid.parse::<bitcoin::Txid>().map_err(|e| HerculesError::SyncFailed {
+            msg: format!("bad txid: {}", e),
+        })?;
+        self.syncer
+            .own_tx_status(&txid)
+            .map(|o| o.map(Into::into))
+            .map_err(|e| HerculesError::StorageError { msg: format!("{}", e) })
+    }
+
+    /// All tracked own transactions, newest first.
+    pub fn list_own_txs(&self) -> Result<Vec<OwnTxInfo>, HerculesError> {
+        self.syncer
+            .list_own_txs()
+            .map(|v| v.into_iter().map(Into::into).collect())
+            .map_err(|e| HerculesError::StorageError { msg: format!("{}", e) })
+    }
+}
+
+/// Successful own-transaction submission.
+#[derive(Debug, Clone)]
+pub struct OwnTxReceipt {
+    pub txid: String,
+    pub warnings: Vec<String>,
+}
+
+/// Tracker state of an own transaction. `status` is one of pending,
+/// propagated, confirmed, replaced, conflicted, expired. Times are unix
+/// seconds.
+#[derive(Debug, Clone)]
+pub struct OwnTxInfo {
+    pub txid: String,
+    pub status: String,
+    pub confirmed_height: Option<u32>,
+    /// Replacing / conflicting txid for replaced / conflicted.
+    pub related_txid: Option<String>,
+    pub first_sent_at: u64,
+    pub last_sent_at: u64,
+    pub next_attempt_at: u64,
+    pub attempts: u32,
+    pub seen_from_peers: u32,
+    pub updated_at: u64,
+}
+
+impl From<own_tx_store::OwnTxRecord> for OwnTxInfo {
+    fn from(r: own_tx_store::OwnTxRecord) -> Self {
+        use own_tx_store::OwnTxStatus;
+        let (confirmed_height, related_txid) = match &r.status {
+            OwnTxStatus::Confirmed { height } => (Some(*height), None),
+            OwnTxStatus::Replaced { by } | OwnTxStatus::Conflicted { by } => {
+                (None, Some(by.to_string()))
+            }
+            _ => (None, None),
+        };
+        OwnTxInfo {
+            txid: r.txid.to_string(),
+            status: r.status.name().to_string(),
+            confirmed_height,
+            related_txid,
+            first_sent_at: r.first_sent_at,
+            last_sent_at: r.last_sent_at,
+            next_attempt_at: r.next_attempt_at,
+            attempts: r.attempts,
+            seen_from_peers: r.seen_from_peers,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+/// Why an own transaction was refused (FFI mirror of
+/// `own_tx_store::SubmitError`).
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastError {
+    #[error("Invalid transaction: {msg}")]
+    Invalid { msg: String },
+    #[error("Consensus-invalid: {msg}")]
+    Consensus { msg: String },
+    #[error("Non-standard: {msg}")]
+    NonStandard { msg: String },
+    #[error("Fee too low: {msg}")]
+    FeeTooLow { msg: String },
+    #[error("Absurd fee: {msg}")]
+    AbsurdFee { msg: String },
+    #[error("Conflict: {msg}")]
+    Conflict { msg: String },
+    #[error("Already known: {txid}")]
+    AlreadyKnown { txid: String },
+    #[error("Not synced: {msg}")]
+    NotSynced { msg: String },
+    #[error("Internal error: {msg}")]
+    Internal { msg: String },
+}
+
+impl From<own_tx_store::SubmitError> for BroadcastError {
+    fn from(e: own_tx_store::SubmitError) -> Self {
+        use own_tx_store::SubmitError as S;
+        let msg = e.to_string();
+        match e {
+            S::Decode(_) => BroadcastError::Invalid { msg },
+            S::Consensus(_) => BroadcastError::Consensus { msg },
+            S::NonStandard(_) => BroadcastError::NonStandard { msg },
+            S::FeeTooLow { .. } => BroadcastError::FeeTooLow { msg },
+            S::AbsurdFee { .. } => BroadcastError::AbsurdFee { msg },
+            S::Conflict { .. } => BroadcastError::Conflict { msg },
+            S::AlreadyKnown { txid } => BroadcastError::AlreadyKnown {
+                txid: txid.to_string(),
+            },
+            S::NotSynced { .. } => BroadcastError::NotSynced { msg },
+            S::Internal(_) => BroadcastError::Internal { msg },
+        }
     }
 }
 
