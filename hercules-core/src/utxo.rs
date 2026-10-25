@@ -263,6 +263,13 @@ const META_KEY_MUHASH: &[u8] = b"muhash";
 /// verified with, even if a later app release bumps the compiled anchor.
 const META_KEY_SNAPSHOT_BLOCK_HASH: &[u8] = b"snapshot_block_hash";
 
+/// Key inside the `meta` DB for the content hash (`SnapshotMeta::utxo_hash`)
+/// of the loaded snapshot file. Lets `open` recognise a set imported from a
+/// snapshot that was later retracted (`RETRACTED_SNAPSHOT_HASHES`). Absent
+/// on sets loaded before it existed, all of which came from the retracted
+/// 943,500 file.
+const META_KEY_SNAPSHOT_UTXO_HASH: &[u8] = b"snapshot_utxo_hash";
+
 /// LMDB key length for the `height_index` DB: height (4 BE) + txid (32) + vout (4 BE).
 const HEIGHT_INDEX_KEY_LEN: usize = 40;
 
@@ -385,7 +392,77 @@ impl UtxoSet {
 
         fs::create_dir_all(&path_buf)
             .map_err(|e| UtxoError(format!("create utxo dir {}: {}", path, e)))?;
-        Self::open_at(&path_buf)
+        let set = Self::open_at(&path_buf)?;
+
+        // A set imported from a retracted snapshot holds wrong coins: wipe
+        // it so the caller sees an empty set (HeaderSync then resets
+        // validated_height and the app re-imports). Reuses the
+        // interrupted-load protocol: once the marker is on disk, a crash
+        // anywhere below still ends in a wipe on the next open.
+        if set.snapshot_is_retracted()? {
+            warn!(
+                "UTXO set at {} was loaded from a retracted snapshot — wiping for re-import",
+                path_buf.display()
+            );
+            if set.is_sole_user() {
+                fs::write(&marker, b"retracted snapshot\n").map_err(|e| {
+                    UtxoError(format!("write loading marker {}: {}", marker.display(), e))
+                })?;
+                drop(set);
+                return Self::open(path);
+            }
+            // Another handle in this process has the env mapped, so the
+            // directory can't be removed under it: clear in place instead.
+            set.clear_all()?;
+            set.env
+                .force_sync()
+                .map_err(|e| UtxoError(format!("force_sync after wipe: {}", e)))?;
+        }
+        Ok(set)
+    }
+
+    /// True if a snapshot was loaded into this set and its content hash is
+    /// either unrecorded (loaded before `META_KEY_SNAPSHOT_UTXO_HASH`
+    /// existed, i.e. from the retracted 943,500 file) or retracted.
+    fn snapshot_is_retracted(&self) -> Result<bool, UtxoError> {
+        if self.assume_valid_floor()? == 0 {
+            return Ok(false);
+        }
+        Ok(match self.snapshot_utxo_hash()? {
+            None => true,
+            Some(h) => crate::assumeutxo::RETRACTED_SNAPSHOT_HASHES.contains(&h),
+        })
+    }
+
+    /// Whether this is the only open `UtxoSet` on its env in the process.
+    fn is_sole_user(&self) -> bool {
+        env_registry()
+            .get(&self.canonical)
+            .map(|slot| slot.users == 1)
+            .unwrap_or(false)
+    }
+
+    /// Content hash of the loaded snapshot file, or `None` on a genesis
+    /// install or a set loaded before this key existed.
+    pub fn snapshot_utxo_hash(&self) -> Result<Option<[u8; 32]>, UtxoError> {
+        let _gate = self.read_gate()?;
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let bytes = self
+            .meta
+            .get(&rtxn, META_KEY_SNAPSHOT_UTXO_HASH)
+            .map_err(|e| UtxoError(format!("read snapshot_utxo_hash: {}", e)))?;
+        match bytes {
+            Some(b) if b.len() == 32 => {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(b);
+                Ok(Some(buf))
+            }
+            Some(b) => Err(UtxoError(format!("corrupt snapshot_utxo_hash: len {}", b.len()))),
+            None => Ok(None),
+        }
     }
 
     fn open_at(path: &Path) -> Result<UtxoSet, UtxoError> {
@@ -1506,6 +1583,9 @@ impl UtxoSet {
             self.meta
                 .put(&mut wtxn, META_KEY_SNAPSHOT_BLOCK_HASH, &block_hash)
                 .map_err(|e| UtxoError(format!("put snapshot_block_hash: {}", e)))?;
+            self.meta
+                .put(&mut wtxn, META_KEY_SNAPSHOT_UTXO_HASH, &file_hash)
+                .map_err(|e| UtxoError(format!("put snapshot_utxo_hash: {}", e)))?;
 
             // Persist the MuHash for UI display and independent verification.
             self.meta
@@ -1914,6 +1994,21 @@ impl std::error::Error for UtxoError {}
 
 #[cfg(test)]
 impl UtxoSet {
+    /// Test-only: set (or with `None`, remove) the recorded snapshot
+    /// content hash, to simulate a set loaded before the key existed or
+    /// from a retracted file.
+    pub(crate) fn test_set_snapshot_utxo_hash(&self, hash: Option<[u8; 32]>) {
+        let _gate = self.read_gate().unwrap();
+        let mut wtxn = self.env.write_txn().unwrap();
+        match hash {
+            Some(h) => self.meta.put(&mut wtxn, META_KEY_SNAPSHOT_UTXO_HASH, &h).unwrap(),
+            None => {
+                self.meta.delete(&mut wtxn, META_KEY_SNAPSHOT_UTXO_HASH).unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+    }
+
     /// Insert a UTXO directly. Bypasses block validation; tests use this to
     /// simulate "this UTXO existed before the block we're about to roll back".
     /// `pub(crate)` so the mempool test suite can build a populated UTXO set
@@ -2677,6 +2772,88 @@ mod tests {
         assert!(utxo.get(&txid, 3).unwrap().is_some());
         assert!(utxo.get(&txid, 2).unwrap().is_none());
         assert!(utxo.get(&txid, 1).unwrap().is_none());
+    }
+
+    /// Load a 3-entry snapshot into a fresh env at `<dir>/utxo`, let
+    /// `tweak` edit the recorded hash, close it, and reopen.
+    fn reopen_after_load(tweak: impl FnOnce(&UtxoSet)) -> (UtxoSet, TempDir, PathBuf) {
+        let (bytes, anchor) = make_snapshot_with_n_utxos(3);
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join("utxo");
+        {
+            let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+            utxo.load_snapshot(std::io::Cursor::new(&bytes), Some(&anchor), |_, _| true)
+                .unwrap();
+            assert_eq!(utxo.snapshot_utxo_hash().unwrap(), Some(anchor.utxo_hash));
+            tweak(&utxo);
+        }
+        let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        (utxo, dir, env_path)
+    }
+
+    #[test]
+    fn open_keeps_set_from_current_snapshot() {
+        let (utxo, _dir, env_path) = reopen_after_load(|_| {});
+        assert_eq!(utxo.count().unwrap(), 3);
+        assert_eq!(utxo.assume_valid_floor().unwrap(), 1);
+        assert!(!loading_marker_path(&env_path).exists());
+    }
+
+    fn assert_wiped(utxo: &UtxoSet, env_path: &Path) {
+        assert_eq!(utxo.count().unwrap(), 0);
+        assert_eq!(utxo.assume_valid_floor().unwrap(), 0);
+        assert_eq!(utxo.snapshot_block_hash().unwrap(), None);
+        assert_eq!(utxo.snapshot_utxo_hash().unwrap(), None);
+        assert_eq!(utxo.muhash().unwrap(), None);
+        assert!(!loading_marker_path(env_path).exists());
+    }
+
+    #[test]
+    fn open_wipes_set_loaded_before_hash_was_recorded() {
+        // Every set loaded before `snapshot_utxo_hash` existed came from
+        // the retracted 943,500 file.
+        let (utxo, _dir, env_path) = reopen_after_load(|u| u.test_set_snapshot_utxo_hash(None));
+        assert_wiped(&utxo, &env_path);
+    }
+
+    #[test]
+    fn open_wipes_set_from_retracted_snapshot() {
+        let bad = crate::assumeutxo::RETRACTED_SNAPSHOT_HASHES[0];
+        let (utxo, _dir, env_path) = reopen_after_load(|u| u.test_set_snapshot_utxo_hash(Some(bad)));
+        assert_wiped(&utxo, &env_path);
+        // And the wiped env takes a fresh import.
+        let (bytes, anchor) = make_snapshot_with_n_utxos(2);
+        utxo.load_snapshot(std::io::Cursor::new(&bytes), Some(&anchor), |_, _| true)
+            .unwrap();
+        assert_eq!(utxo.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn open_clears_retracted_set_in_place_when_env_is_shared() {
+        let (bytes, anchor) = make_snapshot_with_n_utxos(3);
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join("utxo");
+        let first = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        first
+            .load_snapshot(std::io::Cursor::new(&bytes), Some(&anchor), |_, _| true)
+            .unwrap();
+        first.test_set_snapshot_utxo_hash(None);
+        // `first` keeps the env mapped, so the directory can't be removed.
+        let second = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        assert_wiped(&second, &env_path);
+        assert_eq!(first.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn genesis_mode_set_without_snapshot_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join("utxo");
+        {
+            let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+            utxo.apply_block(&genesis_block(), 1).unwrap();
+        }
+        let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
+        assert_eq!(utxo.count().unwrap(), 1);
     }
 
     #[test]

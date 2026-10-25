@@ -31,6 +31,21 @@ pub const ASSUMEUTXO_HASH: [u8; 32] = [
     0x29, 0x64, 0x77, 0x30, 0xae, 0x1b, 0xf7, 0x34,
 ];
 
+/// Snapshot content hashes that were once shipped and later found to be
+/// wrong. A UTXO set loaded from one of them is discarded on open (see
+/// `UtxoSet::open`) so the app re-imports the current snapshot.
+///
+/// - `705528fe…2d133e`: 943,500 file built before the converter decoded
+///   Core's compressed-script types 0x04/0x05 as uncompressed P2PK; 34,336
+///   coins carried a 35-byte compressed-key script instead of the real
+///   67-byte one, so blocks spending them would fail validation.
+pub const RETRACTED_SNAPSHOT_HASHES: &[[u8; 32]] = &[[
+    0x70, 0x55, 0x28, 0xfe, 0x00, 0x33, 0x29, 0xe0,
+    0xe6, 0xde, 0x5c, 0x85, 0x4b, 0x83, 0xd5, 0x7b,
+    0x0b, 0xad, 0xc2, 0xb9, 0x5b, 0x60, 0xdc, 0x73,
+    0xa7, 0xa4, 0x0f, 0x22, 0xf6, 0x2d, 0x13, 0x3e,
+]];
+
 /// Exact number of UTXOs in the snapshot (the HUTX header's `count`, equal
 /// to Core's `dumptxoutset` coin count / `gettxoutsetinfo txouts`).
 ///
@@ -127,6 +142,15 @@ mod tests {
         let display = "a65fdd39101c64f00d6c5cefb134080ec95006c34bd6c25f29647730ae1bf734";
         let from_display = hex::decode(display).unwrap();
         assert_eq!(&from_display[..], &ASSUMEUTXO_HASH[..]);
+    }
+
+    #[test]
+    fn current_hash_is_not_retracted() {
+        assert!(!RETRACTED_SNAPSHOT_HASHES.contains(&ASSUMEUTXO_HASH));
+        assert_eq!(
+            hex::encode(RETRACTED_SNAPSHOT_HASHES[0]),
+            "705528fe003329e0e6de5c854b83d57b0badc2b95b60dc73a7a40f22f62d133e"
+        );
     }
 
     #[test]

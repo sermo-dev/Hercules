@@ -4231,6 +4231,42 @@ mod tests {
     }
 
     #[test]
+    fn reopen_discards_set_from_retracted_snapshot() {
+        // A device that imported the retracted 943,500 file (no recorded
+        // content hash) must be sent back to the snapshot download.
+        let chain = cheap_chain(10, 0);
+        let (dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain, 1).unwrap();
+        hs.load_snapshot(&path, |_, _| true).unwrap();
+        assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
+        assert!(!hs.needs_snapshot().unwrap());
+        hs.utxo.test_set_snapshot_utxo_hash(None);
+        drop(hs);
+
+        let hs = fresh_sync(&dir);
+        assert_eq!(hs.utxo.count().unwrap(), 0);
+        assert_eq!(hs.utxo.assume_valid_floor().unwrap(), 0);
+        assert_eq!(hs.store.validated_height().unwrap(), 0);
+        assert!(hs.needs_snapshot().unwrap());
+        // Headers are kept; only validation state is reset.
+        assert_eq!(hs.store.get_hash_at_height(10).unwrap(), Some(chain[9].block_hash()));
+    }
+
+    #[test]
+    fn reopen_keeps_set_from_current_snapshot() {
+        let chain = cheap_chain(10, 0);
+        let (dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain, 1).unwrap();
+        hs.load_snapshot(&path, |_, _| true).unwrap();
+        drop(hs);
+
+        let hs = fresh_sync(&dir);
+        assert_eq!(hs.utxo.count().unwrap(), 1);
+        assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
+        assert!(!hs.needs_snapshot().unwrap());
+    }
+
+    #[test]
     fn load_snapshot_defers_activation_until_headers_reach_anchor() {
         // The app imports the snapshot before header sync starts.
         let chain = cheap_chain(10, 0);
