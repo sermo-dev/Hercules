@@ -57,7 +57,8 @@ impl HeaderStore {
         }
         // Development builds keyed `failed_block_bans` on `addr` alone, so a
         // peer banned for two failed blocks kept only the last; rekey it on
-        // (addr, hash), keeping the rows.
+        // (addr, hash), keeping the rows, in one transaction so a kill
+        // midway can't lose the table.
         let old_bans_schema: Option<String> = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'failed_block_bans'",
@@ -68,6 +69,7 @@ impl HeaderStore {
         if old_bans_schema.is_some_and(|sql| sql.contains("addr TEXT PRIMARY KEY")) {
             conn.execute_batch(
                 "
+                BEGIN;
                 ALTER TABLE failed_block_bans RENAME TO failed_block_bans_old;
                 CREATE TABLE failed_block_bans (
                     addr TEXT NOT NULL,
@@ -77,6 +79,7 @@ impl HeaderStore {
                 INSERT INTO failed_block_bans (addr, hash)
                     SELECT addr, hash FROM failed_block_bans_old;
                 DROP TABLE failed_block_bans_old;
+                COMMIT;
                 ",
             )
             .map_err(|e| StoreError(format!("rekey failed_block_bans: {}", e)))?;

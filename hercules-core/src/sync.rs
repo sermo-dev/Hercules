@@ -119,6 +119,13 @@ const SCRATCH_STALL_ROUNDS: u32 = 10;
 /// matches no real block, so that block is never taken as already applied.
 const UNKNOWN_BLOCK_HASH: [u8; 32] = [0; 32];
 
+/// Wall-clock budget for following one peer's header chain past a batch
+/// (`HeaderSync::fork_reaches`, and skipping shared headers to find where a
+/// fork begins). Long enough for a mainnet-length fork over Tor (~470
+/// batches), short enough that a peer dribbling headers can't hold the sync
+/// loop indefinitely.
+const FORK_FOLLOW_BUDGET: Duration = Duration::from_secs(10 * 60);
+
 /// Version of the block validation rules. Bump whenever a change to
 /// validation could flip a verdict, so `failed_blocks` rows recorded under
 /// the old rules are dropped at startup and those blocks reconsidered
@@ -1851,15 +1858,27 @@ impl HeaderSync {
     /// batch is full may reach our tip only several batches later (the
     /// eclipse case: a cheap chain ending just short of the anchor, far
     /// past one batch from the fork).
+    ///
+    /// `first` is the fork's part of the peer's batch (non-empty), and
+    /// `first_full` whether the peer's whole batch was full: shared headers
+    /// may lead it, so the fork part can be short although the peer has
+    /// more. The follow is bounded by `FORK_FOLLOW_BUDGET` and `stop`.
     fn fork_reaches(
         &self,
         pool: &mut PeerPool,
         addr: &str,
         fork_at: u32,
         first: &[Header],
+        first_full: bool,
         target: u32,
         stop: &AtomicBool,
     ) -> Result<bool, SyncError> {
+        debug_assert!(!first.is_empty(), "fork_reaches needs the fork's first headers");
+        if first.is_empty() {
+            return Ok(false);
+        }
+        let deadline = Instant::now() + FORK_FOLLOW_BUDGET;
+        let mut full = first_full;
         let (mut prev_hash, fork_header) = self
             .store
             .get_header_at_height(fork_at)
@@ -1933,27 +1952,86 @@ impl HeaderSync {
                 info!("Fork from {} at {} reaches {} (our tip {})", addr, fork_at, prev_height, target);
                 return Ok(true);
             }
-            if batch.len() < 2000 || stop.load(Ordering::Relaxed) {
+            if !full {
                 return Ok(false);
             }
-            let Some(mut peer) = pool.checkout_peer_by_addr(addr) else {
-                return Ok(false);
-            };
-            batch = match peer.get_headers(vec![prev_hash], BlockHash::all_zeros()) {
-                Ok(h) => {
-                    pool.return_peer(peer);
-                    h
+            match self.headers_after(pool, addr, prev_hash, deadline, stop) {
+                Some(next) => {
+                    full = next.len() == 2000;
+                    batch = next;
                 }
-                Err(e) => {
-                    warn!("Peer {} failed while following its fork: {}", addr, e);
-                    pool.remove_peer(addr);
-                    return Ok(false);
-                }
-            };
-            if batch.is_empty() || batch.len() > 2000 || batch[0].prev_blockhash != prev_hash {
-                return Ok(false);
+                None => return Ok(false),
             }
         }
+    }
+
+    /// The next batch of `addr`'s headers after `after` (a one-hash
+    /// locator), for following a chain past one batch. `None` when there is
+    /// nothing usable: `stop` set or `deadline` passed, the peer is gone or
+    /// failed (removed; banned on wrong magic), or it answered with nothing,
+    /// too much, or headers not building on `after`.
+    fn headers_after(
+        &self,
+        pool: &mut PeerPool,
+        addr: &str,
+        after: BlockHash,
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> Option<Vec<Header>> {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        let limit = deadline.saturating_duration_since(Instant::now());
+        let mut peer = pool.checkout_peer_by_addr(addr)?;
+        match peer.get_headers_within(vec![after], BlockHash::all_zeros(), Some(limit)) {
+            Ok(h) => {
+                pool.return_peer(peer);
+                if h.is_empty() || h.len() > 2000 || h[0].prev_blockhash != after {
+                    return None;
+                }
+                Some(h)
+            }
+            Err(PeerError::DeadlineReached) => {
+                pool.return_peer(peer);
+                warn!("Peer {}: header follow budget spent", addr);
+                None
+            }
+            Err(e) => {
+                warn!("Peer {} failed while following its chain: {}", addr, e);
+                if matches!(e, PeerError::WrongMagic { .. }) {
+                    pool.ban_peer(addr);
+                }
+                pool.remove_peer(addr);
+                None
+            }
+        }
+    }
+
+    /// Height of the last header of `headers` (building on our header at
+    /// `base_height`) that matches our chain, walking no further than
+    /// `tip_height`: the fork point if the batch diverges.
+    fn common_prefix_end(
+        &self,
+        headers: &[Header],
+        base_height: u32,
+        tip_height: u32,
+    ) -> Result<u32, SyncError> {
+        let mut fork_at = base_height;
+        for (i, header) in headers.iter().enumerate() {
+            let h = base_height + 1 + i as u32;
+            if h > tip_height {
+                break;
+            }
+            match self
+                .store
+                .get_hash_at_height(h)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?
+            {
+                Some(our_hash) if our_hash == header.block_hash() => fork_at = h,
+                _ => break,
+            }
+        }
+        Ok(fork_at)
     }
 
     /// If the block at `height` in our header chain was recorded as invalid
@@ -2599,7 +2677,7 @@ impl HeaderSync {
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
             // Request headers from best peer
-            let headers = match peer.get_headers(locator, BlockHash::all_zeros()) {
+            let mut headers = match peer.get_headers(locator, BlockHash::all_zeros()) {
                 Ok(h) => {
                     pool.return_peer(peer);
                     // Reward peers that successfully serve us headers — even an
@@ -3192,25 +3270,77 @@ impl HeaderSync {
                         pool.misbehaving(&active_addr, 20);
                         continue;
                     }
-                    Some(base_height) => {
+                    Some(mut base_height) => {
                         // Walk forward to find the exact divergence point
-                        let mut fork_at = base_height;
-                        for i in 0..headers.len() {
-                            let h = base_height + 1 + i as u32;
-                            if h > tip_height {
-                                break;
-                            }
-                            match self
+                        let mut fork_at =
+                            self.common_prefix_end(&headers, base_height, tip_height)?;
+
+                        // A full batch of headers we already have: the peer
+                        // answered from a locator entry below the fork point
+                        // (entries are far apart low in the chain). Ask for
+                        // what follows until its chain diverges from ours,
+                        // within FORK_FOLLOW_BUDGET.
+                        let mut skipped = false;
+                        let skip_deadline = Instant::now() + FORK_FOLLOW_BUDGET;
+                        while fork_at == base_height + headers.len() as u32
+                            && headers.len() == 2000
+                            && fork_at < tip_height
+                        {
+                            let after = self
                                 .store
-                                .get_hash_at_height(h)
+                                .get_hash_at_height(fork_at)
                                 .map_err(|e| SyncError::Store(format!("{}", e)))?
-                            {
-                                Some(our_hash)
-                                    if our_hash == headers[i].block_hash() =>
-                                {
-                                    fork_at = h;
+                                .ok_or_else(|| {
+                                    SyncError::Store(format!("no hash at height {}", fork_at))
+                                })?;
+                            let Some(next) = self.headers_after(
+                                &mut pool,
+                                &active_addr,
+                                after,
+                                skip_deadline,
+                                stop,
+                            ) else {
+                                break;
+                            };
+                            headers = next;
+                            base_height = fork_at;
+                            fork_at = self.common_prefix_end(&headers, base_height, tip_height)?;
+                            skipped = true;
+                        }
+                        if fork_at == base_height + headers.len() as u32 && fork_at < tip_height {
+                            // Still nothing but our own headers: the peer's
+                            // chain is a prefix of ours (it is behind us), or
+                            // it stopped answering. Not a fork.
+                            info!(
+                                "Peer {}'s headers match ours up to {}, below our tip {}",
+                                active_addr, fork_at, tip_height
+                            );
+                            pool.lower_peer_height(&active_addr, fork_at);
+                            continue;
+                        }
+                        if skipped && fork_at < tip_height {
+                            // The diverging batch wasn't the one cross-checked
+                            // above: check it too, from the same locator.
+                            let after = self
+                                .store
+                                .get_hash_at_height(base_height)
+                                .map_err(|e| SyncError::Store(format!("{}", e)))?
+                                .ok_or_else(|| {
+                                    SyncError::Store(format!("no hash at height {}", base_height))
+                                })?;
+                            match self.cross_check_headers(
+                                &mut pool,
+                                &[after],
+                                &active_addr,
+                                headers[0].block_hash(),
+                                strict,
+                                None,
+                            ) {
+                                HeaderCrossCheck::Accept => {}
+                                HeaderCrossCheck::Reject | HeaderCrossCheck::Inconclusive => {
+                                    std::thread::sleep(Duration::from_secs(1));
+                                    continue;
                                 }
-                                _ => break,
                             }
                         }
 
@@ -3266,12 +3396,19 @@ impl HeaderSync {
                                         &active_addr,
                                         fork_at,
                                         &headers[new_chain_offset..],
+                                        headers.len() == 2000,
                                         tip_height,
                                         stop,
                                     )?;
                                     if !reaches {
-                                        // Start the stall count over rather
+                                        // Our tip is below the anchor, so a
+                                        // fork that can't get past it isn't
+                                        // the chain we need: ask others first
+                                        // (no ban: it may just be slow), and
+                                        // start the stall count over rather
                                         // than following it every round.
+                                        pool.lower_peer_height(&active_addr, 0);
+                                        pool.deprioritize(&active_addr, HEADER_DIVERGENCE_PENALTY);
                                         self.scratch_stall_rounds.store(0, Ordering::Relaxed);
                                         continue;
                                     }

@@ -487,23 +487,16 @@ fn eclipsed_low_work_headers_are_replaced_by_honest_chain() {
     node.assert_utxos_match(&honest_chain);
 }
 
-/// PR #24 second review: the same eclipse, but the cheap chain is longer
-/// than one 2,000-header batch past the fork, so no single honest batch
-/// reaches our tip. The fork is followed across batches to prove it does,
-/// and the honest peers are never penalized for offering it.
-#[test]
-fn eclipsed_by_more_than_one_batch_of_cheap_headers_recovers() {
-    const ANCHOR: u32 = 2150;
-    let mut honest_chain = FixtureChain::new();
-    honest_chain.mine(2200);
-    let mut cheap_chain = FixtureChain::new().fork_at(0);
-    cheap_chain.mine(2100);
-    let hostile1 = MockPeer::spawn(&cheap_chain, vec![]);
-    let hostile2 = MockPeer::spawn(&cheap_chain, vec![]);
+/// Eclipse-recovery scenario: a fresh node synced to `cheap_chain`
+/// (stopping short of the anchor), then offered only `honest_chain`.
+/// Asserts it ends on the honest chain and never penalizes honest peers.
+fn recover_from_cheap_chain(honest_chain: &FixtureChain, cheap_chain: &FixtureChain, anchor: u32) {
+    let hostile1 = MockPeer::spawn(cheap_chain, vec![]);
+    let hostile2 = MockPeer::spawn(cheap_chain, vec![]);
     let mut node = Node::new(&[&hostile1, &hostile2]);
     node.hs.anchor = SnapshotAnchor {
-        height: ANCHOR,
-        block_hash: honest_chain.hash_at(ANCHOR).to_byte_array(),
+        height: anchor,
+        block_hash: honest_chain.hash_at(anchor).to_byte_array(),
         utxo_hash: [0u8; 32],
     };
     let headers: Vec<Header> = honest_chain.blocks().iter().map(|b| b.header).collect();
@@ -519,17 +512,54 @@ fn eclipsed_by_more_than_one_batch_of_cheap_headers_recovers() {
 
     drop(hostile1);
     drop(hostile2);
-    let a = MockPeer::spawn(&honest_chain, vec![]);
-    let b = MockPeer::spawn(&honest_chain, vec![]);
+    let a = MockPeer::spawn(honest_chain, vec![]);
+    let b = MockPeer::spawn(honest_chain, vec![]);
     node.use_peers(&[&a, &b]);
-    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&honest_chain));
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(honest_chain));
     assert!(ok, "stuck on the cheap chain: {:?}, tip {:?}", res, node.tip());
-    assert_eq!(node.hash_at(ANCHOR), Some(honest_chain.hash_at(ANCHOR)));
+    assert_eq!(node.hash_at(anchor), Some(honest_chain.hash_at(anchor)));
     for p in [&a, &b] {
         assert!(!node.is_banned(&p.addr()), "honest peer banned");
         let score = node.score(&p.addr());
         assert!(score.map_or(true, |s| s >= FRESH_SCORE), "honest peer penalized: {:?}", score);
     }
+}
+
+/// PR #24 second review: the same eclipse, but the cheap chain is longer
+/// than one 2,000-header batch past the fork, so no single honest batch
+/// reaches our tip. The fork is followed across batches to prove it does,
+/// and the honest peers are never penalized for offering it.
+#[test]
+fn eclipsed_by_more_than_one_batch_of_cheap_headers_recovers() {
+    let mut honest_chain = FixtureChain::new();
+    honest_chain.mine(2200);
+    let mut cheap_chain = FixtureChain::new().fork_at(0);
+    cheap_chain.mine(2100);
+    recover_from_cheap_chain(&honest_chain, &cheap_chain, 2150);
+}
+
+/// Re-review: the fork point (4000) is not in our locator, so the honest
+/// peer's first batch is all headers we already have. It used to panic
+/// following an empty fork slice.
+#[test]
+fn eclipse_fork_beyond_a_full_batch_of_shared_headers_recovers() {
+    let mut honest_chain = FixtureChain::new();
+    honest_chain.mine(6200);
+    let mut cheap_chain = honest_chain.prefix(4000).fork_at(4000);
+    cheap_chain.mine(2100);
+    recover_from_cheap_chain(&honest_chain, &cheap_chain, 6150);
+}
+
+/// Re-review: the honest peer's batch starts with shared headers (fork at
+/// 2100, not in our locator), so its fork slice is under 2,000 headers
+/// although the peer has more. Following it used to give up there.
+#[test]
+fn eclipse_fork_after_some_shared_headers_recovers() {
+    let mut honest_chain = FixtureChain::new();
+    honest_chain.mine(4200);
+    let mut cheap_chain = honest_chain.prefix(2100).fork_at(2100);
+    cheap_chain.mine(2000);
+    recover_from_cheap_chain(&honest_chain, &cheap_chain, 4150);
 }
 
 /// Low-work node for the scratch-replacement tests: honest headers to 300
