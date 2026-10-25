@@ -15,6 +15,20 @@ This ticket collects the missing rules into one module with tests for each rule.
 
 - **BIP34 heights 1–16.** Our coinbase-height check can't parse Core's encoding for heights 1–16 (`OP_1`..`OP_16`, plus `OP_0` handling). Unreachable on mainnet (BIP34 activates at 227,931) but a real divergence, and it blocks regtest fixtures that activate BIP34 at low heights. The 027 harness has an `#[ignore]`d test for it.
 
+## Implementation (2026-10-24, branch `ticket-026-consensus-completeness`)
+
+- **New module `contextual_checks.rs`.** These are direct ports of Core v26: `IsFinalTx`, `CalculateSequenceLocks`/`EvaluateSequenceLocks`, `GetMedianTimePast`, `GetLegacySigOpCount`/`GetP2SHSigOpCount`/`CountWitnessSigOps`/`GetTransactionSigOpCost` (with Core's own `GetScriptOp` parser), `bad-cb-length`, and the BIP34 `CScript() << nHeight` prefix check. A `HeaderTimes` trait supplies header timestamps. The header store implements it, and so do the fixture chain and plain closures.
+- **`validate_block`.** Adds the coinbase length check. Legacy sigops are now counted by the ported `GetLegacySigOpCount`. BIP34 is now Core's byte-prefix comparison, so heights 1–16 work and regtest uses `bip34_height = 1` like Core. The comment that called the in-block duplicate-txid check "BIP30" is corrected.
+- **`validate_block_scripts(..., times)`.** Checks finality for every tx using the MTP cutoff (BIP113), then BIP68 per tx once the spent coins are resolved, then the full sigop cost before any script runs.
+- **Header rule `bad-version`** (`validate_headers`). The old BIP34 parser rejected version-1 blocks as a side effect. The new check covers that, plus Core's BIP66 and BIP65 version floors.
+- **Activation heights** are now in `ChainParams`: `bip66_height`, `bip65_height` and `csv_height`. A test pins them to the script-flag table.
+- **Mempool.** Finality now follows `CheckFinalTxAtTip`: it checks for the next block using the tip's MTP. Before, it allowed `nLockTime = tip+1` and compared time locks to the wall clock. BIP68 follows `CheckSequenceLocksAtTip`, with mempool parents counted at tip+1.
+- **BIP30.** `BIP34_IMPLIES_BIP30_LIMIT` is documented, and a compile-time assert fails the build if the snapshot anchor reaches it. `apply_block` writes with `NO_OVERWRITE`; if an overwrite ever happens it logs an error and `debug_assert!`s.
+- **Not done.**
+  - A full adapter over `tx_valid.json`/`tx_invalid.json`. Those vectors exercise the script interpreter (047 Step 1 runs them), not `IsFinalTx`/`SequenceLocks`. Only the coinbase-size vectors are relevant to this ticket, and they are ported.
+  - Mempool re-checking of finality/BIP68 after a reorg (Core's `removeForReorg`).
+- **Mainnet check.** The ignored test `mainnet_blocks_pass_contextual_rules` (data from `tools/fetch_mainnet_context.py`) passed on blocks 972818, 972962 and 973011–973013. It used real MTP and real coin heights for 265 BIP68-constrained inputs. Zero rejections.
+
 ## Background: what we check today
 
 `validate_block` (`hercules-core/src/block_validation.rs:62`) checks:
@@ -106,6 +120,8 @@ The only place `nLockTime` is checked is the **mempool** (`mempool.rs:222-250`).
 - **Block-level tests** use hand-built regtest blocks from ticket 027's `FixtureChain` (for example, a block that spends a CSV output one block early).
 
 ## Alternative worth evaluating: libbitcoinkernel
+
+**Decided (2026-10-24, ticket 047):** kernel *script* verification is go (047 Step 1), but full kernel *block* validation is blocked: the API lacks UTXO lookup by outpoint, AssumeUTXO loading, pruning and explicit flush. So the block-level rules in this ticket are implemented in our Rust code, as below. Revisit when Core PRs #36630 (pruning) and #35187 (validate a block against caller-supplied UTXOs) land; the original evaluation follows.
 
 Bitcoin Core has been extracting its validation engine as **libbitcoinkernel**, which has a C API, and community Rust bindings exist. Using it would give whole-block validation with exactly Core's semantics, including every rule above, and it would stay current with Core automatically.
 

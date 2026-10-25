@@ -1080,7 +1080,7 @@ impl HeaderSync {
             let mut pool = self.mempool.lock().unwrap();
             let conflicts = pool.conflicting_txids(&tx);
             (
-                pool.accept_own_tx(tx.clone(), &self.utxo, validated_height),
+                pool.accept_own_tx(tx.clone(), &self.utxo, validated_height, &self.store),
                 conflicts,
             )
         };
@@ -1220,7 +1220,7 @@ impl HeaderSync {
                 return true;
             }
             let conflicts = pool.conflicting_txids(&tx);
-            match pool.accept_own_tx(tx, &self.utxo, validated_height) {
+            match pool.accept_own_tx(tx, &self.utxo, validated_height, &self.store) {
                 Ok(_) => conflicts,
                 Err(e) => {
                     // Inputs not validated yet, or a conflict that a block
@@ -1859,7 +1859,7 @@ impl HeaderSync {
                         .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
                     // Script validation + UTXO verification
-                    validate_block_scripts(&block, next_height, &self.utxo, self.params)
+                    validate_block_scripts(&block, next_height, &self.utxo, self.params, &self.store)
                         .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
                     // Update UTXO set with this block's changes
@@ -2766,7 +2766,7 @@ impl HeaderSync {
 
         let result = {
             let mut mempool = self.mempool.lock().unwrap();
-            mempool.accept_tx(tx, &self.utxo, validated_height)
+            mempool.accept_tx(tx, &self.utxo, validated_height, &self.store)
         }; // mempool lock released before acquiring relay_queue lock
 
         match result {
@@ -3081,7 +3081,7 @@ impl HeaderSync {
                 }
 
                 // Script validation
-                if let Err(e) = validate_block_scripts(&block, new_tip, &self.utxo, self.params) {
+                if let Err(e) = validate_block_scripts(&block, new_tip, &self.utxo, self.params, &self.store) {
                     notification.validation_error =
                         Some(format!("scripts: {}", e));
                     return Ok(notification);
@@ -3365,7 +3365,7 @@ impl HeaderSync {
                 .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
             // Script validation + UTXO verification
-            validate_block_scripts(&block, next_height, &self.utxo, self.params)
+            validate_block_scripts(&block, next_height, &self.utxo, self.params, &self.store)
                 .map_err(|e| SyncError::Validation(format!("{}", e)))?;
 
             // Update UTXO set

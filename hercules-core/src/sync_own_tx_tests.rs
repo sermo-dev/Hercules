@@ -22,6 +22,18 @@ fn fresh(dir: &TempDir) -> HeaderSync {
     let db = dir.path().join("headers.sqlite3");
     let mut hs = HeaderSync::new(db.to_str().unwrap(), None).unwrap();
     hs.regular_peers_over_tor = true;
+    // Headers up to the validated height, so mempool finality / BIP 68
+    // (ticket 026) can read the tip's median-time-past. Contents only
+    // need distinct hashes and increasing timestamps.
+    let genesis = hs.store.tip().unwrap().unwrap().2;
+    let headers: Vec<bitcoin::block::Header> = (1..=VALIDATED)
+        .map(|h| bitcoin::block::Header {
+            nonce: h,
+            time: genesis.time + 600 * h,
+            ..genesis
+        })
+        .collect();
+    hs.store.store_headers(&headers, 1).unwrap();
     hs.store.set_validated_height(VALIDATED).unwrap();
     hs
 }
@@ -237,7 +249,7 @@ fn local_relay_policy_does_not_block_own_tx() {
     // From a peer, our 018 policy rejects it...
     let mut other = Mempool::new();
     assert!(matches!(
-        other.accept_tx(tx.clone(), &hs.utxo, VALIDATED),
+        other.accept_tx(tx.clone(), &hs.utxo, VALIDATED, &hs.store),
         Err(crate::mempool::MempoolError::NonStandardScript { index: 1 })
     ));
     hs.handle_tx("1.2.3.4:8333", tx.clone()).unwrap();

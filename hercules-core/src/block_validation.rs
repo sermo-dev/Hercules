@@ -2,10 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use bitcoin::block::Block;
 use bitcoin::consensus::serialize;
-use bitcoin::script::Instruction;
 use bitcoin::{Amount, Txid};
 
 use crate::chain_params::ChainParams;
+use crate::contextual_checks::{
+    calculate_sequence_locks, coinbase_commits_height, coinbase_script_len_ok,
+    evaluate_sequence_locks, is_final_tx, legacy_sigop_count, transaction_sigop_cost,
+    HeaderTimes, MedianTimes, MAX_BLOCK_SIGOPS_COST, WITNESS_SCALE_FACTOR,
+};
 use crate::utxo::UtxoSet;
 
 /// Maximum block weight (BIP-141 consensus rule).
@@ -17,40 +21,12 @@ const INITIAL_SUBSIDY: u64 = 50 * 100_000_000;
 /// Maximum value of a single output (21 million BTC in satoshis).
 const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
 
-/// Maximum sigops cost per block (BIP-141).
-const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
-
-/// Sigops cost multiplier for legacy (non-witness) sigops.
-const WITNESS_SCALE_FACTOR: u64 = 4;
-
-/// Count legacy signature operations in a script.
-/// Uses conservative counting: 20 for each CHECKMULTISIG (MAX_PUBKEYS_PER_MULTISIG).
-/// This matches Bitcoin Core's `GetLegacySigOpCount` with fAccurate=false.
-/// Continues counting through parse errors (malformed opcodes are skipped,
-/// not silently dropped) to avoid sigops undercount on crafted scripts.
-fn count_script_sigops(script: &bitcoin::Script) -> u64 {
-    use bitcoin::opcodes::all::{
-        OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
-    };
-    let mut count = 0u64;
-    for result in script.instructions() {
-        match result {
-            Ok(Instruction::Op(op)) => {
-                if op == OP_CHECKSIG || op == OP_CHECKSIGVERIFY {
-                    count += 1;
-                } else if op == OP_CHECKMULTISIG || op == OP_CHECKMULTISIGVERIFY {
-                    count += 20;
-                }
-            }
-            Ok(_) => {} // PushBytes — not a sigop
-            Err(_) => {} // Malformed opcode — skip, keep counting
-        }
-    }
-    count
-}
-
-/// Validate the structural properties of a full block.
-/// This does NOT validate scripts or UTXO spends (Phase 2b/2c).
+/// Validate the structural properties of a full block: Core's
+/// `CheckBlock` plus the parts of `ContextualCheckBlock` that need only the
+/// height (BIP 34, witness commitment).
+/// This does NOT validate scripts or UTXO spends (Phase 2b/2c), nor the
+/// rules that need median-time-past (finality); those are in
+/// `validate_block_scripts`.
 /// BIP-34 and SegWit activation heights come from `params`.
 pub fn validate_block(
     block: &Block,
@@ -118,16 +94,25 @@ pub fn validate_block(
                     amount: output.value.to_sat(),
                 });
             }
-            block_sigops += count_script_sigops(&output.script_pubkey);
         }
 
-        // Count sigops in input scripts (including coinbase — matches Bitcoin Core)
-        for input in &tx.input {
-            block_sigops += count_script_sigops(&input.script_sig);
+        // Coinbase scriptSig must be 2..=100 bytes (CheckTransaction,
+        // `bad-cb-length`).
+        if i == 0 && !coinbase_script_len_ok(tx) {
+            return Err(BlockValidationError::BadCoinbaseLength {
+                height,
+                len: tx.input[0].script_sig.len(),
+            });
         }
+
+        // Legacy sigops in every scriptSig and scriptPubKey, coinbase
+        // included (GetLegacySigOpCount).
+        block_sigops += legacy_sigop_count(tx);
     }
 
-    // Block-level legacy sigops check (matches Bitcoin Core's CheckBlock)
+    // Block-level legacy sigops check (Core's CheckBlock). The full cost,
+    // with P2SH and witness sigops, needs the spent outputs and is checked
+    // in `validate_block_scripts`.
     if block_sigops * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST {
         return Err(BlockValidationError::ExcessiveSigops {
             height,
@@ -136,7 +121,10 @@ pub fn validate_block(
         });
     }
 
-    // 7. No duplicate transactions (BIP-30)
+    // 7. No duplicate txids within the block. This is not BIP 30, which is
+    // about txids already in the UTXO set (see `BIP34_IMPLIES_BIP30_LIMIT`
+    // in contextual_checks); Core rejects in-block duplicates through its
+    // merkle-mutation check (CVE-2012-2459).
     let mut seen_txids = HashSet::with_capacity(block.txdata.len());
     for tx in &block.txdata {
         if !seen_txids.insert(tx.compute_txid()) {
@@ -165,24 +153,16 @@ pub fn validate_block(
         });
     }
 
-    // 9. BIP-34: coinbase must encode block height (after activation)
-    if height >= params.bip34_height {
-        match block.bip34_block_height() {
-            Ok(encoded_height) => {
-                if encoded_height != height as u64 {
-                    return Err(BlockValidationError::BadCoinbaseHeight {
-                        height,
-                        encoded: encoded_height,
-                    });
-                }
-            }
-            Err(_) => {
-                return Err(BlockValidationError::BadCoinbaseHeight {
-                    height,
-                    encoded: 0,
-                });
-            }
-        }
+    // 9. BIP-34: coinbase scriptSig must start with `CScript() << height`
+    // after activation (ContextualCheckBlock, `bad-cb-height`). A byte
+    // prefix comparison as in Core, so heights 1..=16 are `OP_1..OP_16`.
+    // The block-version half of BIP 34 is a header rule (validate_headers).
+    if height >= params.bip34_height && !coinbase_commits_height(&block.txdata[0], height) {
+        return Err(BlockValidationError::BadCoinbaseHeight {
+            height,
+            // For the message only; 0 if the first push isn't a number.
+            encoded: block.bip34_block_height().unwrap_or(0),
+        });
     }
 
     // 10. Witness commitment (post-SegWit)
@@ -213,6 +193,13 @@ pub fn block_subsidy(height: u32, params: &ChainParams) -> Amount {
 /// This verifies that every spend is authorized (valid script) and that no
 /// value is created from nothing (inputs >= outputs for each tx).
 ///
+/// It also enforces the contextual rules that need the chain's
+/// median-time-past or the spent coins (ticket 026): nLockTime finality
+/// with BIP 113, BIP 68 sequence locks, and the full sigop cost.
+///
+/// `times` must give header timestamps of the chain this block extends, at
+/// least for heights `0..height` (the header store does).
+///
 /// Call this AFTER `validate_block()` succeeds. After this returns Ok,
 /// call `utxo_set.apply_block()` to update the UTXO set.
 pub fn validate_block_scripts(
@@ -220,8 +207,33 @@ pub fn validate_block_scripts(
     height: u32,
     utxo_set: &UtxoSet,
     params: &ChainParams,
+    times: &dyn HeaderTimes,
 ) -> Result<(), BlockValidationError> {
     let flags = params.script_flags(height);
+    let mut mtp = MedianTimes::new(times);
+    let context_err = |msg: String| BlockValidationError::MissingContext { height, msg };
+
+    // BIP 113 and BIP 68 both switch on with the CSV deployment, and both
+    // measure time by the parent block's median-time-past. Before CSV the
+    // nLockTime cutoff is the block's own timestamp, and BIP 68 is off.
+    let csv_active = height >= params.csv_height;
+    let prev_mtp: i64 = if csv_active && height > 0 {
+        mtp.at(height - 1).map_err(context_err)?
+    } else {
+        block.header.time as i64
+    };
+
+    // Finality of every transaction, coinbase included
+    // (ContextualCheckBlock, `bad-txns-nonfinal`).
+    for (tx_idx, tx) in block.txdata.iter().enumerate() {
+        if !is_final_tx(tx, height, prev_mtp) {
+            return Err(BlockValidationError::NonFinalTx {
+                height,
+                tx_index: tx_idx,
+                lock_time: tx.lock_time.to_consensus_u32(),
+            });
+        }
+    }
 
     // Track outputs created within this block for in-block spend resolution.
     // Maps (txid, vout) -> (amount, script_pubkey_bytes, is_coinbase).
@@ -229,11 +241,25 @@ pub fn validate_block_scripts(
     // Track persistent UTXOs already spent in this block (double-spend detection).
     let mut spent_persistent: HashSet<(Txid, u32)> = HashSet::new();
     let mut total_fees: u64 = 0;
+    // Running sigop cost (ConnectBlock, `bad-blk-sigops`).
+    let mut sigop_cost: u64 = 0;
 
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
-        if !tx.is_coinbase() {
+        if tx.is_coinbase() {
+            // A coinbase's cost is its legacy sigops.
+            sigop_cost += transaction_sigop_cost(tx, &[], flags);
+            if sigop_cost > MAX_BLOCK_SIGOPS_COST {
+                return Err(BlockValidationError::ExcessiveSigopCost {
+                    height,
+                    cost: sigop_cost,
+                    max: MAX_BLOCK_SIGOPS_COST,
+                });
+            }
+        } else {
             let serialized_tx = serialize(tx);
             let mut input_sum: u64 = 0;
+            // Height of the block that created each spent coin, for BIP 68.
+            let mut prev_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
 
             // Phase A: resolve every spent output up-front. Taproot's BIP 341
             // sighash commits to *all* spent outputs in a transaction, so the
@@ -246,7 +272,7 @@ pub fn validate_block_scripts(
                 let prev_vout = input.previous_output.vout;
                 let key = (prev_txid, prev_vout);
 
-                let (amount, script_pubkey) =
+                let (amount, script_pubkey, coin_height) =
                     if let Some(entry) = block_utxos.remove(&key) {
                         // In-block spend (output created earlier in this block).
                         // Coinbase outputs cannot be spent in the same block
@@ -259,7 +285,8 @@ pub fn validate_block_scripts(
                                 coinbase_height: height,
                             });
                         }
-                        (entry.0, entry.1)
+                        // Created in this block: its height is ours.
+                        (entry.0, entry.1, height)
                     } else {
                         // Double-spend check: ensure this persistent UTXO hasn't
                         // already been consumed by another input in this block
@@ -296,7 +323,7 @@ pub fn validate_block_scripts(
                             });
                         }
 
-                        (utxo.amount, utxo.script_pubkey)
+                        (utxo.amount, utxo.script_pubkey, utxo.height)
                     };
 
                 input_sum = input_sum
@@ -306,6 +333,33 @@ pub fn validate_block_scripts(
                         tx_index: tx_idx,
                     })?;
                 spent.push((amount, script_pubkey));
+                prev_heights.push(coin_height);
+            }
+
+            // BIP 68 relative lock-times (ConnectBlock → SequenceLocks,
+            // `bad-txns-nonfinal`). Needs the spent coins' heights, so it
+            // runs here rather than with the finality check above.
+            let lock = calculate_sequence_locks(tx, csv_active, &prev_heights, &mut mtp)
+                .map_err(context_err)?;
+            if !evaluate_sequence_locks(height, prev_mtp, lock) {
+                return Err(BlockValidationError::SequenceLockNotMet {
+                    height,
+                    tx_index: tx_idx,
+                    min_height: lock.min_height,
+                    min_time: lock.min_time,
+                });
+            }
+
+            // Full sigop cost: legacy + P2SH + witness, checked before any
+            // script runs, as in ConnectBlock (GetTransactionSigOpCost).
+            let spent_spks: Vec<&[u8]> = spent.iter().map(|(_, spk)| spk.as_slice()).collect();
+            sigop_cost += transaction_sigop_cost(tx, &spent_spks, flags);
+            if sigop_cost > MAX_BLOCK_SIGOPS_COST {
+                return Err(BlockValidationError::ExcessiveSigopCost {
+                    height,
+                    cost: sigop_cost,
+                    max: MAX_BLOCK_SIGOPS_COST,
+                });
             }
 
             // Phase B: build the FFI Utxo array. The raw pointers reference
@@ -508,6 +562,39 @@ pub enum BlockValidationError {
         sigops: u64,
         max: u64,
     },
+    // Ticket 026: contextual rules
+    /// Coinbase scriptSig outside 2..=100 bytes (`bad-cb-length`).
+    BadCoinbaseLength {
+        height: u32,
+        len: usize,
+    },
+    /// nLockTime not yet reached (`bad-txns-nonfinal`, IsFinalTx).
+    NonFinalTx {
+        height: u32,
+        tx_index: usize,
+        lock_time: u32,
+    },
+    /// BIP 68 relative lock not yet reached (`bad-txns-nonfinal`,
+    /// SequenceLocks). `min_height`/`min_time` are the last invalid
+    /// height/MTP, -1 if unconstrained.
+    SequenceLockNotMet {
+        height: u32,
+        tx_index: usize,
+        min_height: i64,
+        min_time: i64,
+    },
+    /// Legacy + P2SH + witness sigop cost over the limit (`bad-blk-sigops`).
+    ExcessiveSigopCost {
+        height: u32,
+        cost: u64,
+        max: u64,
+    },
+    /// A header timestamp needed for median-time-past was unavailable.
+    /// A local problem, not a verdict on the block.
+    MissingContext {
+        height: u32,
+        msg: String,
+    },
 }
 
 impl std::fmt::Display for BlockValidationError {
@@ -625,6 +712,40 @@ impl std::fmt::Display for BlockValidationError {
                 "block {} has {} legacy sigops, exceeds max {}",
                 height, sigops, max
             ),
+            Self::BadCoinbaseLength { height, len } => write!(
+                f,
+                "block {} coinbase scriptSig is {} bytes (must be 2..=100)",
+                height, len
+            ),
+            Self::NonFinalTx {
+                height,
+                tx_index,
+                lock_time,
+            } => write!(
+                f,
+                "block {} tx {} is not final (nLockTime {})",
+                height, tx_index, lock_time
+            ),
+            Self::SequenceLockNotMet {
+                height,
+                tx_index,
+                min_height,
+                min_time,
+            } => write!(
+                f,
+                "block {} tx {} violates BIP 68 relative lock (min height {}, min time {})",
+                height, tx_index, min_height, min_time
+            ),
+            Self::ExcessiveSigopCost { height, cost, max } => write!(
+                f,
+                "block {} sigop cost {} exceeds max {}",
+                height, cost, max
+            ),
+            Self::MissingContext { height, msg } => write!(
+                f,
+                "block {} cannot be validated: header context unavailable: {}",
+                height, msg
+            ),
         }
     }
 }
@@ -678,7 +799,7 @@ mod tests {
             .push_opcode(OP_CHECKSIGVERIFY)
             .push_opcode(OP_CHECKSIG)
             .into_script();
-        assert_eq!(count_script_sigops(&script), 3);
+        assert_eq!(crate::contextual_checks::script_sigop_count(script.as_bytes(), false), 3);
     }
 
     #[test]
@@ -689,14 +810,14 @@ mod tests {
         let script = Builder::new()
             .push_opcode(OP_CHECKMULTISIG)
             .into_script();
-        assert_eq!(count_script_sigops(&script), 20);
+        assert_eq!(crate::contextual_checks::script_sigop_count(script.as_bytes(), false), 20);
     }
 
     #[test]
     fn sigops_empty_script_is_zero() {
         use bitcoin::script::Builder;
         let script = Builder::new().into_script();
-        assert_eq!(count_script_sigops(&script), 0);
+        assert_eq!(crate::contextual_checks::script_sigop_count(script.as_bytes(), false), 0);
     }
 
     #[test]
@@ -707,7 +828,7 @@ mod tests {
         let script = Builder::new()
             .push_slice(&[0x01, 0x02, 0x03])
             .into_script();
-        assert_eq!(count_script_sigops(&script), 0);
+        assert_eq!(crate::contextual_checks::script_sigop_count(script.as_bytes(), false), 0);
     }
 
     // ── Real-mainnet taproot validation ─────────────────────────────
@@ -867,9 +988,9 @@ mod tests {
             input: vec![TxIn {
                 // Coinbase: previous_output is the null outpoint.
                 previous_output: OutPoint::null(),
-                // Pre-BIP-34 we can put anything in script_sig; one byte is
-                // enough to avoid the empty-script edge case.
-                script_sig: ScriptBuf::from_bytes(vec![0x00]),
+                // Pre-BIP-34 we can put anything in script_sig, as long as
+                // it is 2..=100 bytes (`bad-cb-length`).
+                script_sig: ScriptBuf::from_bytes(vec![0x00, 0x00]),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],

@@ -9,6 +9,7 @@ mod assumeutxo;
 mod block_store;
 mod block_validation;
 mod chain_params;
+mod contextual_checks;
 mod mempool;
 mod own_tx_store;
 mod p2p;

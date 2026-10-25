@@ -89,8 +89,19 @@ pub struct ChainParams {
     pub pow_limit_bits: u32,
     /// Regtest never retargets: every header keeps its parent's bits.
     pub no_retargeting: bool,
-    /// Coinbase must encode the block height from this height on.
+    /// Coinbase must encode the block height from this height on, and
+    /// block versions below 2 are rejected (Core's `BIP34Height`).
     pub bip34_height: u32,
+    /// Block versions below 3 are rejected from this height on
+    /// (`BIP66Height`). The DERSIG script flag lives in the flag table.
+    pub bip66_height: u32,
+    /// Block versions below 4 are rejected from this height on
+    /// (`BIP65Height`). The CLTV script flag lives in the flag table.
+    pub bip65_height: u32,
+    /// BIP 68 sequence locks and BIP 113 median-time-past locktime cutoff
+    /// are enforced from this height on (`CSVHeight`, ticket 026). The
+    /// BIP 112 script flag switches on at the same height in the flag table.
+    pub csv_height: u32,
     /// Witness commitment is enforced from this height on.
     pub segwit_height: u32,
     /// Blocks between subsidy halvings.
@@ -114,6 +125,9 @@ static MAINNET: ChainParams = ChainParams {
     pow_limit_bits: 0x1d00ffff,
     no_retargeting: false,
     bip34_height: 227_931,
+    bip66_height: 363_725,
+    bip65_height: 388_381,
+    csv_height: 419_328,
     segwit_height: 481_824,
     subsidy_halving_interval: 210_000,
     script_flag_activations: MAINNET_SCRIPT_FLAGS,
@@ -128,10 +142,12 @@ static REGTEST: ChainParams = ChainParams {
     magic: Magic::REGTEST,
     pow_limit_bits: 0x207fffff,
     no_retargeting: true,
-    // Core's regtest uses 1. Hercules' BIP 34 check can't parse Core's
-    // OP_1..OP_16 encoding of heights 1..=16 (see the ignored ticket-026
-    // test in testkit::fixture_chain), so the harness starts at 17.
-    bip34_height: 17,
+    // Core's regtest values (`CRegTestParams`): everything from height 1,
+    // SegWit from 0.
+    bip34_height: 1,
+    bip66_height: 1,
+    bip65_height: 1,
+    csv_height: 1,
     segwit_height: 0,
     subsidy_halving_interval: 150,
     script_flag_activations: REGTEST_SCRIPT_FLAGS,
@@ -256,11 +272,40 @@ mod tests {
         assert_eq!(p.pow_limit_bits, 0x1d00ffff);
         assert!(!p.no_retargeting);
         assert_eq!(p.bip34_height, 227_931);
+        assert_eq!(p.bip66_height, 363_725);
+        assert_eq!(p.bip65_height, 388_381);
+        assert_eq!(p.csv_height, 419_328);
         assert_eq!(p.segwit_height, 481_824);
         assert_eq!(p.subsidy_halving_interval, 210_000);
         assert_eq!(p.min_chain_work, MIN_CHAIN_WORK);
         assert_eq!(p.anchor, Some(MAINNET_ANCHOR));
         assert!(p.enforce_netgroup_diversity);
+    }
+
+    /// The deployment heights used by the block-level rules (ticket 026)
+    /// must agree with the script-flag table that switches on the matching
+    /// script rule, on every chain.
+    #[test]
+    fn deployment_heights_match_script_flag_table() {
+        for p in [ChainParams::mainnet(), ChainParams::regtest()] {
+            for (height, flag) in [
+                (p.bip66_height, SCRIPT_VERIFY_DERSIG),
+                (p.bip65_height, SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY),
+                (p.csv_height, SCRIPT_VERIFY_CHECKSEQUENCEVERIFY),
+                (p.segwit_height, SCRIPT_VERIFY_WITNESS),
+            ] {
+                assert!(p.script_flags(height) & flag != 0, "{:?} flag {:#x} at {}", p.network, flag, height);
+                if height > 0 {
+                    assert!(
+                        p.script_flags(height - 1) & flag == 0,
+                        "{:?} flag {:#x} before {}",
+                        p.network,
+                        flag,
+                        height
+                    );
+                }
+            }
+        }
     }
 
     #[test]

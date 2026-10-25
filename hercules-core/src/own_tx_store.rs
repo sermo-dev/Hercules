@@ -111,6 +111,20 @@ impl SubmitError {
                 validated_height,
                 tip_height,
             },
+            // A wallet sets nLockTime to the tip it sees (anti-fee-sniping).
+            // If that is the header tip and our UTXO set lags, the tx is
+            // final as soon as we catch up (ticket 026 judges finality at
+            // validated_height + 1, as Core's CheckFinalTxAtTip).
+            M::NonFinal { lock_time, .. }
+                if lagging
+                    && lock_time < crate::contextual_checks::LOCKTIME_THRESHOLD
+                    && lock_time <= tip_height =>
+            {
+                SubmitError::NotSynced {
+                    validated_height,
+                    tip_height,
+                }
+            }
             M::CoinbaseTx
             | M::MalformedTx
             | M::MissingInput { .. }
@@ -118,7 +132,8 @@ impl SubmitError {
             | M::ScriptFailure { .. }
             | M::Inflation
             | M::MathOverflow
-            | M::NonFinal { .. } => SubmitError::Consensus(msg),
+            | M::NonFinal { .. }
+            | M::NonBip68Final { .. } => SubmitError::Consensus(msg),
             M::OversizedTx { .. }
             | M::DustOutput { .. }
             | M::NonStandardScript { .. }
@@ -147,7 +162,7 @@ impl SubmitError {
             M::AlreadyInMempool => SubmitError::Internal(
                 "already in mempool (should be handled by caller)".into(),
             ),
-            M::UtxoLookup(s) => SubmitError::Internal(s),
+            M::UtxoLookup(s) | M::ChainContext(s) => SubmitError::Internal(s),
         }
     }
 
@@ -1142,5 +1157,23 @@ mod tests {
             SubmitError::from_mempool(missing(), true, 5, 10, vec![]),
             SubmitError::NotSynced { validated_height: 5, tip_height: 10 }
         );
+
+        // Same for a height locktime the header tip already satisfies
+        // (ticket 026); one beyond the header tip is still a verdict.
+        let non_final = |lock_time| MempoolError::NonFinal { lock_time, current_height: 5 };
+        assert_eq!(
+            SubmitError::from_mempool(non_final(10), true, 5, 10, vec![]),
+            SubmitError::NotSynced { validated_height: 5, tip_height: 10 }
+        );
+        assert!(matches!(
+            SubmitError::from_mempool(non_final(11), true, 5, 10, vec![]),
+            SubmitError::Consensus(_)
+        ));
+        assert!(matches!(c(non_final(10)), SubmitError::Consensus(_)));
+        assert!(matches!(
+            c(MempoolError::NonBip68Final { min_height: 20, min_time: -1, current_height: 10 }),
+            SubmitError::Consensus(_)
+        ));
+        assert!(matches!(c(MempoolError::ChainContext("x".into())), SubmitError::Internal(_)));
     }
 }

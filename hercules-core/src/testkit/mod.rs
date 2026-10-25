@@ -6,5 +6,9 @@
 pub mod fixture_chain;
 pub mod mock_peer;
 
+/// Block-level tests of the ticket-026 contextual rules on fixture chains.
+#[cfg(test)]
+mod consensus_rules;
+
 pub use fixture_chain::{FixtureChain, Invalid};
 pub use mock_peer::{Behavior, MockPeer};
