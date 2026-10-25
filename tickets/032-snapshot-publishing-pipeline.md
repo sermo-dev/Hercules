@@ -22,16 +22,18 @@ This ticket builds a server-side pipeline that regularly produces, verifies, and
 ## Background (verified)
 
 **Pinned anchor.** `hercules-core/src/assumeutxo.rs` pins:
-- `ASSUMEUTXO_HEIGHT = 943_500` (`:12`)
-- `ASSUMEUTXO_HASH`, the SHA256 over the HUTX entries (`:17-22`)
-- `ASSUMEUTXO_BLOCK_HASH` (`:26-31`)
-- `SNAPSHOT_DOWNLOAD_URL` (`:35-36`)
-- `SNAPSHOT_DOWNLOAD_SIZE` ≈ 8.78 GB compressed (`:39`)
+- `ASSUMEUTXO_HEIGHT = 943_500` (`:16`)
+- `ASSUMEUTXO_HASH`, the SHA256 over the HUTX entries (`:27`): `a65fdd39…1bf734` since PR #27
+- `RETRACTED_SNAPSHOT_HASHES` (`:42`): `705528fe…2d133e`, the first 943,500 file. Its converter wrote 34,336 uncompressed-P2PK coins as compressed-key scripts; sets imported from it are wiped on open
+- `ASSUMEUTXO_UTXO_COUNT = 165_208_261` (`:57`), checked exactly against the header
+- `ASSUMEUTXO_BLOCK_HASH` (`:61`)
+- `SNAPSHOT_DOWNLOAD_URL` (`:115`)
+- `SNAPSHOT_DOWNLOAD_SIZE` = 8,781,448,895 bytes compressed (`:119`)
 
 The file was committed 2026-04-06. Around 28,000 blocks have been mined since, so a new user today downloads roughly 40+ GB of blocks after the snapshot and validates them before reaching the tip. That's the opposite of "install and go".
 
 **Hosting.**
-- `SnapshotDownloader.swift:20-22` hardcodes `https://pub-341db…r2.dev/hercules-utxo.hutx.gz`.
+- `SnapshotDownloader.swift:20-22` hardcodes `https://pub-341db…r2.dev/hercules-943500-utxo-v2.hutx.gz` (was `hercules-utxo.hutx.gz`, the retracted file). Local download/resume file names derive from that object name.
 - `r2.dev` public URLs are rate-limited and Cloudflare documents them as not for production.
 
 **Conversion.**
@@ -82,6 +84,12 @@ The file was committed 2026-04-06. Around 28,000 blocks have been mined since, s
 - Publish MuHash in every manifest so anyone running Core can independently check.
 
 **Daily snapshots?** Possible, but each one needs a human signature, and going from weekly to daily cuts the new-user backlog from at most ~1,000 blocks to at most ~144. That's minutes of validation on a modern iPhone. Weekly is the better tradeoff. If more freshness is wanted later, make the cadence configurable.
+
+## Release gate (required before publishing any snapshot)
+
+The snapshot's MuHash, as Hercules computes it (the value `load_snapshot` stores and TrustInfo shows), **must equal** Bitcoin Core's `bitcoin-cli gettxoutsetinfo muhash <height>` on an independent, fully validating Core node, and the UTXO count must equal Core's `txouts`. No snapshot hash is baked into a release, and no file is uploaded, until this holds. The entries SHA256 only proves the file is the one we converted, not that the conversion was right: the 943,500 file shipped with a converter bug (uncompressed P2PK) that a MuHash comparison would have caught.
+
+Current 943,500 file: Hercules MuHash `73877c075918cdf010b181b7cedb99715df424f70d52d412b0c8d78175d2de4c`. **Not yet compared with Core.**
 
 ## Pipeline design
 
@@ -138,7 +146,7 @@ The file was committed 2026-04-06. Around 28,000 blocks have been mined since, s
 
 ## Verification
 
-- The pipeline produces a snapshot whose MuHash equals Core's `gettxoutsetinfo muhash` at the same height.
+- The pipeline produces a snapshot whose MuHash equals Core's `gettxoutsetinfo muhash` at the same height, and refuses to publish (see Release gate) when it doesn't.
 - The app rejects a manifest with a bad signature, with height below the floor, with `block_hash` not in the header chain, or with a file whose hash doesn't match. In each case it falls back to the embedded anchor.
 - A fresh install, with a manifest one week old, reaches the tip with ≤ ~1,008 blocks to validate.
 - Deleting the custom-domain object makes the app fall back cleanly to the previous manifest or embedded anchor.

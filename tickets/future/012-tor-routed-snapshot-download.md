@@ -2,14 +2,14 @@
 
 ## Summary
 
-The AssumeUTXO snapshot bootstrap (Phase 5a) downloads ~8.2 GB from a Cloudflare R2 bucket over plain HTTPS. All Bitcoin P2P traffic after bootstrap is routed through Tor, but this one-time download leaks the user's IP address to Cloudflare and reveals "this person uses Hercules" to any network observer. Close that gap.
+The AssumeUTXO snapshot bootstrap (Phase 5a) downloads ~8.8 GB from a Cloudflare R2 bucket over plain HTTPS. All Bitcoin P2P traffic after bootstrap is routed through Tor, but this one-time download leaks the user's IP address to Cloudflare and reveals "this person uses Hercules" to any network observer. Close that gap.
 
 ## Background
 
 Hercules is a privacy-preserving Bitcoin node — Arti routes every P2P connection through Tor by default. Phase 5a added one-tap bootstrap by downloading a hash-anchored UTXO snapshot from R2:
 
-- URL: `https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-utxo.hutx.gz`
-- Size: ~8.2 GB compressed
+- URL: `https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-943500-utxo-v2.hutx.gz` (`SNAPSHOT_DOWNLOAD_URL` / `SnapshotDownloader.downloadURL`)
+- Size: ~8.8 GB compressed (8,781,448,895 bytes)
 - Trust model: hash baked into `assumeutxo.rs::ASSUMEUTXO_HASH`, verified by `utxo.rs::load_snapshot` before any data touches the database. The hoster cannot tamper with the bytes undetected.
 
 The snapshot trust model is solid, but the **delivery channel** leaks metadata that the rest of the node carefully hides.
@@ -17,7 +17,7 @@ The snapshot trust model is solid, but the **delivery channel** leaks metadata t
 ### What leaks today
 
 1. **Cloudflare logs** see the user's home IP tagged with the unique R2 bucket URL → "this IP bootstrapped a Hercules node at time T"
-2. **ISP / on-path observers** see SNI = `pub-341db11a2808417d91d4fcabc62a2260.r2.dev` and an 8.2 GB transfer — a strong fingerprint
+2. **ISP / on-path observers** see SNI = `pub-341db11a2808417d91d4fcabc62a2260.r2.dev` and an 8.8 GB transfer — a strong fingerprint
 3. **DNS resolver** sees the R2 hostname (unless the user has DoH/DoT enabled)
 4. **Temporal correlation**: bootstrap traffic followed by Tor circuits from the same IP gives a strong signal that this user runs Hercules, even though P2P content is hidden
 
@@ -30,7 +30,7 @@ The leak is "this person uses Hercules" — bounded but real, and inconsistent w
 
 ### Why we shipped without Tor in v1
 
-- **Speed.** Arti circuits typically deliver 100–500 KB/s end-to-end. 8.2 GB over Tor is 4–22 hours of waiting before the node can do anything useful. Adoption killer.
+- **Speed.** Arti circuits typically deliver 100–500 KB/s end-to-end. 8.8 GB over Tor is 4–22 hours of waiting before the node can do anything useful. Adoption killer.
 - **No onion mirror infrastructure.** R2 isn't directly reachable via Tor; we'd need to host the snapshot on a Hercules-controlled onion service.
 
 ## Design
@@ -41,7 +41,7 @@ Two layers, ship in order.
 
 Add a one-time disclosure dialog before the download starts:
 
-> "Bootstrap downloads 8.2 GB from Cloudflare. This reveals to your ISP and Cloudflare that you use Hercules. All Bitcoin traffic after bootstrap is routed through Tor."
+> "Bootstrap downloads 8.8 GB from Cloudflare. This reveals to your ISP and Cloudflare that you use Hercules. All Bitcoin traffic after bootstrap is routed through Tor."
 
 - Buttons: **Download** (proceeds) / **Cancel** (returns to idle)
 - Persist a "user has acknowledged" flag so we don't nag on retries
