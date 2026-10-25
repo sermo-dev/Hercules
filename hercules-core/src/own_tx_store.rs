@@ -7,12 +7,12 @@
 //! mempool is in memory, so without it an app kill before peers fetched
 //! the transaction would lose it silently.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use bitcoin::block::Block;
 use bitcoin::consensus::deserialize;
-use bitcoin::{Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 use log::{info, warn};
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -32,9 +32,23 @@ pub const TERMINAL_RETENTION_SECS: u64 = 7 * 24 * 3600;
 /// First rebroadcast delay after an announcement; doubles per attempt.
 pub const REBROADCAST_BASE_SECS: u64 = 60;
 
-/// Rebroadcast backoff cap. Every new foreground sync session also makes
-/// all pending transactions due immediately, whatever their backoff.
+/// Rebroadcast backoff cap while pending. Every new foreground sync
+/// session also makes all pending transactions due immediately, whatever
+/// their backoff.
 pub const REBROADCAST_MAX_SECS: u64 = 3600;
+
+/// Once a peer has announced it back (propagated), an own transaction is
+/// resent only every `PROPAGATED_RESEND_MIN_SECS` plus a uniform random
+/// part of up to `PROPAGATED_RESEND_JITTER_SECS` (12–36h), like Bitcoin
+/// Core's wallet. A fast, regular resend of a tx the network already has
+/// is a fingerprint: only the originator keeps re-announcing it.
+pub const PROPAGATED_RESEND_MIN_SECS: u64 = 12 * 3600;
+pub const PROPAGATED_RESEND_JITTER_SECS: u64 = 24 * 3600;
+
+/// Distinct announcing peers remembered per own transaction. Past this the
+/// count stops growing (and nothing more is written), so a peer that
+/// reconnects over and over can't turn `inv`s into SQLite writes.
+const MAX_SEEN_PEERS_PER_TX: usize = 256;
 
 // ── Submission API types ───────────────────────────────────────────────
 
@@ -275,7 +289,7 @@ pub struct OwnTxRecord {
     pub last_sent_at: u64,
     pub next_attempt_at: u64,
     pub attempts: u32,
-    /// Number of `inv` announcements of this tx received from peers.
+    /// Number of distinct peers that announced this tx to us.
     pub seen_from_peers: u32,
     pub status: OwnTxStatus,
     pub updated_at: u64,
@@ -302,19 +316,43 @@ fn db_err(e: rusqlite::Error) -> OwnTxStoreError {
     OwnTxStoreError(e.to_string())
 }
 
-/// Delay before the next rebroadcast after `attempts` announcements.
+/// Delay before the next rebroadcast of a *pending* tx after `attempts`
+/// announcements.
 pub fn rebroadcast_backoff_secs(attempts: u32) -> u64 {
     let shift = attempts.saturating_sub(1).min(16);
     (REBROADCAST_BASE_SECS << shift).min(REBROADCAST_MAX_SECS)
 }
 
+/// Randomized resend interval for a *propagated* tx (12–36h).
+pub fn propagated_resend_secs() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let r = RandomState::new().build_hasher().finish();
+    PROPAGATED_RESEND_MIN_SECS + r % (PROPAGATED_RESEND_JITTER_SECS + 1)
+}
+
 /// Persisted tracker of the user's own transactions.
 pub struct OwnTxStore {
     conn: Mutex<Connection>,
-    /// Txids in an active state, cached so the per-`inv` check in the
-    /// message loop doesn't hit SQLite.
-    active: Mutex<HashSet<Txid>>,
+    /// Txids in an active state -> whether they have propagated, cached so
+    /// the per-`inv` / `getdata` / `mempool` checks in the message loop
+    /// don't hit SQLite.
+    active: Mutex<HashMap<Txid, bool>>,
+    /// Txids `on_block` has to look at: active rows plus `replaced` and
+    /// `expired` ones, which may still confirm. Empty means blocks (IBD)
+    /// skip the hook entirely.
+    watched: Mutex<HashSet<Txid>>,
+    /// Peers already counted in `seen_from_peers`, per active txid, so an
+    /// `inv` flood costs a hash lookup rather than a SQLite write. Backed
+    /// by the `own_tx_seen` table so the count stays distinct across
+    /// restarts.
+    seen_peers: Mutex<HashMap<Txid, HashSet<String>>>,
 }
+
+/// Statuses `on_block` settles: active ones (confirm or conflict), and
+/// `replaced` / `expired` ones, which can still confirm (the original of
+/// an RBF bump wins the race, or a tx we gave up on gets mined).
+const WATCHED_STATUSES: &str = "('pending', 'propagated', 'replaced', 'expired')";
 
 const SELECT_COLS: &str = "txid, raw, first_sent_at, last_sent_at, next_attempt_at, attempts, \
      seen_from_peers, status, status_height, status_txid, updated_at";
@@ -341,24 +379,37 @@ impl OwnTxStore {
                 status_txid TEXT,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS own_tx_seen (
+                txid TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                PRIMARY KEY (txid, peer)
+            );
             ",
         )
         .map_err(db_err)?;
         let store = OwnTxStore {
             conn: Mutex::new(conn),
-            active: Mutex::new(HashSet::new()),
+            active: Mutex::new(HashMap::new()),
+            watched: Mutex::new(HashSet::new()),
+            seen_peers: Mutex::new(HashMap::new()),
         };
         store.refresh_active()?;
         Ok(store)
     }
 
     fn refresh_active(&self) -> Result<(), OwnTxStoreError> {
-        let set: HashSet<Txid> = self
-            .active_records()?
-            .into_iter()
-            .map(|r| r.txid)
+        let watched = self.query(&format!("WHERE status IN {}", WATCHED_STATUSES), &[])?;
+        let active: HashMap<Txid, bool> = watched
+            .iter()
+            .filter(|r| r.status.is_active())
+            .map(|r| (r.txid, r.status == OwnTxStatus::Propagated))
             .collect();
-        *self.active.lock().unwrap() = set;
+        self.seen_peers
+            .lock()
+            .unwrap()
+            .retain(|t, _| active.contains_key(t));
+        *self.watched.lock().unwrap() = watched.iter().map(|r| r.txid).collect();
+        *self.active.lock().unwrap() = active;
         Ok(())
     }
 
@@ -454,23 +505,36 @@ impl OwnTxStore {
 
     /// True if `txid` is tracked and still active (cheap, in-memory).
     pub fn is_active(&self, txid: &Txid) -> bool {
-        self.active.lock().unwrap().contains(txid)
+        self.active.lock().unwrap().contains_key(txid)
     }
 
-    /// Record an announcement at `now` and schedule the next one.
+    /// True if `txid` is active and no peer has announced it back yet
+    /// (cheap, in-memory). Such a tx must not leak out other than by our
+    /// own deliberate announcement (BIP 35 `mempool`, unsolicited
+    /// `getdata`).
+    pub fn is_pending(&self, txid: &Txid) -> bool {
+        self.active.lock().unwrap().get(txid) == Some(&false)
+    }
+
+    /// Record an announcement at `now` and schedule the next one: the
+    /// doubling backoff while pending, 12–36h once propagated.
     pub fn record_sent(&self, txid: &Txid, now: u64) -> Result<(), OwnTxStoreError> {
         let conn = self.conn.lock().unwrap();
-        let attempts: Option<u32> = conn
+        let row: Option<(u32, String)> = conn
             .query_row(
-                "SELECT attempts FROM own_txs WHERE txid = ?1",
+                "SELECT attempts, status FROM own_txs WHERE txid = ?1",
                 params![txid.to_string()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(db_err)?;
-        let Some(attempts) = attempts else { return Ok(()) };
+        let Some((attempts, status)) = row else { return Ok(()) };
         let attempts = attempts.saturating_add(1);
-        let next = now + rebroadcast_backoff_secs(attempts);
+        let next = if status == "propagated" {
+            now + propagated_resend_secs()
+        } else {
+            now + rebroadcast_backoff_secs(attempts)
+        };
         conn.execute(
             "UPDATE own_txs SET attempts = ?2, last_sent_at = ?3, next_attempt_at = ?4 WHERE txid = ?1",
             params![txid.to_string(), attempts, now as i64, next as i64],
@@ -479,102 +543,213 @@ impl OwnTxStore {
         Ok(())
     }
 
-    /// Make every active transaction due now (new foreground session).
+    /// Make every pending transaction due now (new foreground session).
+    /// Propagated ones keep their 12–36h schedule: the network already has
+    /// them, and resending at every app launch would be a fingerprint.
     pub fn make_all_due(&self, now: u64) -> Result<(), OwnTxStoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE own_txs SET next_attempt_at = ?1 WHERE status IN ('pending', 'propagated')",
+            "UPDATE own_txs SET next_attempt_at = ?1 WHERE status = 'pending'",
             params![now as i64],
         )
         .map_err(db_err)?;
         Ok(())
     }
 
-    /// A peer announced this transaction back to us.
-    pub fn record_seen(&self, txid: &Txid, now: u64) -> Result<(), OwnTxStoreError> {
+    /// `peer` announced this transaction back to us. Each (peer, txid)
+    /// pair is counted, and written, at most once; repeats are an
+    /// in-memory lookup. The first one moves a pending tx to propagated
+    /// and onto the slow resend schedule.
+    pub fn record_seen(&self, txid: &Txid, peer: &str, now: u64) -> Result<(), OwnTxStoreError> {
+        if !self.is_active(txid) {
+            return Ok(());
+        }
+        {
+            let mut seen = self.seen_peers.lock().unwrap();
+            let peers = seen.entry(*txid).or_default();
+            if peers.contains(peer) || peers.len() >= MAX_SEEN_PEERS_PER_TX {
+                return Ok(());
+            }
+            peers.insert(peer.to_string());
+        }
         let conn = self.conn.lock().unwrap();
+        let new_peer = conn
+            .execute(
+                "INSERT OR IGNORE INTO own_tx_seen (txid, peer) VALUES (?1, ?2)",
+                params![txid.to_string(), peer],
+            )
+            .map_err(db_err)?;
+        if new_peer == 0 {
+            // Counted in an earlier run.
+            return Ok(());
+        }
+        let propagated_now = conn
+            .execute(
+                "UPDATE own_txs SET status = 'propagated', next_attempt_at = ?2
+                 WHERE txid = ?1 AND status = 'pending'",
+                params![txid.to_string(), (now + propagated_resend_secs()) as i64],
+            )
+            .map_err(db_err)?;
         conn.execute(
-            "UPDATE own_txs SET seen_from_peers = seen_from_peers + 1,
-                status = CASE WHEN status = 'pending' THEN 'propagated' ELSE status END,
-                updated_at = ?2
+            "UPDATE own_txs SET seen_from_peers = seen_from_peers + 1, updated_at = ?2
              WHERE txid = ?1 AND status IN ('pending', 'propagated')",
             params![txid.to_string(), now as i64],
         )
         .map_err(db_err)?;
+        drop(conn);
+        if propagated_now > 0 {
+            if let Some(p) = self.active.lock().unwrap().get_mut(txid) {
+                *p = true;
+            }
+        }
         Ok(())
     }
 
-    /// Record the block height at which a terminal status was reached, for
-    /// statuses whose enum variant doesn't carry it (conflicted).
-    fn set_status_height(&self, txid: &Txid, height: u32) -> Result<(), OwnTxStoreError> {
+    /// Write `status`, plus `status_height` for statuses whose variant
+    /// doesn't carry one (a conflict's block height), in one UPDATE.
+    /// Doesn't refresh the in-memory caches; callers do, once per batch.
+    fn write_status(
+        &self,
+        txid: &Txid,
+        status: &OwnTxStatus,
+        extra_height: Option<u32>,
+        now: u64,
+    ) -> Result<(), OwnTxStoreError> {
+        let (name, height, other) = status.to_row();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE own_txs SET status_height = ?2 WHERE txid = ?1",
-            params![txid.to_string(), height],
+            "UPDATE own_txs SET status = ?2, status_height = ?3, status_txid = ?4, updated_at = ?5
+             WHERE txid = ?1",
+            params![txid.to_string(), name, height.or(extra_height), other, now as i64],
         )
         .map_err(db_err)?;
         Ok(())
     }
 
+    #[cfg(test)]
     fn set_status(&self, txid: &Txid, status: &OwnTxStatus, now: u64) -> Result<(), OwnTxStoreError> {
-        let (name, height, other) = status.to_row();
-        {
-            let conn = self.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE own_txs SET status = ?2, status_height = ?3, status_txid = ?4, updated_at = ?5
-                 WHERE txid = ?1",
-                params![txid.to_string(), name, height, other, now as i64],
-            )
-            .map_err(db_err)?;
-        }
+        self.write_status(txid, status, None, now)?;
         self.refresh_active()
     }
 
-    /// `old` was replaced in the mempool by the user's own `by`.
+    /// `old` was replaced in the mempool by the user's own `by`. Own
+    /// descendants of `old` lose their inputs with it and are marked
+    /// conflicted by `by` (with no height: no block caused it, so a reorg
+    /// doesn't undo it).
     pub fn mark_replaced(&self, old: &Txid, by: Txid, now: u64) -> Result<(), OwnTxStoreError> {
         if self.is_active(old) {
             info!("Own tx {} replaced by {}", old, by);
-            self.set_status(old, &OwnTxStatus::Replaced { by }, now)?;
+            self.write_status(old, &OwnTxStatus::Replaced { by }, None, now)?;
+            self.cascade_conflict(vec![*old], by, None, now)?;
+            self.refresh_active()?;
         }
         Ok(())
     }
 
-    /// Block-connect hook: mark active own transactions in `block` as
-    /// confirmed, and those whose inputs `block` spends with a different
-    /// transaction as conflicted. Returns the number of rows changed.
+    /// Mark every active own tx that spends an output of one of `roots`,
+    /// transitively, as conflicted by `by`. `height` is the block that
+    /// caused it (so `demote_confirmed_above` undoes the whole chain on a
+    /// reorg), or None for an RBF replacement. Returns the rows changed.
+    fn cascade_conflict(
+        &self,
+        roots: Vec<Txid>,
+        by: Txid,
+        height: Option<u32>,
+        now: u64,
+    ) -> Result<usize, OwnTxStoreError> {
+        let mut active: Vec<(Txid, Transaction)> = self
+            .active_records()?
+            .into_iter()
+            .filter_map(|r| Some((r.txid, r.tx()?)))
+            .collect();
+        let mut queue = roots;
+        let mut changed = 0;
+        while let Some(parent) = queue.pop() {
+            let mut i = 0;
+            while i < active.len() {
+                if active[i].1.input.iter().any(|inp| inp.previous_output.txid == parent) {
+                    let (child, _) = active.swap_remove(i);
+                    warn!("Own tx {} conflicted: spends {}, conflicted by {}", child, parent, by);
+                    self.write_status(&child, &OwnTxStatus::Conflicted { by }, height, now)?;
+                    queue.push(child);
+                    changed += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Block-connect hook. Own transactions in `block` become confirmed:
+    /// active ones, and also `replaced` (the original of an RBF bump won)
+    /// and `expired` ones. Active ones whose inputs `block` spends with a
+    /// different transaction become conflicted, and so do their own
+    /// descendants (see `cascade_conflict`); those rows record `height` so
+    /// a reorg can undo them. Returns the number of rows changed.
+    ///
+    /// Idempotent: re-running it for the same block (crash recovery)
+    /// changes nothing more.
     pub fn on_block(&self, block: &Block, height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
-        if self.active.lock().unwrap().is_empty() {
+        if self.watched.lock().unwrap().is_empty() {
             return Ok(0);
         }
-        let active = self.active_records()?;
+        let watched = self.query(
+            &format!("WHERE status IN {} ORDER BY first_sent_at", WATCHED_STATUSES),
+            &[],
+        )?;
+        let block_txids: HashSet<Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
         let mut changed = 0;
-        let block_txids: Vec<Txid> = block.txdata.iter().map(|t| t.compute_txid()).collect();
-        for rec in active {
+        for rec in &watched {
             if block_txids.contains(&rec.txid) {
-                info!("Own tx {} confirmed at height {}", rec.txid, height);
-                self.set_status(&rec.txid, &OwnTxStatus::Confirmed { height }, now)?;
+                info!(
+                    "Own tx {} confirmed at height {} (was {})",
+                    rec.txid,
+                    height,
+                    rec.status.name()
+                );
+                self.write_status(&rec.txid, &OwnTxStatus::Confirmed { height }, None, now)?;
                 changed += 1;
+            }
+        }
+        // Conflicts are judged after confirmations, so a replacement whose
+        // original just confirmed is conflicted by it.
+        let spent: HashMap<OutPoint, Txid> = block
+            .txdata
+            .iter()
+            .filter(|t| !t.is_coinbase())
+            .flat_map(|t| {
+                let id = t.compute_txid();
+                t.input.iter().map(move |i| (i.previous_output, id))
+            })
+            .collect();
+        let mut by_conflict: HashMap<Txid, Vec<Txid>> = HashMap::new();
+        for rec in &watched {
+            if !rec.status.is_active() || block_txids.contains(&rec.txid) {
                 continue;
             }
             let Some(own) = rec.tx() else { continue };
-            let conflicting = block.txdata.iter().zip(&block_txids).find(|(btx, _)| {
-                btx.input.iter().any(|bi| {
-                    own.input
-                        .iter()
-                        .any(|oi| oi.previous_output == bi.previous_output)
-                })
-            });
-            if let Some((_, by)) = conflicting {
+            let by = own
+                .input
+                .iter()
+                .find_map(|oi| spent.get(&oi.previous_output).filter(|s| **s != rec.txid));
+            if let Some(by) = by {
                 warn!(
                     "Own tx {} conflicted: input spent by {} at height {}",
                     rec.txid, by, height
                 );
-                self.set_status(&rec.txid, &OwnTxStatus::Conflicted { by: *by }, now)?;
-                // Remember where, so a reorg that removes this block can
-                // demote it back to pending (see demote_confirmed_above).
-                self.set_status_height(&rec.txid, height)?;
+                // status_height lets a reorg that removes this block demote
+                // it back to pending (see demote_confirmed_above).
+                self.write_status(&rec.txid, &OwnTxStatus::Conflicted { by: *by }, Some(height), now)?;
+                by_conflict.entry(*by).or_default().push(rec.txid);
                 changed += 1;
             }
+        }
+        for (by, roots) in by_conflict {
+            changed += self.cascade_conflict(roots, by, Some(height), now)?;
+        }
+        if changed > 0 {
+            self.refresh_active()?;
         }
         Ok(changed)
     }
@@ -582,7 +757,13 @@ impl OwnTxStore {
     /// Reorg hook: confirmations and conflicts recorded above `fork_height`
     /// are undone, so those transactions go back to pending and are due for
     /// rebroadcast (a re-add that still conflicts is settled again by the
-    /// next block).
+    /// next block). Also run at open with the validated height, to finish
+    /// a reorg (or undo a block hook) that a crash interrupted.
+    ///
+    /// A confirmed row goes back to pending even if it was `replaced` or
+    /// `expired` before it confirmed: the prior status isn't kept. The
+    /// rebroadcast path settles that again (a replaced original loses the
+    /// RBF race in the mempool again; an old one re-expires).
     pub fn demote_confirmed_above(&self, fork_height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
         let n = {
             let conn = self.conn.lock().unwrap();
@@ -601,7 +782,9 @@ impl OwnTxStore {
         Ok(n)
     }
 
-    /// Expire stale pending rows and delete old terminal rows.
+    /// Expire stale pending rows and delete old terminal rows. Only call
+    /// this when the UTXO set is caught up with the headers: while it lags,
+    /// an "unconfirmed" tx may well be in a block we haven't validated yet.
     pub fn expire(&self, now: u64) -> Result<(), OwnTxStoreError> {
         {
             let conn = self.conn.lock().unwrap();
@@ -618,6 +801,12 @@ impl OwnTxStore {
             conn.execute(
                 "DELETE FROM own_txs WHERE status NOT IN ('pending', 'propagated') AND updated_at + ?2 <= ?1",
                 params![now as i64, TERMINAL_RETENTION_SECS as i64],
+            )
+            .map_err(db_err)?;
+            conn.execute(
+                "DELETE FROM own_tx_seen WHERE txid NOT IN
+                    (SELECT txid FROM own_txs WHERE status IN ('pending', 'propagated'))",
+                [],
             )
             .map_err(db_err)?;
         }
@@ -645,7 +834,7 @@ mod tests {
             assert!(s.track(txid(1), &[1, 2, 3], 1000).unwrap());
             assert!(!s.track(txid(1), &[1, 2, 3], 1001).unwrap(), "idempotent");
             s.record_sent(&txid(1), 1000).unwrap();
-            s.record_seen(&txid(1), 1002).unwrap();
+            s.record_seen(&txid(1), "peer-a", 1002).unwrap();
         }
         let s = OwnTxStore::open(path).unwrap();
         assert!(s.is_active(&txid(1)), "active cache rebuilt on open");
@@ -711,10 +900,9 @@ mod tests {
         let s = OwnTxStore::open(":memory:").unwrap();
         s.track(txid(1), &[0], 0).unwrap();
         s.track(txid(2), &[0], 0).unwrap();
-        s.set_status(&txid(1), &OwnTxStatus::Conflicted { by: txid(9) }, 1).unwrap();
-        s.set_status_height(&txid(1), 100).unwrap();
-        s.set_status(&txid(2), &OwnTxStatus::Conflicted { by: txid(8) }, 1).unwrap();
-        s.set_status_height(&txid(2), 90).unwrap();
+        s.write_status(&txid(1), &OwnTxStatus::Conflicted { by: txid(9) }, Some(100), 1).unwrap();
+        s.write_status(&txid(2), &OwnTxStatus::Conflicted { by: txid(8) }, Some(90), 1).unwrap();
+        s.refresh_active().unwrap();
         assert_eq!(s.demote_confirmed_above(95, 2).unwrap(), 1);
         assert_eq!(s.get(&txid(1)).unwrap().unwrap().status, OwnTxStatus::Pending);
         assert!(s.is_active(&txid(1)));
@@ -738,6 +926,182 @@ mod tests {
             s.get(&txid(2)).unwrap().unwrap().status,
             OwnTxStatus::Confirmed { height: 90 }
         );
+    }
+
+    /// One-in, one-out tx spending `prev`, made distinct by `tag`.
+    fn tx_spending(prev: OutPoint, tag: u8) -> Transaction {
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000 + tag as u64),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn out(tx: &Transaction) -> OutPoint {
+        OutPoint { txid: tx.compute_txid(), vout: 0 }
+    }
+
+    fn track_tx(s: &OwnTxStore, tx: &Transaction) -> Txid {
+        s.track(tx.compute_txid(), &bitcoin::consensus::serialize(tx), 0).unwrap();
+        tx.compute_txid()
+    }
+
+    fn block_of(txs: Vec<Transaction>) -> Block {
+        let mut b = crate::p2p::tests::synthetic_block(3);
+        b.txdata.extend(txs);
+        b
+    }
+
+    fn status(s: &OwnTxStore, t: &Txid) -> OwnTxStatus {
+        s.get(t).unwrap().unwrap().status
+    }
+
+    #[test]
+    fn propagated_tx_moves_to_slow_randomized_schedule() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[0], 0).unwrap();
+        s.track(txid(2), &[0], 0).unwrap();
+        s.record_sent(&txid(1), 0).unwrap();
+        s.record_sent(&txid(2), 0).unwrap();
+        assert!(s.is_pending(&txid(1)));
+
+        // First peer announcing it back: off the 60s schedule, onto 12-36h.
+        s.record_seen(&txid(1), "peer-a", 10).unwrap();
+        assert!(!s.is_pending(&txid(1)) && s.is_active(&txid(1)));
+        let in_window = |at: u64, from: u64| {
+            at >= from + PROPAGATED_RESEND_MIN_SECS
+                && at <= from + PROPAGATED_RESEND_MIN_SECS + PROPAGATED_RESEND_JITTER_SECS
+        };
+        let r = s.get(&txid(1)).unwrap().unwrap();
+        assert!(in_window(r.next_attempt_at, 10), "{}", r.next_attempt_at);
+        // Further sends stay on it.
+        s.record_sent(&txid(1), 100).unwrap();
+        let r = s.get(&txid(1)).unwrap().unwrap();
+        assert!(in_window(r.next_attempt_at, 100), "{}", r.next_attempt_at);
+        let due: Vec<Txid> = s.due(100 + REBROADCAST_MAX_SECS).unwrap().iter().map(|r| r.txid).collect();
+        assert_eq!(due, vec![txid(2)], "only the pending tx is on the fast schedule");
+
+        // A new session makes pending txs due, not propagated ones.
+        s.make_all_due(200).unwrap();
+        let due: Vec<Txid> = s.due(200).unwrap().iter().map(|r| r.txid).collect();
+        assert_eq!(due, vec![txid(2)]);
+    }
+
+    #[test]
+    fn record_seen_counts_distinct_peers_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("own_txs.sqlite3");
+        let path = path.to_str().unwrap();
+        {
+            let s = OwnTxStore::open(path).unwrap();
+            s.track(txid(1), &[0], 0).unwrap();
+            for i in 1..1000 {
+                s.record_seen(&txid(1), "peer-a", i).unwrap();
+            }
+            assert_eq!(s.get(&txid(1)).unwrap().unwrap().seen_from_peers, 1);
+            // The flood wrote once: updated_at is from the first inv.
+            assert_eq!(s.get(&txid(1)).unwrap().unwrap().updated_at, 1);
+            s.record_seen(&txid(1), "peer-b", 5).unwrap();
+            assert_eq!(s.get(&txid(1)).unwrap().unwrap().seen_from_peers, 2);
+            // Untracked txids are ignored.
+            s.record_seen(&txid(9), "peer-a", 5).unwrap();
+            assert!(s.get(&txid(9)).unwrap().is_none());
+        }
+        // Distinct across restarts too.
+        let s = OwnTxStore::open(path).unwrap();
+        s.record_seen(&txid(1), "peer-a", 6).unwrap();
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().seen_from_peers, 2);
+        s.record_seen(&txid(1), "peer-c", 7).unwrap();
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().seen_from_peers, 3);
+    }
+
+    #[test]
+    fn replaced_or_expired_tx_that_confirms_is_settled() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let prev = OutPoint { txid: txid(50), vout: 0 };
+        let a = tx_spending(prev, 1);
+        let b = tx_spending(prev, 2); // RBF replacement of a
+        let (ta, tb) = (track_tx(&s, &a), track_tx(&s, &b));
+        s.mark_replaced(&ta, tb, 1).unwrap();
+
+        // The original wins: it confirms, and the replacement is conflicted
+        // by it (at that height, so a reorg would undo it).
+        assert_eq!(s.on_block(&block_of(vec![a.clone()]), 100, 2).unwrap(), 2);
+        assert_eq!(status(&s, &ta), OwnTxStatus::Confirmed { height: 100 });
+        assert_eq!(status(&s, &tb), OwnTxStatus::Conflicted { by: ta });
+        assert_eq!(s.demote_confirmed_above(99, 3).unwrap(), 2);
+
+        // A tx we stopped rebroadcasting can still get mined.
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let c = tx_spending(OutPoint { txid: txid(51), vout: 0 }, 3);
+        let tc = track_tx(&s, &c);
+        s.expire(PENDING_EXPIRY_SECS).unwrap();
+        assert_eq!(status(&s, &tc), OwnTxStatus::Expired);
+        assert_eq!(s.on_block(&block_of(vec![c]), 120, PENDING_EXPIRY_SECS).unwrap(), 1);
+        assert_eq!(status(&s, &tc), OwnTxStatus::Confirmed { height: 120 });
+    }
+
+    #[test]
+    fn conflict_cascades_to_descendants_and_reorg_undoes_it() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let prev = OutPoint { txid: txid(50), vout: 0 };
+        let parent = tx_spending(prev, 1);
+        let child = tx_spending(out(&parent), 2);
+        let grandchild = tx_spending(out(&child), 3);
+        let unrelated = tx_spending(OutPoint { txid: txid(51), vout: 0 }, 4);
+        let ids: Vec<Txid> = [&parent, &child, &grandchild, &unrelated]
+            .iter()
+            .map(|t| track_tx(&s, t))
+            .collect();
+
+        let double_spend = tx_spending(prev, 9);
+        let by = double_spend.compute_txid();
+        assert_eq!(s.on_block(&block_of(vec![double_spend]), 100, 1).unwrap(), 3);
+        for t in &ids[..3] {
+            assert_eq!(status(&s, t), OwnTxStatus::Conflicted { by });
+            assert!(!s.is_active(t));
+        }
+        assert!(s.is_active(&ids[3]));
+
+        // All three were conflicted by block 100, so a reorg below it
+        // restores all three.
+        assert_eq!(s.demote_confirmed_above(99, 2).unwrap(), 3);
+        for t in &ids[..3] {
+            assert_eq!(status(&s, t), OwnTxStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn replacement_cascades_to_descendants() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let prev = OutPoint { txid: txid(50), vout: 0 };
+        let parent = tx_spending(prev, 1);
+        let child = tx_spending(out(&parent), 2);
+        let grandchild = tx_spending(out(&child), 3);
+        let bump = tx_spending(prev, 4);
+        let (tp, tc, tg, tb) = (
+            track_tx(&s, &parent),
+            track_tx(&s, &child),
+            track_tx(&s, &grandchild),
+            track_tx(&s, &bump),
+        );
+        s.mark_replaced(&tp, tb, 1).unwrap();
+        assert_eq!(status(&s, &tp), OwnTxStatus::Replaced { by: tb });
+        assert_eq!(status(&s, &tc), OwnTxStatus::Conflicted { by: tb });
+        assert_eq!(status(&s, &tg), OwnTxStatus::Conflicted { by: tb });
+        assert!(s.is_active(&tb));
+        // No block caused it, so no reorg undoes it.
+        assert_eq!(s.demote_confirmed_above(0, 2).unwrap(), 0);
     }
 
     #[test]

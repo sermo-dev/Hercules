@@ -17,9 +17,11 @@ use tempfile::TempDir;
 const OP_TRUE: u8 = 0x51;
 const VALIDATED: u32 = 200;
 
+/// A node in Tor mode (regular peers over Tor), without a real TorManager.
 fn fresh(dir: &TempDir) -> HeaderSync {
     let db = dir.path().join("headers.sqlite3");
-    let hs = HeaderSync::new(db.to_str().unwrap(), None).unwrap();
+    let mut hs = HeaderSync::new(db.to_str().unwrap(), None).unwrap();
+    hs.regular_peers_over_tor = true;
     hs.store.set_validated_height(VALIDATED).unwrap();
     hs
 }
@@ -165,30 +167,47 @@ fn not_synced_without_utxo_set() {
     ));
 }
 
+/// Regtest-difficulty headers for heights `from..=to` on top of `prev`;
+/// `salt` makes a competing branch.
+fn headers_on(mut prev: BlockHash, from: u32, to: u32, salt: u32) -> Vec<Header> {
+    (from..=to)
+        .map(|i| {
+            let h = Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_231_006_505 + i * 600 + salt,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207fffff),
+                nonce: i + salt,
+            };
+            prev = h.block_hash();
+            h
+        })
+        .collect()
+}
+
+/// Store headers 1..=`tip` on top of genesis.
+fn store_headers_to(hs: &HeaderSync, tip: u32) {
+    let headers = headers_on(genesis_header().block_hash(), 1, tip, 0);
+    hs.store.store_headers(&headers, 1).unwrap();
+}
+
+/// Read one message if the peer sends one within a short wait.
+fn try_read(server: &mut std::net::TcpStream) -> Option<NetworkMessage> {
+    server.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let mut b = [0u8; 1];
+    let got = server.peek(&mut b).map(|n| n > 0).unwrap_or(false);
+    server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    got.then(|| read_one_message(server))
+}
+
 #[test]
 fn coinbase_maturity_uses_validated_height_not_header_tip() {
     let dir = TempDir::new().unwrap();
     let hs = fresh(&dir);
     // Headers reach 300, the UTXO set only 150. A coinbase from height 100
     // is mature at the header tip (300) but not at validated height (150).
-    let headers: Vec<Header> = {
-        let mut prev = genesis_header().block_hash();
-        (1..=300u32)
-            .map(|i| {
-                let h = Header {
-                    version: bitcoin::block::Version::ONE,
-                    prev_blockhash: prev,
-                    merkle_root: bitcoin::TxMerkleNode::all_zeros(),
-                    time: 1_231_006_505 + i * 600,
-                    bits: bitcoin::pow::CompactTarget::from_consensus(0x207fffff),
-                    nonce: i,
-                };
-                prev = h.block_hash();
-                h
-            })
-            .collect()
-    };
-    hs.store.store_headers(&headers, 1).unwrap();
+    store_headers_to(&hs, 300);
     hs.store.set_validated_height(150).unwrap();
 
     let tx = spend(seed(&hs, 1, OP_TRUE, 100, true), 90_000);
@@ -367,4 +386,217 @@ fn private_broadcast_hook_replaces_peer_announcement() {
     let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
     assert_eq!(*rec.0.lock().unwrap(), vec![txid]);
     assert!(queued_own(&hs).is_empty(), "not announced on regular peers");
+}
+
+#[test]
+fn clearnet_without_transport_waits_for_private_broadcast() {
+    let dir = TempDir::new().unwrap();
+    let mut hs = fresh(&dir);
+    hs.regular_peers_over_tor = false;
+    let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+
+    // Accepted and tracked, but not announced on clearnet peers.
+    let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
+    assert!(queued_own(&hs).is_empty());
+    assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending);
+    hs.begin_own_tx_session();
+    assert!(queued_own(&hs).is_empty(), "rebroadcast waits too");
+
+    // Once someone else has put it on the network, announcing it on our
+    // clearnet peers no longer makes us the source.
+    hs.own_txs.record_seen(&txid, "5.6.7.8:8333", unix_now_u32() as u64).unwrap();
+    hs.rebroadcast_due_own_txs(unix_now_u32() as u64 + 2 * 24 * 3600);
+    assert_eq!(queued_own(&hs), vec![txid]);
+}
+
+#[test]
+fn announced_and_announcing_peers_are_not_reannounced_to() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    let mut pool = PeerPool::new_for_test();
+    let (p1, mut s1) = loopback_peer_pair();
+    let (p2, mut s2) = loopback_peer_pair();
+    let (a1, a2) = (p1.addr().to_string(), p2.addr().to_string());
+    assert!(pool.add_inbound_peer(p1));
+    assert!(pool.add_inbound_peer(p2));
+
+    let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
+    hs.drain_relay_queue(&pool);
+    for s in [&mut s1, &mut s2] {
+        assert!(matches!(read_one_message(s), NetworkMessage::Inv(_)));
+    }
+    {
+        let state = hs.relay_state.lock().unwrap();
+        for a in [&a1, &a2] {
+            assert!(state[a].known_txids.contains(&txid), "sent inv recorded for {}", a);
+            assert!(state[a].own_txids.contains(&txid));
+        }
+    }
+
+    // A rebroadcast goes only to peers that don't have it: a new peer.
+    let (p3, mut s3) = loopback_peer_pair();
+    assert!(pool.add_inbound_peer(p3));
+    hs.rebroadcast_due_own_txs(unix_now_u32() as u64 + crate::own_tx_store::REBROADCAST_MAX_SECS);
+    assert_eq!(queued_own(&hs), vec![txid]);
+    hs.drain_relay_queue(&pool);
+    assert!(matches!(read_one_message(&mut s3), NetworkMessage::Inv(_)));
+    assert!(try_read(&mut s1).is_none(), "p1 already knows it");
+    assert!(try_read(&mut s2).is_none(), "p2 already knows it");
+
+    // A peer announcing a tx we already have is recorded too.
+    let other = spend(seed(&hs, 2, OP_TRUE, 1, false), 90_000);
+    let other_id = other.compute_txid();
+    hs.handle_tx("9.9.9.9:8333", other).unwrap();
+    write_message(&mut s1, NetworkMessage::Inv(vec![Inventory::Transaction(other_id)]));
+    hs.service_peer_messages(&mut pool);
+    assert!(hs.relay_state.lock().unwrap()[&a1].known_txids.contains(&other_id));
+    assert!(try_read(&mut s1).is_none(), "no getdata for a tx we have");
+}
+
+#[test]
+fn pending_own_tx_is_hidden_from_mempool_and_unsolicited_getdata() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let mut pool = PeerPool::new_for_test();
+    let (peer, mut server) = loopback_peer_pair();
+    let addr = peer.addr().to_string();
+    assert!(pool.add_inbound_peer(peer));
+
+    let relayed = spend(seed(&hs, 2, OP_TRUE, 1, false), 90_000);
+    hs.handle_tx("9.9.9.9:8333", relayed.clone()).unwrap();
+    let own = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    let txid = hs.submit_own_tx(&raw(&own)).unwrap().txid;
+    // Not drained: this peer has not been told about it.
+
+    write_message(&mut server, NetworkMessage::MemPool);
+    hs.service_peer_messages(&mut pool);
+    match read_one_message(&mut server) {
+        NetworkMessage::Inv(inv) => {
+            assert_eq!(inv, vec![Inventory::Transaction(relayed.compute_txid())])
+        }
+        other => panic!("expected inv, got {}", msg_name(&other)),
+    }
+
+    write_message(&mut server, NetworkMessage::GetData(vec![Inventory::WitnessTransaction(txid)]));
+    hs.service_peer_messages(&mut pool);
+    assert!(matches!(read_one_message(&mut server), NetworkMessage::NotFound(_)));
+
+    // Propagated (someone else announced it): listed in `mempool`, which
+    // counts as announcing it to this peer, so it may now fetch it.
+    hs.own_txs.record_seen(&txid, "5.6.7.8:8333", unix_now_u32() as u64).unwrap();
+    assert!(!hs.peer_knows_own_tx(&addr, &txid));
+    write_message(&mut server, NetworkMessage::MemPool);
+    hs.service_peer_messages(&mut pool);
+    match read_one_message(&mut server) {
+        NetworkMessage::Inv(inv) => assert_eq!(inv.len(), 2),
+        other => panic!("expected inv, got {}", msg_name(&other)),
+    }
+    assert!(hs.peer_knows_own_tx(&addr, &txid));
+    write_message(&mut server, NetworkMessage::GetData(vec![Inventory::WitnessTransaction(txid)]));
+    hs.service_peer_messages(&mut pool);
+    assert!(matches!(read_one_message(&mut server), NetworkMessage::Tx(_)));
+}
+
+#[test]
+fn expiry_waits_until_utxo_set_catches_up() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    store_headers_to(&hs, 300);
+    hs.store.set_validated_height(150).unwrap();
+    let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
+
+    // Long past expiry, but blocks 151..300 may confirm it.
+    let later = unix_now_u32() as u64 + crate::own_tx_store::PENDING_EXPIRY_SECS + 10;
+    hs.rebroadcast_due_own_txs(later);
+    assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending);
+
+    hs.store.set_validated_height(300).unwrap();
+    hs.rebroadcast_due_own_txs(later);
+    assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Expired);
+}
+
+#[test]
+fn replaced_original_confirming_conflicts_the_replacement() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let prev = seed(&hs, 1, OP_TRUE, 1, false);
+    let a_tx = spend(prev, 95_000);
+    let a = hs.submit_own_tx(&raw(&a_tx)).unwrap().txid;
+    let b = hs.submit_own_tx(&raw(&spend(prev, 90_000))).unwrap().txid;
+    assert_eq!(hs.own_tx_status(&a).unwrap().unwrap().status, OwnTxStatus::Replaced { by: b });
+
+    hs.on_block_connected(&block_with(vec![a_tx]), VALIDATED + 1);
+    assert_eq!(
+        hs.own_tx_status(&a).unwrap().unwrap().status,
+        OwnTxStatus::Confirmed { height: VALIDATED + 1 }
+    );
+    assert_eq!(hs.own_tx_status(&b).unwrap().unwrap().status, OwnTxStatus::Conflicted { by: a });
+    assert!(!hs.own_txs.is_active(&b));
+}
+
+#[test]
+fn open_undoes_settlements_above_validated_height() {
+    // Crash after a block hook ran (or mid-reorg) but before the validated
+    // height moved: on reopen the tx is unsettled, ready to be settled
+    // again when the block is re-applied.
+    let dir = TempDir::new().unwrap();
+    let tx = {
+        let hs = fresh(&dir);
+        let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+        hs.submit_own_tx(&raw(&tx)).unwrap();
+        hs.on_block_connected(&block_with(vec![tx.clone()]), VALIDATED + 1);
+        // ...crash here, before set_validated_height(VALIDATED + 1).
+        tx
+    };
+    let txid = tx.compute_txid();
+    let hs = fresh(&dir);
+    assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending);
+    // Re-applying the block (crash-recovery path) settles it again.
+    hs.on_block_connected(&block_with(vec![tx]), VALIDATED + 1);
+    hs.store.set_validated_height(VALIDATED + 1).unwrap();
+    drop(hs);
+    // Opened with the validated height caught up: left alone.
+    let hs = fresh(&dir);
+    assert_eq!(
+        hs.own_tx_status(&txid).unwrap().unwrap().status,
+        OwnTxStatus::Confirmed { height: VALIDATED + 1 }
+    );
+}
+
+#[test]
+fn reorg_path_unsettles_and_rebroadcasts_own_tx() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    store_headers_to(&hs, VALIDATED + 1);
+    let prev = seed(&hs, 1, OP_TRUE, 1, false);
+    let tx = spend(prev, 90_000);
+    let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
+
+    // Block VALIDATED+1 confirms it, through the same steps the sync loop
+    // takes (UTXO apply, block hook, validated height).
+    let block = block_with(vec![tx]);
+    hs.utxo.apply_block(&block, VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block, VALIDATED + 1);
+    hs.store.set_validated_height(VALIDATED + 1).unwrap();
+    assert_eq!(
+        hs.own_tx_status(&txid).unwrap().unwrap().status,
+        OwnTxStatus::Confirmed { height: VALIDATED + 1 }
+    );
+    assert!(hs.utxo.get(&prev.txid, prev.vout).unwrap().is_none());
+
+    // A heavier branch from VALIDATED replaces that block.
+    let fork_hash = hs.store.get_hash_at_height(VALIDATED).unwrap().unwrap();
+    let branch = headers_on(fork_hash, VALIDATED + 1, VALIDATED + 2, 7);
+    let (new_tip, new_validated) = hs.apply_reorg(VALIDATED, &branch).unwrap();
+    assert_eq!((new_tip, new_validated), (VALIDATED + 2, VALIDATED));
+    assert!(hs.utxo.get(&prev.txid, prev.vout).unwrap().is_some(), "input unspent again");
+    assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending);
+
+    // The next rebroadcast puts it back in the mempool and announces it.
+    hs.relay_queue.lock().unwrap().clear();
+    hs.rebroadcast_due_own_txs(unix_now_u32() as u64);
+    assert!(hs.mempool.lock().unwrap().contains(&txid));
+    assert_eq!(queued_own(&hs), vec![txid]);
 }

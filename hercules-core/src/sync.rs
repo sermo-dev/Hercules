@@ -306,10 +306,18 @@ pub struct TrustInfo {
 
 /// Sync block headers and validate full blocks from the Bitcoin P2P network.
 /// Per-peer relay state tracking.
+#[derive(Default)]
 struct PeerRelayState {
     wants_sendheaders: bool,
     feefilter_rate: u64, // sat/kvB from BIP 133
     known_txids: HashSet<Txid>,
+    /// Own transactions (033) this peer is known to have: we announced
+    /// them to it, or it announced them to us. Separate from the bounded,
+    /// coarse-reset `known_txids` because it gates what we serve: a
+    /// `getdata` for an own tx is answered only for peers in this set, and
+    /// rebroadcasts skip them. Holds only tracked own txids, so it is as
+    /// small as the own-tx tracker.
+    own_txids: HashSet<Txid>,
     /// Bitcoin Core caps GetAddr responses to one per connection — repeated
     /// requests are scrapers we should ignore. We mirror that behavior.
     getaddr_responded: bool,
@@ -421,6 +429,12 @@ pub struct HeaderSync {
     validation_paused: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
     tor: Option<Arc<TorManager>>,
+    /// True when our regular peer connections go over Tor (`tor` is set).
+    /// Without Tor they are clearnet, and an own tx announced on them
+    /// first ties it to our IP, so it waits for the 029 private-broadcast
+    /// transport instead. Its own field so tests can run "Tor mode"
+    /// without a `TorManager`.
+    regular_peers_over_tor: bool,
     /// Per-peer relay metadata (keyed by peer address).
     relay_state: Mutex<HashMap<String, PeerRelayState>>,
     /// Queue of transactions waiting to be relayed with Poisson delay.
@@ -535,6 +549,27 @@ impl HeaderSync {
             );
         }
 
+        // Ticket 033: a crash between a block hook (or a reorg's rollback)
+        // and the matching validated-height update can leave own txs
+        // settled by blocks we no longer count as validated. Undo those;
+        // re-applying the block settles them again (on_block is
+        // idempotent, and the crash-recovery path re-runs it). Every path
+        // runs the hook after the UTXO apply and before
+        // `set_validated_height`, so once no block is mid-apply (true here,
+        // before any sync starts) a settled row with status_height above
+        // validated_height can only be such a leftover. Not repeated at
+        // session start: a push-wake `validate_latest_block` could be
+        // mid-apply then. Skipped with no UTXO set (height 0): there is
+        // nothing to re-validate against.
+        let validated = store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if validated > 0 {
+            own_txs
+                .demote_confirmed_above(validated, unix_now_u32() as u64)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        }
+
         if tor.is_some() {
             info!("HeaderSync: Tor enabled — all connections routed through Tor");
         }
@@ -547,6 +582,7 @@ impl HeaderSync {
             mempool: Mutex::new(Mempool::new()),
             validation_paused: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            regular_peers_over_tor: tor.is_some(),
             tor,
             relay_state: Mutex::new(HashMap::new()),
             relay_queue: Mutex::new(Vec::new()),
@@ -1030,6 +1066,11 @@ impl HeaderSync {
     /// Send an own transaction out now: via the 029 private-broadcast
     /// transport if installed, else an immediate `inv` to every peer on
     /// the next monitor-loop tick (`from_peer: None`, no Poisson delay).
+    ///
+    /// Without the transport and without Tor, our regular peers are
+    /// clearnet: a pending tx is not announced on them (it would tie the
+    /// tx to our IP) and waits for 029. A propagated one is: the network
+    /// already has it from someone else, so we are not first.
     fn announce_own_tx(&self, txid: Txid, tx: &bitcoin::Transaction, now: u64) {
         let private = self.private_broadcast.lock().unwrap().clone();
         if let Some(pb) = private {
@@ -1039,6 +1080,14 @@ impl HeaderSync {
                 // fall back to our regular connections silently (029).
                 Err(e) => warn!("Own tx {} private broadcast failed: {}", txid, e),
             }
+        } else if !self.regular_peers_over_tor && self.own_txs.is_pending(&txid) {
+            // Stays pending; record_sent below pushes the retry back so
+            // this doesn't repeat every tick.
+            warn!(
+                "Own tx {} not announced: peers are clearnet; waiting for the \
+                 private-broadcast transport (ticket 029)",
+                txid
+            );
         } else {
             let mut queue = self.relay_queue.lock().unwrap();
             if !queue.iter().any(|e| e.txid == txid && e.from_peer.is_none()) {
@@ -1078,21 +1127,67 @@ impl HeaderSync {
             .map_err(|e| SyncError::Store(format!("{}", e)))
     }
 
-    /// Start of a foreground sync session: put active own transactions
-    /// back in the (in-memory) mempool and make them all due for
-    /// rebroadcast, whatever their backoff.
+    /// Start of a foreground sync session: put every active own
+    /// transaction back in the (in-memory) mempool, and make the pending
+    /// ones due for rebroadcast whatever their backoff. Propagated ones
+    /// keep their 12–36h schedule (see `OwnTxStore::make_all_due`).
     fn begin_own_tx_session(&self) {
         let now = unix_now_u32() as u64;
         let _ = self.own_txs.make_all_due(now);
+        if let Ok(active) = self.own_txs.active_records() {
+            let validated_height = self.store.validated_height().unwrap_or(0);
+            for rec in active {
+                self.readd_own_tx(&rec, validated_height, now);
+            }
+        }
         self.rebroadcast_due_own_txs(now);
     }
 
+    /// Ensure an own tx is in the mempool, re-adding it if needed (app
+    /// restart, eviction, reorg). An accepted re-add that evicts other own
+    /// txs settles them as replaced, as `submit_own_tx` would: after a
+    /// reorg demotes both an RBF original and its replacement, the second
+    /// re-add wins the RBF race again. Returns whether it is in the pool.
+    fn readd_own_tx(
+        &self,
+        rec: &crate::own_tx_store::OwnTxRecord,
+        validated_height: u32,
+        now: u64,
+    ) -> bool {
+        let Some(tx) = rec.tx() else { return false };
+        let replaced = {
+            let mut pool = self.mempool.lock().unwrap();
+            if pool.contains(&rec.txid) {
+                return true;
+            }
+            let conflicts = pool.conflicting_txids(&tx);
+            match pool.accept_own_tx(tx, &self.utxo, validated_height) {
+                Ok(_) => conflicts,
+                Err(e) => {
+                    // Inputs not validated yet, or a conflict that a block
+                    // will settle: retry on schedule.
+                    debug!("own tx {} not re-added to mempool: {}", rec.txid, e);
+                    return false;
+                }
+            }
+        };
+        for c in &replaced {
+            let _ = self.own_txs.mark_replaced(c, rec.txid, now);
+        }
+        true
+    }
+
     /// Re-announce own transactions whose rebroadcast is due, re-adding
-    /// them to the mempool first if needed (app restart, eviction, reorg).
-    /// Called at session start and from the monitor loop's maintenance
-    /// tick.
+    /// them to the mempool first if needed. Called at session start and
+    /// from the monitor loop's maintenance tick.
     fn rebroadcast_due_own_txs(&self, now: u64) {
-        let _ = self.own_txs.expire(now);
+        let validated_height = self.store.validated_height().unwrap_or(0);
+        // Expire only when caught up: while the UTXO set lags the headers,
+        // an "unconfirmed" own tx may sit in a block we haven't validated.
+        let tip_height = self.store.tip().ok().flatten().map(|(h, _, _)| h).unwrap_or(0);
+        if validated_height >= tip_height {
+            let _ = self.own_txs.expire(now);
+        }
         let due = match self.own_txs.due(now) {
             Ok(d) => d,
             Err(e) => {
@@ -1100,32 +1195,81 @@ impl HeaderSync {
                 return;
             }
         };
-        if due.is_empty() {
-            return;
-        }
-        let validated_height = self.store.validated_height().unwrap_or(0);
         for rec in due {
+            // An earlier re-add in this loop may have replaced it.
+            if !self.own_txs.is_active(&rec.txid) {
+                continue;
+            }
             let Some(tx) = rec.tx() else { continue };
-            let in_pool = {
-                let mut pool = self.mempool.lock().unwrap();
-                pool.contains(&rec.txid)
-                    || match pool.accept_own_tx(tx.clone(), &self.utxo, validated_height) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            // Inputs not validated yet, or a conflict that
-                            // a block will settle: retry on schedule.
-                            debug!("own tx {} not re-added to mempool: {}", rec.txid, e);
-                            false
-                        }
-                    }
-            };
-            if in_pool {
+            if self.readd_own_tx(&rec, validated_height, now) {
                 self.announce_own_tx(rec.txid, &tx, now);
             } else {
                 // Push the schedule back so we don't retry every tick.
                 let _ = self.own_txs.record_sent(&rec.txid, now);
             }
         }
+    }
+
+    /// Destructive half of a reorg, run once the new chain's headers are
+    /// validated against the fork point: roll the UTXO set back to
+    /// `fork_at`, replace the headers above it with `new_headers`, clear
+    /// the mempool, and unsettle own txs confirmed or conflicted above the
+    /// fork. Returns `(new_tip, new_validated)`.
+    fn apply_reorg(&self, fork_at: u32, new_headers: &[Header]) -> Result<(u32, u32), SyncError> {
+        let current_validated = self
+            .store
+            .validated_height()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        // Roll back UTXO set for validated blocks above fork point
+        if current_validated > fork_at {
+            for h in (fork_at + 1..=current_validated).rev() {
+                self.utxo
+                    .rollback_block(h)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            }
+            info!("Rolled back UTXO set from {} to {}", current_validated, fork_at);
+        }
+
+        // Delete headers above fork point
+        self.store
+            .delete_headers_above(fork_at)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        // Reset validated height
+        let new_validated = std::cmp::min(current_validated, fork_at);
+        self.store
+            .set_validated_height(new_validated)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        // Step 4: Store the validated new chain headers.
+        self.store
+            .store_headers(new_headers, fork_at + 1)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        let new_tip = fork_at + new_headers.len() as u32;
+
+        // Clear the mempool — transactions may reference UTXOs that no
+        // longer exist on the new chain.
+        {
+            let mut mempool = self.mempool.lock().unwrap();
+            let count = mempool.count();
+            if count > 0 {
+                // Remove all transactions since UTXO state changed
+                let txids: Vec<_> = mempool.get_all_txids();
+                for txid in &txids {
+                    mempool.remove_tx(txid);
+                }
+                info!("Reorg: cleared {} transactions from mempool", count);
+            }
+        }
+        // Own txs confirmed or conflicted above the fork are unsettled
+        // again; rebroadcast re-adds them.
+        let _ = self
+            .own_txs
+            .demote_confirmed_above(fork_at, unix_now_u32() as u64);
+
+        Ok((new_tip, new_validated))
     }
 
     /// Block-connect hook shared by every path that applies a block:
@@ -1624,6 +1768,9 @@ impl HeaderSync {
                             "Block {} already applied (crash recovery), advancing validated height",
                             next_height
                         );
+                        // The block hook may not have run (or was undone
+                        // at open, see HeaderSync::new); it is idempotent.
+                        self.on_block_connected(&block, next_height);
                         self.store
                             .set_validated_height(next_height)
                             .map_err(|e| SyncError::Store(format!("{}", e)))?;
@@ -2045,65 +2192,10 @@ impl HeaderSync {
                             continue;
                         }
 
-                        // Step 3: Validation passed — now perform the
-                        // destructive rollback.
-                        let current_validated = self
-                            .store
-                            .validated_height()
-                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-                        // Roll back UTXO set for validated blocks above fork point
-                        if current_validated > fork_at {
-                            for h in (fork_at + 1..=current_validated).rev() {
-                                self.utxo
-                                    .rollback_block(h)
-                                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
-                            }
-                            info!(
-                                "Rolled back UTXO set from {} to {}",
-                                current_validated, fork_at
-                            );
-                        }
-
-                        // Delete headers above fork point
-                        self.store
-                            .delete_headers_above(fork_at)
-                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-                        // Reset validated height
-                        let new_validated =
-                            std::cmp::min(current_validated, fork_at);
-                        self.store
-                            .set_validated_height(new_validated)
-                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-                        // Step 4: Store the validated new chain headers.
-                        self.store
-                            .store_headers(new_headers, fork_at + 1)
-                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-                        let new_tip = fork_at + new_headers.len() as u32;
+                        // Steps 3-4: Validation passed — now perform the
+                        // destructive rollback and store the new headers.
+                        let (new_tip, new_validated) = self.apply_reorg(fork_at, new_headers)?;
                         peer_height = std::cmp::max(peer_height, new_tip);
-
-                        // Clear the mempool — transactions may reference UTXOs
-                        // that no longer exist on the new chain.
-                        {
-                            let mut mempool = self.mempool.lock().unwrap();
-                            let count = mempool.count();
-                            if count > 0 {
-                                // Remove all transactions since UTXO state changed
-                                let txids: Vec<_> = mempool.get_all_txids();
-                                for txid in &txids {
-                                    mempool.remove_tx(txid);
-                                }
-                                info!("Reorg: cleared {} transactions from mempool", count);
-                            }
-                        }
-                        // Own txs confirmed or conflicted above the fork
-                        // are unsettled again; rebroadcast re-adds them.
-                        let _ = self
-                            .own_txs
-                            .demote_confirmed_above(fork_at, unix_now_u32() as u64);
 
                         info!(
                             "Reorg complete: new tip at height {} ({} new headers)",
@@ -2257,6 +2349,7 @@ impl HeaderSync {
                         wants_sendheaders: false,
                         feefilter_rate: 0,
                         known_txids: HashSet::new(),
+                        own_txids: HashSet::new(),
                         getaddr_responded: false,
                     })
                     .wants_sendheaders = true;
@@ -2272,6 +2365,7 @@ impl HeaderSync {
                         wants_sendheaders: false,
                         feefilter_rate: 0,
                         known_txids: HashSet::new(),
+                        own_txids: HashSet::new(),
                         getaddr_responded: false,
                     })
                     .feefilter_rate = clamped;
@@ -2279,11 +2373,23 @@ impl HeaderSync {
 
             NetworkMessage::MemPool => {
                 let txids = self.mempool.lock().unwrap().get_all_txids();
+                // Own txs no peer has announced back yet stay out: listing
+                // them would reveal us as their source (and, in clearnet
+                // mode, leak them before 029 sends them).
+                let txids: Vec<Txid> = txids
+                    .into_iter()
+                    .filter(|txid| !self.own_txs.is_pending(txid))
+                    .collect();
                 if !txids.is_empty() {
-                    let inv: Vec<Inventory> = txids
-                        .into_iter()
-                        .map(|txid| Inventory::Transaction(txid))
-                        .collect();
+                    // Listed own (propagated) txs count as announced to
+                    // this peer, so it may fetch them.
+                    let own: Vec<Txid> =
+                        txids.iter().copied().filter(|t| self.own_txs.is_active(t)).collect();
+                    if !own.is_empty() {
+                        let mut state = self.relay_state.lock().unwrap();
+                        state.entry(addr.to_string()).or_default().own_txids.extend(own);
+                    }
+                    let inv: Vec<Inventory> = txids.into_iter().map(Inventory::Transaction).collect();
                     peer.send_inv(inv).map_err(|e| format!("mempool inv: {}", e))?;
                 }
             }
@@ -2301,6 +2407,7 @@ impl HeaderSync {
                             wants_sendheaders: false,
                             feefilter_rate: 0,
                             known_txids: HashSet::new(),
+                            own_txids: HashSet::new(),
                             getaddr_responded: false,
                         });
                     if entry.getaddr_responded {
@@ -2456,7 +2563,7 @@ impl HeaderSync {
     /// Handle a getdata request — serve blocks or transactions.
     fn handle_getdata(
         &self,
-        _addr: &str,
+        addr: &str,
         inv_list: &[Inventory],
         peer: &mut crate::p2p::Peer,
     ) -> Result<(), String> {
@@ -2482,6 +2589,13 @@ impl HeaderSync {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                    // An own tx is served only to a peer we announced it
+                    // to or that announced it to us; anyone else asking
+                    // is probing whether we have it (i.e. are its source).
+                    if self.own_txs.is_active(txid) && !self.peer_knows_own_tx(addr, txid) {
+                        not_found.push(*item);
+                        continue;
+                    }
                     let mempool = self.mempool.lock().unwrap();
                     if let Some(tx) = mempool.get(txid) {
                         let tx_clone = tx.clone();
@@ -2530,26 +2644,28 @@ impl HeaderSync {
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    if self.own_txs.is_active(txid) {
+                    let own = self.own_txs.is_active(txid);
+                    if own {
                         // A peer announcing our own tx back: it propagated.
-                        let _ = self.own_txs.record_seen(txid, unix_now_u32() as u64);
+                        // Deduped per (peer, txid) in the store.
+                        let _ = self.own_txs.record_seen(txid, addr, unix_now_u32() as u64);
                     }
-                    if !self.mempool.lock().unwrap().contains(txid) {
-                        // Record that this peer knows about this tx. The
+                    {
+                        // Record that this peer knows about this tx, even
+                        // if we already have it, so we never announce it
+                        // back (an own-tx rebroadcast to a peer that told
+                        // us about it would mark us as the source). The
                         // helper enforces MAX_KNOWN_TXIDS_PER_PEER on every
                         // insert so a malicious INV burst can't grow this
                         // set arbitrarily between maintenance ticks.
                         let mut state = self.relay_state.lock().unwrap();
-                        let entry = state
-                            .entry(addr.to_string())
-                            .or_insert_with(|| PeerRelayState {
-                                wants_sendheaders: false,
-                                feefilter_rate: 0,
-                                known_txids: HashSet::new(),
-                                getaddr_responded: false,
-                            });
+                        let entry = state.entry(addr.to_string()).or_default();
                         record_known_txid(entry, *txid);
-
+                        if own {
+                            entry.own_txids.insert(*txid);
+                        }
+                    }
+                    if !self.mempool.lock().unwrap().contains(txid) {
                         // Request with witness data for segwit transactions
                         request.push(Inventory::WitnessTransaction(*txid));
                     }
@@ -2652,12 +2768,15 @@ impl HeaderSync {
         }
 
         // Snapshot the state we need, then release locks before I/O
-        let relay_snapshot: HashMap<String, (HashSet<Txid>, u64)> = {
+        let relay_snapshot: HashMap<String, (HashSet<Txid>, HashSet<Txid>, u64)> = {
             let state = self.relay_state.lock().unwrap();
             state
                 .iter()
                 .map(|(addr, rs)| {
-                    (addr.clone(), (rs.known_txids.clone(), rs.feefilter_rate))
+                    (
+                        addr.clone(),
+                        (rs.known_txids.clone(), rs.own_txids.clone(), rs.feefilter_rate),
+                    )
                 })
                 .collect()
         };
@@ -2672,8 +2791,14 @@ impl HeaderSync {
                 })
                 .collect()
         };
+        let own: HashSet<Txid> = ready
+            .iter()
+            .map(|(txid, _)| *txid)
+            .filter(|txid| self.own_txs.is_active(txid))
+            .collect();
         // All locks released — safe to do network I/O now
 
+        let mut sent: Vec<(String, Txid)> = Vec::new();
         for ((txid, from_peer), (_, fee_rate_satkvb)) in ready.iter().zip(fee_rates.iter()) {
             let inv = vec![Inventory::Transaction(*txid)];
 
@@ -2682,9 +2807,10 @@ impl HeaderSync {
                 if from_peer.as_deref() == Some(addr) {
                     return Ok(());
                 }
-                if let Some((known, feefilter)) = relay_snapshot.get(addr) {
-                    // Skip if peer already knows about this tx
-                    if known.contains(txid) {
+                if let Some((known, own_known, feefilter)) = relay_snapshot.get(addr) {
+                    // Skip if peer already knows about this tx (so an own
+                    // tx rebroadcast only reaches peers that lack it)
+                    if known.contains(txid) || own_known.contains(txid) {
                         return Ok(());
                     }
                     // BIP 133: skip if tx fee rate is below peer's feefilter
@@ -2693,11 +2819,35 @@ impl HeaderSync {
                     }
                 }
                 peer.send_inv(inv.clone()).map_err(|e| format!("relay inv: {}", e))?;
+                sent.push((addr.to_string(), *txid));
                 Ok(())
             });
 
             self.stats.lock().unwrap().txs_relayed += 1;
         }
+
+        // The peers we just told now know these txs: don't tell them again
+        // (rebroadcasts), and allow them to fetch our own ones.
+        if !sent.is_empty() {
+            let mut state = self.relay_state.lock().unwrap();
+            for (addr, txid) in sent {
+                let entry = state.entry(addr).or_default();
+                record_known_txid(entry, txid);
+                if own.contains(&txid) {
+                    entry.own_txids.insert(txid);
+                }
+            }
+        }
+    }
+
+    /// True if `addr` is known to have own tx `txid` (we announced it to
+    /// the peer, or it announced it to us).
+    fn peer_knows_own_tx(&self, addr: &str, txid: &Txid) -> bool {
+        self.relay_state
+            .lock()
+            .unwrap()
+            .get(addr)
+            .is_some_and(|s| s.own_txids.contains(txid))
     }
 
     /// downloads and validates the latest block — all within `timeout_secs`.
@@ -3150,6 +3300,9 @@ impl HeaderSync {
                     "catch_up_blocks: block {} already applied (crash recovery)",
                     next_height
                 );
+                // The block hook may not have run (or was undone at open,
+                // see HeaderSync::new); it is idempotent.
+                self.on_block_connected(&block, next_height);
                 self.store
                     .set_validated_height(next_height)
                     .map_err(|e| SyncError::Store(format!("{}", e)))?;
@@ -3629,6 +3782,7 @@ mod tests {
             wants_sendheaders: false,
             feefilter_rate: 0,
             known_txids: HashSet::new(),
+            own_txids: HashSet::new(),
             getaddr_responded: false,
         }
     }

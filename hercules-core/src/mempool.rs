@@ -1371,8 +1371,51 @@ fn is_network_standard_script(spk: &bitcoin::Script) -> bool {
         || spk.is_p2sh()
         || spk.is_witness_program()
         || spk.is_p2pk()
-        || spk.is_multisig()
+        || is_standard_bare_multisig(spk)
         || spk.is_op_return()
+}
+
+/// Bare multisig as Bitcoin Core's `Solver` + `IsStandard` accept it:
+/// `OP_m <key>... OP_n OP_CHECKMULTISIG` with 1 <= m <= n <= 3, where each
+/// key push is a well-sized pubkey (33 bytes with an 0x02/0x03 prefix, or
+/// 65 bytes with 0x04, or the hybrid 0x06/0x07 that `CPubKey::ValidSize`
+/// also admits). `Script::is_multisig` is looser (any n up to 20, any key
+/// bytes), and peers would refuse to relay those.
+fn is_standard_bare_multisig(spk: &bitcoin::Script) -> bool {
+    use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1, OP_PUSHNUM_3};
+    use bitcoin::script::Instruction;
+
+    let small_int = |ins: &Instruction| match ins {
+        Instruction::Op(op)
+            if op.to_u8() >= OP_PUSHNUM_1.to_u8() && op.to_u8() <= OP_PUSHNUM_3.to_u8() =>
+        {
+            Some((op.to_u8() - OP_PUSHNUM_1.to_u8() + 1) as usize)
+        }
+        _ => None,
+    };
+    let Ok(ins) = spk.instructions().collect::<Result<Vec<_>, _>>() else {
+        return false;
+    };
+    // m, at least one key, n, OP_CHECKMULTISIG.
+    if ins.len() < 4 || ins.last() != Some(&Instruction::Op(OP_CHECKMULTISIG)) {
+        return false;
+    }
+    let (Some(m), Some(n)) = (small_int(&ins[0]), small_int(&ins[ins.len() - 2])) else {
+        return false;
+    };
+    let keys = &ins[1..ins.len() - 2];
+    let valid_key = |ins: &Instruction| match ins {
+        Instruction::PushBytes(b) => {
+            let b = b.as_bytes();
+            match b.first() {
+                Some(0x02) | Some(0x03) => b.len() == 33,
+                Some(0x04) | Some(0x06) | Some(0x07) => b.len() == 65,
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    m <= n && keys.len() == n && keys.iter().all(valid_key)
 }
 
 /// Errors from mempool transaction validation.
@@ -1542,6 +1585,50 @@ impl std::error::Error for MempoolError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_multisig_standardness_matches_core() {
+        use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1, OP_PUSHNUM_2, OP_PUSHNUM_3, OP_PUSHNUM_4};
+        use bitcoin::opcodes::Opcode;
+        use bitcoin::script::{Builder, PushBytesBuf};
+        let key = |prefix: u8, len: usize| {
+            let mut k = vec![0x11u8; len];
+            k[0] = prefix;
+            PushBytesBuf::try_from(k).unwrap()
+        };
+        let ms = |m: Opcode, keys: Vec<PushBytesBuf>, n: Opcode| {
+            let mut b = Builder::new().push_opcode(m);
+            for k in keys {
+                b = b.push_slice(k);
+            }
+            b.push_opcode(n).push_opcode(OP_CHECKMULTISIG).into_script()
+        };
+        let c = || key(0x02, 33);
+        let ok = |s: &bitcoin::Script| is_network_standard_script(s);
+
+        assert!(ok(&ms(OP_PUSHNUM_1, vec![c()], OP_PUSHNUM_1)));
+        assert!(ok(&ms(OP_PUSHNUM_2, vec![c(), key(0x03, 33), key(0x04, 65)], OP_PUSHNUM_3)));
+        assert!(ok(&ms(OP_PUSHNUM_1, vec![key(0x06, 65), key(0x07, 65)], OP_PUSHNUM_2)));
+        // n > 3.
+        assert!(!ok(&ms(OP_PUSHNUM_1, vec![c(), c(), c(), c()], OP_PUSHNUM_4)));
+        // m > n.
+        assert!(!ok(&ms(OP_PUSHNUM_3, vec![c(), c()], OP_PUSHNUM_2)));
+        // Key count disagrees with n.
+        assert!(!ok(&ms(OP_PUSHNUM_1, vec![c(), c()], OP_PUSHNUM_3)));
+        // Key pushes that aren't pubkeys (data-carrying "multisig").
+        assert!(!ok(&ms(OP_PUSHNUM_1, vec![key(0x02, 65)], OP_PUSHNUM_1)));
+        assert!(!ok(&ms(OP_PUSHNUM_1, vec![key(0x04, 33)], OP_PUSHNUM_1)));
+        assert!(!ok(&ms(OP_PUSHNUM_1, vec![key(0x05, 33)], OP_PUSHNUM_1)));
+        assert!(!ok(&ms(OP_PUSHNUM_1, vec![key(0x02, 32)], OP_PUSHNUM_1)));
+        // m = 0.
+        let zero = Builder::new()
+            .push_int(0)
+            .push_slice(c())
+            .push_opcode(OP_PUSHNUM_1)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert!(!ok(&zero));
+    }
     use bitcoin::hashes::Hash;
 
     #[test]
