@@ -13,10 +13,17 @@ pub struct HeaderStore {
     conn: Mutex<Connection>,
 }
 
+/// How long a SQLite write waits on another connection's lock before
+/// failing with `SQLITE_BUSY` (ticket 028). One node per process means
+/// there is normally no other connection; this is defense in depth.
+pub(crate) const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl HeaderStore {
     /// Open or create a header store at the given path.
     pub fn open(path: &str) -> Result<HeaderStore, StoreError> {
         let conn = Connection::open(path).map_err(|e| StoreError(format!("open: {}", e)))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|e| StoreError(format!("set busy_timeout: {}", e)))?;
 
         // Set WAL journal mode before any writes so that table creation
         // also benefits from WAL's crash-recovery semantics.

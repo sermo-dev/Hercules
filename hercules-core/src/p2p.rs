@@ -554,10 +554,25 @@ impl Peer {
     /// Request a full block by hash. Uses WitnessBlock inventory type
     /// to ensure segwit witness data is included.
     pub fn get_block(&mut self, block_hash: BlockHash) -> Result<Block, PeerError> {
+        self.get_block_within(block_hash, None)
+    }
+
+    /// `get_block` with the read timeout clamped to `limit` (ticket 028):
+    /// a wake passes the time left in its budget so one slow peer can't
+    /// hold the request past the iOS window. Clamped to at least 1 s.
+    pub fn get_block_within(
+        &mut self,
+        block_hash: BlockHash,
+        limit: Option<Duration>,
+    ) -> Result<Block, PeerError> {
         // Use longer timeout for block downloads (blocks can be up to ~4MB)
         let download_timeout = match &self.stream {
             PeerStream::Direct(_) => BLOCK_DOWNLOAD_TIMEOUT,
             PeerStream::Tor(_) => TOR_BLOCK_DOWNLOAD_TIMEOUT,
+        };
+        let download_timeout = match limit {
+            Some(l) => download_timeout.min(l.max(Duration::from_secs(1))),
+            None => download_timeout,
         };
         let normal_timeout = match &self.stream {
             PeerStream::Direct(_) => READ_TIMEOUT,
