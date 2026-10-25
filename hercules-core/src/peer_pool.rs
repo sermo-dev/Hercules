@@ -1271,6 +1271,33 @@ impl PeerPool {
             .map(|s| s.height)
     }
 
+    /// Lift a ban (in memory and on disk), e.g. once the invalid block it
+    /// was banned for is reconsidered (ticket 024).
+    pub fn unban_peer(&mut self, addr: &str) {
+        self.bans.remove(addr);
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.delete_ban(addr) {
+                warn!("PeerPool: failed to drop ban for {}: {}", addr, e);
+            }
+        }
+    }
+
+    /// Disconnect a peer without banning it, and make it less attractive
+    /// next time: apply `penalty`, persist the resulting score (it is
+    /// restored on reconnect), and put its address into retry backoff so
+    /// `maintain` doesn't reconnect it straight away. For peers that relay
+    /// something bad they probably didn't originate (ticket 024).
+    pub fn disconnect_and_deprioritize(&mut self, addr: &str, penalty: u32) {
+        self.misbehaving(addr, penalty);
+        if let (Some(store), Some(score)) = (self.store.as_ref(), self.get_score(addr)) {
+            if let Err(e) = store.save_score(addr, score) {
+                warn!("PeerPool: failed to persist score for {}: {}", addr, e);
+            }
+        }
+        self.addrs.record_failure(addr);
+        self.remove_peer(addr);
+    }
+
     /// Cap a peer's claimed height at `height`, e.g. once it has shown it has
     /// no headers beyond our tip despite claiming more at handshake. Lowers
     /// its weight in `best_peer`; never raises the claim.

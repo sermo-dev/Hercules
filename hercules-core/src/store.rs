@@ -36,14 +36,33 @@ impl HeaderStore {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS failed_blocks (
-                hash BLOB PRIMARY KEY,
-                height INTEGER NOT NULL,
-                reason TEXT NOT NULL
-            );
 ",
         )
         .map_err(|e| StoreError(format!("create tables: {}", e)))?;
+
+        // Ticket 024's failed-block tables. A development build briefly
+        // created `failed_blocks` without the `rules` column; such rows have
+        // no known rules version, so they are dropped like any other stale
+        // row would be.
+        if conn.prepare("SELECT rules FROM failed_blocks LIMIT 0").is_err() {
+            conn.execute_batch("DROP TABLE IF EXISTS failed_blocks;")
+                .map_err(|e| StoreError(format!("drop old failed_blocks: {}", e)))?;
+        }
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS failed_blocks (
+                hash BLOB PRIMARY KEY,
+                height INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                rules TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS failed_block_bans (
+                addr TEXT PRIMARY KEY,
+                hash BLOB NOT NULL
+            );
+            ",
+        )
+        .map_err(|e| StoreError(format!("create failed-block tables: {}", e)))?;
 
         let store = HeaderStore {
             conn: Mutex::new(conn),
@@ -394,20 +413,80 @@ impl HeaderStore {
     /// Record a block that failed consensus validation (ticket 024), so its
     /// headers are refused and it is never requested again, across
     /// restarts. Descendants need no entry: they can only connect through
-    /// it.
+    /// it. `rules` names the validation rules that rejected it (see
+    /// `prune_failed_blocks`).
     pub fn mark_failed(
         &self,
         hash: BlockHash,
         height: u32,
         reason: &str,
+        rules: &str,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
         conn.execute(
-            "INSERT OR REPLACE INTO failed_blocks (hash, height, reason) VALUES (?1, ?2, ?3)",
-            params![hash.to_byte_array().as_slice(), height, reason],
+            "INSERT OR REPLACE INTO failed_blocks (hash, height, reason, rules)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![hash.to_byte_array().as_slice(), height, reason, rules],
         )
         .map_err(|e| StoreError(format!("mark failed: {}", e)))?;
         Ok(())
+    }
+
+    /// Remember that `addr` was banned for announcing failed block `hash`,
+    /// so the ban can be lifted if the block is reconsidered.
+    pub fn record_failed_block_ban(&self, addr: &str, hash: BlockHash) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO failed_block_bans (addr, hash) VALUES (?1, ?2)",
+            params![addr, hash.to_byte_array().as_slice()],
+        )
+        .map_err(|e| StoreError(format!("record failed-block ban: {}", e)))?;
+        Ok(())
+    }
+
+    /// Drop failed blocks recorded under any rules version other than
+    /// `rules`, so an update that fixes a validation bug reconsiders them.
+    /// Returns the peers banned because of the dropped blocks; the caller
+    /// lifts those bans.
+    pub fn prune_failed_blocks(&self, rules: &str) -> Result<Vec<String>, StoreError> {
+        self.delete_failed_where("rules != ?1", rules)
+    }
+
+    /// Forget every failed block ("reconsider invalid blocks"). Returns the
+    /// peers banned because of them.
+    pub fn clear_failed_blocks(&self) -> Result<Vec<String>, StoreError> {
+        // `?1 = ?1` is always true; the shared query binds one parameter.
+        self.delete_failed_where("?1 = ?1", "")
+    }
+
+    /// Delete the failed blocks matching `cond` (one parameter, `?1`) and
+    /// their recorded bans, returning the banned addresses.
+    fn delete_failed_where(&self, cond: &str, param: &str) -> Result<Vec<String>, StoreError> {
+        let mut conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError(format!("begin tx: {}", e)))?;
+        let stale = format!("SELECT hash FROM failed_blocks WHERE {}", cond);
+        let addrs: Vec<String> = {
+            let sql = format!("SELECT addr FROM failed_block_bans WHERE hash IN ({})", stale);
+            let mut stmt = tx
+                .prepare(&sql)
+                .map_err(|e| StoreError(format!("prepare failed bans: {}", e)))?;
+            let rows = stmt
+                .query_map(params![param], |row| row.get::<_, String>(0))
+                .map_err(|e| StoreError(format!("query failed bans: {}", e)))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| StoreError(format!("row failed bans: {}", e)))?
+        };
+        let del_bans = format!("DELETE FROM failed_block_bans WHERE hash IN ({})", stale);
+        let del_blocks = format!("DELETE FROM failed_blocks WHERE {}", cond);
+        for sql in [&del_bans, &del_blocks] {
+            tx.execute(sql, params![param])
+                .map_err(|e| StoreError(format!("delete failed blocks: {}", e)))?;
+        }
+        tx.commit()
+            .map_err(|e| StoreError(format!("commit: {}", e)))?;
+        Ok(addrs)
     }
 
     /// Hashes of every block recorded by `mark_failed`. The set is tiny (a
@@ -742,13 +821,34 @@ mod tests {
         {
             let store = HeaderStore::open(path).unwrap();
             assert!(store.failed_hashes().unwrap().is_empty());
-            store.mark_failed(hash, 1, "test").unwrap();
+            store.mark_failed(hash, 1, "test", "v1").unwrap();
             // Idempotent.
-            store.mark_failed(hash, 1, "test again").unwrap();
+            store.mark_failed(hash, 1, "test again", "v1").unwrap();
         }
         let store = HeaderStore::open(path).unwrap();
         let failed = store.failed_hashes().unwrap();
         assert_eq!(failed.len(), 1);
         assert!(failed.contains(&hash));
+    }
+
+    #[test]
+    fn prune_failed_blocks_drops_other_rules_versions_and_their_bans() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let old = block1_header().block_hash();
+        let new = genesis_header().block_hash();
+        store.mark_failed(old, 1, "old rules", "v1").unwrap();
+        store.mark_failed(new, 2, "new rules", "v2").unwrap();
+        store.record_failed_block_ban("1.1.1.1:8333", old).unwrap();
+        store.record_failed_block_ban("2.2.2.2:8333", new).unwrap();
+
+        let unbanned = store.prune_failed_blocks("v2").unwrap();
+        assert_eq!(unbanned, vec!["1.1.1.1:8333".to_string()]);
+        let failed = store.failed_hashes().unwrap();
+        assert!(!failed.contains(&old) && failed.contains(&new));
+
+        let unbanned = store.clear_failed_blocks().unwrap();
+        assert_eq!(unbanned, vec!["2.2.2.2:8333".to_string()]);
+        assert!(store.failed_hashes().unwrap().is_empty());
+        assert!(store.clear_failed_blocks().unwrap().is_empty());
     }
 }

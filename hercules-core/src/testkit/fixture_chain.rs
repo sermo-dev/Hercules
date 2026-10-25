@@ -662,6 +662,47 @@ mod tests {
         }
     }
 
+    /// Witness data without a commitment (after activation), any witness
+    /// data before activation, and a block without a coinbase are all
+    /// mutations (bad deliveries), never consensus verdicts.
+    #[test]
+    fn witness_and_coinbase_mutations_are_classified_as_delivery() {
+        let p = FixtureChain::params();
+        let c = chain_with_spends();
+        let good = c.block(102);
+        let reseal = |mut b: Block| {
+            b.header.merkle_root = b.compute_merkle_root().unwrap();
+            b
+        };
+
+        // Commitment output and reserved value removed, spend witnesses kept.
+        let mut no_commit = good.clone();
+        no_commit.txdata[0].output.retain(|o| {
+            !(o.script_pubkey.len() >= 38 && o.script_pubkey.as_bytes()[..2] == [0x6a, 0x24])
+        });
+        no_commit.txdata[0].input[0].witness = Witness::new();
+        let err = check_block_mutation(&reseal(no_commit), 102, p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::UnexpectedWitness { .. }), "{:?}", err);
+        assert!(err.is_mutation() && !err.is_consensus_failure());
+
+        // Before SegWit activation no witness data is allowed at all, even
+        // with a valid commitment; a witness-free block is fine.
+        let pre_segwit: &'static ChainParams = Box::leak(Box::new(ChainParams {
+            segwit_height: 1_000,
+            ..*ChainParams::regtest()
+        }));
+        let err = check_block_mutation(good, 102, pre_segwit).unwrap_err();
+        assert!(matches!(err, BlockValidationError::UnexpectedWitness { .. }), "{:?}", err);
+        check_block_mutation(c.block(101), 101, pre_segwit).expect("witness-free block");
+
+        // No coinbase: invalid either way, but blamed on the delivery.
+        let mut no_coinbase = good.clone();
+        no_coinbase.txdata.remove(0);
+        let err = check_block_mutation(&reseal(no_coinbase), 102, p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::NoCoinbase { .. }), "{:?}", err);
+        assert!(err.is_mutation() && !err.is_consensus_failure());
+    }
+
     #[test]
     fn coinbase_height_encoding_matches_core() {
         assert_eq!(coinbase_script(1, 0).as_bytes()[0], 0x51); // OP_1

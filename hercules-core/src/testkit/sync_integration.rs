@@ -61,6 +61,11 @@ impl Node {
         self.hs.store.failed_hashes().unwrap().contains(hash)
     }
 
+    /// Open the header database directly, to tamper with it.
+    fn headers_db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.dir.path().join("headers.sqlite3")).unwrap()
+    }
+
     /// Point later sync sessions at a different set of mock peers.
     fn use_peers(&mut self, peers: &[&MockPeer]) {
         self.hs.peer_source = static_peers(peers);
@@ -463,6 +468,7 @@ fn eclipsed_low_work_headers_are_replaced_by_honest_chain() {
     let mut one = [0u8; 32];
     one[0] = 1;
     node.hs.min_chain_work = u256_add(chainwork_for_headers(&headers), one);
+    node.hs.scratch_stall_threshold = 3;
 
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, |hs| {
         hs.store.tip().ok().flatten().map(|(h, _, _)| h) == Some(cheap_chain.tip_height())
@@ -479,6 +485,86 @@ fn eclipsed_low_work_headers_are_replaced_by_honest_chain() {
     assert!(ok, "stuck on the cheap chain: {:?}, tip {:?}", res, node.tip());
     assert_eq!(node.hash_at(ANCHOR), Some(honest_chain.hash_at(ANCHOR)));
     node.assert_utxos_match(&honest_chain);
+}
+
+/// Low-work node for the scratch-replacement tests: honest headers to 300
+/// stored (no blocks validated: below minimum work, anchor at 330 not yet
+/// reached), plus a cheap 310-block chain forking from genesis.
+fn low_work_fixture() -> (Node, FixtureChain, FixtureChain) {
+    const ANCHOR: u32 = 330;
+    let mut honest_chain = FixtureChain::new();
+    honest_chain.mine(340);
+    let mut cheap_chain = FixtureChain::new().fork_at(0);
+    cheap_chain.mine(310);
+    let mut node = Node::new(&[]);
+    node.hs.anchor = SnapshotAnchor {
+        height: ANCHOR,
+        block_hash: honest_chain.hash_at(ANCHOR).to_byte_array(),
+        utxo_hash: [0u8; 32],
+    };
+    let headers: Vec<Header> = honest_chain.blocks().iter().map(|b| b.header).collect();
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    node.hs.min_chain_work = u256_add(chainwork_for_headers(&headers), one);
+    let prefix: Vec<Header> = (1..=300).map(|h| honest_chain.block(h).header).collect();
+    node.hs.store.store_headers(&prefix, 1).unwrap();
+    (node, honest_chain, cheap_chain)
+}
+
+/// Review finding: two colluding peers that vouch for each other used to
+/// replace low-work headers on their first deep-fork batch, wiping honest
+/// progress. Now the fork is held back (and its sender deprioritized,
+/// unpenalized) until our chain has stalled for `SCRATCH_STALL_ROUNDS`.
+#[test]
+fn colluding_peers_cannot_replace_low_work_headers_before_a_stall() {
+    let (mut node, honest_chain, cheap_chain) = low_work_fixture();
+    let c1 = MockPeer::spawn(&cheap_chain, vec![]);
+    let c2 = MockPeer::spawn(&cheap_chain, vec![]);
+    node.use_peers(&[&c1, &c2]);
+
+    let _ = node.sync_until(Duration::from_secs(5), |_| false);
+    assert_eq!(node.tip(), (300, honest_chain.hash_at(300)), "colluders replaced our headers");
+    let rounds = c1
+        .log()
+        .iter()
+        .chain(c2.log().iter())
+        .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
+        .count();
+    assert!(rounds >= 2, "fork never offered ({} getheaders)", rounds);
+    assert!(!node.is_banned(&c1.addr()) && !node.is_banned(&c2.addr()));
+}
+
+/// The stall rule itself: rounds offering a replacement count up only
+/// while nobody extends our chain; any extension (`scratch_stall_rounds`
+/// reset by the sync loop) starts the count over. Never a candidate once
+/// the fork falls short of our tip or our tip reaches the anchor.
+#[test]
+fn scratch_replacement_requires_a_stall_without_progress() {
+    let (mut node, _honest, _cheap) = low_work_fixture();
+    node.hs.scratch_stall_threshold = 3;
+    let hs = &node.hs;
+    let verdict = |fork_tip| match hs.scratch_replacement(300, 0, 0, fork_tip).unwrap() {
+        ScratchReplacement::No => "no",
+        ScratchReplacement::Wait => "wait",
+        ScratchReplacement::Replace => "replace",
+    };
+
+    // Progress after every two rounds: never replaced.
+    for _ in 0..5 {
+        assert_eq!(verdict(310), "wait");
+        assert_eq!(verdict(310), "wait");
+        hs.scratch_stall_rounds.store(0, Ordering::Relaxed);
+    }
+    // Stalled: the third round in a row replaces.
+    assert_eq!(verdict(310), "wait");
+    assert_eq!(verdict(310), "wait");
+    assert_eq!(verdict(310), "replace");
+    // A fork shorter than our tip never qualifies.
+    hs.scratch_stall_rounds.store(0, Ordering::Relaxed);
+    assert_eq!(verdict(299), "no");
+    // Nor does a fork below validated blocks, or a tip at the anchor.
+    assert!(matches!(hs.scratch_replacement(300, 0, 5, 310).unwrap(), ScratchReplacement::No));
+    assert!(matches!(hs.scratch_replacement(330, 0, 0, 340).unwrap(), ScratchReplacement::No));
 }
 
 // ── Header cross-check ───────────────────────────────────────────────
@@ -708,9 +794,117 @@ fn failed_block_is_refused_after_restart() {
     let node = node.restart(&[&hostile2]);
     let _ = node.sync_until(Duration::from_secs(4), |_| false);
     assert_eq!(node.tip(), (honest_chain.tip_height(), honest_chain.tip_hash()));
-    assert!(node.is_banned(&hostile2.addr()), "peer re-sending the invalid chain not banned");
+    // It only relays the invalid chain: disconnected and deprioritized, not
+    // banned (if our verdict were wrong, banning relayers would ban every
+    // honest peer). The original announcer stays banned.
+    assert!(!node.is_banned(&hostile2.addr()), "relayer of the invalid chain banned");
+    let score = node.score(&hostile2.addr()).expect("relayer score persisted");
+    assert!(score < FRESH_SCORE, "relayer not deprioritized: {}", score);
+    assert!(node.is_banned(&hostile.addr()), "announcer's ban lifted");
     assert!(!hostile2.block_requests().contains(&hostile_chain.hash_at(21)));
+    // Not reconnected in a tight loop.
+    assert!(hostile2.connections() <= 8, "{} connections in 4s", hostile2.connections());
     node.assert_utxos_match(&honest_chain);
+}
+
+/// 1c: failed blocks recorded under other validation rules are dropped at
+/// startup, and the bans they caused lifted.
+#[test]
+fn failed_blocks_from_other_rules_versions_are_reconsidered_at_startup() {
+    let (honest_chain, hostile_chain) = invalid_fork_fixture();
+    let hostile = MockPeer::spawn(&hostile_chain, vec![]);
+    let honest = MockPeer::spawn(&honest_chain, vec![]);
+    let node = Node::new(&[&hostile, &honest]);
+    let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&honest_chain));
+    assert!(ok, "{:?}", res);
+    assert!(node.is_failed(&hostile_chain.hash_at(21)) && node.is_banned(&hostile.addr()));
+
+    node.headers_db()
+        .execute("UPDATE failed_blocks SET rules = '0+0.0.0'", [])
+        .unwrap();
+    let node = node.restart(&[&honest]);
+    assert!(!node.is_failed(&hostile_chain.hash_at(21)), "stale-rules verdict kept");
+    assert!(!node.is_banned(&hostile.addr()), "ban from a stale verdict kept");
+}
+
+/// 1d: "reconsider invalid blocks" forgets every verdict and lifts the
+/// bans it caused, including in a running session's pool.
+#[test]
+fn reconsider_invalid_blocks_clears_verdicts_and_bans() {
+    let (honest_chain, hostile_chain) = invalid_fork_fixture();
+    let hostile = MockPeer::spawn(&hostile_chain, vec![]);
+    let honest = MockPeer::spawn(&honest_chain, vec![]);
+    let node = Node::new(&[&hostile, &honest]);
+    let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&honest_chain));
+    assert!(ok, "{:?}", res);
+    assert!(node.is_banned(&hostile.addr()));
+
+    assert_eq!(node.hs.reconsider_invalid_blocks().unwrap(), 1);
+    assert!(!node.is_failed(&hostile_chain.hash_at(21)));
+    assert!(!node.is_banned(&hostile.addr()));
+    assert_eq!(node.hs.reconsider_invalid_blocks().unwrap(), 0);
+}
+
+/// 1a: a consensus failure is only trusted when the UTXO set is exactly at
+/// our header chain's validated block. Here the UTXO set has lost block
+/// 102 (as after a crash mid-reorg) while the header store says 102 is
+/// validated, so honest block 103 fails to find its inputs: that must be a
+/// local fault, never a verdict against the block or its peers.
+#[test]
+fn utxo_out_of_step_with_headers_is_local_not_invalid() {
+    let chain = chain_with_spends(110).prefix(103);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(102));
+    node.hs.utxo.rollback_block_to(102, chain.hash_at(101).to_byte_array()).unwrap();
+    assert_eq!(node.validated(), 102);
+    let peer = MockPeer::spawn(&chain, vec![]);
+    node.use_peers(&[&peer]);
+
+    let (_, res) = node.sync_until(Duration::from_secs(10), |_| false);
+    let err = format!("{:?}", res.expect_err("sync must stop on a local fault"));
+    assert!(err.contains("doesn't match the header chain"), "{}", err);
+    assert!(!node.is_failed(&chain.hash_at(103)), "honest block marked invalid");
+    assert!(!node.is_banned(&peer.addr()));
+}
+
+/// 1a: the same out-of-step state is repaired at startup when the UTXO
+/// set's block is on our header chain (crash after a reorg's UTXO rollback,
+/// before `set_validated_height`), and sync then completes.
+#[test]
+fn interrupted_rollback_is_repaired_at_startup() {
+    let chain = chain_with_spends(110).prefix(103);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(102));
+    node.hs.utxo.rollback_block_to(102, chain.hash_at(101).to_byte_array()).unwrap();
+    let peer = MockPeer::spawn(&chain, vec![]);
+    let node = node.restart(&[&peer]);
+    assert_eq!(node.validated(), 101, "validated_height not stepped down to the UTXO set");
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&chain));
+    assert!(ok, "{:?}", res);
+    node.assert_utxos_match(&chain);
+}
+
+/// A failed block already in our header chain (stored before the verdict
+/// was recorded) is dropped, never requested.
+#[test]
+fn failed_block_in_header_chain_is_never_requested() {
+    let (honest_chain, hostile_chain) = invalid_fork_fixture();
+    let mut node = Node::new(&[]);
+    presync(&mut node, &honest_chain.prefix(20));
+    let hostile_headers: Vec<Header> =
+        (21..=hostile_chain.tip_height()).map(|h| hostile_chain.block(h).header).collect();
+    node.hs.store.store_headers(&hostile_headers, 21).unwrap();
+    node.hs.store.mark_failed(hostile_chain.hash_at(21), 21, "test", &rules_tag()).unwrap();
+    let a = MockPeer::spawn(&honest_chain, vec![]);
+    let b = MockPeer::spawn(&honest_chain, vec![]);
+    node.use_peers(&[&a, &b]);
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&honest_chain));
+    assert!(ok, "{:?}, tip {:?}", res, node.tip());
+    for p in [&a, &b] {
+        assert!(!p.block_requests().contains(&hostile_chain.hash_at(21)));
+    }
 }
 
 /// The node is presynced to 101 so the mutator has no earlier blocks to
@@ -729,7 +923,7 @@ fn mutated_block_penalizes_peer_and_refetches() {
     let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&chain));
     assert!(ok, "did not sync past the mutated delivery: {:?}", res);
     let score = node.score(&mutator.addr());
-    assert!(score.map_or(true, |s| s < FRESH_SCORE), "mutator not penalized");
+    assert!(score.expect("score persisted") < FRESH_SCORE, "mutator not penalized");
     assert!(!node.is_failed(&chain.hash_at(102)), "valid block marked failed");
     assert!(honest.block_requests().contains(&chain.hash_at(102)));
 }
@@ -751,7 +945,7 @@ fn witnessless_block_is_a_bad_delivery_not_invalid() {
     assert!(ok, "did not sync past the witnessless delivery: {:?}", res);
     assert!(mutator.block_requests().contains(&chain.hash_at(102)));
     let score = node.score(&mutator.addr());
-    assert!(score.map_or(true, |s| s < FRESH_SCORE), "mutator not penalized");
+    assert!(score.expect("score persisted") < FRESH_SCORE, "mutator not penalized");
     assert!(!node.is_failed(&chain.hash_at(102)), "valid block marked failed");
     node.assert_utxos_match(&chain);
 }
@@ -889,12 +1083,35 @@ fn catch_up_blocks_penalizes_invalid_headers_and_validates_backlog() {
     node.use_peers(&[&bad]);
 
     let status = node.hs.catch_up_blocks(50, 10).unwrap();
-    assert!(status.caught_up, "{:?}", status);
+    // The backlog is validated, but an error is never reported as caught up.
+    assert!(!status.caught_up, "{:?}", status);
+    assert_eq!(status.blocks_validated, 10);
     assert_eq!(node.validated(), 20);
     assert!(status.error.is_some(), "{:?}", status);
     assert_eq!(node.tip().0, 20, "invalid header stored");
     let score = node.score(&bad.addr());
-    assert!(score.map_or(true, |s| s < FRESH_SCORE), "sender of bad headers not penalized");
+    assert!(score.expect("score persisted") < FRESH_SCORE, "sender of bad headers not penalized");
+}
+
+/// Review finding: with a one-hash locator, an honest peer whose chain no
+/// longer contains our (reorged-out) tip answers from genesis. That fails
+/// header validation, but is ticket 025's reorg case, not misbehavior: no
+/// penalty on either wake path.
+#[test]
+fn wake_paths_do_not_penalize_honest_peer_after_stale_tip() {
+    let (a, b) = reorg_fixture();
+    let mut node = Node::new(&[]);
+    presync(&mut node, &a);
+    let peer = MockPeer::spawn(&b, vec![]);
+    node.use_peers(&[&peer]);
+
+    assert!(node.hs.validate_latest_block(25).is_err());
+    let status = node.hs.catch_up_blocks(10, 10).unwrap();
+    assert!(!status.caught_up && status.error.is_some(), "{:?}", status);
+    assert!(!node.is_banned(&peer.addr()));
+    let score = node.score(&peer.addr()).expect("score persisted");
+    assert!(score >= FRESH_SCORE, "honest peer penalized: {}", score);
+    assert_eq!(node.tip(), (a.tip_height(), a.tip_hash()));
 }
 
 #[test]
@@ -929,7 +1146,7 @@ fn wake_path_refetches_mutated_block() {
     assert_eq!(node.validated(), 102);
     assert!(!node.is_failed(&chain.hash_at(102)));
     let score = node.score(&mutator.addr());
-    assert!(score.map_or(true, |s| s < FRESH_SCORE), "mutator not penalized");
+    assert!(score.expect("score persisted") < FRESH_SCORE, "mutator not penalized");
 }
 
 // ── Known bugs (documented, not yet fixed) ───────────────────────────

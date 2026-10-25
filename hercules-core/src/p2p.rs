@@ -884,7 +884,8 @@ pub(crate) mod tests {
     /// `send_*` helpers can write into it. The returned listener-side
     /// `TcpStream` is what the test reads to decode the wire bytes.
     pub(crate) fn loopback_peer_pair() -> (Peer, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let listener =
+            TcpListener::bind(crate::testkit::loopback_bind_addr()).expect("bind loopback");
         let addr = listener.local_addr().expect("local_addr");
 
         // Connect side runs in the test thread; accept side runs in a
