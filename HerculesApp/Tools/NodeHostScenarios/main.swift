@@ -140,5 +140,43 @@ check(decoded?.count == 2, "s13 good + future record kept, broken one dropped: \
 check(decoded?.last?.source == .unknown, "s13 unknown source decodes as .unknown")
 check(NotificationHistory.decode(Data("not json".utf8)) == nil, "s13 unparseable file is nil, not []")
 
+// 14. a push or refresh preempts a BG processing round (ticket 051): the
+//     round is cancelled once and attributed, short wakes don't cancel each
+//     other, and the processing loop's "wait for short wakes" ends
+s = NodeSessionState()
+let roundA = Token(), push1 = Token(), push2 = Token()
+check(s.admitWake(roundA, appInForeground: false, kind: .processing) == .run(preemptsForeground: false), "s14 processing round runs on an idle node")
+check(s.inFlightShortWakes == 0, "s14 a round is not a short wake")
+_ = s.admitWake(push1, appInForeground: false)
+check(roundA.cancels == 1 && push1.cancels == 0, "s14 push cancels the running round, not itself")
+check(s.inFlightShortWakes == 1, "s14 push counted as a short wake")
+_ = s.admitWake(push2, appInForeground: false)
+check(roundA.cancels == 1 && push1.cancels == 0, "s14 second push: round not cancelled again, first push untouched")
+check(s.finishWake(roundA, stoppedForegroundSync: false) == .preemptedByWake, "s14 round's cancel attributed to the push")
+s.finishWake(push1, stoppedForegroundSync: false)
+s.finishWake(push2, stoppedForegroundSync: false)
+check(s.inFlightShortWakes == 0 && s.inFlightWakes == 0, "s14 all deregistered")
+// a round admitted while a push still runs isn't cancelled by its own admission
+let push3 = Token(), roundB = Token()
+_ = s.admitWake(push3, appInForeground: false)
+_ = s.admitWake(roundB, appInForeground: false, kind: .processing)
+check(roundB.cancels == 0 && push3.cancels == 0, "s14 round admitted behind a push: nothing cancelled")
+s.finishWake(push3, stoppedForegroundSync: false)
+check(s.finishWake(roundB, stoppedForegroundSync: false) == .none, "s14 unpreempted round has no cancel reason")
+// the processing loop's wait ends once concurrent pushes finish
+s = NodeSessionState()
+let waitDone = DispatchSemaphore(value: 0)
+let pushes = (0..<16).map { _ in Token() }
+pushes.forEach { _ = s.admitWake($0, appInForeground: false) }
+DispatchQueue.global().async {
+    while s.inFlightShortWakes > 0 { Thread.sleep(forTimeInterval: 0.01) }
+    waitDone.signal()
+}
+DispatchQueue.concurrentPerform(iterations: pushes.count) { i in
+    Thread.sleep(forTimeInterval: 0.005 * Double(i % 4))
+    s.finishWake(pushes[i], stoppedForegroundSync: false)
+}
+check(waitDone.wait(timeout: .now() + 5) == .success, "s14 processing wait ends when pushes finish (no deadlock)")
+
 print(fails == 0 ? "ALL PASS" : "\(fails) FAILED")
 exit(fails == 0 ? 0 : 1)
