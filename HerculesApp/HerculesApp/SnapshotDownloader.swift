@@ -5,7 +5,7 @@ import Foundation
 ///
 /// Uses `URLSessionConfiguration.background` so the OS continues the download
 /// when the app is suspended and can resume after network interruption or app
-/// relaunch. The compressed file (~8.2GB) lands in the Caches directory; the
+/// relaunch. The compressed file (~8.8GB) lands in the Caches directory; the
 /// caller is responsible for handing the path to `HerculesNode.loadSnapshot`
 /// and deleting the file once import succeeds.
 ///
@@ -91,15 +91,62 @@ class SnapshotDownloader: NSObject, ObservableObject {
         // that was running when the app was last terminated. The delegate
         // callbacks will fire as the OS catches us up.
         _ = session
+        Self.deleteLegacyFiles()
         rehydrateExistingTask()
+    }
+
+    private static var cachesDir: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+    }
+
+    /// Object name of the current snapshot, e.g. `hercules-943500-utxo-v2`.
+    /// Local file names derive from it so a file, or resume data, from a
+    /// different snapshot can never be mistaken for this one.
+    private static var snapshotName: String {
+        var name = downloadURL.lastPathComponent
+        for ext in [".gz", ".hutx"] where name.hasSuffix(ext) {
+            name = String(name.dropLast(ext.count))
+        }
+        return name
+    }
+
+    /// Download and resume files left by builds that used other snapshots:
+    /// the retracted 943,500 file was saved under these fixed names.
+    private static let legacyFileNames = ["hercules-utxo.hutx.gz", "hercules-utxo.resume"]
+
+    private static func deleteLegacyFiles() {
+        for name in legacyFileNames {
+            try? FileManager.default.removeItem(at: cachesDir.appendingPathComponent(name))
+        }
+    }
+
+    /// Whether `task` is downloading the current snapshot URL. A background
+    /// task started by an older build (for an older snapshot) can still be
+    /// running in this session after an update.
+    private static func isCurrent(_ task: URLSessionTask) -> Bool {
+        let url = task.originalRequest?.url ?? task.currentRequest?.url
+        return url == downloadURL
+    }
+
+    /// Cancel every task in the session that isn't for the current URL and
+    /// return the first one that is.
+    private static func currentTask(among tasks: [URLSessionTask]) -> URLSessionDownloadTask? {
+        var current: URLSessionDownloadTask?
+        for task in tasks {
+            if let dl = task as? URLSessionDownloadTask, isCurrent(dl), current == nil {
+                current = dl
+            } else {
+                task.cancel()
+            }
+        }
+        return current
     }
 
     /// Caches directory destination — temporary storage that survives app
     /// relaunches but isn't backed up to iCloud. Once the snapshot is imported
-    /// into SQLite, the caller deletes this file.
+    /// into the UTXO database, the caller deletes this file.
     static func destinationURL() -> URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        return caches.appendingPathComponent("hercules-utxo.hutx.gz")
+        return cachesDir.appendingPathComponent("\(snapshotName).hutx.gz")
     }
 
     /// Path where we persist `URLSession`-provided resume data so a network
@@ -108,10 +155,12 @@ class SnapshotDownloader: NSObject, ObservableObject {
     /// partial-download cache plus HTTP Range bookkeeping. Lives next to the
     /// destination so if iOS purges Caches, both go together.
     private static func resumeDataURL() -> URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        return caches.appendingPathComponent("hercules-utxo.resume")
+        return cachesDir.appendingPathComponent("\(snapshotName).resume")
     }
 
+    /// The resume blob for the current snapshot. Its file name derives
+    /// from the snapshot's object name (`resumeDataURL`), so a blob for an
+    /// older snapshot is never picked up here.
     private static func loadResumeData() -> Data? {
         return try? Data(contentsOf: resumeDataURL())
     }
@@ -186,8 +235,9 @@ class SnapshotDownloader: NSObject, ObservableObject {
         session.getAllTasks { [weak self] tasks in
             guard let self = self else { return }
             // If iOS already has a task running for our session (e.g. survived
-            // a relaunch), latch onto it instead of starting a new one.
-            if let existing = tasks.first(where: { $0 is URLSessionDownloadTask }) as? URLSessionDownloadTask {
+            // a relaunch), latch onto it instead of starting a new one —
+            // unless it is for another URL (an older build's snapshot).
+            if let existing = Self.currentTask(among: tasks) {
                 self.activeTask = existing
                 return
             }
@@ -250,7 +300,7 @@ class SnapshotDownloader: NSObject, ObservableObject {
     private func rehydrateExistingTask() {
         session.getAllTasks { [weak self] tasks in
             guard let self = self else { return }
-            if let existing = tasks.first(where: { $0 is URLSessionDownloadTask }) as? URLSessionDownloadTask {
+            if let existing = Self.currentTask(among: tasks) {
                 self.activeTask = existing
                 DispatchQueue.main.async {
                     self.status = .downloading
@@ -271,6 +321,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
+        guard Self.isCurrent(downloadTask) else { return }
         let total = totalBytesExpectedToWrite > 0
             ? totalBytesExpectedToWrite
             : Self.expectedBytes
@@ -287,6 +338,9 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
+        // A task for another URL (cancelled by `currentTask`, but it may
+        // finish first) must not land in our destination.
+        guard Self.isCurrent(downloadTask) else { return }
         // `location` is a temporary file iOS will delete the moment this
         // callback returns. We must move it synchronously here.
         let dest = Self.destinationURL()
@@ -307,6 +361,8 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         // Validate HTTP status — R2 returns 200 on success, 403/404 on missing.
         if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
             try? fm.removeItem(at: dest)
+            // Resuming would only replay the same error response forever.
+            Self.deleteResumeData()
             DispatchQueue.main.async {
                 self.status = .failed("Server returned HTTP \(http.statusCode)")
                 self.activeTask = nil
@@ -331,6 +387,9 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         didCompleteWithError error: Error?
     ) {
         guard let error = error else { return }   // success path handled above
+        // Don't save another URL's resume data under our name or report
+        // its failure (including the cancel from `currentTask`).
+        guard Self.isCurrent(task) else { return }
         let nsErr = error as NSError
         // User-initiated cancel — already handled by `cancel()`, which also
         // wipes the resume data blob. Nothing to do here.

@@ -11,7 +11,7 @@ import os
 //       migration-conflicts/ (parked downgrade copies; deleted after 7 days
 //       or on node reset)
 //   Library/Application Support/Wallet/   backed up; empty until 036/039
-//   Library/Caches/hercules-utxo.hutx.gz  snapshot download (SnapshotDownloader)
+//   Library/Caches/<snapshot>.hutx.gz      snapshot download (SnapshotDownloader)
 //   Documents/notification-history.json   small, user-facing, backed up
 //
 // Chain data is deliberately NOT in Caches (iOS purges Caches under storage
