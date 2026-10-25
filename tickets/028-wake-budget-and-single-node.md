@@ -12,6 +12,11 @@ This ticket:
 3. Starts the deadline at wake receipt and passes it into Rust, so transport bootstrap counts against it.
 4. Adds real cancellation and expiration handling.
 
+## Amendment (2026-10-24, from the PR #20 / #21 reviews)
+
+- **The second node is worse than assumed.** The push handler has no "foreground node running" check (`NotificationManager.swift:342`), and silent pushes are delivered while the app is in the foreground too. heed 0.20.5 does *not* refuse the second open: its process-global `OPENED_ENV` returns the same env when the options match, and fails with `BadOpenOptions` only when they differ (e.g. map size, see 030). So two `HeaderSync`s can apply blocks to the same UTXO set concurrently.
+- **033 adds an open-time step that assumes no block is mid-apply.** `HeaderSync::new` demotes own txs settled above `validated_height` (crash recovery). If a wake node opens while the foreground node sits between a block hook and `set_validated_height`, a confirmed own tx is wrongly put back to pending, and it later expires. The single-node host in this ticket removes the race; until then the window is a few milliseconds per block.
+
 ## Background
 
 **Tor bootstrap blocks inside the constructor.** `hercules-core/src/lib.rs:303-330`: `HerculesNode::new(db_path, tor_data_dir)` calls `TorManager::bootstrap(&path)` and then `start_onion_service(8333)` synchronously. The doc comment at `lib.rs:306-307` says "This blocks during Tor bootstrap (~5-15 seconds)."
