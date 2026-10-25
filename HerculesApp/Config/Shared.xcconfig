@@ -11,7 +11,7 @@
 //     BUNDLE_ID_PREFIX, APP_BUNDLE_ID, WIDGET_BUNDLE_ID, APP_GROUP_ID
 //     (APNs topic == APP_BUNDLE_ID; keep server/template.yaml in sync)
 //   Cheap (change any time, one in-flight item lost at most):
-//     BGTASK_CATCHUP_ID, SNAPSHOT_SESSION_ID
+//     BGTASK_CATCHUP_ID, BGTASK_PROCESSING_ID, SNAPSHOT_SESSION_ID
 //   Free (change any time):
 //     APP_DISPLAY_NAME, MARKETING_VERSION, CURRENT_PROJECT_VERSION
 //
@@ -35,6 +35,10 @@ APP_GROUP_ID = group.$(BUNDLE_ID_PREFIX).shared
 
 // BGTaskScheduler identifier for accelerated catch-up (dev.sermo.hercules.catchup).
 BGTASK_CATCHUP_ID = $(BUNDLE_ID_PREFIX).catchup
+
+// BGTaskScheduler identifier for the long, on-power catch-up
+// (BGProcessingTask; dev.sermo.hercules.processing).
+BGTASK_PROCESSING_ID = $(BUNDLE_ID_PREFIX).processing
 
 // Background URLSession identifier for the UTXO snapshot download. Historical
 // value uses the io.hercules namespace; changing it only orphans an in-flight

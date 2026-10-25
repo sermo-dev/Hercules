@@ -56,6 +56,20 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
             NotificationManager.shared.handleCatchUpTask(task as! BGAppRefreshTask)
         }
 
+        // Register BGProcessingTask for long, on-power catch-up of a
+        // backlog (ticket 051), and ask for a window each time the app
+        // goes to the background. iOS keeps one pending request per
+        // identifier, so repeated submissions just replace it.
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: NotificationManager.processingTaskIdentifier,
+            using: nil
+        ) { task in
+            NotificationManager.shared.handleProcessingTask(task as! BGProcessingTask)
+        }
+        NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { _ in NotificationManager.scheduleProcessingTask() }
+            .store(in: &cancellables)
+
         // Re-register with the push relay on every launch while opted in, so
         // a rotated APNs token is picked up and the relay's 30-day TTL never
         // lapses. Throttled to one relay POST per day inside NotificationManager.

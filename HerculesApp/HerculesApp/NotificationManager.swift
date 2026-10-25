@@ -538,7 +538,8 @@ class NotificationManager: ObservableObject {
         receivedAt: Date,
         pushBlock: PushBlockInfo?,
         appInForeground: Bool,
-        trigger: String
+        trigger: String,
+        maxBlocks: UInt32 = WakeConfig.maxBlocks
     ) -> WakeRun {
         let fromPayload = { (source: NotificationSource, error: String?, timings: WakeTimings) -> BlockNotificationRecord in
             var record = Self.payloadRecord(pushBlock: pushBlock, receivedAt: receivedAt, source: source, error: error)
@@ -546,7 +547,9 @@ class NotificationManager: ObservableObject {
             return record
         }
         do {
-            switch try NodeHost.shared.runWake(budget: budget, appInForeground: appInForeground) {
+            switch try NodeHost.shared.runWake(
+                budget: budget, appInForeground: appInForeground, maxBlocks: maxBlocks
+            ) {
             case .foregroundActive:
                 return WakeRun(
                     record: fromPayload(.foregroundActive, nil, WakeTimings(trigger: trigger)),
@@ -671,9 +674,12 @@ class NotificationManager: ObservableObject {
                 )
             }
             activity.finishSuccess(height: status.currentHeight, peerCount: run.peerCount)
-            // If still behind, request a follow-up wake for accelerated catch-up
+            // If still behind, request a follow-up wake for accelerated
+            // catch-up, and a processing window for the rest of a big
+            // backlog (ticket 051).
             if !status.caughtUp && status.blocksValidated > 0 {
                 Self.requestFollowUpWake()
+                Self.scheduleProcessingTask()
             }
         } else if run.neutral {
             SharedNodeStore.markAwake(false)
@@ -981,6 +987,106 @@ class NotificationManager: ObservableObject {
         } catch {
             // Non-fatal: next natural push wake from APNs will continue catch-up
         }
+    }
+
+    // MARK: - Background Processing Task (ticket 051)
+
+    /// `BGTASK_PROCESSING_ID` in Config/Shared.xcconfig (also generates the
+    /// `BGTaskSchedulerPermittedIdentifiers` entry).
+    static let processingTaskIdentifier = AppIdentifiers.processingTaskID
+
+    /// Ask iOS for a processing window (015 Phase 2, 028 §7): minutes of
+    /// background time to work through a backlog that 25-second wakes
+    /// can't. Only on external power and with a network, so a long
+    /// catch-up costs no battery; the handler still applies the cellular
+    /// policy. Replaces any pending request. Submitted when the app goes to
+    /// the background and when a wake ends still behind; skipped until a
+    /// validation mode has been chosen.
+    static func scheduleProcessingTask() {
+        guard ValidationModePreference.current != nil else { return }
+        let request = BGProcessingTaskRequest(identifier: processingTaskIdentifier)
+        request.requiresExternalPower = true
+        request.requiresNetworkConnectivity = true
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            // Non-fatal (and always the case in the simulator): pushes and
+            // refresh wakes still catch up, a few blocks at a time.
+            StoragePaths.log.notice("processing task not scheduled: \(error.localizedDescription)")
+        }
+    }
+
+    /// Handle a BGProcessingTask: catch up in rounds on the shared node
+    /// until caught up, out of progress, or out of time.
+    func handleProcessingTask(_ task: BGProcessingTask) {
+        // setTaskCompleted exactly once: normal finish or expiration.
+        let gate = OnceGate()
+        let expired = LockedBox(false)
+        let round = LockedBox<WakeBudget?>(nil)
+
+        // Expiration: cancel the running round, complete the task
+        // ourselves, and ask for another window to carry on.
+        task.expirationHandler = {
+            expired.value = true
+            round.value?.cancel()
+            gate.fire {
+                StoragePaths.log.notice("processing task expired")
+                task.setTaskCompleted(success: false)
+            }
+            Self.scheduleProcessingTask()
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            // Same gates as a refresh wake, once the network path is known.
+            NetworkPolicy.shared.waitForFirstPath()
+            guard NetworkPolicy.shared.shouldValidate, Self.nodeIsSetUp() else {
+                gate.fire { task.setTaskCompleted(success: true) }
+                return
+            }
+
+            var last: (run: WakeRun, budget: WakeBudget)?
+            for _ in 0..<WakeConfig.processingMaxRounds {
+                if expired.value || !NetworkPolicy.shared.shouldValidate { break }
+                if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes { break }
+                let budget = WakeBudget(budgetMs: WakeConfig.processingRoundMs)
+                round.value = budget
+                // Expired between the check above and publishing `round`.
+                if expired.value { budget.cancel() }
+                let run = self.performWake(
+                    budget: budget, receivedAt: Date(), pushBlock: nil,
+                    appInForeground: Self.appInForegroundNow(), trigger: "processing",
+                    maxBlocks: WakeConfig.processingMaxBlocks
+                )
+                last = (run, budget)
+                // Stop when caught up, or when a round made no progress
+                // (foreground took over, peers unreachable, cancelled).
+                guard let status = run.status, !status.caughtUp, status.blocksValidated > 0 else { break }
+            }
+            round.value = nil
+
+            // One history record per task, for its last round. Published
+            // even if expiration already completed the task.
+            if let (run, budget) = last {
+                self.publish(
+                    run, budget: budget, pushBlock: nil, activity: NoopWakeActivityController(),
+                    initialHeight: 0, initialPeers: 0, isPush: false
+                )
+            }
+            gate.fire {
+                task.setTaskCompleted(success: last?.run.status != nil)
+            }
+        }
+    }
+
+    /// Whether a long catch-up makes sense yet: a validation mode has been
+    /// chosen and, for AssumeUTXO, the snapshot is in. Before that a
+    /// catch-up would validate from genesis on a node meant for a
+    /// snapshot. Opens the shared node, as the wake would.
+    private static func nodeIsSetUp() -> Bool {
+        guard let mode = ValidationModePreference.current else { return false }
+        guard mode == .assumeUtxo else { return true }
+        guard let (node, _) = try? NodeHost.shared.node() else { return false }
+        return (try? node.needsSnapshot()) == false
     }
 
     // MARK: - Locked since reboot

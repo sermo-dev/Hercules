@@ -5,7 +5,7 @@ name: HerculesApp
 # project.pbxproj together with the generated Info.plist / .entitlements
 # files. Never hand-edit project.pbxproj.
 #
-# Every identifier (bundle IDs, App Group, BGTask ID, background URLSession
+# Every identifier (bundle IDs, App Group, BGTask IDs, background URLSession
 # ID, display name, versions) lives in Config/Shared.xcconfig. Nothing below
 # should hardcode one — reference the build setting instead.
 
@@ -47,12 +47,15 @@ targets:
         UIBackgroundModes:
           - remote-notification
           - fetch
+          - processing
         BGTaskSchedulerPermittedIdentifiers:
           - $(BGTASK_CATCHUP_ID)
+          - $(BGTASK_PROCESSING_ID)
         NSSupportsLiveActivities: true
         # Runtime identifiers read by AppIdentifiers.swift.
         HRCAppGroupID: $(APP_GROUP_ID)
         HRCCatchUpTaskID: $(BGTASK_CATCHUP_ID)
+        HRCProcessingTaskID: $(BGTASK_PROCESSING_ID)
         HRCSnapshotSessionID: $(SNAPSHOT_SESSION_ID)
     entitlements:
       path: HerculesApp/HerculesApp.entitlements

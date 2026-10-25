@@ -13,6 +13,14 @@ enum WakeConfig {
     /// up: not enough for one block.
     static let minBlockMs: UInt32 = 8_000
     static let maxBlocks: UInt32 = 7
+
+    // BG processing task (ticket 051): on power, minutes long, so it works
+    // through a backlog in rounds. Each round is one wake on the shared
+    // node, which re-checks the network policy and yields to foreground
+    // sync between rounds; the expiration handler cancels the current one.
+    static let processingRoundMs: UInt32 = 120_000
+    static let processingMaxBlocks: UInt32 = 1_000
+    static let processingMaxRounds = 30
 }
 
 /// Runs a body at most once. Wakes have several ways to finish (Rust

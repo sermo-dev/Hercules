@@ -128,8 +128,12 @@ final class NodeHost {
 
     /// Run one wake's catch-up on the shared node. Blocks; call it off the
     /// main thread. `appInForeground` must be read on the main thread when the
-    /// wake arrives.
-    func runWake(budget: WakeBudget, appInForeground: Bool) throws -> WakeResult {
+    /// wake arrives. `maxBlocks` is larger for a BG processing round.
+    func runWake(
+        budget: WakeBudget,
+        appInForeground: Bool,
+        maxBlocks: UInt32 = WakeConfig.maxBlocks
+    ) throws -> WakeResult {
         switch sessions.admitWake(budget, appInForeground: appInForeground) {
         case .foregroundActive:
             StoragePaths.log.notice("wake: foreground sync active, not running")
@@ -147,7 +151,7 @@ final class NodeHost {
             let nodeReadyMs = budget.elapsedMs()
             let report = node.wakeCatchUp(
                 budget: budget,
-                maxBlocks: WakeConfig.maxBlocks,
+                maxBlocks: maxBlocks,
                 minBlockMs: WakeConfig.minBlockMs
             )
             stoppedSync = report.preemptedSync

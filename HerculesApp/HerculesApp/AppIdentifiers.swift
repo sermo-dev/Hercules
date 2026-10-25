@@ -21,6 +21,12 @@ enum AppIdentifiers {
     /// `BGTASK_CATCHUP_ID` setting). App target only.
     static var catchUpTaskID: String { value(for: "HRCCatchUpTaskID") }
 
+    /// BGTaskScheduler identifier for the long, on-power catch-up
+    /// (`BGProcessingTask`, ticket 051). Also in
+    /// `BGTaskSchedulerPermittedIdentifiers` (from `BGTASK_PROCESSING_ID`).
+    /// App target only.
+    static var processingTaskID: String { value(for: "HRCProcessingTaskID") }
+
     /// Background URLSession identifier for the UTXO snapshot download.
     /// App target only.
     static var snapshotSessionID: String { value(for: "HRCSnapshotSessionID") }
