@@ -309,7 +309,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         } catch {
             DispatchQueue.main.async {
                 self.status = .failed("Could not save snapshot: \(error.localizedDescription)")
-                self.activeTask = nil
+                self.clearActiveTask(ifIs: downloadTask)
             }
             return
         }
@@ -323,7 +323,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
             Self.deleteResumeData()
             DispatchQueue.main.async {
                 self.status = .failed("Server returned HTTP \(http.statusCode)")
-                self.activeTask = nil
+                self.clearActiveTask(ifIs: downloadTask)
             }
             return
         }
@@ -335,7 +335,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         DispatchQueue.main.async {
             self.progress = 1.0
             self.status = .completed(dest)
-            self.activeTask = nil
+            self.clearActiveTask(ifIs: downloadTask)
         }
     }
 
@@ -392,6 +392,16 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         guard isActive else { return }
         DispatchQueue.main.async {
             self.status = .failed("Download failed: \(error.localizedDescription)\(suffix)")
+        }
+    }
+
+    /// Clear `activeTask` if it is still `task`, under the lock: a task
+    /// that finishes after a newer one started must not clear the newer
+    /// one (ticket 051).
+    private func clearActiveTask(ifIs task: URLSessionTask) {
+        taskLock.lock(); defer { taskLock.unlock() }
+        if _activeTask === task {
+            _activeTask = nil
         }
     }
 
