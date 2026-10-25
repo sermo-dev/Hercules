@@ -25,6 +25,8 @@ A whole-repo review of `main` (after 028) found eight iOS-side problems. Most ar
 - `waitForFirstPath()` blocks; for background threads (BG refresh, BG processing, the foreground session before the snapshot download).
 - `afterFirstPath(_:)` is non-blocking for the main thread. The silent-push handler now runs its gates inside it. It runs inline when the path is already known (the common, warm case). The wait counts against the wake budget, which started at receipt.
 
+If there is still no path when the push gate decides (no network, or no first path within the wait), the wake is recorded as a new `.noNetwork` source ("Validation skipped: no network connection", shown as "Offline") instead of the metered-network message.
+
 ### 2. `startSync` stuck after a reset
 
 The reported cause was a flag left set by a timed-out reset. That is not quite it. `NodeHost.reset` clears `resetting` in a `defer`, on every path. The real bug is in `NodeViewModel`'s deferred start:
@@ -46,8 +48,9 @@ This happens in two ways:
 A connectivity error with no fresh resume data also deleted the *previous* blob. One flaky reconnect therefore threw away hours of progress.
 
 **Fix.** Kept small and local to the error path, so it merges cleanly with PR #27 (per-snapshot file names, `deleteLegacyFiles`, `isCurrent` guards):
-- `cancel()` records which task the user cancelled. Only that task's `NSURLErrorCancelled` is ignored.
-- Any other failure saves resume data when the error carries it, and always moves `status` to `.failed`, which releases the waiter.
+- `cancel()` records the tasks the user cancelled (a set). A cancelled task's completion is ignored whatever its error code. If it ends with a network error instead of `NSURLErrorCancelled`, saving its resume data would undo the wipe that `cancel()` (or a reset) just did.
+- Any other failure saves resume data when the error carries it and moves `status` to `.failed`, which releases the waiter. Only the task that is still `activeTask` clears it and fails the waiter, so a stale task's failure can't kill a newer download. A stale task's resume data is kept only if nothing else is downloading, for example a task from the previous process reporting after relaunch.
+- A resumed download finishes with **206** Partial Content. `didFinishDownloadingTo` accepted only 200, so the resume data kept above would have ended in "Server returned HTTP 206" and a deleted file. It now accepts `200 || 206` and deletes resume data on any other status. The change is textually identical to PR #27's (`ff36235`), so the two merge cleanly (checked with `git merge-tree`).
 - With no fresh resume data, the old blob is kept for connectivity errors (`notConnectedToInternet`, `networkConnectionLost`, `timedOut`, `cannotConnectToHost`, `cannotFindHost`, `dnsLookupFailed`, `internationalRoamingOff`, `dataNotAllowed`) and for a system cancel. It is deleted otherwise, for example when the blob itself was stale.
 - Resume data is still discarded on user cancel (`cancel()`), on a bad HTTP status (`didFinishDownloadingTo`; PR #27 also deletes resume data there), and when the import rejects the file (`deleteDownloadedFile`).
 
@@ -57,7 +60,7 @@ The import is ~12 GB of LMDB writes and takes minutes. While it runs:
 - the screen auto-locks, which backgrounds the app;
 - a brief app switch suspends the import thread at once.
 
-**Fix.** `LongTaskAssertion` (ContentView.swift) wraps `loadSnapshot`. It disables the idle timer and restores the previous value afterwards. It also holds a `beginBackgroundTask` so a short trip to the background doesn't freeze the import. All of its state is touched on the main thread. `endBackgroundTask` runs exactly once, whether the import finishes first or the expiration handler fires first. On expiration the import thread is simply suspended with the process: LMDB is crash-safe, and an aborted import's pages are reused (030).
+**Fix.** `LongTaskAssertion` (ContentView.swift) wraps `loadSnapshot`. It disables the idle timer and restores the previous value afterwards. It also holds a `beginBackgroundTask` so a short trip to the background doesn't freeze the import. All of its state is touched on the main thread. `endBackgroundTask` runs exactly once, whether the import finishes first or the expiration handler fires first. On expiration the import thread is simply suspended with the process: LMDB is crash-safe, and an aborted import's pages are reused (030). The background task covers only the first trip to the background. It isn't re-armed after it expires, so a later trip suspends the import at once, and it resumes on return.
 
 ### 5. No privacy manifest
 
@@ -83,7 +86,14 @@ The reported mismatch isn't there. `BGTaskSchedulerPermittedIdentifiers` lists o
 What is missing is the processing task itself. The README's architecture box lists "BGProcessingTask: historical block validation". 015 Phase 2 specified it, and 046 folded it into 028. 028 §7 says to use it for large backlogs, but 028 shipped without it. The README's intent is to have one, so this ticket adds a minimal version:
 - New identifier `BGTASK_PROCESSING_ID` (`$(BUNDLE_ID_PREFIX).processing`) in `Shared.xcconfig`, added to `BGTaskSchedulerPermittedIdentifiers` along with the `processing` background mode, and read through `AppIdentifiers.processingTaskID`.
 - `AppDelegate` registers it. `NotificationManager.scheduleProcessingTask()` submits it with `requiresExternalPower = true` (015's recommendation) and `requiresNetworkConnectivity = true`. It is submitted when the app enters the background and when a wake ends still behind.
-- `handleProcessingTask` waits for the first path and honors `NetworkPolicy` (no metered catch-up without opt-in) and the low-disk floor. It skips a node that hasn't picked a validation mode, or that is in AssumeUTXO mode and still needs its snapshot. Otherwise it runs wake catch-ups on the shared node in rounds (`WakeConfig.processingRoundMs` / `processingMaxBlocks`) until caught up, out of progress, or expired. Each round goes through `NodeHost.runWake`, so the 028 rules still hold: it yields to foreground sync and is cancelled by a reset. The expiration handler cancels the current round, completes the task once (`OnceGate`), and resubmits.
+- `handleProcessingTask` waits for the first path. If the task expired during that wait, it stops there without opening the node or starting Tor. It honors `NetworkPolicy` (no metered catch-up without opt-in) and the low-disk floor. It skips a node that hasn't picked a validation mode, or that is in AssumeUTXO mode and still needs its snapshot. Otherwise it runs wake catch-ups on the shared node in rounds (`WakeConfig.processingRoundMs` / `processingMaxBlocks`, at most `processingMaxRounds`) until caught up, out of progress, or expired. Each round goes through `NodeHost.runWake`, so the 028 rules still hold: it yields to foreground sync and is cancelled by a reset. The expiration handler cancels the current round, completes the task once (`OnceGate`), and resubmits.
+- **Pushes and refreshes go first.** In Rust, a push only polls the session lock (`acquire_within`) and gives up as "busy" once less than 8 s of its budget is left. Back-to-back 120 s rounds would therefore starve it: no block notification, and `.noData`, which counts against iOS's push budget.
+  - `NodeSessionState` tags processing rounds (`WakeKind.processing`). Admitting a push or refresh cancels any running round, and the round's cancel reason is recorded as `.preemptedByWake`.
+  - Before each round, the processing loop waits until no push or refresh is in flight (`inFlightShortWakes == 0`).
+  - A preempted round keeps what it validated, since blocks are committed one at a time. One that validated nothing is not treated as a stall (`WakeRun.preempted`): the loop runs another round, which still counts toward the round cap.
+  - This can't deadlock. Short wakes never wait on the processing loop, and each one is bounded by its own budget. The NodeHostScenarios harness covers it (s14).
+  - Remaining gap: Rust checks for cancellation between steps, so a block download already in progress finishes, or times out, first. A push can therefore still wait a few seconds for the round to let go.
+- **Publishing.** The widget is updated after every round that validated blocks (`SharedNodeStore.publishValidation`). The task writes one history record: the final tip, with the rounds and the total blocks validated in its `WakeTimings`, shown in Settings as e.g. "processing · 3 rounds · 412 blocks". The task is resubmitted whenever the node isn't known to be caught up, whatever the outcome. `setTaskCompleted(success:)` is true if any block was validated or the node is caught up.
 
 ### 8. Low-disk check capacity key
 
@@ -100,9 +110,11 @@ What is missing is the processing task itself. The README's architecture box lis
 | `HerculesApp/HerculesApp/NetworkPolicy.swift` | Locked path snapshot, first-path latch, `waitForFirstPath` / `afterFirstPath` |
 | `HerculesApp/HerculesApp/NotificationManager.swift` | Push gates after first path; refresh waits for path; BGProcessingTask handler + scheduling |
 | `HerculesApp/HerculesApp/AppDelegate.swift` | Register processing task; schedule on entering background |
-| `HerculesApp/HerculesApp/NodeHost.swift`, `WakeCoordination.swift` | `maxBlocks` per wake; processing-round config |
+| `HerculesApp/HerculesApp/NodeHost.swift`, `WakeCoordination.swift` | `maxBlocks` and `kind` per wake; pushes preempt processing rounds; processing-round config |
+| `HerculesApp/HerculesApp/NotificationHistory.swift`, `SettingsView.swift` | `.noNetwork` source; processing rounds / blocks in `WakeTimings` and the history row |
+| `HerculesApp/Tools/NodeHostScenarios/main.swift` | s14: processing preemption |
 | `HerculesApp/HerculesApp/ContentView.swift` | Deferred-start fix; `LongTaskAssertion` around import; first-path wait before download |
-| `HerculesApp/HerculesApp/SnapshotDownloader.swift` | Error/cancel path only |
+| `HerculesApp/HerculesApp/SnapshotDownloader.swift` | Error/cancel path; accept 206 (same text as PR #27) |
 | `HerculesApp/HerculesApp/AppIdentifiers.swift` | `processingTaskID` |
 | `HerculesApp/HerculesApp/PrivacyInfo.xcprivacy` | **New** |
 | `HerculesApp/project.yml`, `Config/Shared.xcconfig`, `HerculesApp/Info.plist`, `project.pbxproj` | Device family, processing task id + mode, manifest (regenerated) |
@@ -116,6 +128,9 @@ What is missing is the processing task itself. The README's architecture box lis
 - `xcrun` / App Store Connect validation reports no missing required-reason declarations.
 - The app installs as iPhone-only (no iPad-native slot on an iPad).
 - Debugger: `e -l objc -- (void)[[BGTaskScheduler sharedScheduler] _simulateLaunchForTaskWithIdentifier:@"dev.sermo.hercules.processing"]` runs a catch-up. Expiring it with `_simulateExpirationForTaskWithIdentifier:` completes the task once and resubmits.
+- During a processing task on a long backlog, send a silent push. The push validates its block (not "Node busy"). The round in progress logs as preempted and keeps its blocks, and the next round starts after the push. The widget advances between rounds, and history shows one "processing · N rounds · M blocks" row.
+- Cold launch from a push in airplane mode: the history row says "Offline", not "Paused" for metered data.
+- `HerculesApp/Tools/NodeHostScenarios/run.sh`: ALL PASS (includes s14).
 
 ## Open questions
 

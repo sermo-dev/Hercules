@@ -898,6 +898,11 @@ final class SnapshotSpaceWatch {
 /// thread; all state lives on the main thread, and `begin` is queued
 /// before `end`. `endBackgroundTask` runs exactly once, from `end` or from
 /// the expiration handler, whichever comes first.
+///
+/// The background task covers the first trip to the background only:
+/// once it expires it isn't re-armed when the app comes back, so a later
+/// trip suspends the import right away (it resumes on return). The idle
+/// timer stays disabled until `end`.
 final class LongTaskAssertion {
     // Main thread only.
     private var taskID: UIBackgroundTaskIdentifier = .invalid
