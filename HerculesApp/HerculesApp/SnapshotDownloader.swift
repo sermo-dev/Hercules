@@ -18,13 +18,13 @@ class SnapshotDownloader: NSObject, ObservableObject {
     // The R2 public URL. Must match `ASSUMEUTXO_HASH` baked into hercules-core,
     // which verifies the file before applying it to the database.
     static let downloadURL = URL(string:
-        "https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-utxo.hutx.gz"
+        "https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-943500-utxo-v2.hutx.gz"
     )!
 
     // Approximate compressed size (matches `SNAPSHOT_DOWNLOAD_SIZE` in assumeutxo.rs).
     // Used as a fallback for progress UI when the server hasn't returned
     // Content-Length yet.
-    static let expectedBytes: Int64 = 8_780_302_668
+    static let expectedBytes: Int64 = 8_781_448_895
 
     /// `SNAPSHOT_SESSION_ID` in Config/Shared.xcconfig.
     private static let backgroundSessionId = AppIdentifiers.snapshotSessionID

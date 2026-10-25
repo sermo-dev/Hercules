@@ -33,6 +33,12 @@ pub const ASSUMEUTXO_HASH: [u8; 32] = [
 
 /// Exact number of UTXOs in the snapshot (the HUTX header's `count`, equal
 /// to Core's `dumptxoutset` coin count / `gettxoutsetinfo txouts`).
+///
+/// For cross-checking against Core: the MuHash3072 Hercules computes over
+/// this file (what `load_snapshot` stores and TrustInfo shows), in Core's
+/// `gettxoutsetinfo muhash 943500` display order, is
+/// 73877c075918cdf010b181b7cedb99715df424f70d52d412b0c8d78175d2de4c
+/// (not yet compared with a Core node).
 pub const ASSUMEUTXO_UTXO_COUNT: u64 = 165_208_261;
 
 /// Block hash at the snapshot height (internal byte order, NOT display order).
@@ -92,10 +98,10 @@ pub const MAINNET_ANCHOR: SnapshotAnchor = SnapshotAnchor {
 /// Public download URL for the gzip-compressed HUTX snapshot.
 /// Hosted on Cloudflare R2 (zero egress fees, edge-cached).
 pub const SNAPSHOT_DOWNLOAD_URL: &str =
-    "https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-utxo.hutx.gz";
+    "https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-943500-utxo-v2.hutx.gz";
 
 /// Approximate compressed download size in bytes (for UI progress estimates).
-pub const SNAPSHOT_DOWNLOAD_SIZE: u64 = 8_780_302_668;
+pub const SNAPSHOT_DOWNLOAD_SIZE: u64 = 8_781_448_895;
 
 /// LMDB map the AssumeUTXO set needs once imported: the env is ~12 GB at
 /// this anchor, plus headroom for block validation in the same session.
