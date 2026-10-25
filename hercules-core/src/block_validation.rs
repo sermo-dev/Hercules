@@ -197,6 +197,107 @@ pub fn validate_block(
     Ok(())
 }
 
+/// Witness commitment output prefix: OP_RETURN, push 36, 0xaa21a9ed (BIP 141).
+const WITNESS_COMMITMENT_MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+
+/// Bitcoin Core's `IsBlockMutated`: does this block's transaction data fail
+/// to match what its header commits to? The block hash covers only the
+/// 80-byte header, so a peer can strip witnesses, pad them, or duplicate
+/// transactions (CVE-2012-2459) and the hash still matches. Such a block
+/// says nothing about the real one, so callers must treat a failure here as
+/// a bad *delivery* (penalize the peer, fetch it elsewhere), never as proof
+/// the block is invalid (ticket 024). Run it before `validate_block` and
+/// script validation: a stripped witness would otherwise surface there as a
+/// script failure, indistinguishable from a consensus-invalid block.
+///
+/// Checks the merkle root (including Core's duplicate-subtree mutation) and
+/// Core's `CheckWitnessMalleation`: once SegWit is active, a coinbase
+/// witness commitment, if present, must match the witness data (with a
+/// single 32-byte reserved value); without one, no transaction may carry
+/// witness data. Before activation no witness data is allowed at all.
+pub fn check_block_mutation(
+    block: &Block,
+    height: u32,
+    params: &ChainParams,
+) -> Result<(), BlockValidationError> {
+    if block.txdata.is_empty() {
+        return Err(BlockValidationError::EmptyBlock { height });
+    }
+    if !block.check_merkle_root() {
+        return Err(BlockValidationError::BadMerkleRoot { height });
+    }
+    if merkle_tree_mutated(block) {
+        return Err(BlockValidationError::MutatedMerkleTree { height });
+    }
+    let coinbase = &block.txdata[0];
+    if !coinbase.is_coinbase() {
+        // Not a mutation; `validate_block` rejects it as invalid.
+        return Ok(());
+    }
+
+    if height >= params.segwit_height {
+        let commitment = coinbase.output.iter().rposition(|o| {
+            o.script_pubkey.len() >= 38
+                && o.script_pubkey.as_bytes()[..6] == WITNESS_COMMITMENT_MAGIC
+        });
+        if let Some(pos) = commitment {
+            use bitcoin::hashes::Hash as _;
+            let reserved: Vec<&[u8]> = coinbase.input[0].witness.iter().collect();
+            if reserved.len() != 1 || reserved[0].len() != 32 {
+                return Err(BlockValidationError::BadWitnessCommitment { height });
+            }
+            let committed = &coinbase.output[pos].script_pubkey.as_bytes()[6..38];
+            let matches = block.witness_root().is_some_and(|root| {
+                let computed = Block::compute_witness_commitment(&root, reserved[0]);
+                computed.as_byte_array()[..] == *committed
+            });
+            if !matches {
+                return Err(BlockValidationError::BadWitnessCommitment { height });
+            }
+            return Ok(());
+        }
+    }
+
+    if block
+        .txdata
+        .iter()
+        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
+    {
+        return Err(BlockValidationError::UnexpectedWitness { height });
+    }
+    Ok(())
+}
+
+/// Core's `ComputeMerkleRoot` mutation flag: two identical adjacent hashes
+/// at any level of the tree. Duplicating the last transaction(s) of a block
+/// this way (CVE-2012-2459) leaves the merkle root unchanged.
+fn merkle_tree_mutated(block: &Block) -> bool {
+    use bitcoin::hashes::{sha256d, Hash};
+    let mut level: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .map(|tx| tx.compute_txid().to_byte_array())
+        .collect();
+    while level.len() > 1 {
+        if level.chunks_exact(2).any(|pair| pair[0] == pair[1]) {
+            return true;
+        }
+        if level.len() % 2 == 1 {
+            level.push(*level.last().unwrap());
+        }
+        level = level
+            .chunks_exact(2)
+            .map(|pair| {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&pair[0]);
+                buf[32..].copy_from_slice(&pair[1]);
+                sha256d::Hash::hash(&buf).to_byte_array()
+            })
+            .collect();
+    }
+    false
+}
+
 /// Coinbase outputs cannot be spent until this many blocks have passed.
 const COINBASE_MATURITY: u32 = 100;
 
@@ -508,6 +609,49 @@ pub enum BlockValidationError {
         sigops: u64,
         max: u64,
     },
+    /// Duplicate adjacent subtree in the merkle tree (CVE-2012-2459).
+    MutatedMerkleTree {
+        height: u32,
+    },
+    /// Witness data in a block that does not commit to it.
+    UnexpectedWitness {
+        height: u32,
+    },
+}
+
+impl BlockValidationError {
+    /// True when the error shows only that *this copy* of the block is not
+    /// what its header commits to (a mutated or corrupted delivery), not
+    /// that the block itself is invalid. The sync loop penalizes the peer
+    /// and fetches the block elsewhere for these, and marks the block
+    /// permanently failed for everything else (ticket 024). Deliberately an
+    /// exhaustive match: a new variant must be classified here.
+    pub fn is_mutation(&self) -> bool {
+        match self {
+            Self::EmptyBlock { .. }
+            | Self::BadMerkleRoot { .. }
+            | Self::MutatedMerkleTree { .. }
+            | Self::BadWitnessCommitment { .. }
+            | Self::UnexpectedWitness { .. } => true,
+            Self::NoCoinbase { .. }
+            | Self::MultipleCoinbase { .. }
+            | Self::ExcessiveWeight { .. }
+            | Self::EmptyInputs { .. }
+            | Self::EmptyOutputs { .. }
+            | Self::DuplicateTx { .. }
+            | Self::CoinbaseOverpayment { .. }
+            | Self::BadCoinbaseHeight { .. }
+            | Self::MissingUtxo { .. }
+            | Self::PrematureCoinbaseSpend { .. }
+            | Self::ScriptFailure { .. }
+            | Self::InsufficientInputValue { .. }
+            | Self::ValueOverflow { .. }
+            | Self::UtxoError { .. }
+            | Self::OutputExceedsMaxMoney { .. }
+            | Self::DuplicateSpend { .. }
+            | Self::ExcessiveSigops { .. } => false,
+        }
+    }
 }
 
 impl std::fmt::Display for BlockValidationError {
@@ -625,6 +769,12 @@ impl std::fmt::Display for BlockValidationError {
                 "block {} has {} legacy sigops, exceeds max {}",
                 height, sigops, max
             ),
+            Self::MutatedMerkleTree { height } => {
+                write!(f, "block {} has a mutated (duplicated) merkle tree", height)
+            }
+            Self::UnexpectedWitness { height } => {
+                write!(f, "block {} has witness data without a witness commitment", height)
+            }
         }
     }
 }

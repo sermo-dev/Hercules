@@ -1271,6 +1271,16 @@ impl PeerPool {
             .map(|s| s.height)
     }
 
+    /// Cap a peer's claimed height at `height`, e.g. once it has shown it has
+    /// no headers beyond our tip despite claiming more at handshake. Lowers
+    /// its weight in `best_peer`; never raises the claim.
+    pub fn lower_peer_height(&self, addr: &str, height: u32) {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+            slot.height = slot.height.min(height);
+        }
+    }
+
     /// Update our reported height (used when connecting to new peers).
     pub fn update_our_height(&mut self, height: u32) {
         self.our_height = height;
@@ -1610,6 +1620,19 @@ mod tests {
         add_slot(&pool, "1.2.3.4:8333", 850_000);
         assert_eq!(pool.get_peer_height("1.2.3.4:8333"), Some(850_000));
         assert_eq!(pool.get_peer_height("9.9.9.9:8333"), None);
+    }
+
+    #[test]
+    fn lower_peer_height_caps_but_never_raises() {
+        let pool = test_pool();
+        add_slot(&pool, "liar.peer:8333", 900_000);
+        add_slot(&pool, "honest.peer:8333", 500_000);
+        assert_eq!(pool.best_peer_addr(), Some("liar.peer:8333".to_string()));
+        pool.lower_peer_height("liar.peer:8333", 400_000);
+        assert_eq!(pool.get_peer_height("liar.peer:8333"), Some(400_000));
+        assert_eq!(pool.best_peer_addr(), Some("honest.peer:8333".to_string()));
+        pool.lower_peer_height("liar.peer:8333", 950_000);
+        assert_eq!(pool.get_peer_height("liar.peer:8333"), Some(400_000));
     }
 
     #[test]

@@ -36,6 +36,11 @@ impl HeaderStore {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS failed_blocks (
+                hash BLOB PRIMARY KEY,
+                height INTEGER NOT NULL,
+                reason TEXT NOT NULL
+            );
 ",
         )
         .map_err(|e| StoreError(format!("create tables: {}", e)))?;
@@ -386,6 +391,46 @@ impl HeaderStore {
             .collect()
     }
 
+    /// Record a block that failed consensus validation (ticket 024), so its
+    /// headers are refused and it is never requested again, across
+    /// restarts. Descendants need no entry: they can only connect through
+    /// it.
+    pub fn mark_failed(
+        &self,
+        hash: BlockHash,
+        height: u32,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO failed_blocks (hash, height, reason) VALUES (?1, ?2, ?3)",
+            params![hash.to_byte_array().as_slice(), height, reason],
+        )
+        .map_err(|e| StoreError(format!("mark failed: {}", e)))?;
+        Ok(())
+    }
+
+    /// Hashes of every block recorded by `mark_failed`. The set is tiny (a
+    /// consensus-invalid block with valid proof-of-work is rare and
+    /// expensive), so callers check whole header batches against it.
+    pub fn failed_hashes(&self) -> Result<std::collections::HashSet<BlockHash>, StoreError> {
+        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let mut stmt = conn
+            .prepare("SELECT hash FROM failed_blocks")
+            .map_err(|e| StoreError(format!("prepare failed: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| StoreError(format!("query failed: {}", e)))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let bytes = row.map_err(|e| StoreError(format!("row failed: {}", e)))?;
+            let hash = BlockHash::from_slice(&bytes)
+                .map_err(|e| StoreError(format!("parse failed hash: {}", e)))?;
+            out.insert(hash);
+        }
+        Ok(out)
+    }
+
     /// Get the total number of stored headers.
     pub fn count(&self) -> Result<u32, StoreError> {
         let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
@@ -686,5 +731,24 @@ mod tests {
         assert_eq!(header1.time, block1.time);
 
         assert!(store.get_header_at_height(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_blocks_persist_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("headers.sqlite3");
+        let path = path.to_str().unwrap();
+        let hash = block1_header().block_hash();
+        {
+            let store = HeaderStore::open(path).unwrap();
+            assert!(store.failed_hashes().unwrap().is_empty());
+            store.mark_failed(hash, 1, "test").unwrap();
+            // Idempotent.
+            store.mark_failed(hash, 1, "test again").unwrap();
+        }
+        let store = HeaderStore::open(path).unwrap();
+        let failed = store.failed_hashes().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed.contains(&hash));
     }
 }

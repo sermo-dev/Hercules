@@ -480,6 +480,16 @@ impl Peer {
             }
         })?;
 
+        // Bytes 0..4 are the network magic. A peer on another network (or
+        // one desynchronized from the message framing) is useless to us;
+        // fail before reading its payload so the caller drops it.
+        if header[..4] != self.magic.to_bytes() {
+            return Err(PeerError::WrongMagic {
+                got: header[..4].try_into().unwrap(),
+                expected: self.magic,
+            });
+        }
+
         // Payload length is at bytes 16..20 (little-endian u32)
         let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap());
         if payload_len > MAX_P2P_PAYLOAD {
@@ -818,6 +828,9 @@ pub enum PeerError {
     /// or download timeout ran out (possibly after sending other blocks).
     /// Distinct from transport errors so callers can penalize and retry.
     BlockNotReceived { expected: BlockHash },
+    /// A message arrived with another network's magic (ticket 024). Never
+    /// honest after a successful handshake; callers drop and ban the peer.
+    WrongMagic { got: [u8; 4], expected: Magic },
 }
 
 impl std::fmt::Display for PeerError {
@@ -830,6 +843,9 @@ impl std::fmt::Display for PeerError {
             PeerError::Timeout => write!(f, "read timed out"),
             PeerError::BlockNotReceived { expected } => {
                 write!(f, "requested block {} not received", expected)
+            }
+            PeerError::WrongMagic { got, expected } => {
+                write!(f, "wrong network magic {:02x?} (expected {})", got, expected)
             }
         }
     }
@@ -1150,6 +1166,31 @@ pub(crate) mod tests {
             }
             other => panic!("expected Tx, got {}", msg_name(&other)),
         }
+    }
+
+    // ── Network magic (ticket 024) ───────────────────────────────────
+
+    #[test]
+    fn receive_rejects_wrong_network_magic() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        let raw = RawNetworkMessage::new(Magic::REGTEST, NetworkMessage::Ping(7));
+        raw.consensus_encode(&mut server).expect("encode message");
+        server.flush().expect("flush");
+        match peer.receive() {
+            Err(PeerError::WrongMagic { got, expected }) => {
+                assert_eq!(got, Magic::REGTEST.to_bytes());
+                assert_eq!(expected, Magic::BITCOIN);
+            }
+            Ok(m) => panic!("accepted {} with regtest magic on mainnet", msg_name(&m)),
+            Err(e) => panic!("expected magic error, got {}", e),
+        }
+    }
+
+    #[test]
+    fn receive_accepts_matching_network_magic() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        write_message(&mut server, NetworkMessage::Ping(7));
+        assert!(matches!(peer.receive(), Ok(NetworkMessage::Ping(7))));
     }
 
     // ── get_block hash binding (ticket 022) ──────────────────────────

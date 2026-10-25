@@ -6,8 +6,8 @@
 //! its own temp directory and its own mock-peer ports, so they run in
 //! parallel.
 //!
-//! Tests that describe behavior the code doesn't have yet (tickets 024 and
-//! 025) are `#[ignore]`d with the ticket named. Run them with
+//! Tests that describe behavior the code doesn't have yet (ticket 025) are
+//! `#[ignore]`d with the ticket named. Run them with
 //! `cargo test --offline -- --ignored sync::integration_tests`.
 
 use std::time::{Duration, Instant};
@@ -34,14 +34,31 @@ struct Node {
 impl Node {
     fn new(peers: &[&MockPeer]) -> Node {
         let dir = TempDir::new().unwrap();
-        let hs = HeaderSync::with_config(SyncConfig {
+        let hs = Node::open(&dir, peers);
+        Node { dir, hs }
+    }
+
+    fn open(dir: &TempDir, peers: &[&MockPeer]) -> HeaderSync {
+        HeaderSync::with_config(SyncConfig {
             db_path: dir.path().join("headers.sqlite3").to_str().unwrap().to_string(),
             tor: None,
             params: ChainParams::regtest(),
             peers: static_peers(peers),
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Simulate an app restart: close every store and reopen the same
+    /// directory, pointed at `peers`.
+    fn restart(self, peers: &[&MockPeer]) -> Node {
+        let Node { dir, hs } = self;
+        drop(hs);
+        let hs = Node::open(&dir, peers);
         Node { dir, hs }
+    }
+
+    fn is_failed(&self, hash: &BlockHash) -> bool {
+        self.hs.store.failed_hashes().unwrap().contains(hash)
     }
 
     /// Point later sync sessions at a different set of mock peers.
@@ -108,6 +125,27 @@ impl Node {
             }
             (r, handle.join().expect("sync thread panicked"))
         })
+    }
+
+    /// Run `sync()` for `duration`, collecting every status error message.
+    fn sync_errors_for(&self, duration: Duration) -> (Vec<String>, Result<(), SyncError>) {
+        let errors = Mutex::new(Vec::new());
+        let res = std::thread::scope(|s| {
+            let handle = s.spawn(|| {
+                self.hs.sync(|st| {
+                    if let Some(e) = st.error {
+                        errors.lock().unwrap().push(e);
+                    }
+                })
+            });
+            std::thread::sleep(duration);
+            while !handle.is_finished() {
+                self.hs.stop_sync();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            handle.join().expect("sync thread panicked")
+        });
+        (errors.into_inner().unwrap(), res)
     }
 
     /// Run `sync()` until `done` holds (true) or `timeout` passes (false).
@@ -401,17 +439,58 @@ fn low_work_chain_from_colluding_peers_is_never_validated() {
     assert!(a.block_requests().is_empty() && b.block_requests().is_empty());
 }
 
+/// Ticket 024 (023 follow-up, option 2): a fresh node eclipsed by peers
+/// feeding a cheap chain that stops short of the anchor recovers once
+/// honest peers appear, although the honest chain forks deeper than
+/// `MAX_REORG_DEPTH` and no single batch shows its full work.
+#[test]
+fn eclipsed_low_work_headers_are_replaced_by_honest_chain() {
+    const ANCHOR: u32 = 310;
+    let mut honest_chain = FixtureChain::new();
+    honest_chain.mine(320);
+    let mut cheap_chain = FixtureChain::new().fork_at(0);
+    cheap_chain.mine(300);
+    let hostile1 = MockPeer::spawn(&cheap_chain, vec![]);
+    let hostile2 = MockPeer::spawn(&cheap_chain, vec![]);
+    let mut node = Node::new(&[&hostile1, &hostile2]);
+    node.hs.anchor = SnapshotAnchor {
+        height: ANCHOR,
+        block_hash: honest_chain.hash_at(ANCHOR).to_byte_array(),
+        utxo_hash: [0u8; 32],
+    };
+    // More than the honest chain's own work: only the anchor satisfies it.
+    let headers: Vec<Header> = honest_chain.blocks().iter().map(|b| b.header).collect();
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    node.hs.min_chain_work = u256_add(chainwork_for_headers(&headers), one);
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, |hs| {
+        hs.store.tip().ok().flatten().map(|(h, _, _)| h) == Some(cheap_chain.tip_height())
+    });
+    assert!(ok, "cheap chain not stored: {:?}, tip {:?}", res, node.tip());
+    assert_eq!(node.validated(), 0);
+
+    drop(hostile1);
+    drop(hostile2);
+    let a = MockPeer::spawn(&honest_chain, vec![]);
+    let b = MockPeer::spawn(&honest_chain, vec![]);
+    node.use_peers(&[&a, &b]);
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&honest_chain));
+    assert!(ok, "stuck on the cheap chain: {:?}, tip {:?}", res, node.tip());
+    assert_eq!(node.hash_at(ANCHOR), Some(honest_chain.hash_at(ANCHOR)));
+    node.assert_utxos_match(&honest_chain);
+}
+
 // ── Header cross-check ───────────────────────────────────────────────
 
 /// Two peers on disjoint chains and no third opinion: every batch is
 /// rejected and both peers take `HEADER_DISAGREEMENT_PENALTY`. The active
 /// peer is also rewarded +1 for answering `getheaders` before the
-/// cross-check runs, so the witness reaches the ban threshold first. Once
-/// it is gone the cross-check has no witness and (outside initial sync)
-/// accepts the survivor's headers. This pins that current behavior: the
-/// peer with the higher claimed height ends up unopposed.
+/// cross-check runs, so the witness reaches the ban threshold first. Its
+/// ban settles nothing (ticket 024): the survivor stays disputed, and its
+/// headers are refused until a fresh witness agrees with it.
 #[test]
-fn cross_check_two_peer_disagreement_rejects_until_witness_banned() {
+fn cross_check_two_peer_disagreement_needs_fresh_witness() {
     let mut a_chain = FixtureChain::new();
     a_chain.mine(10);
     // Taller, so it is the active peer and `a` the witness.
@@ -419,29 +498,34 @@ fn cross_check_two_peer_disagreement_rejects_until_witness_banned() {
     b_chain.mine(11);
     let a = MockPeer::spawn(&a_chain, vec![]);
     let b = MockPeer::spawn(&b_chain, vec![]);
-    let node = Node::new(&[&a, &b]);
+    let mut node = Node::new(&[&a, &b]);
 
-    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&b_chain));
-    assert!(ok, "{:?}, tip {:?}", res, node.tip());
-    assert!(node.is_banned(&a.addr()), "witness not banned by repeated disagreement");
+    let (banned, res) = node.run_sync(|_| {
+        let start = Instant::now();
+        while start.elapsed() < SYNC_TIMEOUT && !node.is_banned(&a.addr()) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Give the survivor several unopposed rounds.
+        std::thread::sleep(Duration::from_secs(3));
+        node.is_banned(&a.addr())
+    });
+    assert!(banned, "witness not banned by repeated disagreement: {:?}", res);
+    assert_eq!(node.tip().0, 0, "survivor's headers accepted without a witness");
     let b_score = node.score(&b.addr());
     assert!(b_score.map_or(false, |s| s < FRESH_SCORE), "active peer not penalized: {:?}", b_score);
-    // Several getheaders rounds were needed before the batch was accepted.
-    let rounds = b
-        .log()
-        .iter()
-        .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
-        .count();
-    assert!(rounds >= 5, "only {} getheaders rounds", rounds);
+
+    // A fresh peer that agrees with the survivor settles it.
+    let c = MockPeer::spawn(&b_chain, vec![]);
+    node.use_peers(&[&b, &c]);
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&b_chain));
+    assert!(ok, "did not sync after a fresh witness agreed: {:?}, tip {:?}", res, node.tip());
 }
 
 /// A peer that claims a higher tip but answers `getheaders` with nothing
-/// is always picked as the active peer (height-weighted), so the node
-/// believes it is synced and never asks the honest peer. Only gaps above
-/// 2016 blocks are treated as lying. Not yet tracked by a ticket; closest
-/// to 024 (a single peer stalls sync).
+/// used to be picked as the active peer every time (height-weighted), so
+/// the node believed it was synced and never asked the honest peer. Now its
+/// claimed height is capped at our tip and it takes a small penalty.
 #[test]
-#[ignore = "untracked (found by 027; cf. 024): an empty-headers peer with a higher claimed height stalls header sync"]
 fn empty_headers_from_taller_peer_do_not_stall_sync() {
     let mut chain = FixtureChain::new();
     chain.mine(10);
@@ -577,41 +661,168 @@ fn one_block_reorg_to_more_work_fork_while_running() {
     assert!(!node.has_utxo(&a.coinbase_outpoint(105)));
 }
 
-// ── Known bugs (documented, not yet fixed) ───────────────────────────
+// ── Ticket 024: misbehavior costs the peer, not the sync ─────────────
 
-#[test]
-#[ignore = "ticket 024: a consensus-invalid block from one peer halts sync instead of marking it failed"]
-fn invalid_block_is_marked_failed_and_honest_chain_followed() {
+/// Honest chain of 30 and a taller hostile fork whose block 21 overpays
+/// its coinbase (valid PoW, structurally intact).
+fn invalid_fork_fixture() -> (FixtureChain, FixtureChain) {
     let mut honest_chain = FixtureChain::new();
     honest_chain.mine(30);
     let mut hostile_chain = honest_chain.fork_at(20);
     hostile_chain.mine_invalid(Invalid::CoinbaseOverpay);
     hostile_chain.mine(15);
+    (honest_chain, hostile_chain)
+}
+
+#[test]
+fn invalid_block_is_marked_failed_and_honest_chain_followed() {
+    let (honest_chain, hostile_chain) = invalid_fork_fixture();
     let hostile = MockPeer::spawn(&hostile_chain, vec![]);
     let honest = MockPeer::spawn(&honest_chain, vec![]);
     let node = Node::new(&[&hostile, &honest]);
 
     let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&honest_chain));
     assert!(ok, "did not recover to the honest chain: {:?}, tip {:?}", res, node.tip());
+    assert!(node.is_failed(&hostile_chain.hash_at(21)), "invalid block not recorded");
+    // It announced the invalid chain (taller, so it was the header peer).
+    assert!(node.is_banned(&hostile.addr()), "announcer of the invalid chain not banned");
+    node.assert_utxos_match(&honest_chain);
 }
 
+/// The failed-block record survives a restart: a new peer pushing the same
+/// invalid chain is refused at the header stage and banned, and the
+/// invalid block is never requested again.
 #[test]
-#[ignore = "ticket 024: a mutated (witness-stripped) delivery halts sync instead of penalize-and-refetch"]
+fn failed_block_is_refused_after_restart() {
+    let (honest_chain, hostile_chain) = invalid_fork_fixture();
+    let hostile = MockPeer::spawn(&hostile_chain, vec![]);
+    let honest = MockPeer::spawn(&honest_chain, vec![]);
+    let node = Node::new(&[&hostile, &honest]);
+    let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&honest_chain));
+    assert!(ok, "{:?}, tip {:?}", res, node.tip());
+
+    // Only the new hostile peer is reachable (the address book remembers
+    // the honest one, which would otherwise be preferred as active peer).
+    drop(honest);
+    let hostile2 = MockPeer::spawn(&hostile_chain, vec![]);
+    let node = node.restart(&[&hostile2]);
+    let _ = node.sync_until(Duration::from_secs(4), |_| false);
+    assert_eq!(node.tip(), (honest_chain.tip_height(), honest_chain.tip_hash()));
+    assert!(node.is_banned(&hostile2.addr()), "peer re-sending the invalid chain not banned");
+    assert!(!hostile2.block_requests().contains(&hostile_chain.hash_at(21)));
+    node.assert_utxos_match(&honest_chain);
+}
+
+/// The node is presynced to 101 so the mutator has no earlier blocks to
+/// earn rewards with (+2 per block served): the penalty then shows in its
+/// persisted score.
+#[test]
 fn mutated_block_penalizes_peer_and_refetches() {
-    let chain = chain_with_spends(110);
+    let chain = chain_with_spends(110).prefix(102);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(101));
     // Block 102 carries witness spends; listed first, so it serves first.
     let mutator = MockPeer::spawn(&chain, vec![Behavior::ServeMutated(102)]);
     let honest = MockPeer::spawn(&chain, vec![]);
-    let node = Node::new(&[&mutator, &honest]);
+    node.use_peers(&[&mutator, &honest]);
 
     let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&chain));
     assert!(ok, "did not sync past the mutated delivery: {:?}", res);
     let score = node.score(&mutator.addr());
     assert!(score.map_or(true, |s| s < FRESH_SCORE), "mutator not penalized");
+    assert!(!node.is_failed(&chain.hash_at(102)), "valid block marked failed");
+    assert!(honest.block_requests().contains(&chain.hash_at(102)));
+}
+
+/// No witness data at all, though the coinbase commits to some: passes
+/// rust-bitcoin's commitment check, so without `check_block_mutation` it
+/// failed in script validation and was marked invalid (ticket 024
+/// amendment, "stripped witness misclassified").
+#[test]
+fn witnessless_block_is_a_bad_delivery_not_invalid() {
+    let chain = chain_with_spends(110).prefix(102);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(101));
+    let mutator = MockPeer::spawn(&chain, vec![Behavior::ServeWitnessless(102)]);
+    let honest = MockPeer::spawn(&chain, vec![]);
+    node.use_peers(&[&mutator, &honest]);
+
+    let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&chain));
+    assert!(ok, "did not sync past the witnessless delivery: {:?}", res);
+    assert!(mutator.block_requests().contains(&chain.hash_at(102)));
+    let score = node.score(&mutator.addr());
+    assert!(score.map_or(true, |s| s < FRESH_SCORE), "mutator not penalized");
+    assert!(!node.is_failed(&chain.hash_at(102)), "valid block marked failed");
+    node.assert_utxos_match(&chain);
+}
+
+/// CVE-2012-2459: block 104 (three transactions) served with its last
+/// transaction repeated. Same merkle root, same hash.
+#[test]
+fn duplicated_transaction_block_is_a_bad_delivery() {
+    let chain = chain_with_spends(110);
+    let dup = FixtureChain::duplicate_last_tx(chain.block(104));
+    assert_eq!(dup.block_hash(), chain.hash_at(104));
+    let mutator = MockPeer::spawn(&chain, vec![Behavior::WrongBlockAt(104, dup)]);
+    let honest = MockPeer::spawn(&chain, vec![]);
+    let node = Node::new(&[&mutator, &honest]);
+
+    let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&chain));
+    assert!(ok, "did not sync past the duplicated-tx delivery: {:?}", res);
+    assert!(mutator.block_requests().contains(&chain.hash_at(104)));
+    assert!(!node.is_failed(&chain.hash_at(104)), "valid block marked failed");
+    node.assert_utxos_match(&chain);
+}
+
+/// Every peer serves a corrupted block 102: the node reports it, backs off
+/// instead of spinning, and never marks the (valid) block failed.
+#[test]
+fn corrupted_blocks_from_every_peer_are_reported_without_spinning() {
+    let chain = chain_with_spends(110);
+    let m1 = MockPeer::spawn(&chain, vec![Behavior::ServeMutated(102)]);
+    let m2 = MockPeer::spawn(&chain, vec![Behavior::ServeWitnessless(102)]);
+    let node = Node::new(&[&m1, &m2]);
+
+    let (errors, res) = node.sync_errors_for(Duration::from_secs(6));
+    assert!(res.is_ok(), "{:?}", res);
+    assert_eq!(node.validated(), 101);
+    assert!(!node.is_failed(&chain.hash_at(102)));
+    assert!(
+        errors.iter().any(|e| e.contains("corrupted blocks at height 102")),
+        "no corrupted-peers status: {:?}",
+        errors
+    );
+    let requests = [&m1, &m2]
+        .iter()
+        .flat_map(|p| p.block_requests())
+        .filter(|h| *h == chain.hash_at(102))
+        .count();
+    assert!(requests <= 12, "spun on block 102: {} requests in 6s", requests);
+}
+
+/// Ticket 024 amendment: a peer answering with another network's magic is
+/// dropped, and sync proceeds from the others.
+#[test]
+fn wrong_network_magic_peer_is_dropped() {
+    let mut chain = FixtureChain::new();
+    chain.mine(12);
+    let mut taller = chain.clone();
+    taller.mine(3);
+    // Taller, so it is asked for headers first.
+    let foreign = MockPeer::spawn(&taller, vec![Behavior::WrongMagic]);
+    let honest = MockPeer::spawn(&chain, vec![]);
+    let node = Node::new(&[&foreign, &honest]);
+
+    let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&chain));
+    assert!(ok, "did not sync: {:?}, tip {:?}", res, node.tip());
+    assert!(
+        foreign.log().iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+        "foreign-magic peer was never asked"
+    );
+    assert!(node.is_banned(&foreign.addr()), "foreign-magic peer not banned");
 }
 
 #[test]
-#[ignore = "ticket 024: invalid extending headers halt sync instead of penalizing the peer"]
 fn invalid_extending_headers_penalize_peer_and_continue() {
     let mut honest_chain = FixtureChain::new();
     honest_chain.mine(30);
@@ -627,6 +838,101 @@ fn invalid_extending_headers_penalize_peer_and_continue() {
     let (ok, res) = node.sync_until(Duration::from_secs(20), synced_to(&honest_chain));
     assert!(ok, "sync halted on bad headers: {:?}", res);
 }
+
+#[test]
+fn catch_up_blocks_marks_invalid_block_failed() {
+    let (honest_chain, hostile_chain) = invalid_fork_fixture();
+    let mut node = Node::new(&[]);
+    presync(&mut node, &honest_chain.prefix(20));
+    let hostile = MockPeer::spawn(&hostile_chain, vec![]);
+    node.use_peers(&[&hostile]);
+
+    let status = node.hs.catch_up_blocks(50, 10).unwrap();
+    assert!(status.invalid_chain_detected, "{:?}", status);
+    assert!(status.error.is_some());
+    assert_eq!(status.current_height, 20);
+    assert_eq!(node.validated(), 20);
+    assert_eq!(node.tip(), (20, honest_chain.hash_at(20)), "invalid chain's headers kept");
+    assert!(node.is_failed(&hostile_chain.hash_at(21)));
+    assert!(node.is_banned(&hostile.addr()));
+}
+
+#[test]
+fn catch_up_blocks_refetches_mutated_block() {
+    let chain = chain_with_spends(110);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(100));
+    let mutator = MockPeer::spawn(&chain, vec![Behavior::ServeMutated(102)]);
+    let honest = MockPeer::spawn(&chain, vec![]);
+    node.use_peers(&[&mutator, &honest]);
+
+    let status = node.hs.catch_up_blocks(50, 20).unwrap();
+    assert!(status.caught_up, "{:?}", status);
+    assert!(!status.invalid_chain_detected);
+    assert!(!node.is_failed(&chain.hash_at(102)));
+    node.assert_utxos_match(&chain);
+}
+
+#[test]
+fn catch_up_blocks_penalizes_invalid_headers_and_validates_backlog() {
+    let mut chain = FixtureChain::new();
+    chain.mine(20);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(10));
+    // Headers 11..=20 are stored, blocks not yet validated.
+    let headers: Vec<Header> = (11..=20).map(|h| chain.block(h).header).collect();
+    node.hs.store.store_headers(&headers, 11).unwrap();
+    let mut bad_chain = chain.clone();
+    let genesis_time = chain.block(0).header.time;
+    bad_chain.mine_custom(vec![], |b| b.header.time = genesis_time);
+    let bad = MockPeer::spawn(&bad_chain, vec![]);
+    node.use_peers(&[&bad]);
+
+    let status = node.hs.catch_up_blocks(50, 10).unwrap();
+    assert!(status.caught_up, "{:?}", status);
+    assert_eq!(node.validated(), 20);
+    assert!(status.error.is_some(), "{:?}", status);
+    assert_eq!(node.tip().0, 20, "invalid header stored");
+    let score = node.score(&bad.addr());
+    assert!(score.map_or(true, |s| s < FRESH_SCORE), "sender of bad headers not penalized");
+}
+
+#[test]
+fn wake_path_rejects_invalid_block_and_drops_header() {
+    let (honest_chain, hostile_chain) = invalid_fork_fixture();
+    let mut node = Node::new(&[]);
+    presync(&mut node, &honest_chain.prefix(20));
+    let hostile = MockPeer::spawn(&hostile_chain.prefix(21), vec![]);
+    node.use_peers(&[&hostile]);
+
+    let n = node.hs.validate_latest_block(25).unwrap();
+    assert!(!n.validated);
+    assert!(n.validation_error.is_some());
+    assert_eq!(node.validated(), 20);
+    assert_eq!(node.tip(), (20, honest_chain.hash_at(20)));
+    assert!(node.is_failed(&hostile_chain.hash_at(21)));
+    assert!(node.is_banned(&hostile.addr()));
+}
+
+#[test]
+fn wake_path_refetches_mutated_block() {
+    let chain = chain_with_spends(110);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(101));
+    let tip = chain.prefix(102);
+    let mutator = MockPeer::spawn(&tip, vec![Behavior::ServeWitnessless(102)]);
+    let honest = MockPeer::spawn(&tip, vec![]);
+    node.use_peers(&[&mutator, &honest]);
+
+    let n = node.hs.validate_latest_block(25).unwrap();
+    assert!(n.validated, "{:?}", n.validation_error);
+    assert_eq!(node.validated(), 102);
+    assert!(!node.is_failed(&chain.hash_at(102)));
+    let score = node.score(&mutator.addr());
+    assert!(score.map_or(true, |s| s < FRESH_SCORE), "mutator not penalized");
+}
+
+// ── Known bugs (documented, not yet fixed) ───────────────────────────
 
 #[test]
 #[ignore = "ticket 025: reorg rolls back before the new branch's blocks are validated"]

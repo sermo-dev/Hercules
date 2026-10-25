@@ -17,7 +17,9 @@ use bitcoin::Txid;
 
 use crate::assumeutxo::{SnapshotAnchor, SNAPSHOT_MAP_REQUIRED_BYTES};
 use crate::block_store::BlockStore;
-use crate::block_validation::{validate_block, validate_block_scripts};
+use crate::block_validation::{
+    check_block_mutation, validate_block, validate_block_scripts, BlockValidationError,
+};
 use crate::chain_params::ChainParams;
 use crate::mempool::Mempool;
 use crate::p2p::{msg_name, PeerError};
@@ -77,6 +79,26 @@ const BLOCK_NOT_RECEIVED_PENALTY: u32 = 10;
 /// peer can produce this, so it's an immediate ban.
 const ANCHOR_CONFLICT_PENALTY: u32 = 100;
 
+/// Penalty for a block whose transactions don't match what its header
+/// commits to (stripped or altered witnesses, duplicated transactions): a
+/// mutated delivery (ticket 024). The block itself may be fine, so it is
+/// fetched from another peer and never marked invalid.
+const MUTATED_BLOCK_PENALTY: u32 = 20;
+
+/// Penalty for headers that fail validation (proof-of-work, timestamps,
+/// difficulty, linkage), on a normal extension or a reorg.
+const INVALID_HEADERS_PENALTY: u32 = 50;
+
+/// Penalty for a peer that claimed a taller chain at handshake but answers
+/// `getheaders` with nothing beyond our tip. Small: its claimed height is
+/// also capped at our tip, which is what stops it being picked again.
+const EMPTY_HEADERS_PENALTY: u32 = 10;
+
+/// Pause before retrying a height at which every connected peer served a
+/// mutated block, so the loop waits for the pool to refill instead of
+/// spinning on the same peers.
+const CORRUPT_DELIVERY_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Cap on how many addresses we'll process from a single addr / addrv2
 /// message. Bitcoin Core's MAX_ADDR_TO_SEND is 1000; we accept the same
 /// limit so a chatty peer can't fill the gossip queue with one message.
@@ -88,6 +110,59 @@ enum HeaderCrossCheck {
     Accept,
     /// Active peer's headers were contradicted by majority — reject the batch.
     Reject,
+}
+
+/// Why a downloaded block was rejected (ticket 024). Each class gets a
+/// different response in `sync()`, `catch_up_blocks()` and
+/// `validate_latest_block()`.
+enum BlockFailure {
+    /// This copy of the block is not what its header commits to (wrong
+    /// hash, mutated transactions or witnesses). The peer is at fault and
+    /// the real block may be fine: penalize, fetch it elsewhere.
+    Delivery(String),
+    /// The block matches its header and breaks a consensus rule, so every
+    /// chain containing it is invalid: record it as failed, drop its header
+    /// and everything above. The peer that announced that header chain (and
+    /// any peer later sending headers through the failed block) is banned
+    /// outright with `ban_peer`, not scored: `misbehaving(.., 100)` can
+    /// leave a peer that earned rewards serving earlier blocks connected.
+    /// Peers that merely served the block are not penalized: like Bitcoin
+    /// Core, we don't punish relaying a block the peer didn't vouch for.
+    Consensus(String),
+    /// Our own storage failed. Nobody else's fault; stop as before.
+    Local(SyncError),
+}
+
+impl From<BlockValidationError> for BlockFailure {
+    fn from(e: BlockValidationError) -> Self {
+        match e {
+            BlockValidationError::UtxoError { .. } => {
+                BlockFailure::Local(SyncError::Store(format!("{}", e)))
+            }
+            e if e.is_mutation() => BlockFailure::Delivery(format!("{}", e)),
+            e => BlockFailure::Consensus(format!("{}", e)),
+        }
+    }
+}
+
+/// Note that `addr` served a bad copy of the block at `height`, so the
+/// next attempt at that height asks someone else.
+fn record_bad_delivery(bad: &mut Option<(u32, Vec<String>)>, height: u32, addr: String) {
+    match bad {
+        Some((h, addrs)) if *h == height => addrs.push(addr),
+        _ => *bad = Some((height, vec![addr])),
+    }
+}
+
+/// The peer whose header batch put the current header at `height` into
+/// our store this session, if any. `sources` holds `(first, last, addr)`
+/// per stored batch, newest last.
+fn header_source(sources: &[(u32, u32, String)], height: u32) -> Option<&str> {
+    sources
+        .iter()
+        .rev()
+        .find(|(first, last, _)| (*first..=*last).contains(&height))
+        .map(|(_, _, addr)| addr.as_str())
 }
 
 /// Format a legacy v1 `Address` from `addr` gossip into the `host:port`
@@ -304,6 +379,11 @@ pub struct CatchUpStatus {
     /// signaling a possible eclipse attack. The wake still proceeds with
     /// the best-work tip, but the UI should surface this to the user.
     pub tip_disagreement: bool,
+    /// True if a block failed consensus validation during this call: it
+    /// was recorded as invalid and its headers dropped (ticket 024). The
+    /// UI can say "rejected an invalid block" rather than show a generic
+    /// error; `error` carries the details.
+    pub invalid_chain_detected: bool,
 }
 
 /// Trust and verification info exposed to the UI.
@@ -359,12 +439,17 @@ fn record_known_txid(state: &mut PeerRelayState, txid: Txid) {
 /// deadline allows, the request is retried once with a different peer.
 /// Transport errors keep the previous behavior: give up and report
 /// header-only.
+///
+/// Peers in `exclude` are never asked (they already served a bad copy,
+/// ticket 024), and a call with any excluded peer counts as a retry for
+/// the deadline. Returns the block and the peer that served it.
 fn fetch_requested_block(
     pool: &mut PeerPool,
     block_hash: BlockHash,
     deadline: Instant,
-) -> Option<bitcoin::block::Block> {
-    let mut tried: Vec<String> = Vec::new();
+    exclude: &[String],
+) -> Option<(bitcoin::block::Block, String)> {
+    let mut tried: Vec<String> = exclude.to_vec();
     for _ in 0..2 {
         if !tried.is_empty() && Instant::now() >= deadline {
             info!("validate_latest_block: deadline reached, not retrying block download");
@@ -386,7 +471,7 @@ fn fetch_requested_block(
             // silently reopen the substitution hole.
             Ok(block) if block.block_hash() == block_hash => {
                 pool.return_peer(block_peer);
-                return Some(block);
+                return Some((block, block_peer_addr));
             }
             Ok(block) => {
                 warn!(
@@ -497,6 +582,13 @@ pub struct HeaderSync {
     params: &'static ChainParams,
     /// Where each session's `PeerPool` gets its addresses.
     peer_source: PeerSource,
+    /// Peers left in an unresolved two-peer header disagreement (ticket
+    /// 024). Their header batches need a fresh agreeing witness before we
+    /// store them, even outside initial sync: otherwise banning the other
+    /// side would leave the survivor's headers accepted unchecked. Cleared
+    /// per peer once a witness agrees with it. Lives for the process, not
+    /// one session, since the survivor is usually still connected next time.
+    disputed_peers: Mutex<HashSet<String>>,
 }
 
 impl HeaderSync {
@@ -642,6 +734,7 @@ impl HeaderSync {
             chainwork_cache: Mutex::new(None),
             params,
             peer_source,
+            disputed_peers: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1331,6 +1424,65 @@ impl HeaderSync {
         Ok((new_tip, new_validated))
     }
 
+    /// Full validation of a downloaded block at `height`, classified for
+    /// the ticket 024 response matrix. The mutation check runs first so a
+    /// stripped or altered copy is blamed on the peer that sent it rather
+    /// than surfacing later (say, as a script failure) and condemning a
+    /// block that may be valid.
+    fn check_block(&self, block: &bitcoin::Block, height: u32) -> Result<(), BlockFailure> {
+        check_block_mutation(block, height, self.params)?;
+        validate_block(block, height, self.params)?;
+        validate_block_scripts(block, height, &self.utxo, self.params)?;
+        Ok(())
+    }
+
+    /// Response to a consensus-invalid block at `height` (ticket 024):
+    /// record it in `failed_blocks` and drop its header and everything
+    /// above, so header sync resumes at `height - 1` and follows whichever
+    /// peers have a valid chain. Callers only validate the block at
+    /// `validated_height + 1`, so the UTXO set needs no rollback.
+    fn reject_invalid_block(
+        &self,
+        height: u32,
+        hash: BlockHash,
+        reason: &str,
+    ) -> Result<(), SyncError> {
+        warn!(
+            "Block {} at height {} is invalid ({}); marking it failed and dropping its headers",
+            hash, height, reason
+        );
+        self.store
+            .mark_failed(hash, height, reason)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        self.store
+            .delete_headers_above(height - 1)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// The first block in `headers` that is, or builds directly on, a
+    /// block recorded as consensus-invalid. A chain through a failed block
+    /// is invalid however much work it has, so such a batch is refused
+    /// before it is cross-checked or stored.
+    fn first_failed_header(&self, headers: &[Header]) -> Result<Option<BlockHash>, SyncError> {
+        let failed = self
+            .store
+            .failed_hashes()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if failed.is_empty() {
+            return Ok(None);
+        }
+        Ok(headers.iter().find_map(|h| {
+            let hash = h.block_hash();
+            if failed.contains(&h.prev_blockhash) {
+                Some(h.prev_blockhash)
+            } else if failed.contains(&hash) {
+                Some(hash)
+            } else {
+                None
+            }
+        }))
+    }
+
     /// Block-connect hook shared by every path that applies a block:
     /// drop its transactions (and their conflicts) from the mempool and
     /// settle any own transactions it confirms or conflicts.
@@ -1407,6 +1559,11 @@ impl HeaderSync {
     /// fresh node only stores headers that two distinct peers agree on. The
     /// caller retries on the next iteration. Steady-state behavior is
     /// unchanged.
+    ///
+    /// The same fail-closed rule applies to a peer in `disputed_peers`
+    /// (step 3's two-peer case, ticket 024): once it has disagreed with a
+    /// witness we couldn't overrule, its batches need a fresh witness that
+    /// agrees with it, however the dispute ended.
     fn cross_check_headers(
         &self,
         pool: &mut PeerPool,
@@ -1415,12 +1572,15 @@ impl HeaderSync {
         active_first_hash: BlockHash,
         strict: bool,
     ) -> HeaderCrossCheck {
+        let disputed = self.disputed_peers.lock().unwrap().contains(active_addr);
+        let strict = strict || disputed;
+
         // Step 1: pick an independent witness peer.
         let witness_addr = match pool.peer_addr_other_than(active_addr) {
             Some(a) => a,
             None if strict => {
                 debug!(
-                    "cross-check: no witness for {} during initial sync; rejecting batch",
+                    "cross-check: no witness for {} (initial sync or disputed); rejecting batch",
                     active_addr
                 );
                 return HeaderCrossCheck::Reject;
@@ -1440,7 +1600,7 @@ impl HeaderSync {
                 // Same "can't conclude" case, but during initial sync we
                 // fail closed. No penalty for the active peer.
                 debug!(
-                    "cross-check witness {} failed during initial sync; rejecting batch",
+                    "cross-check witness {} failed (initial sync or disputed); rejecting batch",
                     witness_addr
                 );
                 return HeaderCrossCheck::Reject;
@@ -1460,6 +1620,9 @@ impl HeaderSync {
             // Two independent peers agree on the first header — accept.
             pool.reward(active_addr, 1);
             pool.reward(&witness_addr, 1);
+            let mut disputed = self.disputed_peers.lock().unwrap();
+            disputed.remove(active_addr);
+            disputed.remove(&witness_addr);
             return HeaderCrossCheck::Accept;
         }
 
@@ -1481,6 +1644,7 @@ impl HeaderSync {
                         witness_addr
                     );
                     pool.misbehaving(&witness_addr, HEADER_DIVERGENCE_PENALTY);
+                    self.disputed_peers.lock().unwrap().remove(active_addr);
                     return HeaderCrossCheck::Accept;
                 } else if tb_first == witness_first {
                     // Witness + tiebreaker agree → active is the liar.
@@ -1489,6 +1653,7 @@ impl HeaderSync {
                         active_addr
                     );
                     pool.misbehaving(active_addr, HEADER_DIVERGENCE_PENALTY);
+                    self.disputed_peers.lock().unwrap().remove(&witness_addr);
                     return HeaderCrossCheck::Reject;
                 } else {
                     // All three peers disagree — pathological case. Penalize
@@ -1509,6 +1674,9 @@ impl HeaderSync {
         );
         pool.misbehaving(active_addr, HEADER_DISAGREEMENT_PENALTY);
         pool.misbehaving(&witness_addr, HEADER_DISAGREEMENT_PENALTY);
+        let mut disputed = self.disputed_peers.lock().unwrap();
+        disputed.insert(active_addr.to_string());
+        disputed.insert(witness_addr);
         HeaderCrossCheck::Reject
     }
 
@@ -1527,10 +1695,28 @@ impl HeaderSync {
         match result {
             Ok(headers) => {
                 pool.return_peer(peer);
+                // A witness answering with a chain we know is invalid
+                // (ticket 024) is no opinion at all: ban it rather than let
+                // it dispute an honest active peer.
+                match self.first_failed_header(&headers) {
+                    Ok(Some(failed)) => {
+                        warn!(
+                            "cross-check: peer {} sent headers through invalid block {}",
+                            addr, failed
+                        );
+                        pool.ban_peer(addr);
+                        return None;
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!("cross-check: failed-block lookup: {}", e),
+                }
                 headers.first().map(|h| h.block_hash())
             }
             Err(e) => {
                 warn!("cross-check: peer {} failed to respond: {}", addr, e);
+                if matches!(e, PeerError::WrongMagic { .. }) {
+                    pool.ban_peer(addr);
+                }
                 pool.remove_peer(addr);
                 None
             }
@@ -1615,6 +1801,13 @@ impl HeaderSync {
 
         let mut peer_height = peer_height;
 
+        // Ticket 024 bookkeeping for this session: which peer supplied each
+        // stored header batch (so the announcer of an invalid block can be
+        // banned), and which peers served a mutated copy of the block at
+        // the height we're stuck on (so it is fetched from someone else).
+        let mut header_sources: Vec<(u32, u32, String)> = Vec::new();
+        let mut bad_deliveries: Option<(u32, Vec<String>)> = None;
+
         loop {
             // Check for shutdown request
             if self.shutdown_requested.load(Ordering::Relaxed) {
@@ -1664,6 +1857,11 @@ impl HeaderSync {
                 }
                 Err(e) => {
                     warn!("Peer {} error during get_headers: {}", active_addr, e);
+                    if matches!(e, PeerError::WrongMagic { .. }) {
+                        // Wrong network after a good handshake: never honest,
+                        // and a plain disconnect would just reconnect it.
+                        pool.ban_peer(&active_addr);
+                    }
                     pool.remove_peer(&active_addr);
                     pool.maintain();
                     if pool.count() == 0 {
@@ -1693,6 +1891,20 @@ impl HeaderSync {
                         );
                         pool.misbehaving(&active_addr, 100);
                         pool.maintain();
+                        continue;
+                    }
+                    // A smaller gap is no proof of lying (it may have
+                    // reorged), but this peer has nothing for us: stop
+                    // preferring it for its claimed height and ask the
+                    // next-best peer, rather than concluding we're synced
+                    // from the one peer that won't serve headers.
+                    if claimed > tip_height {
+                        info!(
+                            "Peer {} claims height {} but has no headers above {}; asking others",
+                            active_addr, claimed, tip_height
+                        );
+                        pool.lower_peer_height(&active_addr, tip_height);
+                        pool.misbehaving(&active_addr, EMPTY_HEADERS_PENALTY);
                         continue;
                     }
                 }
@@ -1767,8 +1979,46 @@ impl HeaderSync {
                             SyncError::Store(format!("no hash at height {}", next_height))
                         })?;
 
-                    // Use any available peer for block download
-                    let block_peer = pool.any_peer();
+                    // Use any available peer for block download, except
+                    // those that already served a bad copy of this block.
+                    let excluded: Vec<String> = match &bad_deliveries {
+                        Some((h, addrs)) if *h == next_height => addrs.clone(),
+                        _ => Vec::new(),
+                    };
+                    let block_peer = if excluded.is_empty() {
+                        pool.any_peer()
+                    } else {
+                        pool.peer_addr_excluding(&excluded)
+                            .and_then(|addr| pool.checkout_peer_by_addr(&addr))
+                    };
+                    if block_peer.is_none() && !excluded.is_empty() {
+                        // Every connected peer served a corrupted copy. Say
+                        // so, refill the pool and start over: each bad copy
+                        // cost its sender MUTATED_BLOCK_PENALTY, so peers
+                        // that keep doing it are eventually banned.
+                        warn!(
+                            "All {} tried peers served corrupted blocks at height {}",
+                            excluded.len(),
+                            next_height
+                        );
+                        bad_deliveries = None;
+                        pool.maintain();
+                        let best = pool.best_peer_addr().unwrap_or_default();
+                        on_progress(self.make_status(
+                            tip_height,
+                            peer_height,
+                            &pool,
+                            &best,
+                            false,
+                            validated,
+                            Some(format!(
+                                "Peers are serving corrupted blocks at height {}",
+                                next_height
+                            )),
+                        ));
+                        std::thread::sleep(CORRUPT_DELIVERY_BACKOFF);
+                        continue;
+                    }
                     if block_peer.is_none() {
                         warn!("No peers available for block download, refilling pool");
                         pool.maintain();
@@ -1794,6 +2044,9 @@ impl HeaderSync {
                                 "Block download error at height {} from {}: {}",
                                 next_height, block_peer_addr, e
                             );
+                            if matches!(e, PeerError::WrongMagic { .. }) {
+                                pool.ban_peer(&block_peer_addr);
+                            }
                             pool.remove_peer(&block_peer_addr);
                             pool.maintain();
                             if pool.count() == 0 {
@@ -1813,14 +2066,20 @@ impl HeaderSync {
                         }
                     };
 
-                    // Verify block hash matches our header chain
+                    // Verify block hash matches our header chain.
+                    // `get_block` already binds it (ticket 022); this is
+                    // defense in depth, handled as a bad delivery.
                     if block.block_hash() != block_hash {
-                        return Err(SyncError::Validation(format!(
-                            "block {} hash mismatch: expected {}, got {}",
+                        warn!(
+                            "Block {} from {}: expected {}, got {}",
                             next_height,
+                            block_peer_addr,
                             block_hash,
                             block.block_hash()
-                        )));
+                        );
+                        pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+                        record_bad_delivery(&mut bad_deliveries, next_height, block_peer_addr);
+                        continue;
                     }
 
                     // Crash recovery: if UTXOs from this block already exist in
@@ -1854,13 +2113,43 @@ impl HeaderSync {
                         continue;
                     }
 
-                    // Structural validation
-                    validate_block(&block, next_height, self.params)
-                        .map_err(|e| SyncError::Validation(format!("{}", e)))?;
-
-                    // Script validation + UTXO verification
-                    validate_block_scripts(&block, next_height, &self.utxo, self.params)
-                        .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+                    // Mutation check, structure, scripts + UTXO spends.
+                    // Ticket 024: a bad copy costs the sender and is fetched
+                    // elsewhere; an invalid block costs the chain.
+                    match self.check_block(&block, next_height) {
+                        Ok(()) => {}
+                        Err(BlockFailure::Delivery(reason)) => {
+                            warn!(
+                                "Mutated block {} from {}: {}; fetching it elsewhere",
+                                next_height, block_peer_addr, reason
+                            );
+                            pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY);
+                            record_bad_delivery(&mut bad_deliveries, next_height, block_peer_addr);
+                            continue;
+                        }
+                        Err(BlockFailure::Consensus(reason)) => {
+                            self.reject_invalid_block(next_height, block_hash, &reason)?;
+                            if let Some(announcer) = header_source(&header_sources, next_height) {
+                                let announcer = announcer.to_string();
+                                pool.ban_peer(&announcer);
+                            }
+                            let best = pool.best_peer_addr().unwrap_or_default();
+                            on_progress(self.make_status(
+                                next_height - 1,
+                                peer_height,
+                                &pool,
+                                &best,
+                                true,
+                                validated,
+                                Some(format!(
+                                    "Rejected an invalid block from the network at height {}: {}",
+                                    next_height, reason
+                                )),
+                            ));
+                            continue;
+                        }
+                        Err(BlockFailure::Local(e)) => return Err(e),
+                    }
 
                     // Update UTXO set with this block's changes
                     self.utxo
@@ -2080,6 +2369,18 @@ impl HeaderSync {
                 continue;
             }
 
+            // A batch through a block we recorded as invalid (ticket 024)
+            // pushes a chain we already know is invalid.
+            if let Some(failed) = self.first_failed_header(&headers)? {
+                warn!(
+                    "Peer {} sent headers through invalid block {}",
+                    active_addr, failed
+                );
+                pool.ban_peer(&active_addr);
+                pool.maintain();
+                continue;
+            }
+
             // ── Eclipse-resistance: cross-check headers against an
             // independent peer before storing them. We re-fetch the locator
             // from the store rather than reusing the earlier `locator` since
@@ -2103,8 +2404,9 @@ impl HeaderSync {
                     // appropriate misbehavior penalty. Drop the batch and
                     // try again on the next iteration.
                     pool.maintain();
-                    if strict && pool.count() < 2 {
-                        // Waiting for a second peer to witness — don't spin.
+                    if pool.count() < 2 {
+                        // Waiting for a second peer to witness (initial sync
+                        // or a disputed peer) — don't spin.
                         std::thread::sleep(Duration::from_secs(1));
                     }
                     continue;
@@ -2172,7 +2474,20 @@ impl HeaderSync {
                             continue;
                         }
 
-                        if reorg_depth > MAX_REORG_DEPTH {
+                        // Ticket 024 (023 follow-up): headers stored while
+                        // the chain is below minimum work were never used to
+                        // validate anything, so treat them as scratch. A fresh
+                        // node eclipsed by peers feeding a cheap chain that
+                        // stops short of the anchor would otherwise be stuck:
+                        // the honest chain forks near genesis, far deeper
+                        // than MAX_REORG_DEPTH, and one 2,000-header batch
+                        // can't show its real work. So below minimum work,
+                        // and as long as no validated block would be
+                        // disconnected, a fork that passes the (strict)
+                        // cross-check and header validation replaces ours.
+                        let scratch = !self.has_min_chain_work()? && fork_at >= current_validated;
+
+                        if reorg_depth > MAX_REORG_DEPTH && !scratch {
                             warn!(
                                 "Peer {} suggests reorg depth {} (max {}), ignoring",
                                 active_addr, reorg_depth, MAX_REORG_DEPTH
@@ -2203,7 +2518,7 @@ impl HeaderSync {
                         let new_work =
                             chainwork_for_headers(&headers[new_chain_offset..]);
 
-                        if !u256_gt(&new_work, &our_work) {
+                        if !scratch && !u256_gt(&new_work, &our_work) {
                             info!(
                                 "Fork at height {} has equal or less work, ignoring",
                                 fork_at
@@ -2256,13 +2571,14 @@ impl HeaderSync {
                                 "Reorg rejected: new chain failed validation: {}",
                                 e
                             );
-                            pool.misbehaving(&active_addr, 50);
+                            pool.misbehaving(&active_addr, INVALID_HEADERS_PENALTY);
                             continue;
                         }
 
                         // Steps 3-4: Validation passed — now perform the
                         // destructive rollback and store the new headers.
                         let (new_tip, new_validated) = self.apply_reorg(fork_at, new_headers)?;
+                        header_sources.push((fork_at + 1, new_tip, active_addr.clone()));
                         peer_height = std::cmp::max(peer_height, new_tip);
 
                         info!(
@@ -2307,7 +2623,10 @@ impl HeaderSync {
                 continue;
             }
 
-            validate_headers(
+            // Invalid headers cost the peer that sent them (ticket 024);
+            // the batch is dropped and the next iteration asks again, by
+            // then most likely of a different, better-scored peer.
+            if let Err(e) = validate_headers(
                 self.params,
                 &headers,
                 tip_hash,
@@ -2315,8 +2634,12 @@ impl HeaderSync {
                 &timestamps,
                 tip_header.bits,
                 &epoch_lookup,
-            )
-            .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+            ) {
+                warn!("Peer {} sent invalid headers: {}", active_addr, e);
+                pool.misbehaving(&active_addr, INVALID_HEADERS_PENALTY);
+                pool.maintain();
+                continue;
+            }
 
             let new_start = tip_height + 1;
             self.store
@@ -2324,6 +2647,7 @@ impl HeaderSync {
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
             let new_height = tip_height + batch_size;
+            header_sources.push((new_start, new_height, active_addr.clone()));
             peer_height = std::cmp::max(peer_height, new_height);
 
             info!(
@@ -2984,8 +3308,18 @@ impl HeaderSync {
 
         // Enforce 2000-header limit (same as main sync loop)
         if headers.len() > 2000 {
+            pool.misbehaving(&peer_addr, 100);
             return Err(SyncError::Validation(format!(
                 "peer sent {} headers (max 2000)", headers.len()
+            )));
+        }
+
+        // Bad headers cost the peer (ticket 024); the wake still ends here.
+        if let Some(failed) = self.first_failed_header(&headers)? {
+            pool.ban_peer(&peer_addr);
+            return Err(SyncError::Validation(format!(
+                "{} sent headers through invalid block {}",
+                peer_addr, failed
             )));
         }
 
@@ -3003,10 +3337,12 @@ impl HeaderSync {
                 .ok_or_else(|| format!("no header at height {}", height))
         };
 
-        self.check_batch_anchor(&headers, tip_height + 1)
-            .map_err(SyncError::Validation)?;
+        if let Err(e) = self.check_batch_anchor(&headers, tip_height + 1) {
+            pool.misbehaving(&peer_addr, ANCHOR_CONFLICT_PENALTY);
+            return Err(SyncError::Validation(e));
+        }
 
-        validate_headers(
+        if let Err(e) = validate_headers(
             self.params,
             &headers,
             tip_hash,
@@ -3014,8 +3350,10 @@ impl HeaderSync {
             &timestamps,
             tip_header.bits,
             &epoch_lookup,
-        )
-        .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+        ) {
+            pool.misbehaving(&peer_addr, INVALID_HEADERS_PENALTY);
+            return Err(SyncError::Validation(format!("{}", e)));
+        }
 
         let new_start = tip_height + 1;
         self.store
@@ -3067,59 +3405,75 @@ impl HeaderSync {
         }
 
         let block_hash = new_header.block_hash();
-        match fetch_requested_block(&mut pool, block_hash, deadline) {
-            Some(block) => {
-                if Instant::now() >= deadline {
-                    return Ok(notification);
-                }
-
-                // Structural validation
-                if let Err(e) = validate_block(&block, new_tip, self.params) {
-                    notification.validation_error =
-                        Some(format!("structural: {}", e));
-                    return Ok(notification);
-                }
-
-                // Script validation
-                if let Err(e) = validate_block_scripts(&block, new_tip, &self.utxo, self.params) {
-                    notification.validation_error =
-                        Some(format!("scripts: {}", e));
-                    return Ok(notification);
-                }
-
-                // Apply to UTXO set
-                if let Err(e) = self.utxo.apply_block(&block, new_tip) {
-                    notification.validation_error =
-                        Some(format!("utxo: {}", e));
-                    return Ok(notification);
-                }
-
-                // Store block for NODE_NETWORK_LIMITED serving. A failure here
-                // means the chain has advanced past `new_tip` in the UTXO set
-                // but `block_store` doesn't have the bytes — we'd be unable to
-                // serve this height to peers asking for it. Surface the error
-                // so the Swift caller can retry, matching the propagation
-                // pattern used in the main sync loop above.
-                if let Err(e) = self.block_store.store_block(&block, new_tip) {
-                    notification.validation_error =
-                        Some(format!("block store: {}", e));
-                    return Ok(notification);
-                }
-
-                // Remove confirmed transactions from mempool
-                self.on_block_connected(&block, new_tip);
-
-                self.store
-                    .set_validated_height(new_tip)
-                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-                notification.validated = true;
-                info!("validate_latest_block: block {} fully validated", new_tip);
-            }
-            None => {
+        // Peers that served a mutated copy (ticket 024); one retry elsewhere.
+        let mut bad_peers: Vec<String> = Vec::new();
+        while bad_peers.len() < 2 {
+            let Some((block, from)) =
+                fetch_requested_block(&mut pool, block_hash, deadline, &bad_peers)
+            else {
                 // Never got the requested block: validated_height stays put
                 // and the caller gets the header-only notification.
+                break;
+            };
+            if Instant::now() >= deadline {
+                return Ok(notification);
             }
+
+            // Mutation check, structure, scripts (ticket 024 classes).
+            match self.check_block(&block, new_tip) {
+                Ok(()) => {}
+                Err(BlockFailure::Delivery(reason)) => {
+                    warn!("validate_latest_block: mutated block from {}: {}", from, reason);
+                    pool.misbehaving(&from, MUTATED_BLOCK_PENALTY);
+                    notification.validation_error =
+                        Some(format!("peer served a corrupted block: {}", reason));
+                    bad_peers.push(from);
+                    continue;
+                }
+                Err(BlockFailure::Consensus(reason)) => {
+                    // The header came from `peer_addr` in this call.
+                    self.reject_invalid_block(new_tip, block_hash, &reason)?;
+                    pool.ban_peer(&peer_addr);
+                    notification.validation_error =
+                        Some(format!("rejected invalid block: {}", reason));
+                    return Ok(notification);
+                }
+                Err(BlockFailure::Local(e)) => {
+                    notification.validation_error = Some(format!("{}", e));
+                    return Ok(notification);
+                }
+            }
+            notification.validation_error = None;
+
+            // Apply to UTXO set
+            if let Err(e) = self.utxo.apply_block(&block, new_tip) {
+                notification.validation_error =
+                    Some(format!("utxo: {}", e));
+                return Ok(notification);
+            }
+
+            // Store block for NODE_NETWORK_LIMITED serving. A failure here
+            // means the chain has advanced past `new_tip` in the UTXO set
+            // but `block_store` doesn't have the bytes — we'd be unable to
+            // serve this height to peers asking for it. Surface the error
+            // so the Swift caller can retry, matching the propagation
+            // pattern used in the main sync loop above.
+            if let Err(e) = self.block_store.store_block(&block, new_tip) {
+                notification.validation_error =
+                    Some(format!("block store: {}", e));
+                return Ok(notification);
+            }
+
+            // Remove confirmed transactions from mempool
+            self.on_block_connected(&block, new_tip);
+
+            self.store
+                .set_validated_height(new_tip)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+            notification.validated = true;
+            info!("validate_latest_block: block {} fully validated", new_tip);
+            break;
         }
 
         Ok(notification)
@@ -3196,13 +3550,23 @@ impl HeaderSync {
         };
 
         let mut new_tip = tip_height;
+        // Bad headers cost the peer and are dropped, but the backlog we
+        // already have headers for is still validated (ticket 024).
+        let mut header_error: Option<String> = None;
 
-        if !headers.is_empty() {
+        'batch: {
+            if headers.is_empty() {
+                break 'batch;
+            }
             if headers.len() > 2000 {
-                return Err(SyncError::Validation(format!(
-                    "peer sent {} headers (max 2000)",
-                    headers.len()
-                )));
+                pool.misbehaving(&peer_addr, 100);
+                header_error = Some(format!("peer sent {} headers (max 2000)", headers.len()));
+                break 'batch;
+            }
+            if let Some(failed) = self.first_failed_header(&headers)? {
+                pool.ban_peer(&peer_addr);
+                header_error = Some(format!("peer sent headers through invalid block {}", failed));
+                break 'batch;
             }
 
             // Eclipse-resistance: cross-check the new headers against an
@@ -3251,10 +3615,13 @@ impl HeaderSync {
                     .ok_or_else(|| format!("no header at height {}", height))
             };
 
-            self.check_batch_anchor(&headers, tip_height + 1)
-                .map_err(SyncError::Validation)?;
+            if let Err(e) = self.check_batch_anchor(&headers, tip_height + 1) {
+                pool.misbehaving(&peer_addr, ANCHOR_CONFLICT_PENALTY);
+                header_error = Some(e);
+                break 'batch;
+            }
 
-            validate_headers(
+            if let Err(e) = validate_headers(
                 self.params,
                 &headers,
                 tip_hash,
@@ -3262,8 +3629,12 @@ impl HeaderSync {
                 &timestamps,
                 tip_header.bits,
                 &epoch_lookup,
-            )
-            .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+            ) {
+                warn!("catch_up_blocks: invalid headers from {}: {}", peer_addr, e);
+                pool.misbehaving(&peer_addr, INVALID_HEADERS_PENALTY);
+                header_error = Some(format!("invalid headers from peer: {}", e));
+                break 'batch;
+            }
 
             let new_start = tip_height + 1;
             self.store
@@ -3281,7 +3652,10 @@ impl HeaderSync {
         // pending snapshot is bound to it (may advance validated_height).
         if !self.ready_to_validate_blocks()? {
             info!("catch_up_blocks: chain below minimum work or snapshot pending, skipping block validation");
-            return Ok(self.make_catchup_status(false, 0, validated_height, new_tip));
+            return Ok(CatchUpStatus {
+                error: header_error,
+                ..self.make_catchup_status(false, 0, validated_height, new_tip)
+            });
         }
         validated_height = self
             .store
@@ -3290,6 +3664,9 @@ impl HeaderSync {
 
         // Block validation loop — oldest-first
         let mut blocks_validated: u32 = 0;
+        // Peers that served a bad copy of the block at `validated_height
+        // + 1` (ticket 024); cleared whenever a block is connected.
+        let mut bad_peers: Vec<String> = Vec::new();
 
         while validated_height < new_tip
             && blocks_validated < max_blocks
@@ -3305,15 +3682,27 @@ impl HeaderSync {
                     SyncError::Store(format!("no hash at height {}", next_height))
                 })?;
 
-            let mut block_peer = match pool.any_peer() {
+            let block_peer = if bad_peers.is_empty() {
+                pool.any_peer()
+            } else {
+                pool.peer_addr_excluding(&bad_peers)
+                    .and_then(|addr| pool.checkout_peer_by_addr(&addr))
+            };
+            let mut block_peer = match block_peer {
                 Some(p) => p,
                 None => {
+                    let error = if bad_peers.is_empty() {
+                        "no peers available for block download".to_string()
+                    } else {
+                        format!("Peers are serving corrupted blocks at height {}", next_height)
+                    };
                     return Ok(CatchUpStatus {
-                        error: Some("no peers available for block download".into()),
+                        error: Some(error),
                         ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
                     });
                 }
             };
+            let block_peer_addr = block_peer.addr().to_string();
 
             let block = match block_peer.get_block(block_hash) {
                 Ok(b) => {
@@ -3328,13 +3717,19 @@ impl HeaderSync {
                 }
             };
 
+            // Defense in depth behind get_block's hash binding (022): a
+            // bad delivery, like a mutated block.
             if block.block_hash() != block_hash {
-                return Err(SyncError::Validation(format!(
-                    "block {} hash mismatch: expected {}, got {}",
+                warn!(
+                    "catch_up_blocks: {} sent {} for height {}, expected {}",
+                    block_peer_addr,
+                    block.block_hash(),
                     next_height,
-                    block_hash,
-                    block.block_hash()
-                )));
+                    block_hash
+                );
+                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+                bad_peers.push(block_peer_addr);
+                continue;
             }
 
             // Crash recovery: if UTXOs from this block already exist,
@@ -3357,16 +3752,45 @@ impl HeaderSync {
                     .map_err(|e| SyncError::Store(format!("{}", e)))?;
                 validated_height = next_height;
                 blocks_validated += 1;
+                bad_peers.clear();
                 continue;
             }
 
-            // Structural validation
-            validate_block(&block, next_height, self.params)
-                .map_err(|e| SyncError::Validation(format!("{}", e)))?;
-
-            // Script validation + UTXO verification
-            validate_block_scripts(&block, next_height, &self.utxo, self.params)
-                .map_err(|e| SyncError::Validation(format!("{}", e)))?;
+            // Mutation check, structure, scripts (ticket 024 classes).
+            match self.check_block(&block, next_height) {
+                Ok(()) => {}
+                Err(BlockFailure::Delivery(reason)) => {
+                    warn!(
+                        "catch_up_blocks: mutated block {} from {}: {}",
+                        next_height, block_peer_addr, reason
+                    );
+                    pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY);
+                    bad_peers.push(block_peer_addr);
+                    continue;
+                }
+                Err(BlockFailure::Consensus(reason)) => {
+                    self.reject_invalid_block(next_height, block_hash, &reason)?;
+                    // Only the peer whose headers (this call) put the block
+                    // in our chain vouched for it.
+                    if (tip_height + 1..=new_tip).contains(&next_height) {
+                        pool.ban_peer(&peer_addr);
+                    }
+                    return Ok(CatchUpStatus {
+                        error: Some(format!(
+                            "Rejected an invalid block from the network at height {}: {}",
+                            next_height, reason
+                        )),
+                        invalid_chain_detected: true,
+                        ..self.make_catchup_status(
+                            false,
+                            blocks_validated,
+                            validated_height,
+                            next_height - 1,
+                        )
+                    });
+                }
+                Err(BlockFailure::Local(e)) => return Err(e),
+            }
 
             // Update UTXO set
             self.utxo
@@ -3390,6 +3814,7 @@ impl HeaderSync {
 
             validated_height = next_height;
             blocks_validated += 1;
+            bad_peers.clear();
 
             info!(
                 "catch_up_blocks: validated block {} ({}/{})",
@@ -3403,7 +3828,10 @@ impl HeaderSync {
             blocks_validated, validated_height, new_tip, caught_up
         );
 
-        Ok(self.make_catchup_status(caught_up, blocks_validated, validated_height, new_tip))
+        Ok(CatchUpStatus {
+            error: header_error,
+            ..self.make_catchup_status(caught_up, blocks_validated, validated_height, new_tip)
+        })
     }
 
     /// Build a CatchUpStatus, reading block hash/timestamp from the store.
@@ -3431,6 +3859,7 @@ impl HeaderSync {
             tip_timestamp,
             error: None,
             tip_disagreement: false,
+            invalid_chain_detected: false,
         }
     }
 
@@ -3558,7 +3987,7 @@ mod tests {
         let wanted_hash = synthetic_block(1).block_hash();
         let deadline = Instant::now() + Duration::from_secs(30);
 
-        assert!(fetch_requested_block(&mut pool, wanted_hash, deadline).is_none());
+        assert!(fetch_requested_block(&mut pool, wanted_hash, deadline, &[]).is_none());
         for (addr, _) in &servers {
             assert_eq!(
                 pool.get_score(addr),
@@ -3578,8 +4007,10 @@ mod tests {
         write_message(&mut servers[1].1, NetworkMessage::Block(wanted));
         let deadline = Instant::now() + Duration::from_secs(30);
 
-        let got = fetch_requested_block(&mut pool, wanted_hash, deadline).expect("block");
+        let (got, from) =
+            fetch_requested_block(&mut pool, wanted_hash, deadline, &[]).expect("block");
         assert_eq!(got.block_hash(), wanted_hash);
+        assert_eq!(from, servers[1].0);
         assert_eq!(
             pool.get_score(&servers[0].0),
             Some(100 - BLOCK_NOT_RECEIVED_PENALTY as i32)
@@ -3596,7 +4027,7 @@ mod tests {
 
         // Deadline already passed: the first attempt still runs (the
         // caller checked the deadline before calling), but no retry.
-        assert!(fetch_requested_block(&mut pool, wanted_hash, Instant::now()).is_none());
+        assert!(fetch_requested_block(&mut pool, wanted_hash, Instant::now(), &[]).is_none());
         assert_eq!(pool.get_score(&servers[1].0), Some(100));
     }
 
