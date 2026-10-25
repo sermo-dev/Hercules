@@ -568,6 +568,13 @@ class NodeViewModel: ObservableObject {
                 return !token.retired && spaceWatch.shouldContinue()
             }
 
+            // The import runs for minutes: keep the screen from
+            // auto-locking (which backgrounds the app), and hold a
+            // background task so a brief app switch doesn't freeze it
+            // mid-write (ticket 051). Released on every exit below.
+            let importAssertion = LongTaskAssertion(name: "Snapshot import")
+            defer { importAssertion.end() }
+
             // Delete the cached .gz after a successful import (it's
             // redundant) or when the file itself was rejected
             // (corrupt, truncated, hash mismatch), so we don't retry
@@ -881,6 +888,54 @@ final class SnapshotSpaceWatch {
             return false
         }
         return true
+    }
+}
+
+/// Keeps a long foreground job (the snapshot import) going (ticket 051):
+/// disables the idle timer, so the screen doesn't auto-lock and background
+/// the app, and holds a UIKit background task, so a brief trip to the
+/// background doesn't suspend it at once. Created and ended from any
+/// thread; all state lives on the main thread, and `begin` is queued
+/// before `end`. `endBackgroundTask` runs exactly once, from `end` or from
+/// the expiration handler, whichever comes first.
+final class LongTaskAssertion {
+    // Main thread only.
+    private var taskID: UIBackgroundTaskIdentifier = .invalid
+    private var savedIdleTimerDisabled = false
+    private var ended = false
+
+    init(name: String) {
+        DispatchQueue.main.async { self.begin(name) }
+    }
+
+    /// Restore the idle timer and end the background task. Idempotent.
+    func end() {
+        DispatchQueue.main.async {
+            guard !self.ended else { return }
+            self.ended = true
+            self.endBackgroundTask()
+            UIApplication.shared.isIdleTimerDisabled = self.savedIdleTimerDisabled
+        }
+    }
+
+    private func begin(_ name: String) {
+        guard !ended else { return }
+        let app = UIApplication.shared
+        savedIdleTimerDisabled = app.isIdleTimerDisabled
+        app.isIdleTimerDisabled = true
+        taskID = app.beginBackgroundTask(withName: name) { [self] in
+            // Out of background time. iOS kills an app that doesn't end
+            // its task here; the import thread is just suspended with the
+            // process and carries on when the app is next active (LMDB is
+            // crash-safe if it never is).
+            endBackgroundTask()
+        }
+    }
+
+    private func endBackgroundTask() {
+        guard taskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(taskID)
+        taskID = .invalid
     }
 }
 
