@@ -885,6 +885,74 @@ fn interrupted_rollback_is_repaired_at_startup() {
     node.assert_utxos_match(&chain);
 }
 
+/// Leave `block` (at `height`, one above `node`'s validated tip) applied to
+/// the UTXO set with its header stored but `validated_height` not
+/// advanced: the state after an iOS kill, or a failed block-store write,
+/// between `apply_block` and `set_validated_height`.
+fn apply_without_advancing(node: &Node, block: &bitcoin::Block, height: u32) {
+    assert_eq!(node.validated(), height - 1);
+    node.hs.store.store_headers(&[block.header], height).unwrap();
+    node.hs.utxo.apply_block(block, height).unwrap();
+    assert_eq!(node.validated(), height - 1);
+}
+
+/// Review finding (PR #24): block A105 applied but not marked validated,
+/// then a one-block reorg replaces it with B105. Recovery used to ask only
+/// whether *some* UTXO was indexed at 105, so B105 was accepted unvalidated
+/// on top of A105's effects. Now the reorg rolls the UTXO set back from the
+/// block it is actually at, and only the exact block counts as applied.
+#[test]
+fn applied_but_unvalidated_block_is_rolled_back_by_reorg() {
+    let (a, b) = reorg_fixture();
+    let mut node = Node::new(&[]);
+    presync(&mut node, &a.prefix(104));
+    apply_without_advancing(&node, a.block(105), 105);
+    assert!(!node.has_utxo(&a.coinbase_outpoint(1)), "A105 spends coinbase 1");
+    let p1 = MockPeer::spawn(&b, vec![]);
+    let p2 = MockPeer::spawn(&b, vec![]);
+    node.use_peers(&[&p1, &p2]);
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&b));
+    assert!(ok, "did not sync to B: {:?}, tip {:?}", res, node.tip());
+    node.assert_utxos_match(&b);
+    assert!(node.has_utxo(&a.coinbase_outpoint(1)), "A105's spend not undone");
+}
+
+/// The same leftover, but the block's only outputs are OP_RETURN (its
+/// spend burns coinbase 1 and the coinbase pays to OP_RETURN), so nothing
+/// is indexed at its height. Recovery used to miss it, re-validate it
+/// against a UTXO set that had already spent its input, and halt on a
+/// local fault. The best-block marker recognises it.
+#[test]
+fn applied_op_return_only_block_is_recovered() {
+    let mut c = FixtureChain::new();
+    c.mine(104);
+    let burn = c.spend(
+        &[c.coinbase_outpoint(1)],
+        vec![TxOut { value: Amount::ZERO, script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x6a]) }],
+    );
+    c.mine_custom(vec![burn], |b| {
+        for out in &mut b.txdata[0].output {
+            out.script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x42]);
+        }
+    });
+    c.mine(2);
+    assert!(c.block(105).txdata.iter().flat_map(|tx| &tx.output).all(|o| o.script_pubkey.is_op_return()));
+
+    let mut node = Node::new(&[]);
+    presync(&mut node, &c.prefix(104));
+    apply_without_advancing(&node, c.block(105), 105);
+    assert!(!node.hs.utxo.has_utxos_at_height(105).unwrap(), "nothing indexed at 105");
+    let peer = MockPeer::spawn(&c, vec![]);
+    node.use_peers(&[&peer]);
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&c));
+    assert!(ok, "did not recover: {:?}, validated {}", res, node.validated());
+    node.assert_utxos_match(&c);
+    assert!(!node.is_failed(&c.hash_at(105)));
+    assert!(node.hs.block_store.has_block(&c.hash_at(105)).unwrap(), "recovered block not stored");
+}
+
 /// A failed block already in our header chain (stored before the verdict
 /// was recorded) is dropped, never requested.
 #[test]

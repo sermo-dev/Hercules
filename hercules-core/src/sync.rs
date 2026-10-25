@@ -112,6 +112,11 @@ const RELAYED_INVALID_CHAIN_PENALTY: u32 = 10;
 /// this is also roughly a minimum stall time in seconds.
 const SCRATCH_STALL_ROUNDS: u32 = 10;
 
+/// Best-block hash recorded when the UTXO set is rolled back to a block
+/// whose header we no longer have (see `HeaderSync::rollback_utxo_to`). It
+/// matches no real block, so that block is never taken as already applied.
+const UNKNOWN_BLOCK_HASH: [u8; 32] = [0; 32];
+
 /// Version of the block validation rules. Bump whenever a change to
 /// validation could flip a verdict, so `failed_blocks` rows recorded under
 /// the old rules are dropped at startup and those blocks reconsidered
@@ -779,8 +784,9 @@ impl HeaderSync {
         // the block it is at in the same LMDB txn as each write, so when
         // that block is on our header chain below `validated_height`, it is
         // the truth: step `validated_height` down to it. (A UTXO set ahead
-        // of `validated_height` is the older crash case that
-        // `has_utxos_at_height` already recovers.)
+        // of `validated_height` is left alone here: `utxo_has_block`
+        // finishes that block if it is still ours when it is next
+        // connected, and rolls it back otherwise.)
         if let Some((utxo_height, utxo_hash)) =
             utxo.best_block().map_err(|e| SyncError::Store(format!("{}", e)))?
         {
@@ -1521,19 +1527,15 @@ impl HeaderSync {
             .validated_height()
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-        // Roll back UTXO set for validated blocks above fork point
-        if current_validated > fork_at {
-            for h in (fork_at + 1..=current_validated).rev() {
-                let parent = self
-                    .store
-                    .get_hash_at_height(h - 1)
-                    .map_err(|e| SyncError::Store(format!("{}", e)))?
-                    .ok_or_else(|| SyncError::Store(format!("no header at height {}", h - 1)))?;
-                self.utxo
-                    .rollback_block_to(h, parent.to_byte_array())
-                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
-            }
-            info!("Rolled back UTXO set from {} to {}", current_validated, fork_at);
+        // Roll the UTXO set back to the fork point from the block it is
+        // actually at, not from `validated_height`: a block applied above
+        // it (crash, or a failed block-store write, before
+        // `set_validated_height`) must go too, or the new chain's block at
+        // that height would later be taken for it. Runs before the old
+        // headers are deleted, so their hashes name the rolled-back-to
+        // blocks.
+        if let Some(from) = self.rollback_utxo_to(fork_at, current_validated)? {
+            info!("Rolled back UTXO set from {} to {}", from, fork_at);
         }
 
         // Delete headers above fork point
@@ -1575,6 +1577,124 @@ impl HeaderSync {
             .demote_confirmed_above(fork_at, unix_now_u32() as u64);
 
         Ok((new_tip, new_validated))
+    }
+
+    /// Height of the block the UTXO set is at. From the best-block marker
+    /// when there is one; on a legacy database written before the marker
+    /// (ticket 024) it is inferred: `validated_height`, or one above it if
+    /// that block's outputs are already indexed (a crash between the UTXO
+    /// write and `set_validated_height`). The marker is written by the
+    /// first apply or rollback, so the inference only ever covers that
+    /// first step after an upgrade.
+    fn utxo_tip_height(&self, validated: u32) -> Result<u32, SyncError> {
+        match self
+            .utxo
+            .best_block()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+        {
+            Some((height, _)) => Ok(height),
+            None => {
+                let ahead = self
+                    .utxo
+                    .has_utxos_at_height(validated + 1)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                Ok(validated + ahead as u32)
+            }
+        }
+    }
+
+    /// Roll the UTXO set back, block by block from wherever it is, until it
+    /// is at `target`. Each step records the new best block's hash: our
+    /// header at that height when it is at or below `validated` (those
+    /// blocks are the ones the UTXO set was built from), otherwise
+    /// `UNKNOWN_BLOCK_HASH`, which never matches a real block, so the next
+    /// connect at that height rolls it back rather than trusting it.
+    /// Returns the height rolled back from, or `None` if the set was
+    /// already at or below `target`.
+    fn rollback_utxo_to(&self, target: u32, validated: u32) -> Result<Option<u32>, SyncError> {
+        let top = self.utxo_tip_height(validated)?;
+        if top <= target {
+            return Ok(None);
+        }
+        for h in (target + 1..=top).rev() {
+            let parent = if h - 1 <= validated {
+                self.store
+                    .get_hash_at_height(h - 1)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?
+                    .map(|hash| hash.to_byte_array())
+            } else {
+                None
+            };
+            self.utxo
+                .rollback_block_to(h, parent.unwrap_or(UNKNOWN_BLOCK_HASH))
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        }
+        Ok(Some(top))
+    }
+
+    /// Crash recovery before connecting block `hash` at `height` (always
+    /// `validated_height + 1`). True iff the UTXO set already holds exactly
+    /// this block (applied, then a kill or failed block-store write before
+    /// `set_validated_height`): the caller then only finishes connecting it
+    /// (`finish_recovered_block`). If the set holds a different block at
+    /// this height (or is above it), e.g. one a reorg replaced, that is
+    /// rolled back first and this returns false, so the block is validated
+    /// in full.
+    ///
+    /// Legacy databases with no best-block marker fall back to asking
+    /// whether any output is indexed at `height`. That can't tell two
+    /// blocks at one height apart, nor see a block whose outputs are all
+    /// OP_RETURN or spent in-block, so it is only used until the first
+    /// apply or rollback writes the marker.
+    fn utxo_has_block(&self, height: u32, hash: BlockHash) -> Result<bool, SyncError> {
+        match self
+            .utxo
+            .best_block()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+        {
+            Some((h, bh)) if h == height && bh == hash.to_byte_array() => Ok(true),
+            Some((h, bh)) if h >= height => {
+                warn!(
+                    "UTXO set is at block {} (height {}), not below {} at {}; rolling it back",
+                    BlockHash::from_byte_array(bh),
+                    h,
+                    hash,
+                    height
+                );
+                self.rollback_utxo_to(height - 1, height - 1)?;
+                Ok(false)
+            }
+            Some(_) => Ok(false),
+            None => self
+                .utxo
+                .has_utxos_at_height(height)
+                .map_err(|e| SyncError::Store(format!("{}", e))),
+        }
+    }
+
+    /// The rest of connecting a block `utxo_has_block` found already
+    /// applied: store it for serving if that write never happened, run the
+    /// block hook (it may not have run, or was undone at open, see
+    /// `HeaderSync::new`; it is idempotent), and advance `validated_height`.
+    fn finish_recovered_block(&self, block: &bitcoin::Block, height: u32) -> Result<(), SyncError> {
+        info!(
+            "Block {} at {} already applied (crash recovery), advancing validated height",
+            block.block_hash(),
+            height
+        );
+        let stored = self
+            .block_store
+            .has_block(&block.block_hash())
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if !stored {
+            self.block_store
+                .store_block(block, height)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        }
+        self.on_block_connected(block, height);
+        self.store
+            .set_validated_height(height)
+            .map_err(|e| SyncError::Store(format!("{}", e)))
     }
 
     /// Full validation of a downloaded block at `height`, classified for
@@ -2365,6 +2485,9 @@ impl HeaderSync {
                         "validated_height {} exceeds tip {}, resetting",
                         validated, tip_height
                     );
+                    // The UTXO set goes back with it (ticket 024), or the
+                    // blocks above the tip would stay applied.
+                    self.rollback_utxo_to(tip_height, validated)?;
                     self.store
                         .set_validated_height(tip_height)
                         .map_err(|e| SyncError::Store(format!("{}", e)))?;
@@ -2491,24 +2614,11 @@ impl HeaderSync {
                         continue;
                     }
 
-                    // Crash recovery: if UTXOs from this block already exist in
-                    // the set, the block was applied but validated_height wasn't
-                    // updated (crash between the two). Just advance the height.
-                    let already_applied = self
-                        .utxo
-                        .has_utxos_at_height(next_height)
-                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
-                    if already_applied {
-                        info!(
-                            "Block {} already applied (crash recovery), advancing validated height",
-                            next_height
-                        );
-                        // The block hook may not have run (or was undone
-                        // at open, see HeaderSync::new); it is idempotent.
-                        self.on_block_connected(&block, next_height);
-                        self.store
-                            .set_validated_height(next_height)
-                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                    // Crash recovery: the UTXO set already holds this very
+                    // block (applied, then validated_height not updated).
+                    // A different block there is rolled back first.
+                    if self.utxo_has_block(next_height, block_hash)? {
+                        self.finish_recovered_block(&block, next_height)?;
                         let best = pool.best_peer_addr().unwrap_or_default();
                         on_progress(self.make_status(
                             tip_height,
@@ -3901,6 +4011,27 @@ impl HeaderSync {
                 return Ok(notification);
             }
 
+            // Crash recovery, as in `sync()` and `catch_up_blocks`: the UTXO
+            // set may already hold this block, or a different one at this
+            // height that must be rolled back before validating.
+            match self.utxo_has_block(new_tip, block_hash) {
+                Ok(false) => {}
+                Ok(true) => {
+                    if let Err(e) = self.finish_recovered_block(&block, new_tip) {
+                        notification.validation_error = Some(format!("{}", e));
+                        return Ok(notification);
+                    }
+                    notification.validation_error = None;
+                    notification.validated = true;
+                    budget.mark(WakePhase::Validated);
+                    break;
+                }
+                Err(e) => {
+                    notification.validation_error = Some(format!("{}", e));
+                    return Ok(notification);
+                }
+            }
+
             // Mutation check, structure, scripts (ticket 024 classes).
             match self.check_block(&block, new_tip) {
                 Ok(()) => {}
@@ -4270,24 +4401,15 @@ impl HeaderSync {
                 continue;
             }
 
-            // Crash recovery: if UTXOs from this block already exist,
-            // the block was applied but validated_height wasn't updated.
-            let already_applied = self
-                .utxo
-                .has_utxos_at_height(next_height)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-            if already_applied {
-                info!(
-                    "catch_up_blocks: block {} already applied (crash recovery)",
-                    next_height
-                );
-                // The block hook may not have run (or was undone at open,
-                // see HeaderSync::new); it is idempotent.
-                self.on_block_connected(&block, next_height);
-                self.store
-                    .set_validated_height(next_height)
-                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            // Crash recovery: the UTXO set already holds this very block
+            // (a different block there is rolled back first).
+            if self.utxo_has_block(next_height, block_hash)? {
+                if let Err(e) = self.finish_recovered_block(&block, next_height) {
+                    return Ok(CatchUpStatus {
+                        error: Some(format!("block {}: {}", next_height, e)),
+                        ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
+                    });
+                }
                 validated_height = next_height;
                 blocks_validated += 1;
                 bad_peers.clear();

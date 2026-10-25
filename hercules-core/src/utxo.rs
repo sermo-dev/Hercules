@@ -1654,8 +1654,10 @@ impl UtxoSet {
     }
 
     /// Check if any UTXOs exist at the given block height.
-    /// Used for crash recovery: if UTXOs from a block exist but validated_height
-    /// wasn't updated, the block was already applied.
+    /// Crash-recovery fallback for legacy databases only (no best-block
+    /// marker, see `HeaderSync::utxo_has_block`): it can't tell two blocks
+    /// at one height apart, and misses blocks whose outputs are all
+    /// OP_RETURN or spent in-block.
     pub fn has_utxos_at_height(&self, height: u32) -> Result<bool, UtxoError> {
         let _gate = self.read_gate()?;
         let rtxn = self
