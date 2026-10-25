@@ -8,6 +8,7 @@ use bitcoin::{Transaction, Txid};
 use log::{debug, info};
 
 use crate::chain_params::ChainParams;
+use crate::script_verify;
 use crate::utxo::{UtxoEntry, UtxoSet};
 
 /// Default maximum mempool size: 50 MB of *serialized* transaction bytes.
@@ -160,7 +161,7 @@ impl Mempool {
     /// 2. Input validation — UTXO set first, then mempool fallback for
     ///    chain spending. Inputs that hit `to_evict` are treated as missing
     ///    so a replacement can't depend on the txs it's replacing.
-    /// 3. Script validation via libbitcoinconsensus, value math, fee rate
+    /// 3. Script validation (`script_verify`), value math, fee rate
     ///    floor, absurd-fee guardrail.
     /// 4. BIP 125 RBF rules 2/3/5 (only if conflicts is non-empty).
     /// 5. Ancestor closure + 25-ancestor / 101 kvB limit checks.
@@ -252,7 +253,7 @@ impl Mempool {
         out
     }
 
-    /// Test-only accept entry point that skips libbitcoinconsensus script
+    /// Test-only accept entry point that skips consensus script
     /// validation and the standard-script-type check. Lets unit tests
     /// exercise the graph state, fee math, RBF, and CPFP paths using
     /// trivial anyone-can-spend script_pubkeys instead of crafting valid
@@ -410,9 +411,9 @@ impl Mempool {
         // the txs it's about to remove.
         //
         // Resolution and script verification are split into two phases so
-        // that the libbitcoinconsensus 26.0 API can see *all* spent outputs
-        // up-front (BIP 341 sighash commits to every spent output, not just
-        // the one being verified).
+        // that script verification can see *all* spent outputs up-front
+        // (BIP 341 sighash commits to every spent output, not just the one
+        // being verified).
         let serialized_tx = serialize(&tx);
         let flags = self.params.script_flags(current_height);
         let mut input_sum: u64 = 0;
@@ -478,32 +479,12 @@ impl Mempool {
         }
 
         if !skip_consensus {
-            // Build the FFI Utxo array. Raw pointers reference the heap
-            // allocations owned by `spent`, which lives until the end of
-            // accept_tx_internal — well past these verify calls.
-            let utxos: Vec<bitcoinconsensus::Utxo> = spent
-                .iter()
-                .map(|(amt, spk)| bitcoinconsensus::Utxo {
-                    script_pubkey: spk.as_ptr(),
-                    script_pubkey_len: spk.len() as u32,
-                    value: *amt as i64,
-                })
-                .collect();
-
-            for (input_idx, (amount, script_pubkey)) in spent.iter().enumerate() {
-                bitcoinconsensus::verify_with_flags(
-                    script_pubkey,
-                    *amount,
-                    &serialized_tx,
-                    Some(&utxos),
-                    input_idx,
-                    flags,
-                )
-                .map_err(|e| MempoolError::ScriptFailure {
-                    input_index: input_idx,
-                    error: format!("{:?}", e),
-                })?;
-            }
+            script_verify::verify_transaction(&tx, &spent, flags).map_err(|f| {
+                MempoolError::ScriptFailure {
+                    input_index: f.input_index,
+                    error: f.error.to_string(),
+                }
+            })?;
         }
 
         // ── Phase 3: value math + fee bounds ────────────────────────────
@@ -1723,7 +1704,7 @@ mod tests {
     // These helpers build a fresh UTXO set and trivial transactions that
     // exercise the full graph/RBF logic without crafting real signatures.
     // The mempool is invoked via `accept_tx_test`, which skips the
-    // libbitcoinconsensus check and the standard-script-type check; every
+    // script verification and the standard-script-type check; every
     // other validation gate runs as in production.
 
     use crate::utxo::UtxoEntry;

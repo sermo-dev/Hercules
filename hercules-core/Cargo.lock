@@ -1788,6 +1788,7 @@ dependencies = [
  "blvm-muhash",
  "flate2",
  "heed",
+ "hercules-kernel-sys",
  "hex",
  "libc",
  "log",
@@ -1804,6 +1805,13 @@ dependencies = [
  "tor-cell",
  "tor-rtcompat",
  "uniffi",
+]
+
+[[package]]
+name = "hercules-kernel-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

@@ -18,6 +18,10 @@ fn main() {
         false
     };
     let target = env::var("TARGET").expect("TARGET was not set");
+    // Hercules (ticket 047): on Apple targets the two archives are sealed
+    // into one object exporting only `bitcoinconsensus_*` (see `seal` below),
+    // so cc must not emit its own link directives for them.
+    let seal = target.contains("apple");
     let is_big_endian = env::var("CARGO_CFG_TARGET_ENDIAN").expect("No endian is set") == "big";
     let mut base_config = cc::Build::new();
     base_config
@@ -29,6 +33,7 @@ fn main() {
         base_config.define("WIN32", "1");
     }
 
+    base_config.cargo_metadata(!seal);
     let mut secp_config = base_config.clone();
     let mut consensus_config = base_config;
 
@@ -92,4 +97,57 @@ fn main() {
         .file("depend/bitcoin/src/script/script.cpp")
         .file("depend/bitcoin/src/script/script_error.cpp")
         .compile("libbitcoinconsensus.a");
+
+    if seal {
+        seal_archives();
+    }
+}
+
+/// Hercules (ticket 047): prelink libbitcoinconsensus.a + libsecp256k1.a
+/// into a single relocatable object in which every symbol except the C API
+/// (`bitcoinconsensus_*`) is made local, and link that instead.
+///
+/// libbitcoinkernel embeds the same Core sources (SHA256, secp256k1,
+/// SignatureHashSchnorr, ...) at a newer version under identical global
+/// names, ~300 of them. Linked side by side, the linker silently binds both
+/// libraries to one copy (an ODR violation). Sealed, this library only ever
+/// calls its own v26 code, so hercules-core can link it next to the kernel
+/// (`script-consensus-legacy` + `script-kernel`, the differential mode).
+fn seal_archives() {
+    let out = std::path::PathBuf::from(env::var("OUT_DIR").unwrap());
+    let exports = out.join("bitcoinconsensus.exports");
+    std::fs::write(&exports, "_bitcoinconsensus_*\n").unwrap();
+    let sealed_obj = out.join("bitcoinconsensus_sealed.o");
+    let sealed_lib = out.join("libbitcoinconsensus_sealed.a");
+
+    // cc's compiler carries the right --target / -isysroot / min OS version,
+    // so the prelink matches the objects it just built.
+    let compiler = cc::Build::new().get_compiler();
+    let mut cmd = compiler.to_command();
+    let mut arg = std::ffi::OsString::from("-Wl,-force_load,");
+    arg.push(out.join("libbitcoinconsensus.a"));
+    let mut secp = std::ffi::OsString::from("-Wl,-force_load,");
+    secp.push(out.join("libsecp256k1.a"));
+    let mut exp = std::ffi::OsString::from("-Wl,-exported_symbols_list,");
+    exp.push(&exports);
+    cmd.args(["-r", "-nostdlib"]).arg(exp).arg(arg);
+    if !cfg!(feature = "external-secp") {
+        cmd.arg(secp);
+    }
+    cmd.arg("-o").arg(&sealed_obj);
+    let status = cmd.status().expect("spawn prelink");
+    assert!(status.success(), "prelinking libbitcoinconsensus failed: {}", status);
+
+    let _ = std::fs::remove_file(&sealed_lib);
+    let status = std::process::Command::new("ar")
+        .arg("crs")
+        .arg(&sealed_lib)
+        .arg(&sealed_obj)
+        .status()
+        .expect("spawn ar");
+    assert!(status.success(), "ar failed: {}", status);
+
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=bitcoinconsensus_sealed");
+    println!("cargo:rustc-link-lib=c++");
 }

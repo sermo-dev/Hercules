@@ -16,10 +16,12 @@ use crate::assumeutxo::{SnapshotAnchor, MAINNET_ANCHOR, MIN_CHAIN_WORK};
 // ── Script verification flags ────────────────────────────────────────
 //
 // Bit positions follow Bitcoin Core's `SCRIPT_VERIFY_*` enum
-// (src/script/interpreter.h), which is also the ABI of
-// libbitcoinconsensus. They are defined here rather than imported from the
-// script library so the activation table below stays independent of which
-// library verifies scripts (ticket 047 swaps it).
+// (src/script/interpreter.h), which is also the ABI of both script
+// backends: libbitcoinkernel's `btck_ScriptVerificationFlags_*` and
+// libbitcoinconsensus's `bitcoinconsensus_SCRIPT_FLAGS_VERIFY_*`. They are
+// defined here rather than imported so the activation table below stays
+// independent of which library verifies scripts (`script_verify`, ticket
+// 047); the tests below check them against each library's own constants.
 
 pub const SCRIPT_VERIFY_NONE: u32 = 0;
 pub const SCRIPT_VERIFY_P2SH: u32 = 1 << 0;
@@ -173,6 +175,7 @@ mod tests {
 
     /// Every height at which a mainnet flag changes, plus the neighbours
     /// and the extremes.
+    #[cfg(feature = "script-consensus-legacy")]
     fn mainnet_probe_heights() -> Vec<u32> {
         let mut heights = vec![0, 1, u32::MAX - 1, u32::MAX];
         for a in MAINNET_SCRIPT_FLAGS {
@@ -186,6 +189,7 @@ mod tests {
         heights
     }
 
+    #[cfg(feature = "script-consensus-legacy")]
     #[test]
     fn mainnet_script_flags_match_height_to_flags() {
         let p = ChainParams::mainnet();
@@ -205,6 +209,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "script-consensus-legacy")]
     #[test]
     fn script_flag_bits_match_libbitcoinconsensus_abi() {
         assert_eq!(SCRIPT_VERIFY_P2SH, bitcoinconsensus::VERIFY_P2SH);
@@ -222,8 +227,38 @@ mod tests {
         assert_eq!(SCRIPT_VERIFY_TAPROOT, bitcoinconsensus::VERIFY_TAPROOT);
     }
 
+    /// Against the pinned release's `bitcoinkernel.h` macros themselves
+    /// (exported by kernel-sys/src/flags.c), not a transcription.
+    #[cfg(feature = "script-kernel")]
+    #[test]
+    fn script_flag_bits_match_libbitcoinkernel_abi() {
+        use hercules_kernel_sys as k;
+        // SAFETY: plain `const uint32_t` data symbols.
+        unsafe {
+            assert_eq!(SCRIPT_VERIFY_NONE, k::hercules_btck_flag_none);
+            assert_eq!(SCRIPT_VERIFY_P2SH, k::hercules_btck_flag_p2sh);
+            assert_eq!(SCRIPT_VERIFY_DERSIG, k::hercules_btck_flag_dersig);
+            assert_eq!(SCRIPT_VERIFY_NULLDUMMY, k::hercules_btck_flag_nulldummy);
+            assert_eq!(
+                SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY,
+                k::hercules_btck_flag_checklocktimeverify
+            );
+            assert_eq!(
+                SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+                k::hercules_btck_flag_checksequenceverify
+            );
+            assert_eq!(SCRIPT_VERIFY_WITNESS, k::hercules_btck_flag_witness);
+            assert_eq!(SCRIPT_VERIFY_TAPROOT, k::hercules_btck_flag_taproot);
+            // Kernel's ALL is exactly our seven flags: no flag we don't map.
+            assert_eq!(
+                crate::script_verify::SCRIPT_VERIFY_ALL_CONSENSUS,
+                k::hercules_btck_flag_all
+            );
+        }
+    }
+
     /// Library-independent statement of the mainnet schedule, so the table
-    /// stays pinned after ticket 047 removes `height_to_flags`.
+    /// stays pinned in kernel-only builds (no `height_to_flags`).
     #[test]
     fn mainnet_script_flags_explicit_values() {
         let p = ChainParams::mainnet();

@@ -14,6 +14,7 @@ mod own_tx_store;
 mod p2p;
 mod peer_pool;
 mod relay_policy;
+mod script_verify;
 mod peer_store;
 mod store;
 mod sync;
