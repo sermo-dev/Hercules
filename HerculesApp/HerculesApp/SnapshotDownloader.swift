@@ -110,13 +110,17 @@ class SnapshotDownloader: NSObject, ObservableObject {
         return name
     }
 
-    /// Download and resume files left by builds that used other snapshots:
-    /// the retracted 943,500 file was saved under these fixed names.
-    private static let legacyFileNames = ["hercules-utxo.hutx.gz", "hercules-utxo.resume"]
-
+    /// Delete download and resume files left by builds that used other
+    /// snapshots (including the retracted 943,500 file, saved as
+    /// `hercules-utxo.*`), so an anchor bump never strands gigabytes in Caches.
     private static func deleteLegacyFiles() {
-        for name in legacyFileNames {
-            try? FileManager.default.removeItem(at: cachesDir.appendingPathComponent(name))
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: cachesDir.path) else { return }
+        for name in names
+        where name.hasPrefix("hercules-")
+            && (name.hasSuffix(".hutx.gz") || name.hasSuffix(".resume"))
+            && !name.hasPrefix(snapshotName + ".") {
+            try? fm.removeItem(at: cachesDir.appendingPathComponent(name))
         }
     }
 
@@ -358,8 +362,10 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
             return
         }
 
-        // Validate HTTP status — R2 returns 200 on success, 403/404 on missing.
-        if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
+        // Validate HTTP status — R2 returns 200 on success (206 when the
+        // download was resumed from resume data), 403/404 on missing.
+        if let http = downloadTask.response as? HTTPURLResponse,
+           http.statusCode != 200 && http.statusCode != 206 {
             try? fm.removeItem(at: dest)
             // Resuming would only replay the same error response forever.
             Self.deleteResumeData()
