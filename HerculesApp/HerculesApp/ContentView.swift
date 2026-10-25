@@ -94,7 +94,15 @@ class NodeViewModel: ObservableObject {
     private var lowDiskBannerShown = false
     private var lastDiskCheck = Date.distantPast
 
-    // Thread-safe access to the node: set from background thread, read from main thread
+    // Foreground sync bookkeeping (ticket 028). A background wake can stop
+    // a sync loop the app left running; it's restarted when the app is
+    // next active, unless the user stopped it. Main thread only.
+    private var syncGeneration = 0
+    private var userStoppedSync = false
+    private var resumeSyncWhenActive = false
+
+    // Thread-safe access to the node: set from background thread, read from main thread.
+    // The node itself belongs to NodeHost (ticket 028); this is our handle on it.
     private var _node: HerculesNode?
     private let nodeLock = NSLock()
     private var node: HerculesNode? {
@@ -142,6 +150,15 @@ class NodeViewModel: ObservableObject {
         Timer.publish(every: 5, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in self?.pollParticipationStats() }
+            .store(in: &downloadCancellables)
+
+        // Restart foreground sync a background wake stopped (ticket 028).
+        NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                guard let self = self, self.resumeSyncWhenActive else { return }
+                self.resumeSyncWhenActive = false
+                self.startSync()
+            }
             .store(in: &downloadCancellables)
     }
 
@@ -298,7 +315,9 @@ class NodeViewModel: ObservableObject {
             // 4. Drop the HerculesNode reference so its open SQLite handles
             // are released BEFORE we try to delete the files. On POSIX an
             // open inode survives unlink, which would leave stale state.
+            // NodeHost owns the node; discarding it cancels any wake.
             self.node = nil
+            NodeHost.shared.discard()
 
             // 5. Wipe the on-disk DBs via Rust.
             do {
@@ -341,16 +360,23 @@ class NodeViewModel: ObservableObject {
         isSyncRunning = true
         errorMessage = nil
         if !lowDiskBannerShown { storageWarning = nil }
+        syncGeneration += 1
+        let generation = syncGeneration
+        userStoppedSync = false
+        resumeSyncWhenActive = false
+
+        // Cancels any in-flight wake so it hands the node over quickly.
+        NodeHost.shared.sessions.beginForeground()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                // Migration + protection + backup exclusion must be complete
-                // before any database is opened (ticket 030).
-                try StoragePaths.prepareForNodeOpen()
-                let node = try HerculesNode(
-                    dbPath: StoragePaths.headersDBPath,
-                    torDataDir: StoragePaths.torDataDir
-                )
+                // The shared node (ticket 028). NodeHost runs the ticket 030
+                // storage preparation before opening it. Opening doesn't wait
+                // for Tor, so wait here to keep the bootstrapping UI.
+                let (node, reused) = try NodeHost.shared.node()
+                if try !node.waitForTransport(timeoutMs: 150_000) {
+                    throw HerculesError.TorError(msg: "Tor bootstrap timed out")
+                }
 
                 // Fetch initial Tor status
                 if let status = node.getTorStatus() {
@@ -364,13 +390,21 @@ class NodeViewModel: ObservableObject {
                     }
                 }
                 self?.node = node
+                let nodePaused = node.isValidationPaused()
                 DispatchQueue.main.async {
-                    // A fresh HerculesNode starts unpaused: drop any pause
-                    // state that belonged to the previous node so the UI
-                    // matches it, and so the forced check below re-pauses
-                    // this node if space is still low.
-                    self?.pausedForLowDisk = false
-                    self?.isValidationPaused = false
+                    if reused {
+                        // NodeHost kept the node from an earlier session (or
+                        // a wake): it keeps its pause state, and so does the
+                        // low-disk guard's ownership of that pause.
+                        self?.isValidationPaused = nodePaused
+                    } else {
+                        // A fresh HerculesNode starts unpaused: drop any pause
+                        // state that belonged to the previous node so the UI
+                        // matches it, and so the forced check below re-pauses
+                        // this node if space is still low.
+                        self?.pausedForLowDisk = false
+                        self?.isValidationPaused = false
+                    }
                     self?.checkDiskSpace(force: true)
                 }
 
@@ -487,10 +521,17 @@ class NodeViewModel: ObservableObject {
                     }
                 }
 
-                // This runs continuously — only returns on unrecoverable error
+                // Runs until stopped: by the user, by a reset, or by a
+                // background wake (ticket 028). Unrecoverable errors throw.
                 try node.startHeaderSync(callback: callback)
 
+                let preempted = NodeHost.shared.sessions.endForeground()
+                DispatchQueue.main.async {
+                    self?.syncDidStop(generation: generation, preemptedByWake: preempted)
+                }
+
             } catch {
+                _ = NodeHost.shared.sessions.endForeground()
                 DispatchQueue.main.async {
                     // Storage errors carry user-facing copy and the low-disk
                     // case already has its own banner.
@@ -523,8 +564,23 @@ class NodeViewModel: ObservableObject {
         }
     }
 
+    /// `startHeaderSync` returned without an error. Main thread.
+    private func syncDidStop(generation: Int, preemptedByWake: Bool) {
+        // A newer session has started since; it owns the UI state.
+        guard generation == syncGeneration else { return }
+        isSyncRunning = false
+        isConnecting = false
+        guard preemptedByWake && !userStoppedSync else { return }
+        if UIApplication.shared.applicationState == .active {
+            startSync()
+        } else {
+            resumeSyncWhenActive = true
+        }
+    }
+
     func stopSync() {
         guard let node = node else { return }
+        userStoppedSync = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             node.stopSync()
             DispatchQueue.main.async {

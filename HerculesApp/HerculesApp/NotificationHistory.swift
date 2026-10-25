@@ -8,6 +8,32 @@ enum NotificationSource: String, Codable {
     case catchUpProgress    // Multi-block catch-up (some blocks validated, more remain)
     case tipDisagreement    // Header cross-check detected peer disagreement (possible eclipse)
     case networkPolicyPaused // Validation skipped: metered network without opt-in
+    // Ticket 028 wake outcomes
+    case foregroundActive   // App on screen and syncing: the wake left it to foreground
+    case transportSlow      // Transport not up with enough budget left for a block
+    case wakeBusy           // Node busy (e.g. snapshot import) for the whole budget
+    case wakeCancelled      // BG task expired or the push watchdog fired
+}
+
+/// Where a wake's time went, in milliseconds since it arrived (ticket 028).
+/// Nil phases weren't reached. Collected to size the wake budget, peer
+/// fanout and transport choices on real hardware.
+struct WakeTimings: Codable, Equatable {
+    /// "push", "refresh" (BG task) or "test".
+    var trigger: String?
+    var nodeReadyMs: UInt64?
+    /// The node was already open in this process (no DB open, warm Tor).
+    var nodeReused: Bool?
+    var transportReadyMs: UInt64?
+    /// The wake's peer pool finished its initial handshakes.
+    var peersReadyMs: UInt64?
+    var headersCheckedMs: UInt64?
+    var blocksDownloadedMs: UInt64?
+    var validatedMs: UInt64?
+    /// Just before the completion handler / setTaskCompleted was called.
+    var completedMs: UInt64?
+    /// A sync loop left running in the background was stopped for this wake.
+    var preemptedSync: Bool?
 }
 
 /// A record of a block notification, persisted to disk.
@@ -22,6 +48,8 @@ struct BlockNotificationRecord: Codable, Identifiable {
     let receivedAt: Date
     let source: NotificationSource
     let validationError: String?
+    /// Wake records only; nil for older records and non-wake sources.
+    var wakeTimings: WakeTimings? = nil
 }
 
 /// Simple JSON file persistence for notification history.

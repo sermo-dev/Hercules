@@ -278,8 +278,10 @@ class NotificationManager: ObservableObject {
 
     // MARK: - Silent Push Handling
 
-    /// Handle a silent push notification. Creates a HerculesNode, validates
-    /// the latest block within 25 seconds, and posts a local notification.
+    /// Handle a silent push notification. Catches up on the process's shared
+    /// node (`NodeHost`) within a budget that starts now, at receipt, and
+    /// posts a local notification. A watchdog guarantees the completion
+    /// handler is called exactly once, before iOS's ~30 s limit (ticket 028).
     ///
     /// If the device is on a metered network and the user has not opted into
     /// "Use Cellular Data", we skip the block download entirely — opening a
@@ -291,6 +293,11 @@ class NotificationManager: ObservableObject {
         userInfo: [AnyHashable: Any],
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
+        // The wake's clock starts here: node open and transport bootstrap
+        // count against the same budget as block work (ticket 028).
+        let budget = WakeBudget(budgetMs: WakeConfig.budgetMs)
+        let receivedAt = Date()
+
         // Parse block info from push payload (used as fallback if validation fails)
         let pushBlock = parsePushPayload(userInfo)
 
@@ -311,7 +318,7 @@ class NotificationManager: ObservableObject {
                     timestampHuman: "",
                     validated: false,
                     headerValidated: false,
-                    receivedAt: Date(),
+                    receivedAt: receivedAt,
                     source: .networkPolicyPaused,
                     validationError: "Validation skipped: metered network without Use Cellular Data opt-in"
                 )
@@ -336,12 +343,29 @@ class NotificationManager: ObservableObject {
                     timestampHuman: "",
                     validated: false,
                     headerValidated: false,
-                    receivedAt: Date(),
+                    receivedAt: receivedAt,
                     source: .pushPayload,
                     validationError: "Validation skipped: storage almost full (\(StorageGuard.format(free)) free)"
                 )
                 appendRecord(record)
             }
+            completionHandler(.noData)
+            return
+        }
+
+        // Read here, on the main thread (AppDelegate delivers pushes on it).
+        let appIsActive = UIApplication.shared.applicationState == .active
+
+        // The app is on screen and syncing: foreground is already
+        // validating. Record that and finish at once, with no Live Activity
+        // and no node call (ticket 028). `runWake` re-checks atomically in
+        // case foreground sync starts in between.
+        if appIsActive && NodeHost.shared.sessions.isForegroundActive {
+            var record = Self.payloadRecord(
+                pushBlock: pushBlock, receivedAt: receivedAt, source: .foregroundActive, error: nil
+            )
+            record.wakeTimings = WakeTimings(trigger: "push", completedMs: budget.elapsedMs())
+            appendRecord(record)
             completionHandler(.noData)
             return
         }
@@ -365,94 +389,65 @@ class NotificationManager: ObservableObject {
         }
         activityController.start(initialHeight: initialHeight, peerCount: initialState.peerCount)
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try StoragePaths.prepareForNodeOpen()
-                let node = try HerculesNode(
-                    dbPath: StoragePaths.headersDBPath,
-                    torDataDir: StoragePaths.torDataDir
+        // The completion handler must be called exactly once, by whichever
+        // of Rust's return and the watchdog gets there first.
+        let gate = OnceGate()
+
+        // Watchdog (ticket 028): if Rust hasn't returned ~27 s after
+        // receipt (a blocking read on a slow peer can outlast the budget),
+        // cancel it and complete ourselves so iOS never kills the wake.
+        let watchdogDelay = max(0, WakeConfig.watchdogSeconds - Double(budget.elapsedMs()) / 1000)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + watchdogDelay) {
+            budget.cancel()
+            gate.fire {
+                StoragePaths.log.notice("wake: watchdog fired at \(budget.elapsedMs()) ms")
+                SharedNodeStore.markAwake(false)
+                activityController.finishFailure(height: initialHeight, peerCount: initialState.peerCount)
+                var record = Self.payloadRecord(
+                    pushBlock: pushBlock, receivedAt: receivedAt, source: .wakeCancelled,
+                    error: "No result within \(Int(WakeConfig.watchdogSeconds)) s; cancelled"
                 )
-
-                // 25 seconds, up to 7 blocks — leaving 5s margin within the 30s iOS window
-                let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
-                let record = Self.makeRecord(from: status)
-
-                let peerCount = (try? node.getStatus().peers.count) ?? 0
-                SharedNodeStore.publishValidation(
-                    height: status.currentHeight,
-                    blockHash: status.tipBlockHash,
-                    peerCount: UInt32(peerCount)
-                )
-
-                activityController.finishSuccess(
-                    height: status.currentHeight,
-                    peerCount: UInt32(peerCount)
-                )
-
+                record.wakeTimings = WakeTimings(trigger: "push", completedMs: budget.elapsedMs())
                 DispatchQueue.main.async {
                     self.appendRecord(record)
                 }
-
-                Self.postLocalNotification(for: record, blocksValidated: status.blocksValidated, remaining: status.targetHeight - status.currentHeight)
-
-                // If still behind, request a follow-up wake for accelerated catch-up
-                if !status.caughtUp && status.blocksValidated > 0 {
-                    Self.requestFollowUpWake()
-                }
-
-                completionHandler(.newData)
-
-            } catch StorageError.protectedDataUnavailable {
-                // Locked since reboot (ticket 030): chain data is
-                // completeUntilFirstUserAuthentication, so nothing can be
-                // opened until the user unlocks once. Detected by the open(2)
-                // probe in prepareForNodeOpen before any database is touched.
-                // Deliberately NOT gated on UIApplication.isProtectedDataAvailable:
-                // that tracks the `complete` class and goes false ~10 s after
-                // every passcode lock, so it would skip every pocketed wake.
-                // markAwake is best-effort here (the App Group is unreadable
-                // too, so the write usually fails).
-                SharedNodeStore.markAwake(false)
-                activityController.finishFailure(
-                    height: initialHeight,
-                    peerCount: initialState.peerCount
-                )
-                Self.recordLockedSinceReboot(pushBlock: pushBlock)
-                completionHandler(.noData)
-            } catch {
-                SharedNodeStore.markAwake(false)
-                activityController.finishFailure(
-                    height: initialHeight,
-                    peerCount: initialState.peerCount
-                )
-                // Validation failed — post notification from push payload if available
-                if let push = pushBlock {
-                    let record = BlockNotificationRecord(
-                        id: UUID(),
-                        height: push.height ?? 0,
-                        blockHash: push.hash,
-                        timestamp: push.timestamp,
-                        timestampHuman: "",
-                        validated: false,
-                        headerValidated: false,
-                        receivedAt: Date(),
-                        source: .pushPayload,
-                        validationError: "\(error)"
-                    )
-                    DispatchQueue.main.async {
-                        self.appendRecord(record)
-                    }
-                    Self.postLocalNotification(for: record)
-                }
                 completionHandler(.failed)
+            }
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let run = self.performWake(
+                budget: budget, receivedAt: receivedAt, pushBlock: pushBlock,
+                appIsActive: appIsActive, trigger: "push"
+            )
+            let completed = gate.fire {
+                self.publish(
+                    run, budget: budget, pushBlock: pushBlock, activity: activityController,
+                    initialHeight: initialHeight, initialPeers: initialState.peerCount, isPush: true
+                )
+                completionHandler(run.fetchResult)
+            }
+            if !completed {
+                // The watchdog already completed this wake. Keep the widget
+                // current; the history already has the watchdog's record.
+                if let status = run.status, status.blocksValidated > 0 {
+                    SharedNodeStore.publishValidation(
+                        height: status.currentHeight, blockHash: status.tipBlockHash, peerCount: run.peerCount
+                    )
+                }
+                StoragePaths.log.notice("wake: Rust returned after the watchdog, at \(budget.elapsedMs()) ms")
             }
         }
     }
 
     // MARK: - Test Notification (for development without APNs)
 
-    /// Simulate a push notification by running validate_latest_block directly.
+    /// Simulate a push notification: runs the same wake path on the shared
+    /// node. Reports "foreground active" if foreground sync is running.
     func testNotification(completion: @escaping (Result<BlockNotificationRecord, Error>) -> Void) {
+        let budget = WakeBudget(budgetMs: WakeConfig.budgetMs)
+        let receivedAt = Date()
+        let appIsActive = UIApplication.shared.applicationState == .active
         SharedNodeStore.markAwake(true)
         let initialState = SharedNodeStore.load()
         let activityController: WakeActivityControllerProtocol
@@ -467,44 +462,210 @@ class NotificationManager: ObservableObject {
         )
 
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try StoragePaths.prepareForNodeOpen()
-                let node = try HerculesNode(
-                    dbPath: StoragePaths.headersDBPath,
-                    torDataDir: StoragePaths.torDataDir
-                )
-
-                let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
-                let record = Self.makeRecord(from: status)
-
-                let peerCount = (try? node.getStatus().peers.count) ?? 0
-                SharedNodeStore.publishValidation(
-                    height: status.currentHeight,
-                    blockHash: status.tipBlockHash,
-                    peerCount: UInt32(peerCount)
-                )
-
-                activityController.finishSuccess(
-                    height: status.currentHeight,
-                    peerCount: UInt32(peerCount)
-                )
-
-                DispatchQueue.main.async {
-                    self.appendRecord(record)
-                    Self.postLocalNotification(for: record, blocksValidated: status.blocksValidated, remaining: status.targetHeight - status.currentHeight)
+            let run = self.performWake(
+                budget: budget, receivedAt: receivedAt, pushBlock: nil,
+                appIsActive: appIsActive, trigger: "test"
+            )
+            self.publish(
+                run, budget: budget, pushBlock: nil, activity: activityController,
+                initialHeight: initialState.blockHeight, initialPeers: initialState.peerCount, isPush: true
+            )
+            DispatchQueue.main.async {
+                if let record = run.record {
                     completion(.success(record))
-                }
-            } catch {
-                SharedNodeStore.markAwake(false)
-                activityController.finishFailure(
-                    height: initialState.blockHeight,
-                    peerCount: initialState.peerCount
-                )
-                DispatchQueue.main.async {
-                    completion(.failure(error))
+                } else {
+                    completion(.failure(StorageError.protectedDataUnavailable))
                 }
             }
         }
+    }
+
+    // MARK: - Wake (ticket 028)
+
+    /// One wake's result, ready to publish.
+    private struct WakeRun {
+        var record: BlockNotificationRecord?
+        var status: CatchUpStatus?
+        var peerCount: UInt32 = 0
+        var fetchResult: UIBackgroundFetchResult
+        /// Worth a local notification (wakes with a push payload, or progress).
+        var notify: Bool
+        var lockedSinceReboot = false
+    }
+
+    /// Run one wake on the shared node. Blocks; call off the main thread.
+    /// Never throws: every outcome becomes a record.
+    private func performWake(
+        budget: WakeBudget,
+        receivedAt: Date,
+        pushBlock: PushBlockInfo?,
+        appIsActive: Bool,
+        trigger: String
+    ) -> WakeRun {
+        let fromPayload = { (source: NotificationSource, error: String?, timings: WakeTimings) -> BlockNotificationRecord in
+            var record = Self.payloadRecord(pushBlock: pushBlock, receivedAt: receivedAt, source: source, error: error)
+            record.wakeTimings = timings
+            return record
+        }
+        do {
+            switch try NodeHost.shared.runWake(budget: budget, appIsActive: appIsActive) {
+            case .foregroundActive:
+                return WakeRun(
+                    record: fromPayload(.foregroundActive, nil, WakeTimings(trigger: trigger)),
+                    fetchResult: .noData,
+                    notify: false
+                )
+            case let .ran(report, nodeReadyMs, nodeReused, peerCount):
+                let timings = Self.timings(report, trigger: trigger, nodeReadyMs: nodeReadyMs, nodeReused: nodeReused)
+                switch report.outcome {
+                case .completed, .cancelled:
+                    if let status = report.status, report.outcome == .completed || status.blocksValidated > 0 {
+                        var record = Self.makeRecord(from: status, receivedAt: receivedAt)
+                        record.wakeTimings = timings
+                        return WakeRun(
+                            record: record, status: status, peerCount: peerCount,
+                            fetchResult: status.blocksValidated > 0 ? .newData : .noData,
+                            notify: true
+                        )
+                    }
+                    return WakeRun(
+                        record: fromPayload(.wakeCancelled, "Cancelled at \(report.elapsedMs) ms", timings),
+                        status: report.status, peerCount: peerCount,
+                        fetchResult: .failed, notify: pushBlock != nil
+                    )
+                case .transportSlow:
+                    return WakeRun(
+                        record: fromPayload(.transportSlow, report.error ?? "Transport not ready", timings),
+                        fetchResult: .failed, notify: pushBlock != nil
+                    )
+                case .busy:
+                    return WakeRun(
+                        record: fromPayload(.wakeBusy, "Node busy for the whole wake budget", timings),
+                        fetchResult: .noData, notify: false
+                    )
+                case .failed:
+                    return WakeRun(
+                        record: fromPayload(.pushPayload, report.error ?? "Wake failed", timings),
+                        fetchResult: .failed, notify: pushBlock != nil
+                    )
+                }
+            }
+        } catch StorageError.protectedDataUnavailable {
+            // Locked since reboot (ticket 030): chain data is
+            // completeUntilFirstUserAuthentication, so nothing can be
+            // opened until the user unlocks once. Detected by the open(2)
+            // probe in prepareForNodeOpen before any database is touched.
+            // Deliberately NOT gated on UIApplication.isProtectedDataAvailable:
+            // that tracks the `complete` class and goes false ~10 s after
+            // every passcode lock, so it would skip every pocketed wake.
+            return WakeRun(record: nil, fetchResult: .noData, notify: false, lockedSinceReboot: true)
+        } catch {
+            return WakeRun(
+                record: fromPayload(.pushPayload, "\(error)", WakeTimings(trigger: trigger, completedMs: nil)),
+                fetchResult: .failed, notify: pushBlock != nil
+            )
+        }
+    }
+
+    /// Publish a wake's result: widget, Live Activity, history, local
+    /// notification, follow-up wake. `isPush` keeps the BG task's quieter
+    /// behavior (widget only on progress, no notifications).
+    private func publish(
+        _ run: WakeRun,
+        budget: WakeBudget,
+        pushBlock: PushBlockInfo?,
+        activity: WakeActivityControllerProtocol,
+        initialHeight: UInt32,
+        initialPeers: UInt32,
+        isPush: Bool
+    ) {
+        if run.lockedSinceReboot {
+            // markAwake is best-effort here (the App Group is unreadable
+            // too, so the write usually fails).
+            SharedNodeStore.markAwake(false)
+            activity.finishFailure(height: initialHeight, peerCount: initialPeers)
+            Self.recordLockedSinceReboot(pushBlock: pushBlock)
+            return
+        }
+
+        if let status = run.status {
+            if isPush || status.blocksValidated > 0 {
+                SharedNodeStore.publishValidation(
+                    height: status.currentHeight,
+                    blockHash: status.tipBlockHash,
+                    peerCount: run.peerCount
+                )
+            }
+            activity.finishSuccess(height: status.currentHeight, peerCount: run.peerCount)
+            // If still behind, request a follow-up wake for accelerated catch-up
+            if !status.caughtUp && status.blocksValidated > 0 {
+                Self.requestFollowUpWake()
+            }
+        } else {
+            SharedNodeStore.markAwake(false)
+            activity.finishFailure(height: initialHeight, peerCount: initialPeers)
+        }
+
+        guard var record = run.record else { return }
+        if record.wakeTimings != nil {
+            record.wakeTimings?.completedMs = budget.elapsedMs()
+        }
+        DispatchQueue.main.async {
+            self.appendRecord(record)
+        }
+        guard isPush && run.notify else { return }
+        if let status = run.status {
+            Self.postLocalNotification(
+                for: record,
+                blocksValidated: status.blocksValidated,
+                remaining: status.targetHeight - status.currentHeight
+            )
+        } else {
+            Self.postLocalNotification(for: record)
+        }
+    }
+
+    private static func timings(
+        _ report: WakeReport,
+        trigger: String,
+        nodeReadyMs: UInt64,
+        nodeReused: Bool
+    ) -> WakeTimings {
+        WakeTimings(
+            trigger: trigger,
+            nodeReadyMs: nodeReadyMs,
+            nodeReused: nodeReused,
+            transportReadyMs: report.timings.transportReadyMs,
+            peersReadyMs: report.timings.peersReadyMs,
+            headersCheckedMs: report.timings.headersCheckedMs,
+            blocksDownloadedMs: report.timings.blocksDownloadedMs,
+            validatedMs: report.timings.validatedMs,
+            completedMs: nil,
+            preemptedSync: report.preemptedSync ? true : nil
+        )
+    }
+
+    /// A record built from the push payload (or, without one, the widget's
+    /// last-known height) for wakes that didn't produce a catch-up status.
+    private static func payloadRecord(
+        pushBlock: PushBlockInfo?,
+        receivedAt: Date,
+        source: NotificationSource,
+        error: String?
+    ) -> BlockNotificationRecord {
+        let known = pushBlock == nil ? SharedNodeStore.load() : nil
+        return BlockNotificationRecord(
+            id: UUID(),
+            height: pushBlock?.height ?? known?.blockHeight ?? 0,
+            blockHash: pushBlock?.hash ?? known?.blockHash ?? "",
+            timestamp: pushBlock?.timestamp ?? 0,
+            timestampHuman: "",
+            validated: false,
+            headerValidated: false,
+            receivedAt: receivedAt,
+            source: source,
+            validationError: error
+        )
     }
 
     // MARK: - Record Creation
@@ -524,7 +685,7 @@ class NotificationManager: ObservableObject {
         )
     }
 
-    private static func makeRecord(from status: CatchUpStatus) -> BlockNotificationRecord {
+    private static func makeRecord(from status: CatchUpStatus, receivedAt: Date = Date()) -> BlockNotificationRecord {
         let source: NotificationSource
         if status.tipDisagreement {
             source = .tipDisagreement
@@ -543,7 +704,7 @@ class NotificationManager: ObservableObject {
             timestampHuman: "",
             validated: status.caughtUp,
             headerValidated: true,
-            receivedAt: Date(),
+            receivedAt: receivedAt,
             source: source,
             validationError: status.error
         )
@@ -600,6 +761,18 @@ class NotificationManager: ObservableObject {
         case .networkPolicyPaused:
             content.title = "\(record.displayTitle) — Validation Paused"
             content.body = "Skipped to save cellular data. Connect to Wi-Fi or enable Use Cellular Data."
+        case .foregroundActive:
+            content.title = record.displayTitle
+            content.body = "Being validated by the running app"
+        case .transportSlow:
+            content.title = "\(record.displayTitle) — Not Yet Validated"
+            content.body = "The network was too slow during this wake. Hercules will validate on the next one."
+        case .wakeBusy:
+            content.title = "\(record.displayTitle) — Not Yet Validated"
+            content.body = "The node was busy. Hercules will validate on the next wake."
+        case .wakeCancelled:
+            content.title = "\(record.displayTitle) — Not Yet Validated"
+            content.body = "Ran out of background time. Hercules will validate on the next wake."
         }
 
         content.sound = .default
@@ -643,56 +816,56 @@ class NotificationManager: ObservableObject {
 
     /// Handle a BGAppRefreshTask for accelerated catch-up after a gap.
     func handleCatchUpTask(_ task: BGAppRefreshTask) {
+        let budget = WakeBudget(budgetMs: WakeConfig.budgetMs)
+        let receivedAt = Date()
+        // setTaskCompleted exactly once: normal finish or expiration.
+        let gate = OnceGate()
+
+        // Expiration (ticket 028): cancel the Rust work, complete the task
+        // ourselves, and ask for another wake to carry on.
+        task.expirationHandler = {
+            budget.cancel()
+            gate.fire {
+                StoragePaths.log.notice("refresh task expired at \(budget.elapsedMs()) ms")
+                task.setTaskCompleted(success: false)
+            }
+            Self.requestFollowUpWake()
+        }
+
         // Respect the same network policy gate as silent push wakes.
         guard NetworkPolicy.shared.shouldValidate else {
-            task.setTaskCompleted(success: true)
+            gate.fire { task.setTaskCompleted(success: true) }
             return
         }
 
-        task.expirationHandler = { /* Rust respects budget_secs */ }
-
         if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
-            task.setTaskCompleted(success: true)
+            gate.fire { task.setTaskCompleted(success: true) }
             return
         }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                // Throws protectedDataUnavailable when locked since reboot
-                // (detected with an open(2) probe; this handler runs off the
-                // main thread) — completes the task below without opening
-                // anything.
-                try StoragePaths.prepareForNodeOpen()
-                let node = try HerculesNode(
-                    dbPath: StoragePaths.headersDBPath,
-                    torDataDir: StoragePaths.torDataDir
+            // Locked since reboot: performWake reports it without opening
+            // anything (open(2) probe; this handler runs off the main thread).
+            let run = self.performWake(
+                budget: budget, receivedAt: receivedAt, pushBlock: nil,
+                appIsActive: Self.appIsActiveNow(), trigger: "refresh"
+            )
+            gate.fire {
+                self.publish(
+                    run, budget: budget, pushBlock: nil, activity: NoopWakeActivityController(),
+                    initialHeight: 0, initialPeers: 0, isPush: false
                 )
-                let status = try node.catchUpBlocks(maxBlocks: 7, budgetSecs: 25)
-
-                // Update widget with new height
-                if status.blocksValidated > 0 {
-                    let peerCount = (try? node.getStatus().peers.count) ?? 0
-                    SharedNodeStore.publishValidation(
-                        height: status.currentHeight,
-                        blockHash: status.tipBlockHash,
-                        peerCount: UInt32(peerCount)
-                    )
-                }
-
-                if !status.caughtUp && status.blocksValidated > 0 {
-                    Self.requestFollowUpWake()
-                }
-
-                let record = Self.makeRecord(from: status)
-                DispatchQueue.main.async {
-                    self.appendRecord(record)
-                }
-
-                task.setTaskCompleted(success: true)
-            } catch {
-                task.setTaskCompleted(success: false)
+                task.setTaskCompleted(success: run.status != nil)
             }
         }
+    }
+
+    /// `applicationState` from any thread.
+    private static func appIsActiveNow() -> Bool {
+        if Thread.isMainThread {
+            return UIApplication.shared.applicationState == .active
+        }
+        return DispatchQueue.main.sync { UIApplication.shared.applicationState == .active }
     }
 
     /// Request iOS to wake us again soon for continued catch-up.

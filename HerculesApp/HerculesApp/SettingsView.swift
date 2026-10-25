@@ -648,7 +648,11 @@ struct SettingsView: View {
             isTestingNotification = false
             switch result {
             case .success(let record):
-                if record.validated {
+                if record.source == .foregroundActive {
+                    testResult = "Foreground sync is running; the wake left it to the app"
+                } else if !record.validated, !record.headerValidated, let error = record.validationError {
+                    testResult = "Error: \(error)"
+                } else if record.validated {
                     testResult = "Block #\(record.height) fully validated"
                 } else if record.headerValidated {
                     testResult = "Block #\(record.height) header verified"
@@ -684,6 +688,12 @@ struct SettingsView: View {
                             Text(record.receivedAt, style: .relative)
                                 .font(.system(size: 11))
                                 .foregroundStyle(Theme.textTertiary)
+                            if let timings = record.wakeTimings {
+                                Text(wakeTimingSummary(timings))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(Theme.textTertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
 
                         Spacer()
@@ -712,6 +722,33 @@ struct SettingsView: View {
         return "\(token.prefix(8))...\(token.suffix(8))"
     }
 
+    /// One line per wake (ticket 028): seconds since receipt at each phase
+    /// reached, e.g. "push · node 0.0 (warm) · tor 4.1 · peers 6.3 · hdrs 6.9
+    /// · blk 8.8 · valid 9.4 · done 9.5".
+    private func wakeTimingSummary(_ t: WakeTimings) -> String {
+        func secs(_ ms: UInt64?) -> String? {
+            ms.map { String(format: "%.1f", Double($0) / 1000) }
+        }
+        var parts: [String] = []
+        if let trigger = t.trigger { parts.append(trigger) }
+        if let node = secs(t.nodeReadyMs) {
+            parts.append("node \(node)" + (t.nodeReused == true ? " (warm)" : ""))
+        }
+        let phases: [(String, UInt64?)] = [
+            ("tor", t.transportReadyMs),
+            ("peers", t.peersReadyMs),
+            ("hdrs", t.headersCheckedMs),
+            ("blk", t.blocksDownloadedMs),
+            ("valid", t.validatedMs),
+            ("done", t.completedMs),
+        ]
+        for (label, ms) in phases {
+            if let v = secs(ms) { parts.append("\(label) \(v)") }
+        }
+        if t.preemptedSync == true { parts.append("stopped bg sync") }
+        return parts.joined(separator: " · ")
+    }
+
     private func iconForSource(_ source: NotificationSource) -> String {
         switch source {
         case .fullValidation: return "checkmark.shield.fill"
@@ -720,6 +757,10 @@ struct SettingsView: View {
         case .headerOnly: return "checkmark.circle.fill"
         case .pushPayload: return "bell.fill"
         case .networkPolicyPaused: return "pause.circle.fill"
+        case .foregroundActive: return "iphone"
+        case .transportSlow: return "tortoise.fill"
+        case .wakeBusy: return "hourglass"
+        case .wakeCancelled: return "clock.badge.xmark"
         }
     }
 
@@ -731,6 +772,10 @@ struct SettingsView: View {
         case .headerOnly: return Theme.warning
         case .pushPayload: return Theme.textSecondary
         case .networkPolicyPaused: return Theme.warning
+        case .foregroundActive: return Theme.textSecondary
+        case .transportSlow: return Theme.warning
+        case .wakeBusy: return Theme.textSecondary
+        case .wakeCancelled: return Theme.error
         }
     }
 
@@ -742,6 +787,10 @@ struct SettingsView: View {
         case .headerOnly: return "Header"
         case .pushPayload: return "Unverified"
         case .networkPolicyPaused: return "Paused"
+        case .foregroundActive: return "Foreground"
+        case .transportSlow: return "Transport Slow"
+        case .wakeBusy: return "Busy"
+        case .wakeCancelled: return "Timed Out"
         }
     }
 }
