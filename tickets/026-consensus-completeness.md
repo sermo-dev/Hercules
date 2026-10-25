@@ -10,6 +10,11 @@ This ticket collects the missing rules into one module with tests for each rule.
 
 **Severity: Medium.** Exploiting these takes PoW, but they are real divergences from consensus.
 
+
+## Amendment (2026-10-24, finding from the 027 harness)
+
+- **BIP34 heights 1–16.** Our coinbase-height check can't parse Core's encoding for heights 1–16 (`OP_1`..`OP_16`, plus `OP_0` handling). Unreachable on mainnet (BIP34 activates at 227,931) but a real divergence, and it blocks regtest fixtures that activate BIP34 at low heights. The 027 harness has an `#[ignore]`d test for it.
+
 ## Background: what we check today
 
 `validate_block` (`hercules-core/src/block_validation.rs:62`) checks:

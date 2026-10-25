@@ -14,6 +14,16 @@ Each kind gets its own response. Peers are penalized and the node retries from s
 
 **Severity: High.** One malicious or buggy peer can currently stall the node indefinitely. That is a cheap denial of service against exactly the users who rely on Hercules for verification.
 
+
+## Amendment (2026-10-24, findings from the 027 harness)
+
+The 027 harness (`hercules-core/src/testkit/`) has `#[ignore]`d tests for each of these; un-ignore them as they're fixed.
+
+- **Empty-headers stall.** A peer that advertises a higher height but answers `getheaders` with zero headers keeps being picked as the sync peer. The node concludes it is synced and never asks the honest peers.
+- **Two-peer cross-check.** With exactly two peers that disagree, the witness is banned and the survivor's headers are then accepted with no cross-check at all. Require a fresh second opinion (or stay unsynced) instead.
+- **Stripped witness misclassified.** A block delivered with its witness data removed fails as a consensus error (block marked invalid) instead of as a bad delivery (re-request from another peer, penalize the sender). Distinguish by checking the witness commitment / wtxid merkle root before script validation.
+- **Network magic not checked on incoming messages.** The 4-byte magic of received messages is never compared with the chain's magic.
+
 ## Background
 
 ### Where the node halts
