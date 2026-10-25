@@ -377,7 +377,7 @@ pub fn validate_block_scripts(
         // Add this transaction's outputs to the in-block map
         let txid = tx.compute_txid();
         for (vout, output) in tx.output.iter().enumerate() {
-            if !output.script_pubkey.is_op_return() {
+            if !crate::utxo::is_unspendable(&output.script_pubkey) {
                 block_utxos.insert(
                     (txid, vout as u32),
                     (

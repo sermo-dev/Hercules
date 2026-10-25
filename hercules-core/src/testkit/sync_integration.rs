@@ -337,6 +337,7 @@ fn anchor_conflict_bans_peer_and_honest_chain_wins() {
         height: 10,
         block_hash: honest_chain.hash_at(10).to_byte_array(),
         utxo_hash: [0u8; 32],
+        utxo_count: 0,
     };
 
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&honest_chain));
@@ -364,7 +365,12 @@ fn pending_snapshot_activates_when_headers_reach_anchor() {
     let mut node = Node::new(&[&peer_a, &peer_b]);
     let path = node.dir.path().join("snapshot.hutx");
     std::fs::write(&path, &buf).unwrap();
-    node.hs.anchor = SnapshotAnchor { height: ANCHOR, block_hash, utxo_hash: meta.utxo_hash };
+    node.hs.anchor = SnapshotAnchor {
+        height: ANCHOR,
+        block_hash,
+        utxo_hash: meta.utxo_hash,
+        utxo_count: meta.utxo_count,
+    };
 
     // Loaded before any headers: pending, validated_height untouched.
     node.hs.load_snapshot(path.to_str().unwrap(), |_, _| true).unwrap();

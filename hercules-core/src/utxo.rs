@@ -21,6 +21,17 @@ use crate::assumeutxo::SnapshotAnchor;
 /// Snapshot file magic bytes: "HUTX"
 const SNAPSHOT_MAGIC: [u8; 4] = [b'H', b'U', b'T', b'X'];
 
+/// Bitcoin Core's `MAX_SCRIPT_SIZE`.
+pub const MAX_SCRIPT_SIZE: usize = 10_000;
+
+/// Core's `CScript::IsUnspendable`: an output that starts with OP_RETURN or
+/// whose script exceeds `MAX_SCRIPT_SIZE` can never be spent, so Core never
+/// adds it to the coins DB (`AddCoin`). We skip the same outputs so our set,
+/// its count and its MuHash match Core's.
+pub fn is_unspendable(script_pubkey: &bitcoin::Script) -> bool {
+    script_pubkey.is_op_return() || script_pubkey.len() > MAX_SCRIPT_SIZE
+}
+
 /// Current snapshot format version.
 const SNAPSHOT_VERSION: u32 = 1;
 
@@ -659,7 +670,7 @@ impl UtxoSet {
         for tx in &block.txdata {
             let txid = tx.compute_txid();
             for (vout, output) in tx.output.iter().enumerate() {
-                if !output.script_pubkey.is_op_return() {
+                if !is_unspendable(&output.script_pubkey) {
                     created.insert((txid, vout as u32));
                 }
             }
@@ -733,14 +744,14 @@ impl UtxoSet {
         }
 
         // Phase 2b: write the new outputs (skipping in-block-spent and
-        // OP_RETURN) plus their `height_index` entries.
+        // unspendable, see `is_unspendable`) plus their `height_index` entries.
         for tx in &block.txdata {
             let txid = tx.compute_txid();
             let txid_bytes = txid.to_byte_array();
             let is_cb = tx.is_coinbase();
 
             for (vout, output) in tx.output.iter().enumerate() {
-                if output.script_pubkey.is_op_return() {
+                if is_unspendable(&output.script_pubkey) {
                     continue;
                 }
                 let vout = vout as u32;
@@ -1246,6 +1257,23 @@ impl UtxoSet {
                     hex::encode(expected.utxo_hash)
                 )));
             }
+            // Before the count sizes the map below: the header's count is
+            // not covered by the content hash until the body is read.
+            if utxo_count != expected.utxo_count {
+                return Err(SnapshotLoadError::Invalid(format!(
+                    "snapshot utxo count mismatch: file={}, expected={}",
+                    utxo_count, expected.utxo_count
+                )));
+            }
+        }
+
+        // ── Emptiness ─────────────────────────────────────────────
+        // Checked before any flag, marker or map change: a non-empty set
+        // must come back untouched, not be wiped by the cleanup path.
+        if !self.is_empty_now()? {
+            return Err(SnapshotLoadError::Storage(
+                "UTXO set must be empty before loading snapshot".into(),
+            ));
         }
 
         info!(
@@ -1297,6 +1325,9 @@ impl UtxoSet {
 
         // ── Bulk-load loop (in a closure so error paths funnel through
         //     the cleanup block below) ──────────────────────────────
+        // Set if the in-txn emptiness re-check fails: nothing of ours was
+        // written, so the cleanup branch must not wipe someone else's rows.
+        let raced_nonempty = std::cell::Cell::new(false);
         let load_result: Result<(), SnapshotLoadError> = (|| {
             // Re-taken around each map growth below (growth needs every
             // txn in the process closed, ours included).
@@ -1312,6 +1343,7 @@ impl UtxoSet {
                 .is_empty(&wtxn)
                 .map_err(|e| UtxoError(format!("is_empty check: {}", e)))?
             {
+                raced_nonempty.set(true);
                 return Err(SnapshotLoadError::Storage(
                     "UTXO set must be empty before loading snapshot".into(),
                 ));
@@ -1503,6 +1535,10 @@ impl UtxoSet {
                     ))
                 })?;
             }
+            Err(e) if raced_nonempty.get() => {
+                let _ = fs::remove_file(&marker);
+                return Err(e);
+            }
             Err(e) => {
                 // Wipe any partial state so the next load can start from
                 // empty. The marker is only removed if BOTH the wipe and
@@ -1533,6 +1569,18 @@ impl UtxoSet {
             utxo_count,
             utxo_hash: file_hash,
         })
+    }
+
+    /// Whether the `utxos` DB has no rows, in a short read txn.
+    fn is_empty_now(&self) -> Result<bool, UtxoError> {
+        let _gate = self.read_gate()?;
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("begin read tx: {}", e)))?;
+        self.utxos
+            .is_empty(&rtxn)
+            .map_err(|e| UtxoError(format!("is_empty check: {}", e)))
     }
 
     /// True when less than `SNAPSHOT_GROW_TRIGGER` of the map is left
@@ -2006,6 +2054,7 @@ mod tests {
             height: meta.height,
             block_hash: meta.block_hash,
             utxo_hash: meta.utxo_hash,
+            utxo_count: meta.utxo_count,
         }
     }
 
@@ -2573,6 +2622,7 @@ mod tests {
                 height: 0,
                 block_hash: [0u8; 32],
                 utxo_hash: [0xFFu8; 32],
+                utxo_count: 1,
             }),
             |_, _| true,
         );
@@ -2589,9 +2639,56 @@ mod tests {
         let mut buf = Vec::new();
         utxo.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
 
+        let before = utxo.count().unwrap();
+        assert!(before > 0);
+
         let result = utxo.load_snapshot(std::io::Cursor::new(&buf), None, |_, _| true);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("must be empty"));
+
+        // Rejected without touching the existing set or leaving a marker.
+        assert_eq!(utxo.count().unwrap(), before);
+        assert!(!loading_marker_path(utxo.env.path()).exists());
+    }
+
+    #[test]
+    fn apply_block_skips_unspendable_outputs() {
+        // Core's IsUnspendable: OP_RETURN-prefixed or > MAX_SCRIPT_SIZE.
+        use bitcoin::{Amount, ScriptBuf, TxOut};
+        let mut block = genesis_block();
+        let outs = &mut block.txdata[0].output;
+        outs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]),
+        });
+        outs.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE + 1]),
+        });
+        outs.push(TxOut {
+            value: Amount::from_sat(2),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE]),
+        });
+        let (utxo, _dir) = fresh();
+        utxo.apply_block(&block, 1).unwrap();
+        // The original P2PK output and the exactly-10,000-byte one.
+        assert_eq!(utxo.count().unwrap(), 2);
+        let txid = block.txdata[0].compute_txid();
+        assert!(utxo.get(&txid, 3).unwrap().is_some());
+        assert!(utxo.get(&txid, 2).unwrap().is_none());
+        assert!(utxo.get(&txid, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_rejects_wrong_utxo_count() {
+        let (bytes, anchor) = make_snapshot_with_n_utxos(3);
+        let wrong = SnapshotAnchor { utxo_count: 4, ..anchor };
+        assert_rejected_untouched(&bytes, &wrong, "snapshot utxo count mismatch");
+        // A header count edited to match a bigger anchor is still caught
+        // (by the count check if the anchor differs, else by the body).
+        let mut tampered = bytes.clone();
+        tampered[44..52].copy_from_slice(&4u64.to_le_bytes());
+        assert_rejected_untouched(&tampered, &anchor, "snapshot utxo count mismatch");
     }
 
     #[test]
@@ -2771,6 +2868,7 @@ mod tests {
                 height: 0,
                 block_hash: [0u8; 32],
                 utxo_hash: [0xFFu8; 32],
+                utxo_count: 1,
             }),
             |_, _| true,
         );

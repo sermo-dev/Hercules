@@ -242,6 +242,7 @@ const NO_ANCHOR: SnapshotAnchor = SnapshotAnchor {
     height: u32::MAX,
     block_hash: [0u8; 32],
     utxo_hash: [0u8; 32],
+    utxo_count: 0,
 };
 
 /// How to construct a `HeaderSync`. Production goes through
@@ -4198,6 +4199,7 @@ mod tests {
                 height,
                 block_hash,
                 utxo_hash: meta.utxo_hash,
+                utxo_count: meta.utxo_count,
             },
         )
     }
@@ -4275,6 +4277,7 @@ mod tests {
                 height: TEST_ANCHOR_HEIGHT,
                 block_hash: chain[4].block_hash().to_byte_array(),
                 utxo_hash: file_anchor.utxo_hash,
+                utxo_count: file_anchor.utxo_count,
             };
             hs.store.store_headers(&chain, 1).unwrap();
 
