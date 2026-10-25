@@ -166,6 +166,17 @@ enum FirstHeader {
     OutOfBudget,
 }
 
+/// Why `HeaderSync::check_witness_headers` didn't accept a cross-check
+/// peer's answer as evidence.
+enum WitnessHeaders {
+    /// Doesn't connect to the locator we sent: says nothing either way and
+    /// costs the peer nothing.
+    NoOpinion(String),
+    /// Invalid in itself (proof-of-work, linkage, timestamps, anchor):
+    /// costs the peer `INVALID_HEADERS_PENALTY`.
+    Invalid(String),
+}
+
 /// Why a downloaded block was rejected (ticket 024). Each class gets a
 /// different response in `sync()`, `catch_up_blocks()` and
 /// `validate_latest_block()`.
@@ -1872,6 +1883,7 @@ impl HeaderSync {
         first_full: bool,
         target: u32,
         stop: &AtomicBool,
+        progress: &dyn Fn(&PeerPool, u32),
     ) -> Result<bool, SyncError> {
         debug_assert!(!first.is_empty(), "fork_reaches needs the fork's first headers");
         if first.is_empty() {
@@ -1952,6 +1964,7 @@ impl HeaderSync {
                 info!("Fork from {} at {} reaches {} (our tip {})", addr, fork_at, prev_height, target);
                 return Ok(true);
             }
+            progress(pool, prev_height);
             if !full {
                 return Ok(false);
             }
@@ -2468,8 +2481,14 @@ impl HeaderSync {
                         first.block_hash(),
                         headers.iter().map(|h| h.block_hash()).collect(),
                     ),
-                    Err(e) => {
-                        warn!("cross-check: peer {} sent unusable headers: {}", addr, e);
+                    Err(WitnessHeaders::NoOpinion(e)) => {
+                        // A peer that lacks our locator's blocks answers
+                        // from elsewhere (genesis): not misbehavior.
+                        debug!("cross-check: peer {}'s headers are no opinion: {}", addr, e);
+                        FirstHeader::Failed
+                    }
+                    Err(WitnessHeaders::Invalid(e)) => {
+                        warn!("cross-check: peer {} sent invalid headers: {}", addr, e);
                         pool.misbehaving(addr, INVALID_HEADERS_PENALTY);
                         FirstHeader::Failed
                     }
@@ -2494,30 +2513,41 @@ impl HeaderSync {
     }
 
     /// Whether a cross-check peer's `headers` are evidence at all: they must
-    /// build on a block in the `locator` we sent (any honest answer does)
-    /// that is on our header chain, respect the chain anchor, and pass the
-    /// same header validation as a batch we would store (proof-of-work at
-    /// the contextually required difficulty, timestamps, linkage).
-    fn check_witness_headers(&self, headers: &[Header], locator: &[BlockHash]) -> Result<(), String> {
+    /// build on a block in the `locator` we sent that is on our header
+    /// chain, respect the chain anchor, and pass the same header validation
+    /// as a batch we would store (proof-of-work at the contextually
+    /// required difficulty, timestamps, linkage).
+    ///
+    /// Not connecting to our locator is `NoOpinion`, never proof: an honest
+    /// peer that has none of the hashes we sent answers from genesis (and
+    /// in an eclipse recovery our stored chain may well be fake). Only
+    /// headers that are invalid in themselves are `Invalid`.
+    fn check_witness_headers(
+        &self,
+        headers: &[Header],
+        locator: &[BlockHash],
+    ) -> Result<(), WitnessHeaders> {
+        let local = |e: String| WitnessHeaders::NoOpinion(e);
         let prev = headers[0].prev_blockhash;
         if !locator.contains(&prev) {
-            return Err(format!("first header builds on {}, not on our locator", prev));
+            return Err(local(format!("first header builds on {}, not on our locator", prev)));
         }
         let height = self
             .store
             .find_height_of_hash(prev)
-            .map_err(|e| format!("{}", e))?
-            .ok_or_else(|| format!("{} is not on our header chain", prev))?;
+            .map_err(|e| local(format!("{}", e)))?
+            .ok_or_else(|| local(format!("{} is not on our header chain", prev)))?;
         let (_, prev_header) = self
             .store
             .get_header_at_height(height)
-            .map_err(|e| format!("{}", e))?
-            .ok_or_else(|| format!("no header at height {}", height))?;
+            .map_err(|e| local(format!("{}", e)))?
+            .ok_or_else(|| local(format!("no header at height {}", height)))?;
         let timestamps = self
             .store
             .timestamps_up_to(height, 11)
-            .map_err(|e| format!("{}", e))?;
-        self.check_batch_anchor(headers, height + 1)?;
+            .map_err(|e| local(format!("{}", e)))?;
+        self.check_batch_anchor(headers, height + 1)
+            .map_err(WitnessHeaders::Invalid)?;
         let store = &self.store;
         let epoch_lookup = |h: u32| -> Result<u32, String> {
             store
@@ -2534,7 +2564,7 @@ impl HeaderSync {
             prev_header.bits,
             &epoch_lookup,
         )
-        .map_err(|e| format!("{}", e))
+        .map_err(|e| WitnessHeaders::Invalid(format!("{}", e)))
     }
 
     /// Build a SyncStatus snapshot from the pool and current state.
@@ -3306,6 +3336,18 @@ impl HeaderSync {
                             base_height = fork_at;
                             fork_at = self.common_prefix_end(&headers, base_height, tip_height)?;
                             skipped = true;
+                            on_progress(self.make_status(
+                                tip_height,
+                                peer_height,
+                                &pool,
+                                &active_addr,
+                                true,
+                                current_validated,
+                                Some(format!(
+                                    "Checking a peer's headers: shared with ours up to {}",
+                                    fork_at
+                                )),
+                            ));
                         }
                         if fork_at == base_height + headers.len() as u32 && fork_at < tip_height {
                             // Still nothing but our own headers: the peer's
@@ -3320,7 +3362,10 @@ impl HeaderSync {
                         }
                         if skipped && fork_at < tip_height {
                             // The diverging batch wasn't the one cross-checked
-                            // above: check it too, from the same locator.
+                            // above: check it too. The locator leads with the
+                            // hash it builds on, then our usual locator, so a
+                            // witness without that block (our stored chain
+                            // may be fake) still lands on a real entry.
                             let after = self
                                 .store
                                 .get_hash_at_height(base_height)
@@ -3328,9 +3373,15 @@ impl HeaderSync {
                                 .ok_or_else(|| {
                                     SyncError::Store(format!("no hash at height {}", base_height))
                                 })?;
+                            let mut recheck_locator = vec![after];
+                            recheck_locator.extend(
+                                self.store
+                                    .get_locator_hashes()
+                                    .map_err(|e| SyncError::Store(format!("{}", e)))?,
+                            );
                             match self.cross_check_headers(
                                 &mut pool,
-                                &[after],
+                                &recheck_locator,
                                 &active_addr,
                                 headers[0].block_hash(),
                                 strict,
@@ -3399,6 +3450,20 @@ impl HeaderSync {
                                         headers.len() == 2000,
                                         tip_height,
                                         stop,
+                                        &|pool: &PeerPool, reached: u32| {
+                                            on_progress(self.make_status(
+                                                tip_height,
+                                                peer_height,
+                                                pool,
+                                                &active_addr,
+                                                true,
+                                                current_validated,
+                                                Some(format!(
+                                                    "Checking a competing header chain: at {} of {}",
+                                                    reached, tip_height
+                                                )),
+                                            ))
+                                        },
                                     )?;
                                     if !reaches {
                                         // Our tip is below the anchor, so a
@@ -5143,34 +5208,96 @@ mod tests {
     }
 
     /// PR #24 review: two colluding witnesses answering with the same junk
-    /// (headers that don't build on our locator) used to outvote the
-    /// active peer until it was banned. Junk is now no opinion: it costs
-    /// the peers that sent it, and the active peer nothing.
+    /// used to outvote the active peer until it was banned. Junk is now no
+    /// opinion and costs the active peer nothing. Junk that doesn't connect
+    /// to our locator costs its sender nothing either (honest peers without
+    /// our blocks answer like that); junk that is invalid in itself (here,
+    /// the wrong difficulty) costs its sender until it is banned.
     #[test]
     fn colluding_junk_witnesses_cannot_get_the_active_peer_banned() {
-        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
-        let active = servers[0].0.clone();
-        let junk = synthetic_block(2).header;
-        for round in 0..4 {
-            for (addr, server) in servers.iter_mut().skip(1) {
-                if pool.get_score(addr).is_some() {
-                    write_message(server, NetworkMessage::Headers(vec![junk]));
+        let mut bad_bits = valid_header(0);
+        bad_bits.bits = bitcoin::CompactTarget::from_consensus(0x1d00ffff);
+        for (junk, provably_invalid) in [(synthetic_block(2).header, false), (bad_bits, true)] {
+            let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+            let active = servers[0].0.clone();
+            for round in 0..4 {
+                for (addr, server) in servers.iter_mut().skip(1) {
+                    // Only the current witness (highest score) is asked.
+                    if pool.cross_check_peer(&[active.clone()]).as_deref() == Some(addr.as_str()) {
+                        write_message(server, NetworkMessage::Headers(vec![junk]));
+                    }
                 }
+                let r = syncer.cross_check_headers(
+                    &mut pool,
+                    &genesis_locator(),
+                    &active,
+                    valid_header(0).block_hash(),
+                    false,
+                    None,
+                );
+                assert!(matches!(r, HeaderCrossCheck::Accept), "round {}", round);
             }
-            let r = syncer.cross_check_headers(
-                &mut pool,
-                &genesis_locator(),
-                &active,
-                valid_header(0).block_hash(),
-                false,
-                None,
-            );
-            assert!(matches!(r, HeaderCrossCheck::Accept), "round {}", round);
+            assert_eq!(pool.get_score(&active), Some(100), "active peer paid for junk");
+            assert_eq!(pool.get_demerit(&active), Some(0));
+            assert!(!pool.is_banned(&active));
+            for (addr, _) in &servers[1..] {
+                assert_eq!(
+                    pool.is_banned(addr),
+                    provably_invalid,
+                    "junk sender {} (provably invalid: {})",
+                    addr,
+                    provably_invalid
+                );
+            }
         }
-        assert_eq!(pool.get_score(&active), Some(100), "active peer paid for junk");
-        assert!(!pool.is_banned(&active));
-        assert!(pool.is_banned(&servers[1].0), "junk sender not banned");
-        assert!(pool.is_banned(&servers[2].0), "junk sender not banned");
+    }
+
+    /// Re-review of 1cbfcd8: in an eclipse recovery our stored chain may be
+    /// fake, and honest witnesses don't have its blocks. Asked with a
+    /// locator of only such a block, they answer from genesis: that is no
+    /// opinion, never a penalty. Asked with that block plus our full
+    /// locator (as the diverging-batch re-check now does), they land on a
+    /// real entry and simply disagree: a demerit for the active peer, still
+    /// nothing against them.
+    #[test]
+    fn honest_witnesses_without_our_fake_blocks_are_never_penalized() {
+        let (mut pool, mut servers, _dir, syncer) = cross_check_pool();
+        let mut fake = crate::testkit::FixtureChain::new().fork_at(0).fork_at(0);
+        fake.mine(10);
+        let fake_headers: Vec<Header> = (1..=10).map(|h| fake.block(h).header).collect();
+        syncer.store.store_headers(&fake_headers, 1).unwrap();
+        let mut honest = crate::testkit::FixtureChain::new();
+        honest.mine(3);
+        let honest_batch: Vec<Header> = (1..=3).map(|h| honest.block(h).header).collect();
+        let (active, tiebreaker, witness) =
+            (servers[0].0.clone(), servers[1].0.clone(), servers[2].0.clone());
+        // The attacker's diverging batch: builds on fake block 5.
+        let after = fake.hash_at(5);
+        let active_first = valid_header(7).block_hash();
+
+        // One-hash locator: the witness answers from genesis. No opinion.
+        for round in 0..4 {
+            write_message(&mut servers[2].1, NetworkMessage::Headers(honest_batch.clone()));
+            let r = syncer.cross_check_headers(&mut pool, &[after], &active, active_first, true, None);
+            assert!(matches!(r, HeaderCrossCheck::Reject), "round {}", round);
+        }
+        // Full locator: ordinary disagreement.
+        let mut locator = vec![after];
+        locator.extend(syncer.store.get_locator_hashes().unwrap());
+        for round in 0..4 {
+            for (_, server) in servers.iter_mut().skip(1) {
+                write_message(server, NetworkMessage::Headers(honest_batch.clone()));
+            }
+            let r = syncer.cross_check_headers(&mut pool, &locator, &active, active_first, true, None);
+            assert!(matches!(r, HeaderCrossCheck::Reject), "round {}", round);
+        }
+        for (addr, fresh) in [(&witness, 105), (&tiebreaker, 100)] {
+            assert!(!pool.is_banned(addr), "honest witness {} banned", addr);
+            assert_eq!(pool.get_score(addr), Some(fresh), "honest witness {} penalized", addr);
+            assert_eq!(pool.get_demerit(addr), Some(0));
+        }
+        assert!(pool.get_demerit(&active).unwrap() > 0, "outvoted active peer not deprioritized");
+        assert_eq!(pool.count(), 3);
     }
 
     /// Even valid headers from colluding witnesses (a real competing
