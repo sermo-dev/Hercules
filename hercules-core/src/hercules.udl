@@ -93,7 +93,8 @@ callback interface SyncCallback {
 };
 
 callback interface SnapshotCallback {
-    void on_progress(u64 loaded, u64 total);
+    // Return false to cancel the load.
+    boolean on_progress(u64 loaded, u64 total);
 };
 
 interface HerculesNode {
@@ -108,6 +109,9 @@ interface HerculesNode {
 
     [Throws=HerculesError]
     boolean needs_snapshot();
+
+    [Throws=HerculesError]
+    void check_snapshot_capacity();
 
     [Throws=HerculesError]
     SnapshotInfo load_snapshot(string snapshot_path, SnapshotCallback callback);
@@ -146,4 +150,5 @@ interface HerculesError {
     StorageError(string msg);
     NetworkError(string msg);
     TorError(string msg);
+    SnapshotInvalid(string msg);
 };

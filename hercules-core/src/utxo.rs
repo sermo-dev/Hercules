@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 
 use bitcoin::block::Block;
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
 use heed::types::{Bytes, Unit};
-use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, PutFlags};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, MdbError, PutFlags};
 use sha2::{Digest, Sha256};
 use blvm_muhash::{MuHash3072, serialize_coin_for_muhash};
 
@@ -43,6 +47,187 @@ const MAX_MAP_SIZE: u64 = 128 * GIB;
 /// Headroom over the current data file kept by the *smallest* fallback map,
 /// i.e. how much the env can grow in one session if VA is tight.
 const MIN_MAP_HEADROOM: u64 = 4 * GIB;
+
+/// Rough LMDB footprint per snapshot entry (key + value + B-tree overhead),
+/// used to check before a load that the map can hold the set the header
+/// announces. ~12 GB for the mainnet anchor's set, with margin.
+const SNAPSHOT_EST_BYTES_PER_UTXO: u64 = 80;
+
+/// During a snapshot load, grow the map at a batch boundary once less than
+/// this much of it is left (a 1M-entry batch is ~100 MB, so this is many
+/// batches of warning).
+const SNAPSHOT_GROW_TRIGGER: u64 = 2 * GIB;
+
+/// Times a write txn is retried after growing the map on `MDB_MAP_FULL`.
+const MAP_FULL_RETRIES: usize = 3;
+
+/// Map-sizing knobs, bundled so tests can shrink them (a real 32 GiB floor
+/// can't be filled in a unit test). Production always uses `DEFAULT_SIZING`.
+#[derive(Clone, Copy, Debug)]
+struct MapSizing {
+    min: u64,
+    max: u64,
+    headroom: u64,
+    /// Every map size is a multiple of this (and so of the page size).
+    granule: u64,
+}
+
+const DEFAULT_SIZING: MapSizing = MapSizing {
+    min: MIN_MAP_SIZE,
+    max: MAX_MAP_SIZE,
+    headroom: MIN_MAP_HEADROOM,
+    granule: GIB,
+};
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SIZING: std::cell::Cell<Option<MapSizing>> = const { std::cell::Cell::new(None) };
+}
+
+fn sizing() -> MapSizing {
+    #[cfg(test)]
+    if let Some(s) = TEST_SIZING.with(|c| c.get()) {
+        return s;
+    }
+    DEFAULT_SIZING
+}
+
+/// Process-wide bookkeeping per canonical env path (ticket 030).
+///
+/// heed 0.20 caches one `Env` per path in a process-global `OPENED_ENV`
+/// map and returns `BadOpenOptions` if a later open of the same path passes
+/// different options while that `Env` is alive. Our map size depends on
+/// `data.mdb`'s size at open time, so a second `UtxoSet` on the same path
+/// (a push-wake node while the foreground node is running) would otherwise
+/// fail to open once the data file had grown. Every open while the env is
+/// live therefore passes exactly the size it was first opened with, and a
+/// reopen after a full close starts from the last size that worked.
+///
+/// It also counts users, so heed's cache entry is only torn down when the
+/// *last* `UtxoSet` on the path drops (tearing it down earlier makes every
+/// later open fail with `DatabaseClosing` while another set still holds the
+/// env).
+struct EnvSlot {
+    /// Shared with every live `UtxoSet` on this env; `None` once all closed.
+    shared: Option<Arc<EnvShared>>,
+    users: usize,
+    /// `map_size` the live heed `Env` was created with.
+    opened_with: u64,
+    /// Map size (including any growth) when the env was last fully closed.
+    remembered: u64,
+}
+
+/// State every `UtxoSet` on one live env shares.
+struct EnvShared {
+    /// Held shared for the lifetime of every txn and exclusively to resize:
+    /// `mdb_env_set_mapsize` remaps the file, so no txn in this process may
+    /// be open (LMDB doesn't check; a reader would be left pointing at an
+    /// unmapped region).
+    gate: RwLock<()>,
+    /// Current map size, including growth since open.
+    map_size: AtomicU64,
+    /// Set if a resize failed after LMDB had already dropped the old map:
+    /// the env can't be used until it is closed and reopened.
+    poisoned: AtomicBool,
+}
+
+fn env_registry() -> MutexGuard<'static, HashMap<PathBuf, EnvSlot>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, EnvSlot>>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether `size` bytes of address space can be reserved right now. Probed
+/// with a `PROT_NONE` anonymous mapping before a resize, because once LMDB
+/// has unmapped the old map a failed remap leaves the env unusable. The old
+/// map is still in place during the probe, so this is conservative.
+fn can_reserve_address_space(size: u64) -> bool {
+    let Ok(len) = usize::try_from(size) else { return false };
+    // SAFETY: an anonymous PROT_NONE mapping touches no memory and is
+    // unmapped immediately; it only asks the kernel for address space.
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        libc::munmap(p, len);
+    }
+    true
+}
+
+/// A write-path error that remembers whether LMDB ran out of map space, so
+/// the caller can grow the map and retry the (aborted, so side-effect-free)
+/// txn.
+enum WriteError {
+    MapFull(String),
+    Other(UtxoError),
+}
+
+impl From<UtxoError> for WriteError {
+    fn from(e: UtxoError) -> Self {
+        WriteError::Other(e)
+    }
+}
+
+/// `map_err` adapter for heed calls on a write path.
+fn lmdb(ctx: &'static str) -> impl FnOnce(heed::Error) -> WriteError {
+    move |e| {
+        let msg = format!("{}: {}", ctx, e);
+        if matches!(e, heed::Error::Mdb(MdbError::MapFull)) {
+            WriteError::MapFull(msg)
+        } else {
+            WriteError::Other(UtxoError(msg))
+        }
+    }
+}
+
+/// Why a snapshot load failed. The app keeps the downloaded file unless
+/// the file itself is bad, so a retry after freeing space (or on a device
+/// that can map the set) doesn't re-download ~9 GB.
+#[derive(Debug)]
+pub enum SnapshotLoadError {
+    /// The snapshot is corrupt, truncated, unsorted, or doesn't match the
+    /// anchor (header or content hash): delete it and download again.
+    Invalid(String),
+    /// The file may be fine but couldn't be stored: map or disk full, an
+    /// LMDB error, a non-empty set, or the load was cancelled.
+    Storage(String),
+}
+
+impl std::fmt::Display for SnapshotLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotLoadError::Invalid(m) => write!(f, "invalid snapshot: {}", m),
+            SnapshotLoadError::Storage(m) => write!(f, "utxo error: {}", m),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotLoadError {}
+
+impl From<UtxoError> for SnapshotLoadError {
+    fn from(e: UtxoError) -> Self {
+        SnapshotLoadError::Storage(e.0)
+    }
+}
+
+impl From<WriteError> for SnapshotLoadError {
+    fn from(e: WriteError) -> Self {
+        match e {
+            WriteError::MapFull(m) => SnapshotLoadError::Storage(m),
+            WriteError::Other(e) => SnapshotLoadError::Storage(e.0),
+        }
+    }
+}
 
 /// Number of named DBs we open inside the env. heed requires this up-front.
 const MAX_DBS: u32 = 8;
@@ -149,7 +334,12 @@ pub struct UtxoEntry {
 /// loading a snapshot computed under different on-disk semantics will fail
 /// the SHA256 verification before any data lands.
 pub struct UtxoSet {
-    env: Env,
+    /// `ManuallyDrop` so `Drop` can release it while holding the env
+    /// registry lock (see `EnvSlot`).
+    env: ManuallyDrop<Env>,
+    shared: Arc<EnvShared>,
+    /// Canonical env path: the registry key.
+    canonical: PathBuf,
     utxos: Database<Bytes, Bytes>,
     undo: Database<Bytes, Bytes>,
     height_index: Database<Bytes, Unit>,
@@ -192,17 +382,45 @@ impl UtxoSet {
         // mmap'd file isn't simultaneously opened with conflicting flags from
         // another process. We're a single-process iOS app and never share the
         // env directory across processes, so this contract holds.
-        // Map sizing (ticket 030): prefer max(32 GiB, 2 x current data file),
-        // re-evaluated on every open, so the map grows with the UTXO set
-        // across launches/wakes without a resize-while-open dance (an
-        // `MDB_MAP_FULL` mid-session surfaces as an error and the next open
-        // picks a bigger map). If the mmap can't be reserved (iOS VA limit),
-        // fall back to progressively smaller maps down to data + 4 GiB so the
-        // node still opens instead of failing outright.
+        // Map sizing (ticket 030): prefer max(32 GiB, 2 x current data file)
+        // for the first open in a process. If the mmap can't be reserved (iOS
+        // VA limit), fall back to progressively smaller maps down to data +
+        // 4 GiB so the node still opens instead of failing outright. Within
+        // a process the size is pinned per path (see `EnvSlot`): later opens
+        // while the env is live reuse it exactly, and a reopen after a full
+        // close starts from the last size that worked. The map grows in
+        // place on `MDB_MAP_FULL` (`grow_map`).
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| UtxoError(format!("canonicalize {}: {}", path.display(), e)))?;
         let data_len = fs::metadata(path.join("data.mdb")).map(|m| m.len()).unwrap_or(0);
+        let sz = sizing();
+
+        // Held across the heed open so two threads opening the same path
+        // agree on the options, and so a concurrent last-user drop can't
+        // tear heed's cache entry down in between.
+        let mut registry = env_registry();
+        let live = registry
+            .get(&canonical)
+            .and_then(|slot| slot.shared.clone().map(|sh| (sh, slot.opened_with)));
+        let candidates = match &live {
+            Some((_, opened_with)) => vec![*opened_with],
+            None => {
+                let mut c = map_size_candidates_with(data_len, &sz);
+                let floor = round_up(data_len + sz.headroom, sz.granule);
+                if let Some(r) = registry.get(&canonical).map(|slot| slot.remembered) {
+                    if r >= floor {
+                        c.retain(|size| *size < r);
+                        c.insert(0, r);
+                    }
+                }
+                c
+            }
+        };
+
         let mut last_err = None;
         let mut opened = None;
-        for size in map_size_candidates(data_len) {
+        for size in candidates {
             match unsafe {
                 EnvOpenOptions::new()
                     .map_size(size as usize)
@@ -215,16 +433,16 @@ impl UtxoSet {
                 }
                 Err(e) => {
                     warn!(
-                        "LMDB open at {} with map_size={} GiB failed: {}",
+                        "LMDB open at {} with map_size={} MiB failed: {}",
                         path.display(),
-                        size / GIB,
+                        size >> 20,
                         e
                     );
                     last_err = Some(e);
                 }
             }
         }
-        let (env, map_size) = opened.ok_or_else(|| {
+        let (env, opened_with) = opened.ok_or_else(|| {
             UtxoError(format!(
                 "open env at {}: {}",
                 path.display(),
@@ -232,33 +450,70 @@ impl UtxoSet {
             ))
         })?;
 
-        let mut wtxn = env
-            .write_txn()
-            .map_err(|e| UtxoError(format!("begin create-tx: {}", e)))?;
-        let utxos: Database<Bytes, Bytes> = env
-            .create_database(&mut wtxn, Some("utxos"))
-            .map_err(|e| UtxoError(format!("create utxos db: {}", e)))?;
-        let undo: Database<Bytes, Bytes> = env
-            .create_database(&mut wtxn, Some("undo"))
-            .map_err(|e| UtxoError(format!("create undo db: {}", e)))?;
-        let height_index: Database<Bytes, Unit> = env
-            .create_database(&mut wtxn, Some("height_index"))
-            .map_err(|e| UtxoError(format!("create height_index db: {}", e)))?;
-        let meta: Database<Bytes, Bytes> = env
-            .create_database(&mut wtxn, Some("meta"))
-            .map_err(|e| UtxoError(format!("create meta db: {}", e)))?;
-        wtxn.commit()
-            .map_err(|e| UtxoError(format!("commit create-tx: {}", e)))?;
+        let shared = match live {
+            Some((shared, _)) => shared,
+            None => Arc::new(EnvShared {
+                gate: RwLock::new(()),
+                // LMDB may round a too-small request up to the data size.
+                map_size: AtomicU64::new(env.info().map_size as u64),
+                poisoned: AtomicBool::new(false),
+            }),
+        };
+        let slot = registry.entry(canonical.clone()).or_insert(EnvSlot {
+            shared: None,
+            users: 0,
+            opened_with,
+            remembered: 0,
+        });
+        if slot.users == 0 {
+            slot.opened_with = opened_with;
+            slot.shared = Some(shared.clone());
+        }
+        slot.users += 1;
+        drop(registry);
+
+        // The slot now counts us: any error below must release it.
+        let set_env = ManuallyDrop::new(env);
+        let create = (|| {
+            let _gate = shared.gate.read().unwrap_or_else(|e| e.into_inner());
+            let mut wtxn = set_env
+                .write_txn()
+                .map_err(|e| UtxoError(format!("begin create-tx: {}", e)))?;
+            let utxos: Database<Bytes, Bytes> = set_env
+                .create_database(&mut wtxn, Some("utxos"))
+                .map_err(|e| UtxoError(format!("create utxos db: {}", e)))?;
+            let undo: Database<Bytes, Bytes> = set_env
+                .create_database(&mut wtxn, Some("undo"))
+                .map_err(|e| UtxoError(format!("create undo db: {}", e)))?;
+            let height_index: Database<Bytes, Unit> = set_env
+                .create_database(&mut wtxn, Some("height_index"))
+                .map_err(|e| UtxoError(format!("create height_index db: {}", e)))?;
+            let meta: Database<Bytes, Bytes> = set_env
+                .create_database(&mut wtxn, Some("meta"))
+                .map_err(|e| UtxoError(format!("create meta db: {}", e)))?;
+            wtxn.commit()
+                .map_err(|e| UtxoError(format!("commit create-tx: {}", e)))?;
+            Ok::<_, UtxoError>((utxos, undo, height_index, meta))
+        })();
+        let (utxos, undo, height_index, meta) = match create {
+            Ok(dbs) => dbs,
+            Err(e) => {
+                release_env(&canonical, ManuallyDrop::into_inner(set_env));
+                return Err(e);
+            }
+        };
 
         info!(
-            "UTXO LMDB env opened at {} (map_size={} GiB, data={} MiB)",
+            "UTXO LMDB env opened at {} (map_size={} MiB, data={} MiB)",
             path.display(),
-            map_size / GIB,
+            shared.map_size.load(Ordering::Acquire) >> 20,
             data_len >> 20
         );
 
         Ok(UtxoSet {
-            env,
+            env: set_env,
+            shared,
+            canonical,
             utxos,
             undo,
             height_index,
@@ -266,9 +521,93 @@ impl UtxoSet {
         })
     }
 
+    /// Shared hold on the resize gate, taken before every txn and kept for
+    /// its whole lifetime (declare it *before* the txn so it drops after).
+    fn read_gate(&self) -> Result<RwLockReadGuard<'_, ()>, UtxoError> {
+        if self.shared.poisoned.load(Ordering::Acquire) {
+            return Err(UtxoError(
+                "LMDB map resize failed; the UTXO env must be reopened (restart the node)".into(),
+            ));
+        }
+        Ok(self.shared.gate.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Current LMDB map size in bytes (address space reserved, not disk).
+    pub fn map_size(&self) -> u64 {
+        self.shared.map_size.load(Ordering::Acquire)
+    }
+
+    /// Grow the map in place to at least `min_size` (ticket 030).
+    ///
+    /// Takes the gate exclusively, so it waits until no txn is open on this
+    /// env anywhere in the process; callers must not hold a txn or a
+    /// `read_gate` guard. Address space for the new size is probed first:
+    /// LMDB unmaps the old map before mapping the new one, so a failed remap
+    /// would leave the env unusable (it is then poisoned and must be
+    /// reopened). A probe failure leaves the env untouched.
+    fn grow_map(&self, min_size: u64) -> Result<(), UtxoError> {
+        let _gate = self.shared.gate.write().unwrap_or_else(|e| e.into_inner());
+        if self.shared.poisoned.load(Ordering::Acquire) {
+            return Err(UtxoError("LMDB env poisoned by an earlier failed resize".into()));
+        }
+        let current = self.env.info().map_size as u64;
+        if current >= min_size {
+            // Another thread grew it while we waited for the gate.
+            self.shared.map_size.store(current, Ordering::Release);
+            return Ok(());
+        }
+        let sz = sizing();
+        // Grow by at least half again so repeated MAP_FULLs don't resize per block.
+        let target = round_up(min_size.max(current + current / 2), sz.granule);
+        if !can_reserve_address_space(target) {
+            return Err(UtxoError(format!(
+                "can't grow LMDB map from {} MiB to {} MiB: not enough address space",
+                current >> 20,
+                target >> 20
+            )));
+        }
+        // SAFETY: the exclusive gate guarantees no txn is active on this env
+        // in this process (every txn holds the gate shared), which is
+        // `mdb_env_set_mapsize`'s precondition. Single-process app.
+        if let Err(e) = unsafe { self.env.resize(target as usize) } {
+            self.shared.poisoned.store(true, Ordering::Release);
+            return Err(UtxoError(format!("resize LMDB map to {} MiB: {}", target >> 20, e)));
+        }
+        let now = self.env.info().map_size as u64;
+        self.shared.map_size.store(now, Ordering::Release);
+        info!("UTXO LMDB map grown from {} MiB to {} MiB", current >> 20, now >> 20);
+        Ok(())
+    }
+
+    /// Grow after `MDB_MAP_FULL`: to the next step above the current size.
+    fn grow_after_map_full(&self, what: &str) -> Result<(), UtxoError> {
+        let current = self.map_size();
+        warn!("{}: LMDB map full at {} MiB, growing", what, current >> 20);
+        self.grow_map(current + sizing().headroom)
+    }
+
+    /// Make sure the map can hold at least `bytes` (growing it if needed),
+    /// or fail with a clear message. Used before an AssumeUTXO download so a
+    /// device that can't map the set finds out before fetching ~9 GB.
+    pub fn ensure_map_capacity(&self, bytes: u64) -> Result<(), UtxoError> {
+        if self.map_size() >= bytes {
+            return Ok(());
+        }
+        self.grow_map(bytes).map_err(|e| {
+            UtxoError(format!(
+                "this device can't map the UTXO set: it needs about {} GiB of address space \
+                 and only {} GiB could be reserved ({})",
+                bytes.div_ceil(GIB),
+                self.map_size() / GIB,
+                e.0
+            ))
+        })
+    }
+
     /// Look up an unspent output by txid and output index.
     pub fn get(&self, txid: &Txid, vout: u32) -> Result<Option<UtxoEntry>, UtxoError> {
         let key = utxo_key(&txid.to_byte_array(), vout);
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -287,7 +626,27 @@ impl UtxoSet {
     /// Removes spent outputs and adds new unspent outputs.
     /// Handles in-block spends correctly (outputs created and spent
     /// within the same block never touch the database).
+    ///
+    /// On `MDB_MAP_FULL` the txn is aborted (nothing written), the map is
+    /// grown in place, and the block is applied again (ticket 030).
     pub fn apply_block(&self, block: &Block, height: u32) -> Result<(), UtxoError> {
+        let mut attempt = 0;
+        loop {
+            match self.apply_block_txn(block, height) {
+                Ok(()) => return Ok(()),
+                Err(WriteError::Other(e)) => return Err(e),
+                Err(WriteError::MapFull(msg)) => {
+                    attempt += 1;
+                    if attempt > MAP_FULL_RETRIES {
+                        return Err(UtxoError(msg));
+                    }
+                    self.grow_after_map_full("apply_block")?;
+                }
+            }
+        }
+    }
+
+    fn apply_block_txn(&self, block: &Block, height: u32) -> Result<(), WriteError> {
         // Phase 1: Analyze the block to find in-block spends so we can skip
         // writing then immediately deleting outputs that are spent in the
         // same block. (`HashSet` of (txid, vout) since we only need
@@ -314,10 +673,11 @@ impl UtxoSet {
             }
         }
 
+        let _gate = self.read_gate()?;
         let mut wtxn = self
             .env
             .write_txn()
-            .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
+            .map_err(lmdb("begin tx"))?;
 
         // Index inside the block for the undo key — multiple inputs can be
         // recorded against the same height, so we tie-break with a counter.
@@ -341,7 +701,7 @@ impl UtxoSet {
                 let val = self
                     .utxos
                     .get(&wtxn, &utxo_k)
-                    .map_err(|e| UtxoError(format!("get for spend: {}", e)))?
+                    .map_err(lmdb("get for spend"))?
                     .ok_or_else(|| {
                         UtxoError(format!(
                             "apply_block: missing utxo {}:{}",
@@ -359,16 +719,16 @@ impl UtxoSet {
                 let undo_v = encode_undo_value(&prev_txid_bytes, prev_vout, &entry);
                 self.undo
                     .put(&mut wtxn, &undo_k, &undo_v)
-                    .map_err(|e| UtxoError(format!("put undo: {}", e)))?;
+                    .map_err(lmdb("put undo"))?;
 
                 self.utxos
                     .delete(&mut wtxn, &utxo_k)
-                    .map_err(|e| UtxoError(format!("delete utxo: {}", e)))?;
+                    .map_err(lmdb("delete utxo"))?;
 
                 let hi_k = height_index_key(entry.height, &prev_txid_bytes, prev_vout);
                 self.height_index
                     .delete(&mut wtxn, &hi_k)
-                    .map_err(|e| UtxoError(format!("delete height_index: {}", e)))?;
+                    .map_err(lmdb("delete height_index"))?;
             }
         }
 
@@ -397,17 +757,17 @@ impl UtxoSet {
                 let utxo_v = encode_utxo_value(&entry);
                 self.utxos
                     .put(&mut wtxn, &utxo_k, &utxo_v)
-                    .map_err(|e| UtxoError(format!("put utxo: {}", e)))?;
+                    .map_err(lmdb("put utxo"))?;
 
                 let hi_k = height_index_key(height, &txid_bytes, vout);
                 self.height_index
                     .put(&mut wtxn, &hi_k, &())
-                    .map_err(|e| UtxoError(format!("put height_index: {}", e)))?;
+                    .map_err(lmdb("put height_index"))?;
             }
         }
 
         wtxn.commit()
-            .map_err(|e| UtxoError(format!("commit: {}", e)))?;
+            .map_err(lmdb("commit"))?;
         Ok(())
     }
 
@@ -424,6 +784,7 @@ impl UtxoSet {
     /// snapshot floor sits well below `MAX_REORG_DEPTH` from tip, but it's
     /// the kind of guard we'd rather have explicit than implicit.
     pub fn assume_valid_floor(&self) -> Result<u32, UtxoError> {
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -450,6 +811,7 @@ impl UtxoSet {
     /// `None` on a fresh-from-genesis install or a snapshot loaded before
     /// this key existed.
     pub fn snapshot_block_hash(&self) -> Result<Option<[u8; 32]>, UtxoError> {
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -475,6 +837,7 @@ impl UtxoSet {
     /// Read the stored MuHash from the meta database. Returns `None` if no
     /// snapshot has been loaded (genesis-mode sync).
     pub fn muhash(&self) -> Result<Option<[u8; 32]>, UtxoError> {
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -502,6 +865,8 @@ impl UtxoSet {
     ///
     /// Rejects rollbacks at or below the assume-valid floor — see
     /// `assume_valid_floor` for the rationale.
+    ///
+    /// Retried after growing the map on `MDB_MAP_FULL`, like `apply_block`.
     pub fn rollback_block(&self, height: u32) -> Result<(), UtxoError> {
         let floor = self.assume_valid_floor()?;
         if height <= floor && floor > 0 {
@@ -511,11 +876,29 @@ impl UtxoSet {
                 height, floor
             )));
         }
+        let mut attempt = 0;
+        loop {
+            match self.rollback_block_txn(height) {
+                Ok(()) => return Ok(()),
+                Err(WriteError::Other(e)) => return Err(e),
+                Err(WriteError::MapFull(msg)) => {
+                    attempt += 1;
+                    if attempt > MAP_FULL_RETRIES {
+                        return Err(UtxoError(msg));
+                    }
+                    self.grow_after_map_full("rollback_block")?;
+                }
+            }
+        }
+    }
 
+    fn rollback_block_txn(&self, height: u32) -> Result<(), WriteError> {
+
+        let _gate = self.read_gate()?;
         let mut wtxn = self
             .env
             .write_txn()
-            .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
+            .map_err(lmdb("begin tx"))?;
 
         // Step 1: collect (txid, vout) pairs created at this height.
         // We can't delete during iteration in heed, so buffer first.
@@ -525,15 +908,16 @@ impl UtxoSet {
             let iter = self
                 .height_index
                 .prefix_iter(&wtxn, &prefix)
-                .map_err(|e| UtxoError(format!("prefix iter: {}", e)))?;
+                .map_err(lmdb("prefix iter"))?;
             for r in iter {
                 let (k, _) =
-                    r.map_err(|e| UtxoError(format!("height_index iter: {}", e)))?;
+                    r.map_err(lmdb("height_index iter"))?;
                 if k.len() != HEIGHT_INDEX_KEY_LEN {
                     return Err(UtxoError(format!(
                         "corrupt height_index key len {}",
                         k.len()
-                    )));
+                    ))
+                    .into());
                 }
                 // Extract the (txid, vout) suffix as the utxo key.
                 let utxo_k = k[4..].to_vec();
@@ -543,10 +927,10 @@ impl UtxoSet {
         for (hi_k, utxo_k) in &to_delete {
             self.utxos
                 .delete(&mut wtxn, utxo_k.as_slice())
-                .map_err(|e| UtxoError(format!("delete utxo: {}", e)))?;
+                .map_err(lmdb("delete utxo"))?;
             self.height_index
                 .delete(&mut wtxn, hi_k.as_slice())
-                .map_err(|e| UtxoError(format!("delete height_index: {}", e)))?;
+                .map_err(lmdb("delete height_index"))?;
         }
 
         // Step 2 & 3: walk undo entries for this height, then restore each
@@ -558,9 +942,9 @@ impl UtxoSet {
             let iter = self
                 .undo
                 .prefix_iter(&wtxn, &prefix)
-                .map_err(|e| UtxoError(format!("undo prefix iter: {}", e)))?;
+                .map_err(lmdb("undo prefix iter"))?;
             for r in iter {
-                let (k, v) = r.map_err(|e| UtxoError(format!("undo iter: {}", e)))?;
+                let (k, v) = r.map_err(lmdb("undo iter"))?;
                 let (txid, vout, entry) = decode_undo_value(v)?;
                 restorations.push((k.to_vec(), txid, vout, entry));
             }
@@ -570,18 +954,18 @@ impl UtxoSet {
             let utxo_v = encode_utxo_value(&entry);
             self.utxos
                 .put(&mut wtxn, &utxo_k, &utxo_v)
-                .map_err(|e| UtxoError(format!("restore utxo: {}", e)))?;
+                .map_err(lmdb("restore utxo"))?;
             let hi_k = height_index_key(entry.height, &txid, vout);
             self.height_index
                 .put(&mut wtxn, &hi_k, &())
-                .map_err(|e| UtxoError(format!("restore height_index: {}", e)))?;
+                .map_err(lmdb("restore height_index"))?;
             self.undo
                 .delete(&mut wtxn, undo_k.as_slice())
-                .map_err(|e| UtxoError(format!("delete undo: {}", e)))?;
+                .map_err(lmdb("delete undo"))?;
         }
 
         wtxn.commit()
-            .map_err(|e| UtxoError(format!("commit rollback: {}", e)))?;
+            .map_err(lmdb("commit rollback"))?;
         Ok(())
     }
 
@@ -589,6 +973,7 @@ impl UtxoSet {
     /// Call this to reclaim disk space for deeply-buried blocks
     /// that will never be rolled back.
     pub fn prune_undo_below(&self, height: u32) -> Result<(), UtxoError> {
+        let _gate = self.read_gate()?;
         let mut wtxn = self
             .env
             .write_txn()
@@ -614,6 +999,7 @@ impl UtxoSet {
     /// Compute a deterministic SHA256 hash over the entire UTXO set.
     /// Iterates all UTXOs in (txid, vout) order and hashes each entry.
     pub fn compute_hash(&self) -> Result<[u8; 32], UtxoError> {
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -683,6 +1069,7 @@ impl UtxoSet {
 
         // Entries — natural cursor order is `(txid, vout)` because vout is BE
         // in the key.
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -754,7 +1141,12 @@ impl UtxoSet {
     /// the entries (HUTX v1), so these explicit header checks are what bind
     /// the snapshot to a position on the chain.
     ///
-    /// `on_progress` is called periodically with (loaded_count, total_count).
+    /// `on_progress` is called periodically with (loaded_count, total_count);
+    /// returning `false` cancels the load (cleaned up like any failure).
+    ///
+    /// Errors are `SnapshotLoadError::Invalid` when the file itself is bad
+    /// and `Storage` otherwise (map/disk full, cancelled, LMDB failure), so
+    /// the caller knows whether the file is worth keeping.
     ///
     /// ## Performance and crash safety
     ///
@@ -791,64 +1183,64 @@ impl UtxoSet {
         reader: R,
         expected: Option<&SnapshotAnchor>,
         on_progress: F,
-    ) -> Result<SnapshotMeta, UtxoError>
+    ) -> Result<SnapshotMeta, SnapshotLoadError>
     where
-        F: Fn(u64, u64),
+        F: Fn(u64, u64) -> bool,
     {
         let mut r = BufReader::with_capacity(SNAPSHOT_READ_BUF, reader);
 
         // ── Header ─────────────────────────────────────────────────
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)
-            .map_err(|e| UtxoError(format!("read magic: {}", e)))?;
+            .map_err(|e| SnapshotLoadError::Invalid(format!("read magic: {}", e)))?;
         if magic != SNAPSHOT_MAGIC {
-            return Err(UtxoError("invalid snapshot magic".into()));
+            return Err(SnapshotLoadError::Invalid("invalid snapshot magic".into()));
         }
 
         let mut buf4 = [0u8; 4];
         r.read_exact(&mut buf4)
-            .map_err(|e| UtxoError(format!("read version: {}", e)))?;
+            .map_err(|e| SnapshotLoadError::Invalid(format!("read version: {}", e)))?;
         let version = u32::from_le_bytes(buf4);
         if version != SNAPSHOT_VERSION {
-            return Err(UtxoError(format!(
+            return Err(SnapshotLoadError::Invalid(format!(
                 "unsupported snapshot version {}",
                 version
             )));
         }
 
         r.read_exact(&mut buf4)
-            .map_err(|e| UtxoError(format!("read height: {}", e)))?;
+            .map_err(|e| SnapshotLoadError::Invalid(format!("read height: {}", e)))?;
         let height = u32::from_le_bytes(buf4);
 
         let mut block_hash = [0u8; 32];
         r.read_exact(&mut block_hash)
-            .map_err(|e| UtxoError(format!("read block_hash: {}", e)))?;
+            .map_err(|e| SnapshotLoadError::Invalid(format!("read block_hash: {}", e)))?;
 
         let mut buf8 = [0u8; 8];
         r.read_exact(&mut buf8)
-            .map_err(|e| UtxoError(format!("read count: {}", e)))?;
+            .map_err(|e| SnapshotLoadError::Invalid(format!("read count: {}", e)))?;
         let utxo_count = u64::from_le_bytes(buf8);
 
         let mut file_hash = [0u8; 32];
         r.read_exact(&mut file_hash)
-            .map_err(|e| UtxoError(format!("read hash: {}", e)))?;
+            .map_err(|e| SnapshotLoadError::Invalid(format!("read hash: {}", e)))?;
 
         if let Some(expected) = expected {
             if height != expected.height {
-                return Err(UtxoError(format!(
+                return Err(SnapshotLoadError::Invalid(format!(
                     "snapshot height mismatch: file={}, expected={}",
                     height, expected.height
                 )));
             }
             if block_hash != expected.block_hash {
-                return Err(UtxoError(format!(
+                return Err(SnapshotLoadError::Invalid(format!(
                     "snapshot block hash mismatch: file={}, expected={}",
                     hex::encode(block_hash),
                     hex::encode(expected.block_hash)
                 )));
             }
             if file_hash != expected.utxo_hash {
-                return Err(UtxoError(format!(
+                return Err(SnapshotLoadError::Invalid(format!(
                     "snapshot hash mismatch: file={}, expected={}",
                     hex::encode(file_hash),
                     hex::encode(expected.utxo_hash)
@@ -862,6 +1254,15 @@ impl UtxoSet {
             utxo_count,
             hex::encode(file_hash)
         );
+
+        // ── Map capacity (ticket 030) ─────────────────────────────
+        // Fail before touching the env if the map can't be grown to hold
+        // the set the header announces (an iOS VA limit). A storage error,
+        // not a bad file: the caller keeps the download.
+        let needed = utxo_count
+            .saturating_mul(SNAPSHOT_EST_BYTES_PER_UTXO)
+            .saturating_add(sizing().headroom);
+        self.ensure_map_capacity(needed)?;
 
         // ── NO_META_SYNC for the load window ──────────────────────
         // SAFETY: NO_META_SYNC is documented as integrity-preserving (a
@@ -896,7 +1297,10 @@ impl UtxoSet {
 
         // ── Bulk-load loop (in a closure so error paths funnel through
         //     the cleanup block below) ──────────────────────────────
-        let load_result: Result<(), UtxoError> = (|| {
+        let load_result: Result<(), SnapshotLoadError> = (|| {
+            // Re-taken around each map growth below (growth needs every
+            // txn in the process closed, ours included).
+            let mut gate = self.read_gate()?;
             let mut wtxn = self
                 .env
                 .write_txn()
@@ -908,7 +1312,7 @@ impl UtxoSet {
                 .is_empty(&wtxn)
                 .map_err(|e| UtxoError(format!("is_empty check: {}", e)))?
             {
-                return Err(UtxoError(
+                return Err(SnapshotLoadError::Storage(
                     "UTXO set must be empty before loading snapshot".into(),
                 ));
             }
@@ -925,37 +1329,37 @@ impl UtxoSet {
 
             for i in 0..utxo_count {
                 r.read_exact(&mut txid)
-                    .map_err(|e| UtxoError(format!("read txid at {}: {}", i, e)))?;
+                    .map_err(|e| SnapshotLoadError::Invalid(format!("read txid at {}: {}", i, e)))?;
                 r.read_exact(&mut buf4)
-                    .map_err(|e| UtxoError(format!("read vout at {}: {}", i, e)))?;
+                    .map_err(|e| SnapshotLoadError::Invalid(format!("read vout at {}: {}", i, e)))?;
                 let vout = u32::from_le_bytes(buf4);
 
                 r.read_exact(&mut buf8)
-                    .map_err(|e| UtxoError(format!("read amount at {}: {}", i, e)))?;
+                    .map_err(|e| SnapshotLoadError::Invalid(format!("read amount at {}: {}", i, e)))?;
                 let amount = u64::from_le_bytes(buf8);
                 if amount > MAX_MONEY {
-                    return Err(UtxoError(format!(
+                    return Err(SnapshotLoadError::Invalid(format!(
                         "snapshot entry {}: amount {} exceeds MAX_MONEY",
                         i, amount
                     )));
                 }
 
                 r.read_exact(&mut buf4)
-                    .map_err(|e| UtxoError(format!("read entry height at {}: {}", i, e)))?;
+                    .map_err(|e| SnapshotLoadError::Invalid(format!("read entry height at {}: {}", i, e)))?;
                 let entry_height = u32::from_le_bytes(buf4);
 
                 let mut cb_byte = [0u8; 1];
                 r.read_exact(&mut cb_byte)
-                    .map_err(|e| UtxoError(format!("read is_coinbase at {}: {}", i, e)))?;
+                    .map_err(|e| SnapshotLoadError::Invalid(format!("read is_coinbase at {}: {}", i, e)))?;
                 let is_coinbase = cb_byte[0] != 0;
 
                 r.read_exact(&mut buf2)
-                    .map_err(|e| UtxoError(format!("read script_len at {}: {}", i, e)))?;
+                    .map_err(|e| SnapshotLoadError::Invalid(format!("read script_len at {}: {}", i, e)))?;
                 let script_len = u16::from_le_bytes(buf2) as usize;
 
                 let mut script = vec![0u8; script_len];
                 r.read_exact(&mut script)
-                    .map_err(|e| UtxoError(format!("read script at {}: {}", i, e)))?;
+                    .map_err(|e| SnapshotLoadError::Invalid(format!("read script at {}: {}", i, e)))?;
 
                 // Build the LMDB key and assert strictly-ascending order so the
                 // APPEND optimization stays valid across commits. (LMDB's APPEND
@@ -963,7 +1367,7 @@ impl UtxoSet {
                 let key = utxo_key(&txid, vout);
                 if let Some(ref prev) = prev_key {
                     if key.as_slice() <= prev.as_slice() {
-                        return Err(UtxoError(
+                        return Err(SnapshotLoadError::Invalid(
                             "snapshot entries not sorted by (txid, vout)".into(),
                         ));
                     }
@@ -1016,13 +1420,27 @@ impl UtxoSet {
                     wtxn.commit().map_err(|e| {
                         UtxoError(format!("commit batch at {}: {}", next_i, e))
                     })?;
+                    // Between batches no txn is open, so this is where the
+                    // map can grow before it fills mid-batch (ticket 030).
+                    if self.snapshot_map_low() {
+                        drop(gate);
+                        let used = self.env.real_disk_size().unwrap_or(0);
+                        self.grow_map(used + sizing().headroom)?;
+                        gate = self.read_gate()?;
+                    }
                     wtxn = self.env.write_txn().map_err(|e| {
                         UtxoError(format!("reopen tx at {}: {}", next_i, e))
                     })?;
                 }
 
-                if i % 100_000 == 0 {
-                    on_progress(i, utxo_count);
+                // `false` from the callback cancels (e.g. the app saw free
+                // space drop below its threshold). The cleanup block below
+                // wipes the committed batches; the file itself is fine.
+                if i % 100_000 == 0 && !on_progress(i, utxo_count) {
+                    return Err(SnapshotLoadError::Storage(format!(
+                        "snapshot load cancelled at entry {} of {}",
+                        i, utxo_count
+                    )));
                 }
             }
 
@@ -1031,7 +1449,7 @@ impl UtxoSet {
             // earlier batched commits.
             let loaded_hash: [u8; 32] = hasher.finalize().into();
             if loaded_hash != file_hash {
-                return Err(UtxoError(format!(
+                return Err(SnapshotLoadError::Invalid(format!(
                     "snapshot verification failed: loaded={}, expected={}",
                     hex::encode(loaded_hash),
                     hex::encode(file_hash)
@@ -1102,7 +1520,7 @@ impl UtxoSet {
             }
         }
 
-        on_progress(utxo_count, utxo_count);
+        let _ = on_progress(utxo_count, utxo_count);
 
         info!(
             "UTXO snapshot loaded and verified: {} utxos at height {}",
@@ -1117,10 +1535,20 @@ impl UtxoSet {
         })
     }
 
+    /// True when less than `SNAPSHOT_GROW_TRIGGER` of the map is left
+    /// beyond the data file (LMDB extends the file as pages are written,
+    /// so its size tracks the highest page in use).
+    fn snapshot_map_low(&self) -> bool {
+        let used = self.env.real_disk_size().unwrap_or(0);
+        let trigger = SNAPSHOT_GROW_TRIGGER.min(sizing().headroom);
+        self.map_size().saturating_sub(used) < trigger
+    }
+
     /// Wipe every named DB inside the env in a single transaction. Used by
     /// the snapshot-load error path to clear partial state from earlier
     /// batched commits before returning the error to the caller.
     fn clear_all(&self) -> Result<(), UtxoError> {
+        let _gate = self.read_gate()?;
         let mut wtxn = self
             .env
             .write_txn()
@@ -1146,6 +1574,7 @@ impl UtxoSet {
     /// Used for crash recovery: if UTXOs from a block exist but validated_height
     /// wasn't updated, the block was already applied.
     pub fn has_utxos_at_height(&self, height: u32) -> Result<bool, UtxoError> {
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -1164,6 +1593,7 @@ impl UtxoSet {
 
     /// Get the number of UTXOs in the set.
     pub fn count(&self) -> Result<u64, UtxoError> {
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -1176,7 +1606,7 @@ impl UtxoSet {
 
 impl Drop for UtxoSet {
     /// Force heed to actually close the LMDB env when the last `UtxoSet`
-    /// reference goes away.
+    /// on this path goes away.
     ///
     /// Without this, heed's process-global `OPENED_ENV` cache holds an
     /// extra `Arc<EnvInner>` for every opened path, so the underlying env
@@ -1192,24 +1622,64 @@ impl Drop for UtxoSet {
     /// 2. **Tests** that simulate restart by dropping a `UtxoSet` and
     ///    reopening the same path.
     ///
-    /// `prepare_for_closing` takes the cache's `Arc` out (replacing it with
-    /// `None`) so subsequent opens of the same path are guaranteed cache
-    /// misses. The actual `mdb_env_close` happens once our last `Arc`
-    /// (`self.env`) drops as part of normal field destruction below.
+    /// Only the last user does this (see `EnvSlot`): `prepare_for_closing`
+    /// marks heed's entry as closing, and every later open of the path
+    /// fails with `DatabaseClosing` until the env is really gone, so doing
+    /// it while another `UtxoSet` still holds the env would break it.
     fn drop(&mut self) {
-        let _ = self.env.clone().prepare_for_closing();
+        // SAFETY: `self.env` is not used again after this.
+        let env = unsafe { ManuallyDrop::take(&mut self.env) };
+        release_env(&self.canonical, env);
     }
+}
+
+/// Drop one user's handle on the env at `canonical`; the last user closes
+/// it (synchronously, under the registry lock, so a concurrent open can't
+/// see heed's entry half torn down) and remembers its map size.
+fn release_env(canonical: &Path, env: Env) {
+    let mut registry = env_registry();
+    let last = match registry.get_mut(canonical) {
+        Some(slot) => {
+            slot.users = slot.users.saturating_sub(1);
+            if slot.users == 0 {
+                if let Some(shared) = slot.shared.take() {
+                    slot.remembered = shared.map_size.load(Ordering::Acquire);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        None => true,
+    };
+    if last {
+        // Takes heed's cached `Arc` out; with ours dropped at the end of the
+        // call that was the last reference, so `mdb_env_close` runs here.
+        let _ = env.prepare_for_closing();
+    } else {
+        drop(env);
+    }
+}
+
+fn round_up(n: u64, granule: u64) -> u64 {
+    n.div_ceil(granule) * granule
 }
 
 /// Map sizes to try, largest first, for an env whose `data.mdb` is
 /// `data_len` bytes. All are whole GiB (a multiple of every page size).
 /// The first is the preferred size; the rest are fallbacks for when the
 /// address space can't be reserved, ending at data + `MIN_MAP_HEADROOM`.
+/// (`_with` takes the sizing knobs so tests can shrink them.)
+#[cfg(test)]
 fn map_size_candidates(data_len: u64) -> Vec<u64> {
-    let round_up = |n: u64| n.div_ceil(GIB) * GIB;
-    let floor = round_up(data_len + MIN_MAP_HEADROOM);
+    map_size_candidates_with(data_len, &DEFAULT_SIZING)
+}
+
+fn map_size_candidates_with(data_len: u64, sz: &MapSizing) -> Vec<u64> {
+    let round_up = |n: u64| round_up(n, sz.granule);
+    let floor = round_up(data_len + sz.headroom);
     let preferred = round_up(data_len.saturating_mul(2))
-        .clamp(MIN_MAP_SIZE, MAX_MAP_SIZE)
+        .clamp(sz.min, sz.max)
         .max(floor);
     let mut sizes = vec![preferred];
     let mut next = preferred / 2;
@@ -1406,6 +1876,7 @@ impl UtxoSet {
         vout: u32,
         entry: UtxoEntry,
     ) -> Result<(), UtxoError> {
+        let _gate = self.read_gate()?;
         let mut wtxn = self
             .env
             .write_txn()
@@ -1432,6 +1903,7 @@ impl UtxoSet {
         vout: u32,
         raw_value: &[u8],
     ) -> Result<(), UtxoError> {
+        let _gate = self.read_gate()?;
         let mut wtxn = self
             .env
             .write_txn()
@@ -1455,6 +1927,7 @@ impl UtxoSet {
         vout: u32,
         entry: UtxoEntry,
     ) -> Result<(), UtxoError> {
+        let _gate = self.read_gate()?;
         let mut wtxn = self
             .env
             .write_txn()
@@ -1471,6 +1944,7 @@ impl UtxoSet {
 
     /// Count of undo entries currently persisted (across all heights).
     fn test_count_undo(&self) -> Result<u64, UtxoError> {
+        let _gate = self.read_gate()?;
         let rtxn = self
             .env
             .read_txn()
@@ -1589,6 +2063,167 @@ mod tests {
         let set = UtxoSet::open(path.to_str().unwrap()).unwrap();
         assert_eq!(set.count().unwrap(), 1);
         assert!(set.env.info().map_size >= (32 * GIB) as usize);
+    }
+
+    /// Shrink the map-sizing knobs for this test thread so a few MiB of data
+    /// exercise growth (the real floor is 32 GiB). Restored on drop.
+    struct SmallMaps;
+    impl SmallMaps {
+        fn install() -> SmallMaps {
+            TEST_SIZING.with(|c| {
+                c.set(Some(MapSizing {
+                    min: 1 << 20,
+                    max: GIB,
+                    headroom: 1 << 20,
+                    granule: 1 << 20,
+                }))
+            });
+            SmallMaps
+        }
+    }
+    impl Drop for SmallMaps {
+        fn drop(&mut self) {
+            TEST_SIZING.with(|c| c.set(None));
+        }
+    }
+
+    /// A coinbase-only block whose single tx carries `outputs` outputs with
+    /// `script_len`-byte scripts (~`outputs * script_len` bytes of UTXOs).
+    /// `tag` makes the txid unique per block.
+    fn fat_block(tag: u32, outputs: u32, script_len: usize) -> Block {
+        use bitcoin::{absolute::LockTime, transaction::Version, Amount, ScriptBuf, Transaction, TxIn, TxOut};
+        let tx = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::from_consensus(tag),
+            input: vec![TxIn::default()],
+            output: (0..outputs)
+                .map(|i| TxOut {
+                    value: Amount::from_sat(1_000 + i as u64),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51; script_len]),
+                })
+                .collect(),
+        };
+        Block { header: genesis_block().header, txdata: vec![tx] }
+    }
+
+    #[test]
+    fn same_path_opened_twice_after_growth_shares_one_env() {
+        // Ticket 030: the map size depends on data.mdb's size at open, and
+        // heed rejects a second open of a live path with different options
+        // (BadOpenOptions). A push-wake node opening the env while the
+        // foreground node is running, after the data file grew, must still
+        // succeed, and the map must grow in place on MDB_MAP_FULL.
+        let _small = SmallMaps::install();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("utxo-lmdb");
+        let path = path.to_str().unwrap();
+
+        let a = UtxoSet::open(path).unwrap();
+        let initial_map = a.map_size();
+        // ~6 MiB of UTXOs into a 1 MiB map: only works if MAP_FULL grows it.
+        for tag in 0..40 {
+            a.apply_block(&fat_block(tag, 300, 500), tag).unwrap();
+        }
+        assert!(a.map_size() > initial_map, "map should have grown from {}", initial_map);
+        let data_len = fs::metadata(Path::new(path).join("data.mdb")).unwrap().len();
+        assert!(
+            map_size_candidates_with(data_len, &sizing())[0] != initial_map,
+            "test needs the fresh-open size to differ from the live env's"
+        );
+
+        // Second open while `a` is live: same env, no BadOpenOptions.
+        let b = UtxoSet::open(path).unwrap();
+        assert_eq!(b.count().unwrap(), a.count().unwrap());
+        b.apply_block(&fat_block(1000, 10, 500), 1000).unwrap();
+        assert_eq!(a.count().unwrap(), b.count().unwrap());
+
+        // Dropping one user must not close the env under the other, nor
+        // make later opens fail with DatabaseClosing.
+        let expected = b.count().unwrap();
+        drop(a);
+        assert_eq!(b.count().unwrap(), expected);
+        let c = UtxoSet::open(path).unwrap();
+        assert_eq!(c.count().unwrap(), expected);
+        drop(b);
+        drop(c);
+
+        // Full close, then reopen: starts from the remembered (grown) size.
+        let d = UtxoSet::open(path).unwrap();
+        assert_eq!(d.count().unwrap(), expected);
+        assert!(d.map_size() as u64 >= data_len);
+    }
+
+    #[test]
+    fn ensure_map_capacity_fails_cleanly_without_address_space() {
+        let (utxo, _dir) = fresh();
+        utxo.apply_block(&genesis_block(), 0).unwrap();
+        let before = utxo.map_size();
+        // No process can reserve 2^62 bytes: the probe fails, so the env
+        // must be left mapped and usable (not poisoned).
+        let err = utxo.ensure_map_capacity(1 << 62).unwrap_err();
+        assert!(err.0.contains("can't map the UTXO set"), "got: {}", err);
+        assert_eq!(utxo.map_size(), before);
+        assert_eq!(utxo.count().unwrap(), 1);
+        utxo.ensure_map_capacity(before).unwrap();
+    }
+
+    #[test]
+    fn snapshot_load_grows_map_between_batches() {
+        // Source set with ~3 MiB of entries (few, large: every batch of 4
+        // commits with an fsync), written at default sizing.
+        let (src, _src_dir) = fresh();
+        for i in 0..250u32 {
+            let mut txid = [0u8; 32];
+            txid[..4].copy_from_slice(&i.to_be_bytes());
+            src.test_insert_utxo(
+                txid,
+                0,
+                UtxoEntry { amount: 1, script_pubkey: vec![0x51; 12_000], height: 1, is_coinbase: false },
+            )
+            .unwrap();
+        }
+        let mut buf = Vec::new();
+        let meta = src.write_snapshot(&mut buf, 1, &[0u8; 32]).unwrap();
+
+        let _small = SmallMaps::install();
+        let dir = TempDir::new().unwrap();
+        let dst = UtxoSet::open(dir.path().join("utxo").to_str().unwrap()).unwrap();
+        let initial_map = dst.map_size();
+        dst.load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| true)
+            .unwrap();
+        assert_eq!(dst.count().unwrap(), 250);
+        assert!(dst.map_size() > initial_map);
+    }
+
+    #[test]
+    fn snapshot_load_errors_say_whether_the_file_is_bad() {
+        let (buf, anchor) = make_snapshot_with_n_utxos(10);
+
+        // Cancelled from the progress callback: a storage error (keep the
+        // file), and the env is left empty for a retry.
+        let (utxo, _dir) = fresh();
+        let err = utxo
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor), |_, _| false)
+            .unwrap_err();
+        assert!(matches!(err, SnapshotLoadError::Storage(ref m) if m.contains("cancelled")), "got: {}", err);
+        assert_eq!(utxo.count().unwrap(), 0);
+        utxo.load_snapshot(std::io::Cursor::new(&buf), Some(&anchor), |_, _| true)
+            .unwrap();
+
+        // Wrong content hash: the file is bad.
+        let (utxo, _dir) = fresh();
+        let wrong = SnapshotAnchor { utxo_hash: [0xEE; 32], ..anchor };
+        let err = utxo
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&wrong), |_, _| true)
+            .unwrap_err();
+        assert!(matches!(err, SnapshotLoadError::Invalid(_)), "got: {}", err);
+
+        // Truncated stream: the file is bad.
+        let (utxo, _dir) = fresh();
+        let err = utxo
+            .load_snapshot(std::io::Cursor::new(&buf[..buf.len() - 3]), Some(&anchor), |_, _| true)
+            .unwrap_err();
+        assert!(matches!(err, SnapshotLoadError::Invalid(_)), "got: {}", err);
     }
 
     #[test]
@@ -1909,7 +2544,7 @@ mod tests {
 
         let (utxo2, _dir2) = fresh();
         let loaded = utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| true)
             .unwrap();
         assert_eq!(loaded.height, 0);
         assert_eq!(loaded.utxo_count, 1);
@@ -1939,7 +2574,7 @@ mod tests {
                 block_hash: [0u8; 32],
                 utxo_hash: [0xFFu8; 32],
             }),
-            |_, _| {},
+            |_, _| true,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
@@ -1954,7 +2589,7 @@ mod tests {
         let mut buf = Vec::new();
         utxo.write_snapshot(&mut buf, 0, &[0u8; 32]).unwrap();
 
-        let result = utxo.load_snapshot(std::io::Cursor::new(&buf), None, |_, _| {});
+        let result = utxo.load_snapshot(std::io::Cursor::new(&buf), None, |_, _| true);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("must be empty"));
     }
@@ -1965,7 +2600,7 @@ mod tests {
         let result = utxo.load_snapshot(
             std::io::Cursor::new(b"BADXsomegarbagedata"),
             None,
-            |_, _| {},
+            |_, _| true,
         );
         assert!(result.is_err());
         assert!(result
@@ -1988,7 +2623,7 @@ mod tests {
 
         let (utxo2, _dir2) = fresh();
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| true)
             .unwrap();
 
         // utxos populated as expected.
@@ -2020,7 +2655,7 @@ mod tests {
         let (utxo2, _dir2) = fresh();
         assert_eq!(utxo2.assume_valid_floor().unwrap(), 0);
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| true)
             .unwrap();
         assert_eq!(utxo2.assume_valid_floor().unwrap(), 12345);
     }
@@ -2043,7 +2678,7 @@ mod tests {
                 .load_snapshot(
                     std::io::Cursor::new(&buf),
                     Some(&anchor_of(&meta)),
-                    |_, _| {},
+                    |_, _| true,
                 )
                 .unwrap();
             assert_eq!(utxo2.assume_valid_floor().unwrap(), 700_000);
@@ -2067,7 +2702,7 @@ mod tests {
 
         let (utxo2, _dir2) = fresh();
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| true)
             .unwrap();
 
         // Below the floor.
@@ -2108,7 +2743,7 @@ mod tests {
         let env_path = dir2.path().join("utxo");
         let utxo2 = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| true)
             .unwrap();
 
         // Marker must be gone after a clean load.
@@ -2137,7 +2772,7 @@ mod tests {
                 block_hash: [0u8; 32],
                 utxo_hash: [0xFFu8; 32],
             }),
-            |_, _| {},
+            |_, _| true,
         );
         assert!(result.is_err());
 
@@ -2157,7 +2792,7 @@ mod tests {
         let env_path = dir.path().join("utxo");
         let utxo = UtxoSet::open(env_path.to_str().unwrap()).unwrap();
         let err = utxo
-            .load_snapshot(std::io::Cursor::new(bytes), Some(anchor), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(bytes), Some(anchor), |_, _| true)
             .unwrap_err();
         assert!(err.to_string().contains(needle), "got: {}", err);
         assert!(!loading_marker_path(&env_path).exists());
@@ -2203,7 +2838,7 @@ mod tests {
 
         let (utxo2, _dir2) = fresh();
         utxo2
-            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| {})
+            .load_snapshot(std::io::Cursor::new(&buf), Some(&anchor_of(&meta)), |_, _| true)
             .unwrap();
         assert_eq!(utxo2.snapshot_block_hash().unwrap(), Some([0x5Au8; 32]));
     }
@@ -2254,7 +2889,7 @@ mod tests {
             .load_snapshot(
                 std::io::Cursor::new(&snapshot_bytes),
                 Some(&expected),
-                |_, _| {},
+                |_, _| true,
             )
             .unwrap();
         assert_eq!(meta.utxo_count, 13);
@@ -2296,7 +2931,7 @@ mod tests {
         let result = utxo.load_snapshot(
             std::io::Cursor::new(&snapshot_bytes),
             Some(&expected),
-            |_, _| {},
+            |_, _| true,
         );
         assert!(result.is_err());
         assert!(result

@@ -66,4 +66,16 @@ check(parked(l).count == 1 && parked(l)[0].contains(".stale."), "s5 stale compan
 let before = (try! fm.subpathsOfDirectory(atPath: l.chainDir.path)).sorted()
 try! StoragePaths.migrate(l)
 check((try! fm.subpathsOfDirectory(atPath: l.chainDir.path)).sorted() == before, "s6 rerun changes nothing")
+// 7. parked items older than 7 days are pruned; newer and unstamped ones kept
+l = mk(base.appendingPathComponent("s7"))
+try! fm.createDirectory(at: l.conflictDir, withIntermediateDirectories: true)
+let now = Date(), day = 24 * 3600
+let oldTs = Int(now.timeIntervalSince1970) - 8 * day, newTs = Int(now.timeIntervalSince1970) - 6 * day
+put(l.conflictDir, "peers.sqlite3.\(oldTs)", "old"); put(l.conflictDir, "blocks.sqlite3-wal.stale.\(oldTs)", "old-stale")
+try! fm.createDirectory(at: l.conflictDir.appendingPathComponent("utxo-lmdb.\(oldTs)"), withIntermediateDirectories: true)
+put(l.conflictDir, "peers.sqlite3-wal.\(newTs)", "new"); put(l.conflictDir, "notes.txt", "unstamped")
+let pruned = StoragePaths.pruneParkedConflicts(l, now: now).sorted()
+check(pruned == ["blocks.sqlite3-wal.stale.\(oldTs)", "peers.sqlite3.\(oldTs)", "utxo-lmdb.\(oldTs)"], "s7 old items (files + env dir) pruned: \(pruned)")
+check(parked(l) == ["notes.txt", "peers.sqlite3-wal.\(newTs)"], "s7 recent + unstamped kept: \(parked(l))")
+check(StoragePaths.pruneParkedConflicts(l, now: now).isEmpty, "s7 rerun prunes nothing")
 print(fails == 0 ? "ALL PASS" : "\(fails) FAILED"); exit(fails == 0 ? 0 : 1)

@@ -364,7 +364,15 @@ class NodeViewModel: ObservableObject {
                     }
                 }
                 self?.node = node
-                DispatchQueue.main.async { self?.checkDiskSpace(force: true) }
+                DispatchQueue.main.async {
+                    // A fresh HerculesNode starts unpaused: drop any pause
+                    // state that belonged to the previous node so the UI
+                    // matches it, and so the forced check below re-pauses
+                    // this node if space is still low.
+                    self?.pausedForLowDisk = false
+                    self?.isValidationPaused = false
+                    self?.checkDiskSpace(force: true)
+                }
 
                 // Honor the user's explicit validation-mode choice. AssumeUTXO
                 // runs the download/import path on a fresh DB; Genesis skips
@@ -376,13 +384,26 @@ class NodeViewModel: ObservableObject {
                         self?.isConnecting = false
                     }
 
+                    // Map-capacity check (ticket 030): if the UTXO env can't
+                    // be mapped big enough for the snapshot (iOS VA limit
+                    // forced a small fallback map), say so now rather than
+                    // after an 8.8 GB download.
+                    do {
+                        try node.checkSnapshotCapacity()
+                    } catch HerculesError.StorageError(let msg) {
+                        throw StorageError.cannotMapUtxoSet(msg)
+                    }
+
                     // Free-space preflight: refuse to start an 8.8 GB download
                     // that can't be imported. A finished download on disk is
-                    // credited against the requirement.
+                    // credited against the requirement, as are pages a
+                    // previous (aborted) import left in the LMDB file, which
+                    // the next import reuses.
                     do {
                         try StorageGuard.snapshotPreflight(
                             alreadyDownloaded: SnapshotDownloader.hasDownloadedFile()
-                                ? SnapshotDownloader.expectedBytes : 0
+                                ? SnapshotDownloader.expectedBytes : 0,
+                            reusable: StorageGuard.utxoEnvFileBytes()
                         )
                     } catch {
                         DispatchQueue.main.async {
@@ -406,17 +427,24 @@ class NodeViewModel: ObservableObject {
                         self?.isLoadingSnapshot = true
                     }
 
+                    // The import writes ~12 GB; watch free space while it
+                    // runs (ticket 030) and cancel cleanly below the pause
+                    // threshold rather than letting LMDB hit ENOSPC.
+                    let spaceWatch = SnapshotSpaceWatch()
                     let snapCallback = SnapshotProgressCallback { loaded, total in
                         DispatchQueue.main.async {
                             self?.snapshotProgress = total > 0
                                 ? Double(loaded) / Double(total) : 0
                         }
+                        return spaceWatch.shouldContinue()
                     }
 
-                    // Always delete the cached .gz after the import attempt:
-                    // on success it's redundant (UTXOs are now in SQLite); on
-                    // failure it prevents an infinite hash-mismatch retry loop
-                    // against the same bad bytes.
+                    // Delete the cached .gz after a successful import (it's
+                    // redundant) or when the file itself was rejected
+                    // (corrupt, truncated, hash mismatch), so we don't retry
+                    // the same bad bytes forever. Keep it for any other
+                    // failure (map or disk full, cancelled): it's fine, and a
+                    // retry shouldn't re-download 8.8 GB.
                     do {
                         let _ = try node.loadSnapshot(
                             snapshotPath: snapshotURL.path,
@@ -424,7 +452,18 @@ class NodeViewModel: ObservableObject {
                         )
                         SnapshotDownloader.deleteDownloadedFile()
                     } catch {
-                        SnapshotDownloader.deleteDownloadedFile()
+                        if case HerculesError.SnapshotInvalid = error {
+                            SnapshotDownloader.deleteDownloadedFile()
+                        }
+                        if let free = spaceWatch.abortedAtFreeBytes {
+                            let lowSpace = StorageError.insufficientSpace(
+                                message: StorageGuard.snapshotImportLowSpaceMessage(free: free)
+                            )
+                            DispatchQueue.main.async {
+                                self?.storageWarning = lowSpace.localizedDescription
+                            }
+                            throw lowSpace
+                        }
                         throw error
                     }
 
@@ -560,6 +599,9 @@ class NodeViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             node.setValidationPaused(paused: newState)
             DispatchQueue.main.async {
+                // A manual toggle takes the pause back from the low-disk
+                // guard; if space is still low its next check re-pauses.
+                self?.pausedForLowDisk = false
                 self?.isValidationPaused = newState
             }
         }
@@ -582,7 +624,9 @@ class NodeViewModel: ObservableObject {
         if free < StorageGuard.pauseBelowBytes {
             storageWarning = StorageGuard.lowSpaceMessage(free: free)
             lowDiskBannerShown = true
-            if !pausedForLowDisk, let node = node {
+            // Take ownership only if validation is running: a manual pause
+            // stays the user's, so recovery below never resumes it.
+            if !pausedForLowDisk, !isValidationPaused, let node = node {
                 pausedForLowDisk = true
                 isValidationPaused = true
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -622,14 +666,44 @@ class SyncProgressCallback: SyncCallback {
 }
 
 class SnapshotProgressCallback: SnapshotCallback {
-    let handler: (UInt64, UInt64) -> Void
+    /// Returns false to cancel the import.
+    let handler: (UInt64, UInt64) -> Bool
 
-    init(handler: @escaping (UInt64, UInt64) -> Void) {
+    init(handler: @escaping (UInt64, UInt64) -> Bool) {
         self.handler = handler
     }
 
-    func onProgress(loaded: UInt64, total: UInt64) {
+    func onProgress(loaded: UInt64, total: UInt64) -> Bool {
         handler(loaded, total)
+    }
+}
+
+/// Free-space watch for the snapshot import (ticket 030), polled from the
+/// Rust progress callback (on the import thread, roughly every 100k
+/// entries). Checks at most every 5 s; below `StorageGuard.pauseBelowBytes`
+/// it records the free space and tells the import to stop.
+final class SnapshotSpaceWatch {
+    private let lock = NSLock()
+    private var lastCheck = Date.distantPast
+    private var abortedAt: Int64?
+
+    /// Free bytes when the import was cancelled for low space, else nil.
+    var abortedAtFreeBytes: Int64? {
+        lock.lock(); defer { lock.unlock() }
+        return abortedAt
+    }
+
+    func shouldContinue() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if abortedAt != nil { return false }
+        let now = Date()
+        guard now.timeIntervalSince(lastCheck) >= 5 else { return true }
+        lastCheck = now
+        if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
+            abortedAt = free
+            return false
+        }
+        return true
     }
 }
 

@@ -7,7 +7,9 @@ import os
 //   Library/Application Support/Chain/    isExcludedFromBackup = true
 //       hercules-headers.sqlite3(-wal,-shm), blocks.sqlite3(-wal,-shm),
 //       peers.sqlite3(-wal,-shm), own_txs.sqlite3(-wal,-shm), utxo-lmdb/, utxo-lmdb.loading (transient),
-//       tor/ (Arti state + cache), wallet_auth_token, .layout-v1 (marker)
+//       tor/ (Arti state + cache), wallet_auth_token, .layout-v1 (marker),
+//       migration-conflicts/ (parked downgrade copies; deleted after 7 days
+//       or on node reset)
 //   Library/Application Support/Wallet/   backed up; empty until 036/039
 //   Library/Caches/hercules-utxo.hutx.gz  snapshot download (SnapshotDownloader)
 //   Documents/notification-history.json   small, user-facing, backed up
@@ -22,9 +24,11 @@ import os
 // `completeUntilFirstUserAuthentication`, set explicitly. Push wakes and
 // BGTasks run while the phone is locked, so `complete` would make every wake
 // fail. The consequence is that after a reboot, *before the first unlock*,
-// none of these files can be opened: wakes in that state are detected
-// (`UIApplication.isProtectedDataAvailable` on the push path, an open(2)
-// probe in `prepareForNodeOpen`) and skipped without touching the databases.
+// none of these files can be opened: wakes in that state are detected by
+// an open(2) probe in `prepareForNodeOpen` and skipped without touching the
+// databases. `UIApplication.isProtectedDataAvailable` is NOT used: it tracks
+// the `complete` class, so it goes false ~10 s after every passcode lock,
+// while our files stay readable until the next reboot.
 
 /// Errors surfaced by storage preparation and the disk-space guard.
 enum StorageError: LocalizedError {
@@ -36,6 +40,9 @@ enum StorageError: LocalizedError {
     case migrationFailed(String)
     /// Not enough free space for the requested operation.
     case insufficientSpace(message: String)
+    /// The UTXO LMDB map can't be made large enough for the AssumeUTXO set
+    /// on this device (address-space limit). Detail from the Rust core.
+    case cannotMapUtxoSet(String)
 
     var errorDescription: String? {
         switch self {
@@ -45,6 +52,8 @@ enum StorageError: LocalizedError {
             return "Could not move node data to its new location (\(detail)). Your data is intact; Hercules will retry on next launch."
         case .insufficientSpace(let message):
             return message
+        case .cannotMapUtxoSet(let detail):
+            return "This iPhone can't reserve enough memory-mapped address space for the UTXO database, so the node can't be set up from a snapshot on this device. (\(detail))"
         }
     }
 }
@@ -179,8 +188,10 @@ enum StoragePaths {
             throw StorageError.migrationFailed("create directories: \(error.localizedDescription)")
         }
 
-        // 2. One-time migration out of Documents.
+        // 2. One-time migration out of Documents, then drop conflict copies
+        //    parked long enough ago that nobody is going to recover them.
         try migrate(layout)
+        pruneParkedConflicts(layout)
 
         // 3. Explicit protection class on everything already in Chain/
         //    (files the Rust core creates inherit the directory's class, but
@@ -205,7 +216,9 @@ enum StoragePaths {
     /// - If an item exists in BOTH places (only possible after a downgrade to
     ///   a pre-030 build recreated data in Documents), Chain/ wins and the
     ///   Documents copy is parked in `Chain/migration-conflicts/` (still out of
-    ///   backup) instead of being deleted or merged.
+    ///   backup) instead of being deleted or merged. Parked items are deleted
+    ///   `parkedRetention` (7 days) later by `pruneParkedConflicts`, or by a
+    ///   node reset.
     static func migrate(_ layout: Layout) throws {
         let fm = FileManager.default
         var moved: [String] = []
@@ -290,10 +303,50 @@ enum StoragePaths {
         }
     }
 
+    /// How long a parked conflict copy is kept before it's deleted at launch.
+    /// Long enough to recover from a bad migration by hand; parked chain
+    /// data is otherwise multi-GB of dead weight.
+    static let parkedRetention: TimeInterval = 7 * 24 * 3600
+
+    /// Delete items in `Chain/migration-conflicts/` parked more than
+    /// `parkedRetention` before `now`. Age comes from the Unix timestamp
+    /// `migrate` appends to the name (`<name>.<ts>`, `<name>.stale.<ts>`),
+    /// not the file dates, which a rename preserves from the original.
+    /// Items without a parseable stamp are left alone. Best-effort: never
+    /// blocks the node from opening. Returns the names removed.
+    @discardableResult
+    static func pruneParkedConflicts(_ layout: Layout, now: Date = Date()) -> [String] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: layout.conflictDir.path) else { return [] }
+        var removed: [String] = []
+        for name in names {
+            guard let stamp = parkedStamp(name),
+                  now.timeIntervalSince1970 - TimeInterval(stamp) >= parkedRetention else { continue }
+            do {
+                try fm.removeItem(at: layout.conflictDir.appendingPathComponent(name))
+                removed.append(name)
+            } catch {
+                log.error("prune parked \(name, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if !removed.isEmpty {
+            log.notice("migration: deleted parked conflicts older than 7 days: \(removed, privacy: .public)")
+        }
+        return removed
+    }
+
+    /// Parking time encoded in a parked item's name, if any.
+    static func parkedStamp(_ name: String) -> Int? {
+        guard let dot = name.lastIndex(of: ".") else { return nil }
+        return Int(name[name.index(after: dot)...])
+    }
+
     /// Returns false when chain files exist but can't be opened, i.e. the
-    /// device rebooted and hasn't been unlocked. Probes with open(2) because
-    /// `UIApplication.isProtectedDataAvailable` is main-thread-only and this
-    /// runs on background queues (BGTask handlers, node threads).
+    /// device rebooted and hasn't been unlocked. Probes with open(2) on a
+    /// file of our own class, so it fails only before first unlock (unlike
+    /// `UIApplication.isProtectedDataAvailable`, which reflects `complete`
+    /// and flips false on every lock). Plain syscalls, so safe on any thread
+    /// (push handler's global queue, BGTask handlers, node threads).
     static func protectedDataReadable(_ layout: Layout) -> Bool {
         let candidates = [
             layout.markerURL.path,
@@ -377,6 +430,9 @@ enum StorageGuard {
     /// at once during import) + headroom for headers, blocks, and iOS.
     static let snapshotRequiredBytes: Int64 = 25 * 1_000_000_000
 
+    /// The imported UTXO LMDB's share of `snapshotRequiredBytes`.
+    static let utxoEnvBytes: Int64 = 12 * 1_000_000_000
+
     /// Below this, block validation is paused so LMDB/SQLite never hit
     /// ENOSPC mid-transaction. Resumes above `resumeAboveBytes` (hysteresis
     /// so it doesn't flap around the threshold).
@@ -401,13 +457,31 @@ enum StorageGuard {
     /// Throws `insufficientSpace` with user-facing copy if there isn't room
     /// to download and import the snapshot. Bytes of a completed download
     /// already on disk are credited.
-    static func snapshotPreflight(alreadyDownloaded: Int64 = 0) throws {
+    ///
+    /// `reusable` is the size of an existing UTXO LMDB file (left by an
+    /// aborted import: LMDB never shrinks its file, and the next import
+    /// reuses those pages), credited up to the LMDB's share.
+    static func snapshotPreflight(alreadyDownloaded: Int64 = 0, reusable: Int64 = 0) throws {
         guard let free = availableBytes() else { return } // unknown: don't block
-        let needed = snapshotRequiredBytes - alreadyDownloaded
+        let needed = snapshotRequiredBytes - alreadyDownloaded - min(reusable, utxoEnvBytes)
         if free < needed {
             throw StorageError.insufficientSpace(message:
                 "Not enough storage to set up the node. The snapshot download and the UTXO database it unpacks into need about \(format(needed)) free; this iPhone has \(format(free)). Free up space in Settings > General > iPhone Storage, then tap Start again.")
         }
+    }
+
+    /// Banner copy when the snapshot import was stopped for low storage.
+    static func snapshotImportLowSpaceMessage(free: Int64) -> String {
+        "Storage almost full: the snapshot import was stopped (\(format(free)) free). The downloaded snapshot was kept. Free up space in Settings > General > iPhone Storage, then tap Start again."
+    }
+
+    /// Size of the UTXO LMDB data file, 0 if absent.
+    static func utxoEnvFileBytes() -> Int64 {
+        let url = StoragePaths.chainDirectory
+            .appendingPathComponent("utxo-lmdb", isDirectory: true)
+            .appendingPathComponent("data.mdb")
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber
+        return size?.int64Value ?? 0
     }
 
     /// Banner copy shown while validation is paused for low storage.

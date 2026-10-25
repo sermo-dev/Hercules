@@ -324,17 +324,6 @@ class NotificationManager: ObservableObject {
             return
         }
 
-        // Locked since reboot (ticket 030): chain data is
-        // completeUntilFirstUserAuthentication, so nothing can be opened
-        // until the user unlocks once. Complete immediately without touching
-        // the databases, the history file, or the App Group (all equally
-        // unreadable). Called on the main thread, as UIKit requires.
-        if !UIApplication.shared.isProtectedDataAvailable {
-            Self.recordLockedSinceReboot(pushBlock: pushBlock)
-            completionHandler(.noData)
-            return
-        }
-
         // Low storage (ticket 030): don't let a wake push LMDB/SQLite into
         // ENOSPC. Record a visible skip instead.
         if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
@@ -414,8 +403,16 @@ class NotificationManager: ObservableObject {
                 completionHandler(.newData)
 
             } catch StorageError.protectedDataUnavailable {
-                // Lost the race with the main-thread check (or the probe is
-                // stricter than UIKit's flag). Same graceful skip.
+                // Locked since reboot (ticket 030): chain data is
+                // completeUntilFirstUserAuthentication, so nothing can be
+                // opened until the user unlocks once. Detected by the open(2)
+                // probe in prepareForNodeOpen before any database is touched.
+                // Deliberately NOT gated on UIApplication.isProtectedDataAvailable:
+                // that tracks the `complete` class and goes false ~10 s after
+                // every passcode lock, so it would skip every pocketed wake.
+                // markAwake is best-effort here (the App Group is unreadable
+                // too, so the write usually fails).
+                SharedNodeStore.markAwake(false)
                 activityController.finishFailure(
                     height: initialHeight,
                     peerCount: initialState.peerCount
@@ -561,7 +558,10 @@ class NotificationManager: ObservableObject {
                 notificationHistory.insert(record, at: 0)
                 return
             }
-            notificationHistory = loaded + notificationHistory
+            // In-memory records arrived after the file was last written
+            // (appended while it was unreadable), so they are newer: keep them first
+            // so the prefix cap below drops the oldest, not the newest.
+            notificationHistory = notificationHistory + loaded
             historyLoaded = true
         }
         notificationHistory.insert(record, at: 0)
