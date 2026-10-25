@@ -833,7 +833,7 @@ class NotificationManager: ObservableObject {
             content.body = "Peers disagree on the chain tip at block #\(record.height). Retrying next wake."
         case .invalidChain:
             content.title = "Invalid Block Rejected"
-            content.body = "A peer relayed a block that breaks consensus rules after #\(record.height). Hercules rejected it and dropped the peer."
+            content.body = "A peer relayed a block that breaks consensus rules after #\(record.height). Hercules rejected it and keeps following the valid chain."
         case .headerOnly:
             content.title = "Block #\(record.height) Header Verified"
             content.body = "PoW validated, full block validation pending"

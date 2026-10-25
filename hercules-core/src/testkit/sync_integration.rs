@@ -487,6 +487,51 @@ fn eclipsed_low_work_headers_are_replaced_by_honest_chain() {
     node.assert_utxos_match(&honest_chain);
 }
 
+/// PR #24 second review: the same eclipse, but the cheap chain is longer
+/// than one 2,000-header batch past the fork, so no single honest batch
+/// reaches our tip. The fork is followed across batches to prove it does,
+/// and the honest peers are never penalized for offering it.
+#[test]
+fn eclipsed_by_more_than_one_batch_of_cheap_headers_recovers() {
+    const ANCHOR: u32 = 2150;
+    let mut honest_chain = FixtureChain::new();
+    honest_chain.mine(2200);
+    let mut cheap_chain = FixtureChain::new().fork_at(0);
+    cheap_chain.mine(2100);
+    let hostile1 = MockPeer::spawn(&cheap_chain, vec![]);
+    let hostile2 = MockPeer::spawn(&cheap_chain, vec![]);
+    let mut node = Node::new(&[&hostile1, &hostile2]);
+    node.hs.anchor = SnapshotAnchor {
+        height: ANCHOR,
+        block_hash: honest_chain.hash_at(ANCHOR).to_byte_array(),
+        utxo_hash: [0u8; 32],
+    };
+    let headers: Vec<Header> = honest_chain.blocks().iter().map(|b| b.header).collect();
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    node.hs.min_chain_work = u256_add(chainwork_for_headers(&headers), one);
+    node.hs.scratch_stall_threshold = 3;
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, |hs| {
+        hs.store.tip().ok().flatten().map(|(h, _, _)| h) == Some(cheap_chain.tip_height())
+    });
+    assert!(ok, "cheap chain not stored: {:?}, tip {:?}", res, node.tip());
+
+    drop(hostile1);
+    drop(hostile2);
+    let a = MockPeer::spawn(&honest_chain, vec![]);
+    let b = MockPeer::spawn(&honest_chain, vec![]);
+    node.use_peers(&[&a, &b]);
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&honest_chain));
+    assert!(ok, "stuck on the cheap chain: {:?}, tip {:?}", res, node.tip());
+    assert_eq!(node.hash_at(ANCHOR), Some(honest_chain.hash_at(ANCHOR)));
+    for p in [&a, &b] {
+        assert!(!node.is_banned(&p.addr()), "honest peer banned");
+        let score = node.score(&p.addr());
+        assert!(score.map_or(true, |s| s >= FRESH_SCORE), "honest peer penalized: {:?}", score);
+    }
+}
+
 /// Low-work node for the scratch-replacement tests: honest headers to 300
 /// stored (no blocks validated: below minimum work, anchor at 330 not yet
 /// reached), plus a cheap 310-block chain forking from genesis.
@@ -537,13 +582,14 @@ fn colluding_peers_cannot_replace_low_work_headers_before_a_stall() {
 /// The stall rule itself: rounds offering a replacement count up only
 /// while nobody extends our chain; any extension (`scratch_stall_rounds`
 /// reset by the sync loop) starts the count over. Never a candidate once
-/// the fork falls short of our tip or our tip reaches the anchor.
+/// the fork (a final, short batch) falls short of our tip or our tip
+/// reaches the anchor.
 #[test]
 fn scratch_replacement_requires_a_stall_without_progress() {
     let (mut node, _honest, _cheap) = low_work_fixture();
     node.hs.scratch_stall_threshold = 3;
     let hs = &node.hs;
-    let verdict = |fork_tip| match hs.scratch_replacement(300, 0, 0, fork_tip).unwrap() {
+    let verdict = |fork_tip| match hs.scratch_replacement(300, 0, 0, fork_tip, false).unwrap() {
         ScratchReplacement::No => "no",
         ScratchReplacement::Wait => "wait",
         ScratchReplacement::Replace => "replace",
@@ -562,17 +608,20 @@ fn scratch_replacement_requires_a_stall_without_progress() {
     // A fork shorter than our tip never qualifies.
     hs.scratch_stall_rounds.store(0, Ordering::Relaxed);
     assert_eq!(verdict(299), "no");
+    // Unless its batch was full: it may go on past our tip (the caller
+    // then follows it, `fork_reaches`, before replacing anything).
+    assert!(matches!(hs.scratch_replacement(300, 0, 0, 299, true).unwrap(), ScratchReplacement::Wait));
     // Nor does a fork below validated blocks, or a tip at the anchor.
-    assert!(matches!(hs.scratch_replacement(300, 0, 5, 310).unwrap(), ScratchReplacement::No));
-    assert!(matches!(hs.scratch_replacement(330, 0, 0, 340).unwrap(), ScratchReplacement::No));
+    assert!(matches!(hs.scratch_replacement(300, 0, 5, 310, false).unwrap(), ScratchReplacement::No));
+    assert!(matches!(hs.scratch_replacement(330, 0, 0, 340, false).unwrap(), ScratchReplacement::No));
 }
 
 // ── Header cross-check ───────────────────────────────────────────────
 
 /// Two peers on disjoint chains and no third opinion: every batch is
-/// rejected and both peers are deprioritized by
-/// `HEADER_DISAGREEMENT_PENALTY`, but never banned (PR #24 review:
-/// divergence alone proves nothing). Both stay disputed, and the active
+/// rejected and both peers get a selection demerit, but are never banned
+/// and their ban scores never drop (PR #24 review: divergence alone proves
+/// nothing). Both stay disputed, and the active
 /// peer's headers are refused until a fresh witness agrees with it.
 #[test]
 fn cross_check_two_peer_disagreement_needs_fresh_witness() {
@@ -593,7 +642,7 @@ fn cross_check_two_peer_disagreement_needs_fresh_witness() {
     assert_eq!(node.tip().0, 0, "disputed headers accepted without a witness");
     for p in [&a, &b] {
         let score = node.score(&p.addr());
-        assert!(score.map_or(false, |s| s < FRESH_SCORE), "{} not deprioritized: {:?}", p.addr(), score);
+        assert!(score.map_or(true, |s| s >= FRESH_SCORE), "{} ban score lowered: {:?}", p.addr(), score);
     }
 
     // A fresh peer that agrees with the survivor settles it.
@@ -636,12 +685,9 @@ fn cross_check_tiebreaker_rejects_minority_active_peer() {
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&a_chain));
     assert!(ok, "did not sync majority chain: {:?}, tip {:?}", res, node.tip());
     assert_eq!(node.hash_at(1), Some(a_chain.hash_at(1)));
-    let score = node.score(&b.addr());
-    assert!(
-        node.is_banned(&b.addr()) || score.map_or(false, |s| s < FRESH_SCORE),
-        "minority peer not penalized (score {:?})",
-        score
-    );
+    // Outvoted, so deprioritized for this session, but divergence alone
+    // never bans (PR #24 review).
+    assert!(!node.is_banned(&b.addr()), "minority peer banned over divergence");
 }
 
 // ── catch_up_blocks ──────────────────────────────────────────────────

@@ -42,11 +42,30 @@ struct PeerSlot {
     score: i32,
     /// True if this peer connected to us (inbound).
     inbound: bool,
+    /// Selection-only demerit from header cross-check divergence
+    /// (`PeerPool::deprioritize`): subtracted from `score` when choosing a
+    /// peer, but never counted toward a ban and never persisted, so
+    /// divergence evidence can't combine with an unrelated small penalty
+    /// into a ban.
+    demerit: i32,
     /// When the peer was last checked out (taken from the slot). Used to
     /// detect leaked slots where the caller dropped the Peer without
     /// calling return_peer().
     checked_out_at: Option<Instant>,
 }
+
+impl PeerSlot {
+    /// What peer selection ranks by: reputation minus divergence demerits.
+    fn weight(&self) -> i32 {
+        (self.score - self.demerit).max(SCORE_MIN)
+    }
+}
+
+/// Floor for `PeerPool::disconnect_and_deprioritize`'s persisted penalty:
+/// a relayer of a bad chain is made less attractive, but stays far enough
+/// from the ban threshold that a later routine penalty (a download timeout)
+/// can't ban it.
+const SOFT_PENALTY_FLOOR: i32 = SCORE_DEFAULT / 2;
 
 /// Minimum interval between DNS re-discovery attempts.
 const DNS_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
@@ -995,7 +1014,8 @@ impl PeerPool {
                         height,
                         score,
                         inbound: false,
-                        checked_out_at: None,
+                        demerit: 0,
+            checked_out_at: None,
                     };
 
                     self.slots.lock().unwrap().push(slot);
@@ -1132,8 +1152,8 @@ impl PeerPool {
             .enumerate()
             .filter(|(_, s)| s.peer.is_some() && !s.inbound)
             .max_by(|(_, a), (_, b)| {
-                let wa = a.height as f64 * (a.score as f64 / SCORE_DEFAULT as f64);
-                let wb = b.height as f64 * (b.score as f64 / SCORE_DEFAULT as f64);
+                let wa = a.height as f64 * (a.weight() as f64 / SCORE_DEFAULT as f64);
+                let wb = b.height as f64 * (b.weight() as f64 / SCORE_DEFAULT as f64);
                 wa.partial_cmp(&wb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)?;
@@ -1353,8 +1373,21 @@ impl PeerPool {
     /// restored on reconnect), and put its address into retry backoff so
     /// `maintain` doesn't reconnect it straight away. For peers that relay
     /// something bad they probably didn't originate (ticket 024).
+    ///
+    /// The penalty never takes the score below `SOFT_PENALTY_FLOOR`, so
+    /// this never bans, now or combined with a later routine penalty.
     pub fn disconnect_and_deprioritize(&mut self, addr: &str, penalty: u32) {
-        self.deprioritize(addr, penalty);
+        {
+            let mut slots = self.slots.lock().unwrap();
+            if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+                let floor = SOFT_PENALTY_FLOOR.min(slot.score);
+                slot.score = (slot.score as i64 - penalty as i64).max(floor as i64) as i32;
+                warn!(
+                    "PeerPool: peer {} deprioritized (-{}), score now {}",
+                    addr, penalty, slot.score
+                );
+            }
+        }
         let score = if self.is_inbound(addr) { None } else { self.get_score(addr) };
         if let (Some(store), Some(score)) = (self.store.as_ref(), score) {
             if let Err(e) = store.save_score(addr, score) {
@@ -1365,23 +1398,28 @@ impl PeerPool {
         self.remove_peer(addr);
     }
 
-    /// Lower a peer's score by `penalty`, but never to the ban threshold:
-    /// for evidence that a peer is wrong or unhelpful that falls short of
-    /// proof it sent invalid data (ticket 024, header cross-check
-    /// divergence). Repeated, it leaves the peer just above the threshold,
-    /// unattractive to `best_peer` and as a cross-check witness, but
-    /// connected. Only proven-invalid data (`misbehaving`) bans.
+    /// Make a peer less attractive by `penalty` without touching its
+    /// reputation score: for evidence short of proof that it sent invalid
+    /// data (header cross-check divergence; two colluding witnesses can
+    /// outvote an honest peer). The demerit only lowers its weight in
+    /// `best_peer` and as a cross-check peer; it never counts toward a ban
+    /// (`misbehaving`, for proven-invalid data, does) and lasts only for
+    /// this connection.
     pub fn deprioritize(&mut self, addr: &str, penalty: u32) {
         let mut slots = self.slots.lock().unwrap();
         if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
-            let floor = (BAN_LOW_THRESHOLD + 1).min(slot.score);
-            let new_score = (slot.score as i64 - penalty as i64).max(floor as i64);
-            slot.score = new_score as i32;
+            slot.demerit = (slot.demerit as i64 + penalty as i64).min(SCORE_MAX as i64) as i32;
             warn!(
-                "PeerPool: peer {} deprioritized (-{}), score now {}",
-                addr, penalty, slot.score
+                "PeerPool: peer {} deprioritized (+{} demerit, now {}), score {}",
+                addr, penalty, slot.demerit, slot.score
             );
         }
+    }
+
+    /// A connected peer's selection demerit (see `deprioritize`).
+    pub fn get_demerit(&self, addr: &str) -> Option<i32> {
+        let slots = self.slots.lock().unwrap();
+        slots.iter().find(|s| s.addr == addr).map(|s| s.demerit)
     }
 
     /// True if `addr` is a connected inbound peer.
@@ -1432,7 +1470,7 @@ impl PeerPool {
             {
                 continue;
             }
-            if best.map_or(true, |b| s.score > b.score) {
+            if best.map_or(true, |b| s.weight() > b.weight()) {
                 best = Some(s);
             }
         }
@@ -1448,7 +1486,7 @@ impl PeerPool {
             if s.inbound || s.peer.is_none() || excluded.iter().any(|e| e == &s.addr) {
                 continue;
             }
-            if best.map_or(true, |b| s.score > b.score) {
+            if best.map_or(true, |b| s.weight() > b.weight()) {
                 best = Some(s);
             }
         }
@@ -1478,8 +1516,8 @@ impl PeerPool {
             .iter()
             .filter(|s| !s.inbound)
             .max_by(|a, b| {
-                let wa = a.height as f64 * (a.score as f64 / SCORE_DEFAULT as f64);
-                let wb = b.height as f64 * (b.score as f64 / SCORE_DEFAULT as f64);
+                let wa = a.height as f64 * (a.weight() as f64 / SCORE_DEFAULT as f64);
+                let wb = b.height as f64 * (b.weight() as f64 / SCORE_DEFAULT as f64);
                 wa.partial_cmp(&wb).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|s| s.addr.clone())
@@ -1518,6 +1556,7 @@ impl PeerPool {
             height,
             score: SCORE_DEFAULT,
             inbound: true,
+            demerit: 0,
             checked_out_at: None,
         });
         true
@@ -1535,6 +1574,7 @@ impl PeerPool {
             height: 0,
             score: SCORE_DEFAULT,
             inbound: false,
+            demerit: 0,
             checked_out_at: None,
         });
     }
@@ -1737,6 +1777,7 @@ mod tests {
             height,
             score: SCORE_DEFAULT,
             inbound,
+            demerit: 0,
             checked_out_at: None,
         });
     }
@@ -2021,6 +2062,7 @@ mod tests {
                 height: 100,
                 score: SCORE_DEFAULT,
                 inbound: false,
+                demerit: 0,
                 checked_out_at: Some(Instant::now() - Duration::from_secs(300)),
             });
             // Also add a healthy slot with no checkout
@@ -2031,7 +2073,8 @@ mod tests {
                 height: 200,
                 score: SCORE_DEFAULT,
                 inbound: false,
-                checked_out_at: None,
+                demerit: 0,
+            checked_out_at: None,
             });
         }
         assert_eq!(pool.count(), 2);
@@ -2057,6 +2100,7 @@ mod tests {
                 height: 100,
                 score: SCORE_DEFAULT,
                 inbound: false,
+                demerit: 0,
                 checked_out_at: Some(Instant::now()), // just now
             });
         }
@@ -2158,6 +2202,7 @@ mod tests {
             height,
             score,
             inbound,
+            demerit: 0,
             checked_out_at: None,
         });
         server
@@ -2244,18 +2289,37 @@ mod tests {
     }
 
     #[test]
-    fn deprioritize_never_bans() {
+    fn deprioritize_never_bans_or_compounds_with_later_penalties() {
         let mut pool = test_pool();
         add_slot(&pool, "1.2.3.4:8333", 100);
+        add_slot(&pool, "5.6.7.8:8333", 100);
         for _ in 0..10 {
             pool.deprioritize("1.2.3.4:8333", 50);
         }
         assert!(!pool.is_banned("1.2.3.4:8333"));
-        assert_eq!(pool.get_score("1.2.3.4:8333"), Some(BAN_LOW_THRESHOLD + 1));
-        assert_eq!(pool.count(), 1);
-        // Proven misbehavior still bans.
-        pool.misbehaving("1.2.3.4:8333", 1);
-        assert!(pool.is_banned("1.2.3.4:8333"));
+        assert_eq!(pool.get_score("1.2.3.4:8333"), Some(SCORE_DEFAULT), "demerits touched the score");
+        assert_eq!(pool.get_demerit("1.2.3.4:8333"), Some(SCORE_MAX));
+        // Selection sees the demerit...
+        assert_eq!(pool.best_peer_addr().as_deref(), Some("5.6.7.8:8333"));
+        // ...but a later routine penalty doesn't turn it into a ban.
+        pool.misbehaving("1.2.3.4:8333", 10);
+        assert!(!pool.is_banned("1.2.3.4:8333"));
+        assert_eq!(pool.get_score("1.2.3.4:8333"), Some(SCORE_DEFAULT - 10));
+    }
+
+    #[test]
+    fn disconnect_and_deprioritize_stops_at_the_soft_floor() {
+        let mut pool = test_pool_with_store();
+        for _ in 0..5 {
+            add_slot(&pool, "1.2.3.4:8333", 100);
+            if let Some(score) = pool.store.as_ref().unwrap().load_score("1.2.3.4:8333").unwrap() {
+                pool.slots.lock().unwrap()[0].score = score;
+            }
+            pool.disconnect_and_deprioritize("1.2.3.4:8333", 40);
+            assert!(!pool.is_banned("1.2.3.4:8333"));
+        }
+        let saved = pool.store.as_ref().unwrap().load_score("1.2.3.4:8333").unwrap();
+        assert_eq!(saved, Some(SOFT_PENALTY_FLOOR));
     }
 
     #[test]

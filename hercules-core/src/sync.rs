@@ -60,9 +60,10 @@ const MAX_REORG_DEPTH: u32 = 288;
 /// the dedup is best-effort and a coarse reset is acceptable.
 const MAX_KNOWN_TXIDS_PER_PEER: usize = 10_000;
 
-/// Score cost for a peer outvoted 2-to-1 in the header cross-check. Applied
-/// with `PeerPool::deprioritize`, so it never bans: two colluding witnesses
-/// can outvote an honest peer, and divergence alone proves nothing.
+/// Selection demerit for a peer outvoted 2-to-1 in the header cross-check.
+/// Applied with `PeerPool::deprioritize`, which never touches the ban
+/// score: two colluding witnesses can outvote an honest peer, and
+/// divergence alone proves nothing.
 const HEADER_DIVERGENCE_PENALTY: u32 = 50;
 
 /// Lighter cost for a 2-peer disagreement we can't break with a third
@@ -1614,7 +1615,22 @@ impl HeaderSync {
     /// connect at that height rolls it back rather than trusting it.
     /// Returns the height rolled back from, or `None` if the set was
     /// already at or below `target`.
+    ///
+    /// Never steps at or below a loaded snapshot's floor (its rows can't be
+    /// rolled back, see `UtxoSet::assume_valid_floor`), and rolls nothing
+    /// back while that snapshot is still pending (`validated` below the
+    /// floor: not yet bound to our header chain, so no header reorg can
+    /// have disconnected anything in it). Otherwise any reorg of cheap
+    /// headers below the anchor would fail every sync with a store error.
     fn rollback_utxo_to(&self, target: u32, validated: u32) -> Result<Option<u32>, SyncError> {
+        let floor = self
+            .utxo
+            .assume_valid_floor()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if validated < floor {
+            return Ok(None);
+        }
+        let target = target.max(floor);
         let top = self.utxo_tip_height(validated)?;
         if top <= target {
             return Ok(None);
@@ -1667,7 +1683,18 @@ impl HeaderSync {
                 self.rollback_utxo_to(height - 1, height - 1)?;
                 Ok(false)
             }
-            Some(_) => Ok(false),
+            Some((h, _)) if h + 1 == height => Ok(false),
+            // Behind `validated_height`: validating against it would be
+            // wrong, and only a restart's repair (HeaderSync::new) can fix
+            // it safely. A local fault, never a verdict on the block.
+            Some((h, bh)) => Err(SyncError::Store(format!(
+                "UTXO set at height {} block {} doesn't match the header chain at {}; \
+                 not validating block {} (restart to repair)",
+                h,
+                BlockHash::from_byte_array(bh),
+                height - 1,
+                height
+            ))),
             None => self
                 .utxo
                 .has_utxos_at_height(height)
@@ -1778,7 +1805,10 @@ impl HeaderSync {
     ///
     /// - our chain is below minimum work and its tip below the anchor;
     /// - no validated block would be disconnected;
-    /// - the fork reaches at least our tip height;
+    /// - the fork reaches at least our tip height. A full batch
+    ///   (`fork_continues`) that stops short may go on in later batches: it
+    ///   stays a candidate, and the caller proves its reach with
+    ///   `fork_reaches` before replacing anything;
     /// - our chain has stalled: `scratch_stall_threshold` rounds of such
     ///   forks with no peer extending our tip in between (any extension
     ///   resets the count), so an honest, progressing chain is never
@@ -1790,11 +1820,12 @@ impl HeaderSync {
         fork_at: u32,
         validated: u32,
         fork_tip: u32,
+        fork_continues: bool,
     ) -> Result<ScratchReplacement, SyncError> {
         if self.has_min_chain_work()?
             || tip_height >= self.anchor.height
             || fork_at < validated
-            || fork_tip < tip_height
+            || (fork_tip < tip_height && !fork_continues)
         {
             return Ok(ScratchReplacement::No);
         }
@@ -1803,6 +1834,125 @@ impl HeaderSync {
             Ok(ScratchReplacement::Wait)
         } else {
             Ok(ScratchReplacement::Replace)
+        }
+    }
+
+    /// Follow a fork from `addr` beyond its first batch (`first`, building
+    /// on our header at `fork_at`) until it reaches height `target`,
+    /// validating every batch as it comes (linkage, proof-of-work at the
+    /// contextual difficulty, timestamps, the anchor, recorded-invalid
+    /// blocks). Only constant state is kept (the last header, the last 11
+    /// timestamps, and the fork's retarget-epoch start times), never the
+    /// headers themselves, so a fork hundreds of thousands of headers long
+    /// costs bandwidth and time but not memory. True iff the fork reaches
+    /// `target`; invalid headers cost the peer as on the normal path.
+    ///
+    /// For `scratch_replacement`: below minimum work, a fork whose first
+    /// batch is full may reach our tip only several batches later (the
+    /// eclipse case: a cheap chain ending just short of the anchor, far
+    /// past one batch from the fork).
+    fn fork_reaches(
+        &self,
+        pool: &mut PeerPool,
+        addr: &str,
+        fork_at: u32,
+        first: &[Header],
+        target: u32,
+        stop: &AtomicBool,
+    ) -> Result<bool, SyncError> {
+        let (mut prev_hash, fork_header) = self
+            .store
+            .get_header_at_height(fork_at)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .ok_or_else(|| SyncError::Store(format!("no header at fork height {}", fork_at)))?;
+        let mut prev_bits = fork_header.bits;
+        let mut prev_height = fork_at;
+        let mut timestamps = self
+            .store
+            .timestamps_up_to(fork_at, 11)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        // Timestamps of the fork's retarget-epoch first blocks.
+        let mut epoch_starts: HashMap<u32, u32> = HashMap::new();
+        let mut batch: Vec<Header> = first.to_vec();
+        loop {
+            if self.first_failed_header(&batch)?.is_some() {
+                pool.disconnect_and_deprioritize(addr, RELAYED_INVALID_CHAIN_PENALTY);
+                return Ok(false);
+            }
+            if let Err(e) = self.check_batch_anchor(&batch, prev_height + 1) {
+                warn!("Fork from {} conflicts with anchor: {}", addr, e);
+                pool.misbehaving(addr, ANCHOR_CONFLICT_PENALTY);
+                return Ok(false);
+            }
+            let validated = {
+                let store = &self.store;
+                let starts = &epoch_starts;
+                let lookup = |h: u32| -> Result<u32, String> {
+                    if h <= fork_at {
+                        store
+                            .get_timestamp_at(h)
+                            .map_err(|e| format!("{}", e))?
+                            .ok_or_else(|| format!("no header at height {}", h))
+                    } else {
+                        starts
+                            .get(&h)
+                            .copied()
+                            .ok_or_else(|| format!("no fork header at height {}", h))
+                    }
+                };
+                validate_headers(
+                    self.params,
+                    &batch,
+                    prev_hash,
+                    prev_height,
+                    &timestamps,
+                    prev_bits,
+                    &lookup,
+                )
+            };
+            if let Err(e) = validated {
+                warn!("Fork from {} has invalid headers: {}", addr, e);
+                pool.misbehaving(addr, INVALID_HEADERS_PENALTY);
+                return Ok(false);
+            }
+            for (i, h) in batch.iter().enumerate() {
+                let height = prev_height + 1 + i as u32;
+                if height % 2016 == 0 {
+                    epoch_starts.insert(height, h.time);
+                }
+                timestamps.push(h.time);
+            }
+            let excess = timestamps.len().saturating_sub(11);
+            timestamps.drain(..excess);
+            let last = batch[batch.len() - 1];
+            prev_hash = last.block_hash();
+            prev_bits = last.bits;
+            prev_height += batch.len() as u32;
+
+            if prev_height >= target {
+                info!("Fork from {} at {} reaches {} (our tip {})", addr, fork_at, prev_height, target);
+                return Ok(true);
+            }
+            if batch.len() < 2000 || stop.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let Some(mut peer) = pool.checkout_peer_by_addr(addr) else {
+                return Ok(false);
+            };
+            batch = match peer.get_headers(vec![prev_hash], BlockHash::all_zeros()) {
+                Ok(h) => {
+                    pool.return_peer(peer);
+                    h
+                }
+                Err(e) => {
+                    warn!("Peer {} failed while following its fork: {}", addr, e);
+                    pool.remove_peer(addr);
+                    return Ok(false);
+                }
+            };
+            if batch.is_empty() || batch.len() > 2000 || batch[0].prev_blockhash != prev_hash {
+                return Ok(false);
+            }
         }
     }
 
@@ -3005,9 +3155,10 @@ impl HeaderSync {
                     // appropriate misbehavior penalty. Drop the batch and
                     // try again on the next iteration.
                     pool.maintain();
-                    if pool.count() < 2 {
-                        // Waiting for a second peer to witness (initial sync
-                        // or a disputed peer) — don't spin.
+                    if pool.cross_check_peer(&[active_addr.clone()]).is_none() {
+                        // Waiting for an independent witness (initial sync
+                        // or a disputed peer) — don't spin. Inbound peers
+                        // and same-netgroup peers don't count as one.
                         std::thread::sleep(Duration::from_secs(1));
                     }
                     continue;
@@ -3102,9 +3253,30 @@ impl HeaderSync {
                                 fork_at,
                                 current_validated,
                                 fork_tip,
+                                headers.len() == 2000,
                             )? {
                                 ScratchReplacement::No => false,
-                                ScratchReplacement::Replace => true,
+                                ScratchReplacement::Replace if fork_tip >= tip_height => true,
+                                ScratchReplacement::Replace => {
+                                    // Only the first batch is stored; the
+                                    // rest of the fork follows as normal
+                                    // extensions once it has replaced us.
+                                    let reaches = self.fork_reaches(
+                                        &mut pool,
+                                        &active_addr,
+                                        fork_at,
+                                        &headers[new_chain_offset..],
+                                        tip_height,
+                                        stop,
+                                    )?;
+                                    if !reaches {
+                                        // Start the stall count over rather
+                                        // than following it every round.
+                                        self.scratch_stall_rounds.store(0, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    true
+                                }
                                 ScratchReplacement::Wait => {
                                     // Not a penalty (an honest peer looks
                                     // the same), but ask someone else next.
@@ -3126,7 +3298,15 @@ impl HeaderSync {
                                 "Peer {} suggests reorg depth {} (max {}), ignoring",
                                 active_addr, reorg_depth, MAX_REORG_DEPTH
                             );
-                            pool.misbehaving(&active_addr, 20);
+                            // Below minimum work our own headers prove
+                            // nothing, and a deep fork may be the honest
+                            // chain: never a penalty then, just ask someone
+                            // else next.
+                            if strict {
+                                pool.lower_peer_height(&active_addr, 0);
+                            } else {
+                                pool.misbehaving(&active_addr, 20);
+                            }
                             continue;
                         }
 
@@ -4879,8 +5059,11 @@ mod tests {
         }
         assert!(!pool.is_banned(&active), "divergence alone banned the active peer");
         assert_eq!(pool.count(), 3);
-        let score = pool.get_score(&active).unwrap();
-        assert!(score < 100 && score > 20, "score {}", score);
+        assert_eq!(pool.get_score(&active), Some(100), "divergence touched the ban score");
+        assert!(pool.get_demerit(&active).unwrap() > 0, "outvoted peer not deprioritized");
+        // A later routine penalty can't combine with it into a ban.
+        pool.misbehaving(&active, BLOCK_NOT_RECEIVED_PENALTY);
+        assert!(!pool.is_banned(&active));
     }
 
     /// Inbound peers are never witnesses or tiebreakers, whatever they'd
@@ -4940,8 +5123,9 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
         assert_eq!(pool.get_score(&tiebreaker), Some(100), "deadline counted against tiebreaker");
         assert_eq!(pool.count(), 3, "tiebreaker removed over our deadline");
-        assert_eq!(pool.get_score(&active), Some(100 - HEADER_DISAGREEMENT_PENALTY as i32));
-        assert_eq!(pool.get_score(&witness), Some(105 - HEADER_DISAGREEMENT_PENALTY as i32));
+        assert_eq!(pool.get_score(&active), Some(100));
+        assert_eq!(pool.get_demerit(&active), Some(HEADER_DISAGREEMENT_PENALTY as i32));
+        assert_eq!(pool.get_demerit(&witness), Some(HEADER_DISAGREEMENT_PENALTY as i32));
     }
 
     #[test]
@@ -5372,6 +5556,29 @@ mod tests {
         hs.store.store_headers(&chain[3..], 4).unwrap();
         assert!(hs.ready_to_validate_blocks().unwrap());
         assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
+    }
+
+    /// PR #24 second review: with a snapshot loaded but not yet bound to
+    /// our headers (validated_height 0, best block at the floor), a reorg
+    /// of cheap headers below the anchor used to try rolling the snapshot
+    /// back and fail every sync with a store error.
+    #[test]
+    fn reorg_below_pending_snapshot_leaves_the_utxo_set_alone() {
+        let chain = cheap_chain(10, 0);
+        let (_dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain[..3], 1).unwrap();
+        hs.load_snapshot(&path, |_, _| true).unwrap();
+        assert_eq!(hs.store.validated_height().unwrap(), 0);
+        let best = hs.utxo.best_block().unwrap();
+
+        let (new_tip, new_validated) = hs.apply_reorg(1, &cheap_chain(10, 1)[1..4]).unwrap();
+        assert_eq!((new_tip, new_validated), (4, 0));
+        assert_eq!(hs.utxo.best_block().unwrap(), best, "snapshot touched");
+        assert_eq!(hs.utxo.count().unwrap(), 1);
+
+        // Once bound, a rollback target below the floor stops at it.
+        assert_eq!(hs.rollback_utxo_to(0, TEST_ANCHOR_HEIGHT).unwrap(), None);
+        assert_eq!(hs.utxo.best_block().unwrap(), best);
     }
 
     #[test]
