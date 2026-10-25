@@ -535,7 +535,8 @@ class NotificationManager: ObservableObject {
         /// Live Activity without a failure state.
         var neutral = false
         /// A processing round a push or refresh cancelled before it
-        /// validated anything (ticket 051): not a stall, run another.
+        /// validated anything, or that never started because one was in
+        /// flight (ticket 051): not a stall, run another.
         var preempted = false
     }
 
@@ -566,6 +567,9 @@ class NotificationManager: ObservableObject {
                     notify: false,
                     neutral: true
                 )
+            case .yielded:
+                // Processing only: a push or refresh is running. No record.
+                return WakeRun(record: nil, fetchResult: .noData, notify: false, neutral: true, preempted: true)
             case let .ran(report, nodeReadyMs, nodeReused, peerCount, cancelReason):
                 let timings = Self.timings(report, trigger: trigger, nodeReadyMs: nodeReadyMs, nodeReused: nodeReused)
                 switch report.outcome {
@@ -1062,29 +1066,36 @@ class NotificationManager: ObservableObject {
             // Expired while waiting: the handler already completed and
             // resubmitted the task. Don't open the node or start Tor.
             if expired.value { return }
-            guard Self.nodeIsSetUp() else {
-                gate.fire { task.setTaskCompleted(success: true) }
-                return
-            }
-            // Same gate as a refresh wake. Metered or offline now: try
-            // again in a later window.
+            // Same gate as a refresh wake, before anything opens the node:
+            // opening starts Tor and the onion service, which is network
+            // traffic. Metered or offline now: try again in a later
+            // window (`scheduleProcessingTask` does nothing until a
+            // validation mode has been chosen).
             guard NetworkPolicy.shared.shouldValidate else {
                 Self.scheduleProcessingTask()
                 gate.fire { task.setTaskCompleted(success: true) }
                 return
             }
+            guard Self.nodeIsSetUp() else {
+                gate.fire { task.setTaskCompleted(success: true) }
+                return
+            }
 
             var rounds = 0
+            var yields = 0
             var totalBlocks: UInt32 = 0
+            // The last round that wasn't cut short by a push: its record
+            // says why the task stopped.
             var lastRun: WakeRun?
             var lastStatus: CatchUpStatus?
-            while rounds < WakeConfig.processingMaxRounds {
+            while rounds < WakeConfig.processingMaxRounds && yields < WakeConfig.processingMaxYields {
                 if expired.value || !NetworkPolicy.shared.shouldValidate { break }
                 if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes { break }
                 // Pushes and refreshes go first: they have ~30 s, a round
-                // has minutes. One admitted mid-round cancels the round
-                // (`NodeSessionState.admitWake`); this waits out any that
-                // are still running. They never wait on us, and each is
+                // has minutes. One admitted mid-round cancels the round,
+                // and a round asking while one is in flight is told to
+                // yield (`NodeSessionState.admitWake`, atomically); this
+                // waits them out. They never wait on us, and each is
                 // bounded by its own budget, so this can't deadlock.
                 while NodeHost.shared.sessions.inFlightShortWakes > 0 && !expired.value {
                     Thread.sleep(forTimeInterval: 0.25)
@@ -1100,8 +1111,12 @@ class NotificationManager: ObservableObject {
                     appInForeground: Self.appInForegroundNow(), trigger: "processing",
                     maxBlocks: WakeConfig.processingMaxBlocks, kind: .processing
                 )
-                rounds += 1
-                lastRun = run
+                if run.preempted {
+                    yields += 1
+                } else {
+                    rounds += 1
+                    lastRun = run
+                }
                 if let status = run.status {
                     lastStatus = status
                     // Progress reaches the widget round by round, not
@@ -1149,8 +1164,8 @@ class NotificationManager: ObservableObject {
     }
 
     /// The history record for one processing task: the final tip, with
-    /// the blocks validated and rounds run summed in its timings. Nil if
-    /// no round ran.
+    /// the blocks validated and rounds run summed in its timings. `last` is
+    /// the last round that wasn't cut short by a push. Nil if nothing ran.
     private static func processingRecord(
         last: WakeRun?,
         status: CatchUpStatus?,
@@ -1158,7 +1173,7 @@ class NotificationManager: ObservableObject {
         rounds: Int,
         startedAt: Date
     ) -> BlockNotificationRecord? {
-        guard let last = last else { return nil }
+        guard last != nil || status != nil else { return nil }
         let timings = WakeTimings(
             trigger: "processing",
             completedMs: UInt64(max(0, Date().timeIntervalSince(startedAt)) * 1000),
@@ -1167,7 +1182,7 @@ class NotificationManager: ObservableObject {
         )
         guard let status = status else {
             // No round reached the network: keep the last round's reason.
-            var record = last.record
+            var record = last?.record
             record?.wakeTimings = timings
             return record
         }
@@ -1192,7 +1207,7 @@ class NotificationManager: ObservableObject {
             receivedAt: startedAt,
             source: source,
             // A later round that failed outright says why it stopped.
-            validationError: last.status == nil ? last.record?.validationError : status.error
+            validationError: last.map { $0.status == nil ? $0.record?.validationError : status.error } ?? status.error
         )
         record.wakeTimings = timings
         return record

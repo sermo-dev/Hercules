@@ -119,6 +119,9 @@ final class NodeHost {
     enum WakeResult {
         /// The app is on screen and syncing; nothing was run.
         case foregroundActive
+        /// A processing round found a push or refresh in flight; nothing
+        /// was run (ticket 051).
+        case yielded
         /// `cancelReason`: why the app (not iOS) cancelled the wake, if it did.
         case ran(
             WakeReport, nodeReadyMs: UInt64, nodeReused: Bool, peerCount: UInt32,
@@ -140,6 +143,8 @@ final class NodeHost {
         case .foregroundActive:
             StoragePaths.log.notice("wake: foreground sync active, not running")
             return .foregroundActive
+        case .yield:
+            return .yielded
         case .run(let preemptsForeground):
             var stoppedSync = false
             var finished = false

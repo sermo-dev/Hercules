@@ -20,7 +20,13 @@ enum WakeConfig {
     // sync between rounds; the expiration handler cancels the current one.
     static let processingRoundMs: UInt32 = 120_000
     static let processingMaxBlocks: UInt32 = 1_000
+    /// Rounds that ran to their end (caught up, stalled, or out of budget).
     static let processingMaxRounds = 30
+    /// Rounds that gave way to a push or refresh (cancelled mid-round, or
+    /// never started). Counted apart so block wakes don't eat the round
+    /// cap; still capped so the loop is bounded. ~1 per 10-minute block,
+    /// so this is far more than any processing window sees.
+    static let processingMaxYields = 200
 }
 
 /// Runs a body at most once. Wakes have several ways to finish (Rust
@@ -65,6 +71,11 @@ final class NodeSessionState {
         /// The app is on screen and syncing: foreground is already
         /// validating, so the wake records that and completes at once.
         case foregroundActive
+        /// A processing round asked while a push or refresh is in flight
+        /// (ticket 051). Not registered; wait for it to finish and ask
+        /// again. Decided under the same lock as a push's admission, so a
+        /// push can't slip in between the check and the round starting.
+        case yield
     }
 
     /// What kind of wake is asking. A push or BG refresh has ~30 s and
@@ -115,6 +126,10 @@ final class NodeSessionState {
             return .foregroundActive
         }
         let id = ObjectIdentifier(token)
+        if kind == .processing && wakes.count > processingWakes.count {
+            lock.unlock()
+            return .yield
+        }
         wakes[id] = token
         // A push or refresh preempts a processing round: Rust's session
         // lock goes to whoever holds it, and a round holds it for minutes

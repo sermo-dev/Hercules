@@ -156,13 +156,33 @@ check(s.finishWake(roundA, stoppedForegroundSync: false) == .preemptedByWake, "s
 s.finishWake(push1, stoppedForegroundSync: false)
 s.finishWake(push2, stoppedForegroundSync: false)
 check(s.inFlightShortWakes == 0 && s.inFlightWakes == 0, "s14 all deregistered")
-// a round admitted while a push still runs isn't cancelled by its own admission
+// a round asking while a push still runs yields (atomically, so no push can
+// slip in between a "no short wakes" check and the round starting), and
+// isn't registered; once the push is done it runs
 let push3 = Token(), roundB = Token()
 _ = s.admitWake(push3, appInForeground: false)
-_ = s.admitWake(roundB, appInForeground: false, kind: .processing)
-check(roundB.cancels == 0 && push3.cancels == 0, "s14 round admitted behind a push: nothing cancelled")
+check(s.admitWake(roundB, appInForeground: false, kind: .processing) == .yield, "s14 round asking behind a push yields")
+check(roundB.cancels == 0 && push3.cancels == 0 && s.inFlightWakes == 1, "s14 yielded round not registered, push untouched")
 s.finishWake(push3, stoppedForegroundSync: false)
+check(s.admitWake(roundB, appInForeground: false, kind: .processing) == .run(preemptsForeground: false), "s14 round runs once the push is done")
 check(s.finishWake(roundB, stoppedForegroundSync: false) == .none, "s14 unpreempted round has no cancel reason")
+// racing admissions: every push that runs alongside a round cancels it
+for i in 0..<200 {
+    let st = NodeSessionState()
+    let r = Token(), p = Token()
+    var roundRan = false
+    DispatchQueue.concurrentPerform(iterations: 2) { j in
+        if j == 0 {
+            roundRan = st.admitWake(r, appInForeground: false, kind: .processing) != .yield
+        } else {
+            _ = st.admitWake(p, appInForeground: false)
+        }
+    }
+    if roundRan && r.cancels != 1 {
+        check(false, "s14 race \(i): round ran beside a push without being cancelled"); break
+    }
+    if i == 199 { check(true, "s14 a round never runs uncancelled beside a push (200 races)") }
+}
 // the processing loop's wait ends once concurrent pushes finish
 s = NodeSessionState()
 let waitDone = DispatchSemaphore(value: 0)
