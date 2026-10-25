@@ -275,7 +275,8 @@ impl<T: Clone + Send + 'static> TransportGate<T> {
         loop {
             match &*state {
                 GateState::Ready(t) => {
-                    return if Instant::now() > give_up_at {
+                    // Ready is ready; only a floor can make it too late.
+                    return if !floor.is_zero() && Instant::now() > give_up_at {
                         Err(TransportWait::Slow)
                     } else {
                         Ok(t.clone())
@@ -427,6 +428,14 @@ mod tests {
         assert_eq!(gate.wait_within(&WakeBudget::new(5_000), Duration::ZERO), Ok(9));
         assert!(start.elapsed() < Duration::from_millis(20));
         assert_eq!(gate.get(), Some(9));
+    }
+
+    #[test]
+    fn ready_transport_with_zero_timeout_is_ready() {
+        let gate = gate_after(Duration::ZERO, Ok(4));
+        assert_eq!(gate.wait_within(&WakeBudget::new(5_000), Duration::ZERO), Ok(4));
+        // A zero-length wait on a ready gate (wait_for_transport(0)).
+        assert_eq!(gate.wait_until(Instant::now(), Duration::ZERO, || false), Ok(4));
     }
 
     #[test]

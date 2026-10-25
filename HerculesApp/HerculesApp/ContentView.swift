@@ -98,7 +98,13 @@ class NodeViewModel: ObservableObject {
     // a sync loop the app left running; it's restarted when the app is
     // next active, unless the user stopped it. Main thread only.
     private var syncGeneration = 0
-    private var userStoppedSync = false
+    /// The session whose callbacks own the UI; nil once it ended or a
+    /// reset retired it.
+    private var activeSession: SyncSessionToken?
+    /// A session's background thread hasn't returned yet.
+    private var sessionInFlight = false
+    /// Start was tapped while a stopped session was still winding down.
+    private var startWhenSessionEnds = false
     private var resumeSyncWhenActive = false
 
     // Thread-safe access to the node: set from background thread, read from main thread.
@@ -297,9 +303,10 @@ class NodeViewModel: ObservableObject {
             SnapshotDownloader.deleteDownloadedFile()
 
             // 2. Retire the current sync session: its callbacks stop
-            // touching the UI, and a wake preemption won't restart it.
+            // touching the UI, a snapshot import it runs cancels at its next
+            // progress tick, and a wake preemption won't restart it.
             DispatchQueue.main.sync {
-                self.syncGeneration += 1
+                self.retireActiveSession()
                 self.resumeSyncWhenActive = false
             }
 
@@ -309,6 +316,8 @@ class NodeViewModel: ObservableObject {
             // a Tor-bootstrap wait and cancels wakes. Nothing is deleted
             // until every holder has let go of the old node: on POSIX an
             // open inode survives unlink, and LMDB would keep using it.
+            // (The retired session can't set the handle again: see
+            // `adopt(_:for:)`.)
             self.node = nil
             do {
                 try NodeHost.shared.reset()
@@ -318,12 +327,14 @@ class NodeViewModel: ObservableObject {
                     self.isSyncRunning = false
                     self.isConnecting = false
                     self.isBootstrappingTor = false
+                    self.isWalletApiRunning = false
+                    self.walletApiConnectionString = nil
                     completion(error)
                 }
                 return
             }
 
-            // 6. Persist the new mode and reset transient UI state.
+            // 4. Persist the new mode and reset transient UI state.
             DispatchQueue.main.async {
                 ValidationModePreference.current = mode
                 self.validationMode = mode
@@ -340,10 +351,13 @@ class NodeViewModel: ObservableObject {
                 self.isSyncRunning = false
                 self.isConnecting = false
                 self.isBootstrappingTor = false
+                // The close stopped the wallet API with the old node.
+                self.isWalletApiRunning = false
+                self.walletApiConnectionString = nil
 
                 completion(nil)
 
-                // 7. Kick off a fresh sync with the new mode.
+                // 5. Kick off a fresh sync with the new mode.
                 self.startSync()
             }
         }
@@ -356,235 +370,314 @@ class NodeViewModel: ObservableObject {
         isSyncRunning = true
         errorMessage = nil
         if !lowDiskBannerShown { storageWarning = nil }
-        syncGeneration += 1
-        let generation = syncGeneration
-        userStoppedSync = false
         resumeSyncWhenActive = false
+
+        // One session thread at a time (ticket 028). After a quick Stop
+        // then Start, wait for the stopped session to actually return
+        // rather than queue a second one behind it in Rust.
+        if sessionInFlight {
+            startWhenSessionEnds = true
+            return
+        }
+        launchSession()
+    }
+
+    /// Start a foreground session's background thread. Main thread.
+    private func launchSession() {
+        syncGeneration += 1
+        let token = SyncSessionToken(generation: syncGeneration)
+        activeSession = token
+        sessionInFlight = true
 
         // Cancels any in-flight wake so it hands the node over quickly.
         NodeHost.shared.sessions.beginForeground()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var failure: Error?
             do {
-                // The shared node (ticket 028). NodeHost runs the ticket 030
-                // storage preparation before opening it. Opening doesn't wait
-                // for Tor, so wait here to keep the bootstrapping UI.
-                let (node, reused) = try NodeHost.shared.node()
-                // Set before waiting, so Stop can reach this session.
-                self?.node = node
-                if try !node.waitForTransport(timeoutMs: 150_000) {
-                    throw HerculesError.TorError(msg: "Tor bootstrap timed out")
-                }
-
-                // Fetch initial Tor status
-                if let status = node.getTorStatus() {
-                    DispatchQueue.main.async {
-                        self?.torStatus = status
-                        self?.isBootstrappingTor = false
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        self?.isBootstrappingTor = false
-                    }
-                }
-                let nodePaused = node.isValidationPaused()
-                DispatchQueue.main.async {
-                    if reused {
-                        // NodeHost kept the node from an earlier session (or
-                        // a wake): it keeps its pause state, and so does the
-                        // low-disk guard's ownership of that pause.
-                        self?.isValidationPaused = nodePaused
-                    } else {
-                        // A fresh HerculesNode starts unpaused: drop any pause
-                        // state that belonged to the previous node so the UI
-                        // matches it, and so the forced check below re-pauses
-                        // this node if space is still low.
-                        self?.pausedForLowDisk = false
-                        self?.isValidationPaused = false
-                    }
-                    self?.checkDiskSpace(force: true)
-                }
-
-                // Honor the user's explicit validation-mode choice. AssumeUTXO
-                // runs the download/import path on a fresh DB; Genesis skips
-                // it entirely (block-by-block validation will start from
-                // wherever validated_height is — 0 on a clean wipe).
-                let mode = self?.validationMode ?? .assumeUtxo
-                if mode == .assumeUtxo, try node.needsSnapshot() {
-                    DispatchQueue.main.async {
-                        self?.isConnecting = false
-                    }
-
-                    // Map-capacity check (ticket 030): if the UTXO env can't
-                    // be mapped big enough for the snapshot (iOS VA limit
-                    // forced a small fallback map), say so now rather than
-                    // after an 8.8 GB download.
-                    do {
-                        try node.checkSnapshotCapacity()
-                    } catch HerculesError.StorageError(let msg) {
-                        throw StorageError.cannotMapUtxoSet(msg)
-                    }
-
-                    // Free-space preflight: refuse to start an 8.8 GB download
-                    // that can't be imported. A finished download on disk is
-                    // credited against the requirement, as are pages a
-                    // previous (aborted) import left in the LMDB file, which
-                    // the next import reuses.
-                    do {
-                        try StorageGuard.snapshotPreflight(
-                            alreadyDownloaded: SnapshotDownloader.hasDownloadedFile()
-                                ? SnapshotDownloader.expectedBytes : 0,
-                            reusable: StorageGuard.utxoEnvFileBytes()
-                        )
-                    } catch {
-                        DispatchQueue.main.async {
-                            self?.storageWarning = error.localizedDescription
-                        }
-                        throw error
-                    }
-
-                    // Block until the file is on disk. Surfaces progress to
-                    // the UI via the SnapshotDownloader subscriptions set up
-                    // in init().
-                    let downloadedURL = try self?.awaitSnapshotDownload()
-                    guard let snapshotURL = downloadedURL else {
-                        throw NSError(
-                            domain: "Hercules", code: 2,
-                            userInfo: [NSLocalizedDescriptionKey: "Snapshot download cancelled"]
-                        )
-                    }
-
-                    DispatchQueue.main.async {
-                        self?.isLoadingSnapshot = true
-                    }
-
-                    // The import writes ~12 GB; watch free space while it
-                    // runs (ticket 030) and cancel cleanly below the pause
-                    // threshold rather than letting LMDB hit ENOSPC.
-                    let spaceWatch = SnapshotSpaceWatch()
-                    let snapCallback = SnapshotProgressCallback { loaded, total in
-                        DispatchQueue.main.async {
-                            self?.snapshotProgress = total > 0
-                                ? Double(loaded) / Double(total) : 0
-                        }
-                        return spaceWatch.shouldContinue()
-                    }
-
-                    // Delete the cached .gz after a successful import (it's
-                    // redundant) or when the file itself was rejected
-                    // (corrupt, truncated, hash mismatch), so we don't retry
-                    // the same bad bytes forever. Keep it for any other
-                    // failure (map or disk full, cancelled): it's fine, and a
-                    // retry shouldn't re-download 8.8 GB.
-                    do {
-                        let _ = try node.loadSnapshot(
-                            snapshotPath: snapshotURL.path,
-                            callback: snapCallback
-                        )
-                        SnapshotDownloader.deleteDownloadedFile()
-                    } catch {
-                        if case HerculesError.SnapshotInvalid = error {
-                            SnapshotDownloader.deleteDownloadedFile()
-                        }
-                        if let free = spaceWatch.abortedAtFreeBytes {
-                            let lowSpace = StorageError.insufficientSpace(
-                                message: StorageGuard.snapshotImportLowSpaceMessage(free: free)
-                            )
-                            DispatchQueue.main.async {
-                                self?.storageWarning = lowSpace.localizedDescription
-                            }
-                            throw lowSpace
-                        }
-                        throw error
-                    }
-
-                    DispatchQueue.main.async {
-                        self?.isLoadingSnapshot = false
-                    }
-                }
-
-                let status = try node.getStatus()
-                DispatchQueue.main.async {
-                    self?.syncStatus = status
-                }
-
-                let callback = SyncProgressCallback { status in
-                    DispatchQueue.main.async {
-                        self?.syncStatus = status
-                        self?.isConnecting = false
-                        self?.errorMessage = status.error
-                        self?.maybePublishWidgetState(from: status)
-                        self?.checkDiskSpace()
-                    }
-                }
-
-                // Runs until stopped: by the user, by a reset, or by a
-                // background wake (ticket 028). Unrecoverable errors throw.
-                try node.startHeaderSync(callback: callback)
-
-                let preempted = NodeHost.shared.sessions.endForeground()
-                DispatchQueue.main.async {
-                    self?.syncDidStop(generation: generation, preemptedByWake: preempted)
-                }
-
+                try self?.runSession(token)
             } catch {
-                _ = NodeHost.shared.sessions.endForeground()
-                DispatchQueue.main.async {
-                    // Retired (reset) or superseded: not ours to report.
-                    guard generation == self?.syncGeneration else { return }
-                    // Storage errors carry user-facing copy and the low-disk
-                    // case already has its own banner.
-                    if let storageError = error as? StorageError {
-                        if case .insufficientSpace = storageError {
-                            self?.errorMessage = nil
-                        } else {
-                            self?.errorMessage = storageError.localizedDescription
-                        }
-                    } else {
-                        self?.errorMessage = "\(error)"
-                    }
-                    self?.isConnecting = false
-                    self?.isSyncRunning = false
-                    self?.isLoadingSnapshot = false
-                    self?.isDownloadingSnapshot = false
-                    if let s = self?.syncStatus {
-                        self?.syncStatus = SyncStatus(
-                            syncedHeaders: s.syncedHeaders,
-                            peerHeight: 0,
-                            peers: [],
-                            activePeerAddr: "",
-                            isSyncing: false,
-                            validatedBlocks: s.validatedBlocks,
-                            error: "\(error)"
-                        )
-                    }
-                }
+                failure = error
+            }
+            let preempted = NodeHost.shared.sessions.endForeground()
+            token.markEnded()
+            DispatchQueue.main.async {
+                self?.sessionEnded(token, preemptedByWake: preempted, error: failure)
             }
         }
     }
 
-    /// `startHeaderSync` returned without an error. Main thread.
-    private func syncDidStop(generation: Int, preemptedByWake: Bool) {
-        // A newer session has started since; it owns the UI state.
-        guard generation == syncGeneration else { return }
-        isSyncRunning = false
-        isConnecting = false
-        guard preemptedByWake && !userStoppedSync else { return }
-        if UIApplication.shared.applicationState == .active {
+    /// Run `body` on the main thread if `token` is still the active session.
+    private func onMain(_ token: SyncSessionToken, _ body: @escaping (NodeViewModel) -> Void) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.activeSession === token else { return }
+            body(self)
+        }
+    }
+
+    /// Take `node` as our handle unless the session is already over. Atomic
+    /// with `retireActiveSession`'s nil-out (both under `nodeLock`), so a
+    /// retired session can never hand a reset's old node back to us.
+    private func adopt(_ node: HerculesNode, for token: SyncSessionToken) -> Bool {
+        nodeLock.lock(); defer { nodeLock.unlock() }
+        guard !token.isOver else { return false }
+        _node = node
+        return true
+    }
+
+    /// A reset (or anything that must own the node) takes over. Main thread.
+    private func retireActiveSession() {
+        nodeLock.lock()
+        activeSession?.retire()
+        _node = nil
+        nodeLock.unlock()
+        activeSession = nil
+        syncGeneration += 1
+    }
+
+    /// The foreground session, on its background thread. Returns early
+    /// (no error) once the user stops it or a reset retires it; every UI
+    /// update goes through `onMain`, which drops it if it's no longer the
+    /// active session.
+    private func runSession(_ token: SyncSessionToken) throws {
+        // The shared node (ticket 028). NodeHost runs the ticket 030
+        // storage preparation before opening it.
+        let (node, reused) = try NodeHost.shared.node()
+        // Our handle before the Tor wait, so Stop and the wallet API see
+        // this session's node. Stop itself works through `token` (checked
+        // between steps) plus `stopSync`, repeated until we return.
+        guard adopt(node, for: token) else { return }
+
+        // Opening doesn't wait for Tor, so wait here (in slices, so a Stop
+        // or reset ends the wait) to keep the bootstrapping UI.
+        let transportDeadline = Date().addingTimeInterval(150)
+        while try !node.waitForTransport(timeoutMs: 1_000) {
+            if token.isOver { return }
+            if Date() >= transportDeadline {
+                throw HerculesError.TorError(msg: "Tor bootstrap timed out")
+            }
+        }
+        if token.isOver { return }
+
+        // Fetch initial Tor status
+        let torStatus = node.getTorStatus()
+        let nodePaused = node.isValidationPaused()
+        onMain(token) { vm in
+            if let status = torStatus {
+                vm.torStatus = status
+            }
+            vm.isBootstrappingTor = false
+            if reused {
+                // NodeHost kept the node from an earlier session (or a
+                // wake): it keeps its pause state, and so does the low-disk
+                // guard's ownership of that pause.
+                vm.isValidationPaused = nodePaused
+            } else {
+                // A fresh HerculesNode starts unpaused: drop any pause state
+                // that belonged to the previous node so the UI matches it,
+                // and so the forced check below re-pauses this node if space
+                // is still low.
+                vm.pausedForLowDisk = false
+                vm.isValidationPaused = false
+            }
+            vm.checkDiskSpace(force: true)
+        }
+
+        // Honor the user's explicit validation-mode choice. AssumeUTXO
+        // runs the download/import path on a fresh DB; Genesis skips
+        // it entirely (block-by-block validation will start from
+        // wherever validated_height is — 0 on a clean wipe).
+        let mode = DispatchQueue.main.sync { validationMode } ?? .assumeUtxo
+        if mode == .assumeUtxo, try node.needsSnapshot() {
+            onMain(token) { vm in
+                vm.isConnecting = false
+            }
+
+            // Map-capacity check (ticket 030): if the UTXO env can't
+            // be mapped big enough for the snapshot (iOS VA limit
+            // forced a small fallback map), say so now rather than
+            // after an 8.8 GB download.
+            do {
+                try node.checkSnapshotCapacity()
+            } catch HerculesError.StorageError(let msg) {
+                throw StorageError.cannotMapUtxoSet(msg)
+            }
+
+            // Free-space preflight: refuse to start an 8.8 GB download
+            // that can't be imported. A finished download on disk is
+            // credited against the requirement, as are pages a
+            // previous (aborted) import left in the LMDB file, which
+            // the next import reuses.
+            do {
+                try StorageGuard.snapshotPreflight(
+                    alreadyDownloaded: SnapshotDownloader.hasDownloadedFile()
+                        ? SnapshotDownloader.expectedBytes : 0,
+                    reusable: StorageGuard.utxoEnvFileBytes()
+                )
+            } catch {
+                onMain(token) { vm in
+                    vm.storageWarning = error.localizedDescription
+                }
+                throw error
+            }
+
+            // Don't start an 8.8 GB download for a session that's over.
+            if token.isOver { return }
+
+            // Block until the file is on disk. Surfaces progress to
+            // the UI via the SnapshotDownloader subscriptions set up
+            // in init().
+            let snapshotURL = try awaitSnapshotDownload()
+            if token.isOver { return }
+
+            onMain(token) { vm in
+                vm.isLoadingSnapshot = true
+            }
+
+            // The import writes ~12 GB; watch free space while it
+            // runs (ticket 030) and cancel cleanly below the pause
+            // threshold rather than letting LMDB hit ENOSPC. A reset
+            // retiring this session cancels it too (Rust also treats
+            // the node's close as a cancel).
+            let spaceWatch = SnapshotSpaceWatch()
+            let snapCallback = SnapshotProgressCallback { [weak self] loaded, total in
+                self?.onMain(token) { vm in
+                    vm.snapshotProgress = total > 0
+                        ? Double(loaded) / Double(total) : 0
+                }
+                return !token.retired && spaceWatch.shouldContinue()
+            }
+
+            // Delete the cached .gz after a successful import (it's
+            // redundant) or when the file itself was rejected
+            // (corrupt, truncated, hash mismatch), so we don't retry
+            // the same bad bytes forever. Keep it for any other
+            // failure (map or disk full, cancelled): it's fine, and a
+            // retry shouldn't re-download 8.8 GB.
+            do {
+                let _ = try node.loadSnapshot(
+                    snapshotPath: snapshotURL.path,
+                    callback: snapCallback
+                )
+                SnapshotDownloader.deleteDownloadedFile()
+            } catch {
+                if case HerculesError.SnapshotInvalid = error {
+                    SnapshotDownloader.deleteDownloadedFile()
+                }
+                if token.retired { return }
+                if let free = spaceWatch.abortedAtFreeBytes {
+                    let lowSpace = StorageError.insufficientSpace(
+                        message: StorageGuard.snapshotImportLowSpaceMessage(free: free)
+                    )
+                    onMain(token) { vm in
+                        vm.storageWarning = lowSpace.localizedDescription
+                    }
+                    throw lowSpace
+                }
+                throw error
+            }
+
+            onMain(token) { vm in
+                vm.isLoadingSnapshot = false
+            }
+        }
+
+        let status = try node.getStatus()
+        onMain(token) { vm in
+            vm.syncStatus = status
+        }
+
+        let callback = SyncProgressCallback { [weak self] status in
+            self?.onMain(token) { vm in
+                vm.syncStatus = status
+                vm.isConnecting = false
+                vm.errorMessage = status.error
+                vm.maybePublishWidgetState(from: status)
+                vm.checkDiskSpace()
+            }
+        }
+
+        if token.isOver { return }
+        // Runs until stopped: by the user, by a reset, or by a
+        // background wake (ticket 028). Unrecoverable errors throw.
+        try node.startHeaderSync(callback: callback)
+    }
+
+    /// A session's thread returned, cleanly or with `error`. Main thread.
+    private func sessionEnded(_ token: SyncSessionToken, preemptedByWake: Bool, error: Error?) {
+        sessionInFlight = false
+        if activeSession === token {
+            activeSession = nil
+            isSyncRunning = false
+            isConnecting = false
+            isBootstrappingTor = false
+            isLoadingSnapshot = false
+            isDownloadingSnapshot = false
+
+            // A wake stopped it: restart, whether the loop returned cleanly
+            // or (commonly, sockets dead after suspension) with an error,
+            // which then isn't worth showing.
+            let restart = ForegroundRestart.decide(
+                preempted: preemptedByWake,
+                userStopped: token.stopped,
+                appInForeground: UIApplication.shared.applicationState != .background
+            )
+            switch restart {
+            case .now:
+                startSync()
+            case .whenActive:
+                resumeSyncWhenActive = true
+            case .none:
+                if let error = error {
+                    showSessionError(error)
+                }
+            }
+        }
+        if startWhenSessionEnds {
+            startWhenSessionEnds = false
             startSync()
+        }
+    }
+
+    private func showSessionError(_ error: Error) {
+        // Storage errors carry user-facing copy and the low-disk
+        // case already has its own banner.
+        if let storageError = error as? StorageError {
+            if case .insufficientSpace = storageError {
+                errorMessage = nil
+            } else {
+                errorMessage = storageError.localizedDescription
+            }
         } else {
-            resumeSyncWhenActive = true
+            errorMessage = "\(error)"
+        }
+        if let s = syncStatus {
+            syncStatus = SyncStatus(
+                syncedHeaders: s.syncedHeaders,
+                peerHeight: 0,
+                peers: [],
+                activePeerAddr: "",
+                isSyncing: false,
+                validatedBlocks: s.validatedBlocks,
+                error: "\(error)"
+            )
         }
     }
 
     func stopSync() {
-        guard let node = node else { return }
-        userStoppedSync = true
+        guard let token = activeSession else { return }
+        token.stop()
+        isSyncRunning = false
+        isConnecting = false
+        // Rust only knows the session once `startHeaderSync` has registered
+        // it, so a single stop could land just before that. Repeat until
+        // this session's thread has returned (stops are per session, and no
+        // other session runs meanwhile).
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            node.stopSync()
-            DispatchQueue.main.async {
-                self?.isSyncRunning = false
-                self?.isConnecting = false
+            let deadline = Date().addingTimeInterval(15)
+            while !token.ended && Date() < deadline {
+                self?.node?.stopSync()
+                Thread.sleep(forTimeInterval: 0.25)
             }
         }
     }

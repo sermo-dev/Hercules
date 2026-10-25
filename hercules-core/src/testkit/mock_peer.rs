@@ -113,7 +113,7 @@ pub struct MockPeer {
 impl MockPeer {
     /// Start serving `chain` (regtest magic) with the given behaviors.
     pub fn spawn(chain: &FixtureChain, behaviors: Vec<Behavior>) -> MockPeer {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock peer");
+        let listener = TcpListener::bind(crate::testkit::loopback_bind()).expect("bind mock peer");
         let addr = listener.local_addr().expect("mock peer addr");
         let shared = Arc::new(Shared {
             magic: FixtureChain::params().magic,

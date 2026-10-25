@@ -75,9 +75,10 @@ final class NodeHost {
     /// loop stopped, transport waits ended, wakes cancelled), then the
     /// files are deleted once every holder has let go: Rust's
     /// `resetDatabase` refuses while any reference to the old node is
-    /// alive, and is retried until `timeout`. On timeout nothing has been
-    /// deleted.
+    /// alive, and is retried. One `timeout` covers the close and the
+    /// retries together; on timeout nothing has been deleted.
     func reset(timeout: TimeInterval = 30) throws {
+        let deadline = Date().addingTimeInterval(timeout)
         lock.lock()
         if resetting {
             lock.unlock()
@@ -95,13 +96,13 @@ final class NodeHost {
 
         sessions.cancelAllWakes()
         if let node = old {
-            _ = node.close(timeoutMs: UInt32(timeout * 1000))
+            let left = max(0, deadline.timeIntervalSinceNow)
+            _ = node.close(timeoutMs: UInt32(left * 1000))
         }
         old = nil
         StoragePaths.log.notice("NodeHost: node closed for reset")
 
         try StoragePaths.prepareForNodeOpen()
-        let deadline = Date().addingTimeInterval(timeout)
         while true {
             do {
                 try resetDatabase(dbPath: StoragePaths.headersDBPath)
@@ -118,19 +119,18 @@ final class NodeHost {
     enum WakeResult {
         /// The app is on screen and syncing; nothing was run.
         case foregroundActive
-        /// `cancelledByForeground`: foreground sync started mid-wake and
-        /// cancelled it.
+        /// `cancelReason`: why the app (not iOS) cancelled the wake, if it did.
         case ran(
             WakeReport, nodeReadyMs: UInt64, nodeReused: Bool, peerCount: UInt32,
-            cancelledByForeground: Bool
+            cancelReason: WakeCancelReason
         )
     }
 
     /// Run one wake's catch-up on the shared node. Blocks; call it off the
-    /// main thread. `appIsActive` must be read on the main thread when the
+    /// main thread. `appInForeground` must be read on the main thread when the
     /// wake arrives.
-    func runWake(budget: WakeBudget, appIsActive: Bool) throws -> WakeResult {
-        switch sessions.admitWake(budget, appIsActive: appIsActive) {
+    func runWake(budget: WakeBudget, appInForeground: Bool) throws -> WakeResult {
+        switch sessions.admitWake(budget, appInForeground: appInForeground) {
         case .foregroundActive:
             StoragePaths.log.notice("wake: foreground sync active, not running")
             return .foregroundActive
@@ -153,13 +153,13 @@ final class NodeHost {
             stoppedSync = report.preemptedSync
             let peerCount = UInt32((try? node.getStatus().peers.count) ?? 0)
             finished = true
-            let byForeground = sessions.finishWake(budget, stoppedForegroundSync: stoppedSync)
+            let reason = sessions.finishWake(budget, stoppedForegroundSync: stoppedSync)
             StoragePaths.log.notice(
                 "wake: \(String(describing: report.outcome)) in \(report.elapsedMs) ms (node \(reused ? "reused" : "opened") at \(nodeReadyMs) ms)"
             )
             return .ran(
                 report, nodeReadyMs: nodeReadyMs, nodeReused: reused, peerCount: peerCount,
-                cancelledByForeground: byForeground
+                cancelReason: reason
             )
         }
     }

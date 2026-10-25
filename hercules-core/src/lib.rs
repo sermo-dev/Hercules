@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -87,12 +87,9 @@ pub fn hercules_version() -> String {
 pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
     // Ticket 028: never unlink files under a live node. Its LMDB env would
     // keep the deleted inodes, and heed would hand that stale env to the
-    // next open of the same path.
-    if PathClaim::is_claimed(&db_path) {
-        return Err(HerculesError::NodeOpen {
-            msg: format!("a node is still open for {}", db_path),
-        });
-    }
+    // next open of the same path. The registry stays locked until the
+    // deletes are done, so no node can open in between.
+    let _no_open = PathClaim::lock_unclaimed(&db_path)?;
     // Mirror the path-derivation logic in `HeaderSync::new`. Keep in sync.
     let utxo_dir = sync::derive_sibling_path(&db_path, "utxo-lmdb");
     let blocks_path = sync::derive_sibling_path(&db_path, "blocks.sqlite3");
@@ -399,6 +396,39 @@ fn map_sync_error(e: sync::SyncError) -> HerculesError {
     }
 }
 
+/// Removes a `start_header_sync` session from `sync_sessions` on return.
+struct SyncRegistration<'a> {
+    node: &'a HerculesNode,
+    id: u64,
+}
+
+impl Drop for SyncRegistration<'_> {
+    fn drop(&mut self) {
+        lock(&self.node.sync_sessions).retain(|s| s.id != self.id);
+    }
+}
+
+/// Clears `running_sync` when the sync loop returns.
+struct RunningSync<'a>(&'a HerculesNode);
+
+impl Drop for RunningSync<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.running_sync) = None;
+    }
+}
+
+/// A wake that ended in an error: cancelled, out of time (e.g. no peer
+/// connected before the deadline), or a real failure.
+fn wake_error_outcome(budget: &WakeBudget) -> WakeOutcome {
+    if budget.is_cancelled() {
+        WakeOutcome::Cancelled
+    } else if budget.remaining().is_zero() {
+        WakeOutcome::TimedOut
+    } else {
+        WakeOutcome::Failed
+    }
+}
+
 /// Removes a wake's budget from `HerculesNode::wakes` when it returns.
 struct WakeRegistration<'a> {
     node: &'a HerculesNode,
@@ -407,11 +437,11 @@ struct WakeRegistration<'a> {
 
 impl Drop for WakeRegistration<'_> {
     fn drop(&mut self) {
-        self.node
-            .wakes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|b| !Arc::ptr_eq(b, self.budget));
+        // One entry: two wakes may share a budget.
+        let mut wakes = lock(&self.node.wakes);
+        if let Some(i) = wakes.iter().position(|b| Arc::ptr_eq(b, self.budget)) {
+            wakes.remove(i);
+        }
     }
 }
 
@@ -422,7 +452,7 @@ const FOREGROUND_TRANSPORT_WAIT: Duration = Duration::from_secs(150);
 /// Tor client that bootstraps in the background (ticket 028).
 type TorGate = TransportGate<Arc<TorManager>>;
 
-/// Sets a flag for as long as it lives (`sync_running`, `snapshot_loading`).
+/// Sets a flag for as long as it lives (`snapshot_loading`).
 struct FlagGuard<'a>(&'a AtomicBool);
 
 impl<'a> FlagGuard<'a> {
@@ -438,39 +468,134 @@ impl Drop for FlagGuard<'_> {
     }
 }
 
-/// Database paths with a live `HerculesNode` in this process.
-static OPEN_NODES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Poison-tolerant lock: a panic elsewhere must not turn into a panic in
+/// Drop or across the FFI.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
-/// One node per database per process (ticket 028). Held by the node and
-/// released when it is dropped, after its stores have closed.
-struct PathClaim(String);
+/// Registry key for a path: the parent directory canonicalized (the file
+/// itself may not exist yet), as the UTXO env registry does, so two
+/// spellings of one database are one claim.
+fn claim_key(path: &str) -> PathBuf {
+    let p = std::path::Path::new(path);
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            parent
+                .canonicalize()
+                .map(|c| c.join(name))
+                .unwrap_or_else(|_| p.to_path_buf())
+        }
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Database paths with a live `HerculesNode` in this process.
+static OPEN_NODES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// One node per database per process (ticket 028). Shared by the node and
+/// anything that can outlive it holding its stores (the wallet RPC
+/// thread), so it is released only once the stores have closed.
+struct PathClaim(PathBuf);
 
 impl PathClaim {
     fn take(db_path: &str) -> Result<PathClaim, HerculesError> {
-        let mut open = OPEN_NODES.lock().unwrap_or_else(|e| e.into_inner());
-        if open.iter().any(|p| p == db_path) {
+        let key = claim_key(db_path);
+        let mut open = lock(&OPEN_NODES);
+        if open.contains(&key) {
             return Err(HerculesError::NodeOpen {
                 msg: format!("a node is already open for {}", db_path),
             });
         }
-        open.push(db_path.to_string());
-        Ok(PathClaim(db_path.to_string()))
+        open.push(key.clone());
+        Ok(PathClaim(key))
     }
 
-    fn is_claimed(db_path: &str) -> bool {
-        OPEN_NODES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|p| p == db_path)
+    /// The registry, locked, provided nothing holds `db_path`: while the
+    /// guard lives no node can open it.
+    fn lock_unclaimed(db_path: &str) -> Result<MutexGuard<'static, Vec<PathBuf>>, HerculesError> {
+        let open = lock(&OPEN_NODES);
+        if open.contains(&claim_key(db_path)) {
+            return Err(HerculesError::NodeOpen {
+                msg: format!("a node is still open for {}", db_path),
+            });
+        }
+        Ok(open)
     }
 }
 
 impl Drop for PathClaim {
     fn drop(&mut self) {
-        let mut open = OPEN_NODES.lock().unwrap_or_else(|e| e.into_inner());
-        open.retain(|p| p != &self.0);
+        lock(&OPEN_NODES).retain(|p| p != &self.0);
     }
+}
+
+/// Arti state directories with a live (or bootstrapping) Tor client.
+static OPEN_TOR_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// One Tor client per state directory (ticket 028). A node reopened after
+/// a reset must not start Arti on the directory while the old node's
+/// bootstrap is still running: its bootstrap waits for this instead. Held
+/// by the `TorManager` for its lifetime.
+struct TorDirClaim(PathBuf);
+
+impl TorDirClaim {
+    /// Wait until `dir` is free, then claim it. None if `cancelled` first.
+    fn wait_take(dir: &std::path::Path, cancelled: impl Fn() -> bool) -> Option<TorDirClaim> {
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let mut logged = false;
+        loop {
+            {
+                let mut open = lock(&OPEN_TOR_DIRS);
+                if !open.contains(&key) {
+                    open.push(key.clone());
+                    return Some(TorDirClaim(key));
+                }
+            }
+            if cancelled() {
+                return None;
+            }
+            if !logged {
+                log::info!("Tor: waiting for the previous client on {} to exit", key.display());
+                logged = true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for TorDirClaim {
+    fn drop(&mut self) {
+        lock(&OPEN_TOR_DIRS).retain(|p| p != &self.0);
+    }
+}
+
+/// One foreground sync session's stop flag (ticket 028). Every
+/// `start_header_sync` call gets its own, so a stop aimed at one session
+/// never stops the next.
+#[derive(Clone)]
+struct SyncSession {
+    id: u64,
+    stop: Arc<AtomicBool>,
+}
+
+/// Wait for a thread for up to `timeout`; detach it (false) if it is still
+/// running then.
+fn join_within(thread: JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = thread.join();
+    true
 }
 
 /// State for a running wallet RPC server thread.
@@ -489,14 +614,18 @@ pub struct HerculesNode {
     /// never apply blocks at once (ticket 028; also what makes 033's
     /// open-time demotion safe, since no block is mid-apply at open).
     session: Mutex<()>,
-    /// True while `start_header_sync` holds `session`, so a wake knows a
-    /// stop request will free it.
-    sync_running: AtomicBool,
+    /// Every `start_header_sync` call in progress (waiting or running), so
+    /// `stop_sync` and `close` reach all of them.
+    sync_sessions: Mutex<Vec<SyncSession>>,
+    /// The one holding `session`, so a wake stops exactly that loop.
+    running_sync: Mutex<Option<SyncSession>>,
+    next_sync_id: AtomicU64,
     /// True while `load_snapshot` holds `session`. It can't be preempted,
     /// so a wake gives up at once rather than wait out its budget.
     snapshot_loading: AtomicBool,
-    /// Set by `close`: every later session is refused.
-    closed: AtomicBool,
+    /// Set by `close`: every later session is refused. Shared with the Tor
+    /// bootstrap thread.
+    closed: Arc<AtomicBool>,
     /// Budgets of the wakes running now, so `close` can cancel them.
     wakes: Mutex<Vec<Arc<WakeBudget>>>,
     wallet_rpc: Mutex<Option<WalletRpcHandle>>,
@@ -505,16 +634,18 @@ pub struct HerculesNode {
     /// Path to the directory where we persist wallet API secrets.
     data_dir: String,
     /// Last field, so it is released after the stores above have closed.
-    _claim: PathClaim,
+    /// Shared with the wallet RPC thread, which holds the stores too.
+    claim: Arc<PathClaim>,
 }
 
 impl Drop for HerculesNode {
     fn drop(&mut self) {
-        // The wallet RPC thread holds the syncer; stop it so the stores
-        // close with the node.
-        let running = self.wallet_rpc.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        // The wallet RPC thread holds the syncer. Ask it to stop, but don't
+        // block here for long: if it lingers it keeps the path claim, so a
+        // reset still waits for it.
+        let running = lock(&self.wallet_rpc).is_some();
         if running {
-            self.stop_wallet_api();
+            self.stop_wallet_api_within(Duration::from_millis(500));
         }
     }
 }
@@ -542,7 +673,7 @@ impl HerculesNode {
     pub fn open(db_path: String, tor_data_dir: Option<String>) -> Result<Self, HerculesError> {
         // Before any store opens: a second node on these files would share
         // the first one's LMDB env (heed returns it) and race it.
-        let claim = PathClaim::take(&db_path)?;
+        let claim = Arc::new(PathClaim::take(&db_path)?);
         let mut syncer =
             sync::HeaderSync::new(&db_path, None).map_err(|e| HerculesError::StorageError {
                 msg: format!("{}", e),
@@ -552,14 +683,31 @@ impl HerculesNode {
         }
         let syncer = Arc::new(syncer);
 
+        let closed = Arc::new(AtomicBool::new(false));
         let tor = tor_data_dir.map(|dir| {
             let path = PathBuf::from(dir);
             // Weak: a bootstrap still running when the node is dropped
             // must not keep the stores open (reset_database needs them
             // closed).
             let weak_syncer = Arc::downgrade(&syncer);
+            let closed = Arc::clone(&closed);
             let gate = Arc::new(TorGate::new(move || {
+                let is_closed = || closed.load(Ordering::SeqCst);
+                // Never two Arti clients on one state dir: wait out a
+                // previous node's client (e.g. still bootstrapping when it
+                // was reset).
+                let dir_claim = TorDirClaim::wait_take(&path, is_closed)
+                    .ok_or_else(|| "node closed".to_string())?;
+                if is_closed() {
+                    return Err("node closed".into());
+                }
                 let mut manager = TorManager::bootstrap(&path).map_err(|e| format!("{}", e))?;
+                manager.hold(Box::new(dir_claim));
+                if is_closed() {
+                    // Closed while bootstrapping: no onion service for a
+                    // dead node. Dropping the client frees the directory.
+                    return Err("node closed".into());
+                }
 
                 // Start the onion hidden service so we can accept inbound connections.
                 // Must be called before wrapping in Arc (requires &mut self).
@@ -593,14 +741,16 @@ impl HerculesNode {
             syncer,
             tor,
             session: Mutex::new(()),
-            sync_running: AtomicBool::new(false),
+            sync_sessions: Mutex::new(Vec::new()),
+            running_sync: Mutex::new(None),
+            next_sync_id: AtomicU64::new(1),
             snapshot_loading: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
+            closed,
             wakes: Mutex::new(Vec::new()),
             wallet_rpc: Mutex::new(None),
             wallet_auth_token: Mutex::new(None),
             data_dir,
-            _claim: claim,
+            claim,
         })
     }
 
@@ -612,17 +762,17 @@ impl HerculesNode {
     /// The files stay open until the last reference to the node is
     /// dropped; `reset_database` refuses until then.
     pub fn close(&self, timeout_ms: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         self.closed.store(true, Ordering::SeqCst);
         log::info!("HerculesNode: closing");
-        for budget in self.wakes.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for budget in lock(&self.wakes).iter() {
             budget.cancel();
         }
-        if self.wallet_rpc.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-            self.stop_wallet_api();
+        if lock(&self.wallet_rpc).is_some() {
+            self.stop_wallet_api_within(deadline.saturating_duration_since(Instant::now()));
         }
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         loop {
-            self.syncer.stop_sync();
+            self.stop_sync();
             if self.try_lock_session().is_some() {
                 return true;
             }
@@ -734,9 +884,11 @@ impl HerculesNode {
             }
         };
 
-        // A sync loop resets its stop flag on entry, so keep asking until
-        // the session is free.
+        // Stop the sync loop holding the session when the wake first looked,
+        // and only that one: a session started after it (by the user) is
+        // not this wake's to stop.
         let mut preempted = false;
+        let mut target: Option<u64> = None;
         let session = wake::acquire_within(
             &budget,
             floor,
@@ -746,12 +898,15 @@ impl HerculesNode {
                     // Can't be stopped, and outlasts any wake budget.
                     return false;
                 }
-                if self.sync_running.load(Ordering::SeqCst) {
-                    if !preempted {
-                        log::info!("wake: stopping the running sync loop");
+                let running = lock(&self.running_sync).clone();
+                if let Some(sync) = running {
+                    if *target.get_or_insert(sync.id) == sync.id {
+                        if !preempted {
+                            log::info!("wake: stopping the running sync loop");
+                        }
+                        preempted = true;
+                        sync.stop.store(true, Ordering::SeqCst);
                     }
-                    preempted = true;
-                    self.syncer.stop_sync();
                 }
                 true
             },
@@ -805,7 +960,7 @@ impl HerculesNode {
         match self.syncer.catch_up_blocks_in(max_blocks, &budget) {
             // Out of budget before any peer answered for the headers: the
             // status only reflects the local tip, so it is no "Validated".
-            Ok(status) if budget.marks().headers_checked_ms.is_none() => report(
+            Ok(status) if budget.marks().headers_checked_ms.is_none() && !status.tip_disagreement => report(
                 cancelled_or(WakeOutcome::TimedOut),
                 Some(status.into()),
                 preempted,
@@ -818,7 +973,7 @@ impl HerculesNode {
                 None,
             ),
             Err(e) => report(
-                cancelled_or(WakeOutcome::Failed),
+                wake_error_outcome(&budget),
                 None,
                 preempted,
                 Some(format!("{}", map_sync_error(e))),
@@ -840,10 +995,17 @@ impl HerculesNode {
     /// preempts it in the background). Waits for the transport first, then
     /// for any wake still holding the node.
     ///
-    /// A `stop_sync` issued while it waits is honored: the stop flag is
-    /// cleared here, at the start, not when the loop begins.
+    /// Each call is its own session with its own stop token: a `stop_sync`
+    /// issued while it waits is honored, and a wake's stop of an earlier
+    /// session can't reach it.
     pub fn start_header_sync(&self, callback: Box<dyn SyncCallback>) -> Result<(), HerculesError> {
-        self.syncer.clear_stop();
+        let sync = SyncSession {
+            id: self.next_sync_id.fetch_add(1, Ordering::SeqCst),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        lock(&self.sync_sessions).push(sync.clone());
+        let _registered = SyncRegistration { node: self, id: sync.id };
+
         if !self.wait_for_transport(FOREGROUND_TRANSPORT_WAIT.as_millis() as u32)? {
             return Err(HerculesError::TorError {
                 msg: "Tor bootstrap timed out".into(),
@@ -853,13 +1015,14 @@ impl HerculesNode {
         if self.is_closed() {
             return Err(Self::closed_error());
         }
-        if self.syncer.stop_requested() {
+        if sync.stop.load(Ordering::SeqCst) {
             log::info!("Sync stopped before it started");
             return Ok(());
         }
-        let _running = FlagGuard::set(&self.sync_running);
+        *lock(&self.running_sync) = Some(sync.clone());
+        let _running = RunningSync(self);
         self.syncer
-            .run_sync(|status| {
+            .run_sync(&sync.stop, |status| {
                 callback.on_progress(status.into());
             })
             .map_err(map_sync_error)
@@ -911,10 +1074,11 @@ impl HerculesNode {
             return Err(Self::closed_error());
         }
         let _loading = FlagGuard::set(&self.snapshot_loading);
+        // `close` cancels the import like the callback returning false.
         let meta = self
             .syncer
             .load_snapshot(&snapshot_path, |loaded, total| {
-                callback.on_progress(loaded, total)
+                !self.is_closed() && callback.on_progress(loaded, total)
             })
             .map_err(|e| match e {
                 sync::SyncError::SnapshotInvalid(msg) => HerculesError::SnapshotInvalid { msg },
@@ -931,9 +1095,13 @@ impl HerculesNode {
     }
 
     /// Request the sync loop to stop cleanly. The blocking `start_header_sync`
-    /// call will return on the next loop iteration.
+    /// call will return on the next loop iteration. Stops every session in
+    /// progress, including one still waiting to start.
     pub fn stop_sync(&self) {
-        self.syncer.stop_sync();
+        for sync in lock(&self.sync_sessions).iter() {
+            sync.stop.store(true, Ordering::SeqCst);
+        }
+        log::info!("Sync stop requested");
     }
 
     /// Get the current Tor status. Returns None if Tor is not enabled.
@@ -1038,6 +1206,9 @@ impl HerculesNode {
     /// Calling this when the server is already running is a no-op that
     /// returns the existing connection string.
     pub fn start_wallet_api(&self) -> Result<String, HerculesError> {
+        if self.is_closed() {
+            return Err(Self::closed_error());
+        }
         let tor = self.tor_manager().ok_or_else(|| HerculesError::TorError {
             msg: if self.tor.is_some() {
                 "Tor is still bootstrapping — try again shortly".into()
@@ -1048,8 +1219,9 @@ impl HerculesNode {
 
         // If already running, return existing connection string.
         {
-            let guard = self.wallet_rpc.lock().unwrap();
+            let guard = lock(&self.wallet_rpc);
             if guard.is_some() {
+                drop(guard);
                 return self.get_wallet_api_connection_string();
             }
         }
@@ -1072,16 +1244,21 @@ impl HerculesNode {
         ));
 
         let server_clone = Arc::clone(&server);
+        // The thread holds the stores (via the server), so it holds the
+        // path claim too, until they are dropped.
+        let claim = Arc::clone(&self.claim);
         let thread = std::thread::Builder::new()
             .name("wallet-rpc".into())
             .spawn(move || {
                 server_clone.serve();
+                drop(server_clone);
+                drop(claim);
             })
             .map_err(|e| HerculesError::NetworkError {
                 msg: format!("failed to spawn wallet RPC thread: {}", e),
             })?;
 
-        *self.wallet_rpc.lock().unwrap() = Some(WalletRpcHandle {
+        *lock(&self.wallet_rpc) = Some(WalletRpcHandle {
             server,
             thread: Some(thread),
         });
@@ -1093,13 +1270,22 @@ impl HerculesNode {
         Ok(format!("{}/{}", onion_addr, token))
     }
 
-    /// Stop the wallet API server and its onion service.
+    /// Stop the wallet API server and its onion service. Waits up to 5 s
+    /// for the server thread.
     pub fn stop_wallet_api(&self) {
-        let handle = self.wallet_rpc.lock().unwrap().take();
+        self.stop_wallet_api_within(Duration::from_secs(5));
+    }
+
+    /// Stop the wallet API, waiting up to `timeout` for the server thread;
+    /// after that it is detached (it exits at its next shutdown check).
+    fn stop_wallet_api_within(&self, timeout: Duration) {
+        let handle = lock(&self.wallet_rpc).take();
         if let Some(mut h) = handle {
             h.server.stop();
             if let Some(thread) = h.thread.take() {
-                let _ = thread.join();
+                if !join_within(thread, timeout) {
+                    log::warn!("Wallet API thread still running after {:?}; detached", timeout);
+                }
             }
         }
 
@@ -1113,7 +1299,7 @@ impl HerculesNode {
 
     /// Get the wallet API connection string, or None if not running.
     pub fn get_wallet_api_connection_string(&self) -> Result<String, HerculesError> {
-        let guard = self.wallet_rpc.lock().unwrap();
+        let guard = lock(&self.wallet_rpc);
         if guard.is_none() {
             return Err(HerculesError::NetworkError {
                 msg: "wallet API is not running".into(),
@@ -1128,7 +1314,7 @@ impl HerculesNode {
             msg: "wallet onion service not available".into(),
         })?;
 
-        let token = self.wallet_auth_token.lock().unwrap();
+        let token = lock(&self.wallet_auth_token);
         let token = token.as_ref().ok_or_else(|| HerculesError::NetworkError {
             msg: "no auth token".into(),
         })?;
@@ -1205,7 +1391,7 @@ impl HerculesNode {
         log::info!("Wallet API auth token rotated");
 
         // If the server is running, restart it with the new token.
-        let was_running = self.wallet_rpc.lock().unwrap().is_some();
+        let was_running = lock(&self.wallet_rpc).is_some();
         if was_running {
             self.stop_wallet_api();
             return self.start_wallet_api();

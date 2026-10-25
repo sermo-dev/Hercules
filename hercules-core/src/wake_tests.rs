@@ -37,14 +37,16 @@ fn node_with(peers: &[&MockPeer], tor: Option<Arc<TorGate>>) -> Node {
         syncer: Arc::new(syncer),
         tor,
         session: Mutex::new(()),
-        sync_running: AtomicBool::new(false),
+        sync_sessions: Mutex::new(Vec::new()),
+        running_sync: Mutex::new(None),
+        next_sync_id: AtomicU64::new(1),
         snapshot_loading: AtomicBool::new(false),
-        closed: AtomicBool::new(false),
+        closed: Arc::new(AtomicBool::new(false)),
         wakes: Mutex::new(Vec::new()),
         wallet_rpc: Mutex::new(None),
         wallet_auth_token: Mutex::new(None),
         data_dir: dir.path().to_str().unwrap().to_string(),
-        _claim: PathClaim::take(&db_path).unwrap(),
+        claim: Arc::new(PathClaim::take(&db_path).unwrap()),
     };
     Node { _dir: dir, node }
 }
@@ -52,6 +54,24 @@ fn node_with(peers: &[&MockPeer], tor: Option<Arc<TorGate>>) -> Node {
 impl Node {
     fn validated(&self) -> u32 {
         self.node.syncer.rpc_validated_height().unwrap()
+    }
+
+    /// A sync loop holds the session.
+    fn sync_running(&self) -> bool {
+        lock(&self.node.running_sync).is_some()
+    }
+
+    fn sync_running_id(&self) -> Option<u64> {
+        lock(&self.node.running_sync).as_ref().map(|s| s.id)
+    }
+}
+
+/// Wait (up to 10 s) until `cond` holds.
+fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !cond() {
+        assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {}", what);
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -180,7 +200,7 @@ fn wake_preempts_a_running_sync_loop() {
     };
     // Wait until the loop owns the session.
     let start = Instant::now();
-    while !n.node.sync_running.load(Ordering::SeqCst) {
+    while !n.sync_running() {
         assert!(start.elapsed() < Duration::from_secs(10), "sync never started");
         thread::sleep(Duration::from_millis(10));
     }
@@ -189,7 +209,7 @@ fn wake_preempts_a_running_sync_loop() {
     assert!(r.preempted_sync, "{:?}", r);
     assert_eq!(r.outcome, WakeOutcome::Completed, "{:?}", r);
     assert!(sync_thread.join().unwrap().is_ok(), "sync loop stops cleanly");
-    assert!(!n.node.sync_running.load(Ordering::SeqCst));
+    assert!(!n.sync_running());
     assert_eq!(n.validated(), 10);
 }
 
@@ -349,7 +369,7 @@ fn tor_required_without_tor_never_dials_clearnet() {
     let err = hs.catch_up_blocks_in(50, &WakeBudget::new(5_000)).unwrap_err();
     assert!(format!("{}", err).contains("Tor transport not ready"), "{}", err);
     assert!(hs.validate_latest_block_in(&WakeBudget::new(5_000)).is_err());
-    assert!(hs.run_sync(|_| {}).is_err());
+    assert!(hs.run_sync(&AtomicBool::new(false), |_| {}).is_err());
     assert_eq!(a.connections() + b.connections(), 0, "no clearnet fallback");
 }
 
@@ -422,7 +442,7 @@ fn close_ends_sync_wakes_and_transport_waits() {
         thread::spawn(move || n.node.start_header_sync(Box::new(NoProgress)))
     };
     let start = Instant::now();
-    while !n.node.sync_running.load(Ordering::SeqCst) {
+    while !n.sync_running() {
         assert!(start.elapsed() < Duration::from_secs(10), "sync never started");
         thread::sleep(Duration::from_millis(10));
     }
@@ -480,4 +500,171 @@ fn close_cancels_a_running_wake() {
     assert!(budget.is_cancelled());
     let r = wake.join().unwrap();
     assert_eq!(r.outcome, WakeOutcome::Cancelled, "{:?}", r);
+}
+
+// ── Review round 2 ───────────────────────────────────────────────────
+
+#[test]
+fn wake_reports_tip_disagreement_not_timed_out() {
+    // The eclipse alert must survive: a taller fork as the active peer,
+    // outvoted by two honest peers, is a tip disagreement.
+    let mut honest = FixtureChain::new();
+    honest.mine(10);
+    let mut fork = FixtureChain::new().fork_at(0);
+    fork.mine(12);
+    let liar = MockPeer::spawn(&fork, vec![]);
+    let a = MockPeer::spawn(&honest, vec![]);
+    let b = MockPeer::spawn(&honest, vec![]);
+    let n = node_with(&[&liar, &a, &b], None);
+
+    let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(20_000)), 50, 1_000);
+    assert_eq!(r.outcome, WakeOutcome::Completed, "{:?}", r);
+    let s = r.status.expect("status");
+    assert!(s.tip_disagreement, "{:?}", s);
+    assert!(!s.caught_up);
+    assert!(r.timings.headers_checked_ms.is_some(), "headers were checked: they disagree");
+    assert_eq!(n.validated(), 0, "nothing from the fork applied");
+}
+
+#[test]
+fn header_phase_is_bounded_by_the_budget() {
+    // Peers answer getheaders far too late. Unbounded, the request waits
+    // out the read timeout; bounded, the wake ends at its deadline as
+    // TimedOut (headers never checked), not Failed.
+    let c = chain(5);
+    let slow = Behavior::DelayResponses(Duration::from_secs(5));
+    let a = MockPeer::spawn(&c, vec![slow.clone()]);
+    let b = MockPeer::spawn(&c, vec![slow]);
+    let n = node_with(&[&a, &b], None);
+
+    let start = Instant::now();
+    let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(1_500)), 50, 0);
+    let took = start.elapsed();
+    assert!(took < Duration::from_millis(2_500), "overran budget: {:?}", took);
+    assert_eq!(r.outcome, WakeOutcome::TimedOut, "{:?}", r);
+    assert!(!r.status.expect("status").caught_up);
+    // Our deadline cut the peers off: no penalty.
+    let store = crate::peer_store::PeerStore::open(
+        n._dir.path().join("peers.sqlite3").to_str().unwrap(),
+    )
+    .unwrap();
+    for p in [&a, &b] {
+        assert!(store.load_score(&p.addr()).unwrap().map_or(true, |s| s >= 100), "{} penalized", p.addr());
+    }
+}
+
+#[test]
+fn a_wakes_stop_never_reaches_the_next_sync_session() {
+    // Sync A runs; the user starts sync B, which queues on the session; a
+    // wake W stops A. Whoever gets the session next, B must keep running
+    // until the user stops it.
+    let c = chain(5);
+    let (a, b) = honest_pair(&c);
+    let n = Arc::new(node_with(&[&a, &b], None));
+
+    let sync_a = {
+        let n = Arc::clone(&n);
+        thread::spawn(move || n.node.start_header_sync(Box::new(NoProgress)))
+    };
+    wait_for("sync A", || n.sync_running());
+    let a_id = n.sync_running_id().unwrap();
+
+    let sync_b = {
+        let n = Arc::clone(&n);
+        thread::spawn(move || n.node.start_header_sync(Box::new(NoProgress)))
+    };
+    wait_for("sync B registered", || lock(&n.node.sync_sessions).len() == 2);
+
+    let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(3_000)), 50, 0);
+    assert!(r.preempted_sync, "{:?}", r);
+    assert!(sync_a.join().unwrap().is_ok());
+
+    wait_for("sync B running", || n.sync_running_id().is_some_and(|id| id != a_id));
+    thread::sleep(Duration::from_millis(300));
+    assert!(!sync_b.is_finished(), "W's stop leaked into session B");
+
+    n.node.stop_sync();
+    assert!(sync_b.join().unwrap().is_ok());
+}
+
+#[test]
+fn tor_dir_claim_waits_for_the_previous_client() {
+    let dir = TempDir::new().unwrap();
+    let first = TorDirClaim::wait_take(dir.path(), || false).unwrap();
+
+    // A second client on the same dir waits...
+    let path = dir.path().to_path_buf();
+    let waiter = thread::spawn(move || {
+        let start = Instant::now();
+        let claim = TorDirClaim::wait_take(&path, || false);
+        (claim.is_some(), start.elapsed())
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert!(!waiter.is_finished(), "second Arti allowed on a live dir");
+    drop(first);
+    let (got, waited) = waiter.join().unwrap();
+    assert!(got && waited >= Duration::from_millis(250), "{:?}", waited);
+
+    // ...and gives up if its node closes meanwhile.
+    let _held = TorDirClaim::wait_take(dir.path(), || false).unwrap();
+    assert!(TorDirClaim::wait_take(dir.path(), || true).is_none());
+}
+
+#[test]
+fn join_within_bounds_a_stuck_thread() {
+    let stuck = thread::spawn(|| thread::sleep(Duration::from_secs(3)));
+    let start = Instant::now();
+    assert!(!join_within(stuck, Duration::from_millis(100)));
+    assert!(start.elapsed() < Duration::from_millis(400));
+    let quick = thread::spawn(|| {});
+    assert!(join_within(quick, Duration::from_secs(1)));
+}
+
+#[test]
+fn closed_node_refuses_the_wallet_api() {
+    let c = chain(1);
+    let a = MockPeer::spawn(&c, vec![]);
+    let n = node_with(&[&a], None);
+    assert!(n.node.close(1_000));
+    assert!(matches!(n.node.start_wallet_api(), Err(HerculesError::NodeOpen { .. })));
+}
+
+#[test]
+fn two_wakes_sharing_a_budget_unregister_one_at_a_time() {
+    let c = chain(1);
+    let a = MockPeer::spawn(&c, vec![]);
+    let n = node_with(&[&a], None);
+    let budget = Arc::new(WakeBudget::new(1_000));
+    lock(&n.node.wakes).push(Arc::clone(&budget));
+    lock(&n.node.wakes).push(Arc::clone(&budget));
+    {
+        let _one = WakeRegistration { node: &n.node, budget: &budget };
+    }
+    assert_eq!(lock(&n.node.wakes).len(), 1, "only one registration removed");
+}
+
+#[test]
+fn wake_errors_out_of_time_are_timed_out() {
+    let spent = WakeBudget::starting_at(Instant::now() - Duration::from_secs(2), Duration::from_secs(1));
+    assert_eq!(wake_error_outcome(&spent), WakeOutcome::TimedOut);
+    let live = WakeBudget::new(60_000);
+    assert_eq!(wake_error_outcome(&live), WakeOutcome::Failed);
+    live.cancel();
+    assert_eq!(wake_error_outcome(&live), WakeOutcome::Cancelled);
+}
+
+#[test]
+fn path_claim_is_per_database_not_per_spelling() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("hercules-headers.sqlite3");
+    let other = dir.path().join(".").join("hercules-headers.sqlite3");
+    let _node = HerculesNode::open(db.to_string_lossy().into_owned(), None).unwrap();
+    assert!(matches!(
+        HerculesNode::open(other.to_string_lossy().into_owned(), None),
+        Err(HerculesError::NodeOpen { .. })
+    ));
+    assert!(matches!(
+        reset_database(other.to_string_lossy().into_owned()),
+        Err(HerculesError::NodeOpen { .. })
+    ));
 }

@@ -354,13 +354,15 @@ class NotificationManager: ObservableObject {
         }
 
         // Read here, on the main thread (AppDelegate delivers pushes on it).
-        let appIsActive = UIApplication.shared.applicationState == .active
+        // `.inactive` (e.g. Control Center pulled down) still counts as on
+        // screen: the app is about to be active again.
+        let appInForeground = UIApplication.shared.applicationState != .background
 
         // The app is on screen and syncing: foreground is already
         // validating. Record that and finish at once, with no Live Activity
         // and no node call (ticket 028). `runWake` re-checks atomically in
         // case foreground sync starts in between.
-        if appIsActive && NodeHost.shared.sessions.isForegroundActive {
+        if appInForeground && NodeHost.shared.sessions.isForegroundActive {
             var record = Self.payloadRecord(
                 pushBlock: pushBlock, receivedAt: receivedAt, source: .foregroundActive, error: nil
             )
@@ -392,6 +394,10 @@ class NotificationManager: ObservableObject {
         // The completion handler must be called exactly once, by whichever
         // of Rust's return and the watchdog gets there first.
         let gate = OnceGate()
+        // The watchdog's record id is fixed up front, so a late result can
+        // replace it whichever lands first; its completion time is kept.
+        let watchdogRecordID = UUID()
+        let watchdogCompletedMs = LockedBox<UInt64?>(nil)
 
         // Watchdog (ticket 028): if Rust hasn't returned ~27 s after
         // receipt (a blocking read on a slow peer can outlast the budget),
@@ -407,9 +413,11 @@ class NotificationManager: ObservableObject {
                     pushBlock: pushBlock, receivedAt: receivedAt, source: .wakeCancelled,
                     error: "No result within \(Int(WakeConfig.watchdogSeconds)) s; cancelled"
                 )
+                record = record.replacing(id: watchdogRecordID)
                 record.wakeTimings = WakeTimings(trigger: "push", completedMs: budget.elapsedMs())
+                watchdogCompletedMs.value = record.wakeTimings?.completedMs
                 DispatchQueue.main.async {
-                    self.appendRecord(record)
+                    self.appendRecord(record, ifAbsent: true)
                 }
                 completionHandler(.failed)
             }
@@ -418,7 +426,7 @@ class NotificationManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let run = self.performWake(
                 budget: budget, receivedAt: receivedAt, pushBlock: pushBlock,
-                appIsActive: appIsActive, trigger: "push"
+                appInForeground: appInForeground, trigger: "push"
             )
             let completed = gate.fire {
                 self.publish(
@@ -428,14 +436,23 @@ class NotificationManager: ObservableObject {
                 completionHandler(run.fetchResult)
             }
             if !completed {
-                // The watchdog already completed this wake. Keep the widget
-                // current; the history already has the watchdog's record.
+                // The watchdog already completed this wake. Keep widget and
+                // history consistent with what Rust actually did: the real
+                // result replaces the watchdog's record (same id, and the
+                // completion time stays the watchdog's).
+                StoragePaths.log.notice("wake: Rust returned after the watchdog, at \(budget.elapsedMs()) ms")
                 if let status = run.status, status.blocksValidated > 0 {
                     SharedNodeStore.publishValidation(
                         height: status.currentHeight, blockHash: status.tipBlockHash, peerCount: run.peerCount
                     )
                 }
-                StoragePaths.log.notice("wake: Rust returned after the watchdog, at \(budget.elapsedMs()) ms")
+                if var late = run.record, run.status != nil {
+                    late = late.replacing(id: watchdogRecordID)
+                    late.wakeTimings?.completedMs = watchdogCompletedMs.value ?? budget.elapsedMs()
+                    DispatchQueue.main.async {
+                        self.replaceRecord(late)
+                    }
+                }
             }
         }
     }
@@ -447,7 +464,7 @@ class NotificationManager: ObservableObject {
     func testNotification(completion: @escaping (Result<BlockNotificationRecord, Error>) -> Void) {
         let budget = WakeBudget(budgetMs: WakeConfig.budgetMs)
         let receivedAt = Date()
-        let appIsActive = UIApplication.shared.applicationState == .active
+        let appInForeground = UIApplication.shared.applicationState != .background
         SharedNodeStore.markAwake(true)
         let initialState = SharedNodeStore.load()
         let activityController: WakeActivityControllerProtocol
@@ -464,7 +481,7 @@ class NotificationManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let run = self.performWake(
                 budget: budget, receivedAt: receivedAt, pushBlock: nil,
-                appIsActive: appIsActive, trigger: "test"
+                appInForeground: appInForeground, trigger: "test"
             )
             self.publish(
                 run, budget: budget, pushBlock: nil, activity: activityController,
@@ -491,6 +508,9 @@ class NotificationManager: ObservableObject {
         /// Worth a local notification (wakes with a push payload, or progress).
         var notify: Bool
         var lockedSinceReboot = false
+        /// Nothing failed (foreground handled it, node busy, reset): end the
+        /// Live Activity without a failure state.
+        var neutral = false
     }
 
     /// Run one wake on the shared node. Blocks; call off the main thread.
@@ -499,7 +519,7 @@ class NotificationManager: ObservableObject {
         budget: WakeBudget,
         receivedAt: Date,
         pushBlock: PushBlockInfo?,
-        appIsActive: Bool,
+        appInForeground: Bool,
         trigger: String
     ) -> WakeRun {
         let fromPayload = { (source: NotificationSource, error: String?, timings: WakeTimings) -> BlockNotificationRecord in
@@ -508,14 +528,15 @@ class NotificationManager: ObservableObject {
             return record
         }
         do {
-            switch try NodeHost.shared.runWake(budget: budget, appIsActive: appIsActive) {
+            switch try NodeHost.shared.runWake(budget: budget, appInForeground: appInForeground) {
             case .foregroundActive:
                 return WakeRun(
                     record: fromPayload(.foregroundActive, nil, WakeTimings(trigger: trigger)),
                     fetchResult: .noData,
-                    notify: false
+                    notify: false,
+                    neutral: true
                 )
-            case let .ran(report, nodeReadyMs, nodeReused, peerCount, cancelledByForeground):
+            case let .ran(report, nodeReadyMs, nodeReused, peerCount, cancelReason):
                 let timings = Self.timings(report, trigger: trigger, nodeReadyMs: nodeReadyMs, nodeReused: nodeReused)
                 switch report.outcome {
                 case .completed, .cancelled, .timedOut:
@@ -531,12 +552,20 @@ class NotificationManager: ObservableObject {
                             notify: true
                         )
                     }
-                    if cancelledByForeground {
+                    switch cancelReason {
+                    case .foregroundStarted:
                         // Foreground sync started and took over the node.
                         return WakeRun(
                             record: fromPayload(.foregroundActive, nil, timings),
-                            fetchResult: .noData, notify: false
+                            fetchResult: .noData, notify: false, neutral: true
                         )
+                    case .reset:
+                        return WakeRun(
+                            record: fromPayload(.nodeReset, "Cancelled: the node is being reset", timings),
+                            fetchResult: .noData, notify: false, neutral: true
+                        )
+                    case .none:
+                        break
                     }
                     let why = report.outcome == .timedOut
                         ? (report.error ?? "Budget spent before peers answered")
@@ -553,7 +582,7 @@ class NotificationManager: ObservableObject {
                 case .busy:
                     return WakeRun(
                         record: fromPayload(.wakeBusy, "Node busy for the whole wake budget", timings),
-                        fetchResult: .noData, notify: false
+                        fetchResult: .noData, notify: false, neutral: true
                     )
                 case .failed:
                     return WakeRun(
@@ -571,6 +600,14 @@ class NotificationManager: ObservableObject {
             // that tracks the `complete` class and goes false ~10 s after
             // every passcode lock, so it would skip every pocketed wake.
             return WakeRun(record: nil, fetchResult: .noData, notify: false, lockedSinceReboot: true)
+        } catch NodeHost.HostError.resetting {
+            return WakeRun(
+                record: fromPayload(
+                    .nodeReset, NodeHost.HostError.resetting.localizedDescription,
+                    WakeTimings(trigger: trigger)
+                ),
+                fetchResult: .noData, notify: false, neutral: true
+            )
         } catch {
             return WakeRun(
                 record: fromPayload(.pushPayload, "\(error)", WakeTimings(trigger: trigger, completedMs: nil)),
@@ -596,7 +633,12 @@ class NotificationManager: ObservableObject {
             // too, so the write usually fails).
             SharedNodeStore.markAwake(false)
             activity.finishFailure(height: initialHeight, peerCount: initialPeers)
-            Self.recordLockedSinceReboot(pushBlock: pushBlock)
+            if isPush {
+                Self.recordLockedSinceReboot(pushBlock: pushBlock)
+            } else {
+                // A BG refresh announced no block: nothing to tell the user.
+                StoragePaths.log.notice("refresh skipped: device locked since reboot")
+            }
             return
         }
 
@@ -613,6 +655,9 @@ class NotificationManager: ObservableObject {
             if !status.caughtUp && status.blocksValidated > 0 {
                 Self.requestFollowUpWake()
             }
+        } else if run.neutral {
+            SharedNodeStore.markAwake(false)
+            activity.finishNeutral()
         } else {
             SharedNodeStore.markAwake(false)
             activity.finishFailure(height: initialHeight, peerCount: initialPeers)
@@ -724,7 +769,12 @@ class NotificationManager: ObservableObject {
 
     // MARK: - History
 
-    private func appendRecord(_ record: BlockNotificationRecord) {
+    /// `ifAbsent`: skip if a record with this id is already there (the
+    /// watchdog's placeholder, when the real result landed first).
+    private func appendRecord(_ record: BlockNotificationRecord, ifAbsent: Bool = false) {
+        if ifAbsent && notificationHistory.contains(where: { $0.id == record.id }) {
+            return
+        }
         if !historyLoaded {
             guard let loaded = NotificationHistory.loadIfReadable() else {
                 // Still unreadable: keep it in memory only, don't clobber the file.
@@ -741,6 +791,17 @@ class NotificationManager: ObservableObject {
         if notificationHistory.count > NotificationHistory.maxRecords {
             notificationHistory = Array(notificationHistory.prefix(NotificationHistory.maxRecords))
         }
+        NotificationHistory.save(notificationHistory)
+    }
+
+    /// Replace the record with `record.id` (a watchdog placeholder) in
+    /// place; append it if it's gone. Main thread.
+    private func replaceRecord(_ record: BlockNotificationRecord) {
+        guard historyLoaded, let i = notificationHistory.firstIndex(where: { $0.id == record.id }) else {
+            appendRecord(record)
+            return
+        }
+        notificationHistory[i] = record
         NotificationHistory.save(notificationHistory)
     }
 
@@ -785,6 +846,12 @@ class NotificationManager: ObservableObject {
         case .wakeCancelled:
             content.title = "\(record.displayTitle) — Not Yet Validated"
             content.body = "Ran out of background time. Hercules will validate on the next wake."
+        case .nodeReset:
+            content.title = "\(record.displayTitle) — Not Yet Validated"
+            content.body = "The node is being reset."
+        case .unknown:
+            content.title = record.displayTitle
+            content.body = record.validationError ?? ""
         }
 
         content.sound = .default
@@ -860,7 +927,7 @@ class NotificationManager: ObservableObject {
             // anything (open(2) probe; this handler runs off the main thread).
             let run = self.performWake(
                 budget: budget, receivedAt: receivedAt, pushBlock: nil,
-                appIsActive: Self.appIsActiveNow(), trigger: "refresh"
+                appInForeground: Self.appInForegroundNow(), trigger: "refresh"
             )
             // Published even if expiration already completed the task, so a
             // late result still reaches history and the widget.
@@ -875,11 +942,11 @@ class NotificationManager: ObservableObject {
     }
 
     /// `applicationState` from any thread.
-    private static func appIsActiveNow() -> Bool {
+    private static func appInForegroundNow() -> Bool {
         if Thread.isMainThread {
-            return UIApplication.shared.applicationState == .active
+            return UIApplication.shared.applicationState != .background
         }
-        return DispatchQueue.main.sync { UIApplication.shared.applicationState == .active }
+        return DispatchQueue.main.sync { UIApplication.shared.applicationState != .background }
     }
 
     /// Request iOS to wake us again soon for continued catch-up.
@@ -981,6 +1048,9 @@ protocol WakeActivityControllerProtocol {
     func start(initialHeight: UInt32, peerCount: UInt32)
     func finishSuccess(height: UInt32, peerCount: UInt32)
     func finishFailure(height: UInt32, peerCount: UInt32)
+    /// End without a success or failure state (nothing ran, or it was
+    /// handed off): the activity just goes away.
+    func finishNeutral()
 }
 
 /// Fallback for iOS 16.0/16.1 — Live Activities aren't available so we
@@ -991,6 +1061,7 @@ final class NoopWakeActivityController: WakeActivityControllerProtocol {
     func start(initialHeight: UInt32, peerCount: UInt32) {}
     func finishSuccess(height: UInt32, peerCount: UInt32) {}
     func finishFailure(height: UInt32, peerCount: UInt32) {}
+    func finishNeutral() {}
 }
 
 /// Owns one `Activity<NodeActivityAttributes>` for the lifetime of a
@@ -1048,6 +1119,21 @@ final class WakeActivityController: WakeActivityControllerProtocol {
 
     func finishFailure(height: UInt32, peerCount: UInt32) {
         end(phase: .failed, height: height, peerCount: peerCount)
+    }
+
+    func finishNeutral() {
+        lock.lock()
+        let alreadyFinished = finished
+        finished = true
+        lock.unlock()
+        guard !alreadyFinished else { return }
+
+        phaseTimer?.cancel()
+        phaseTimer = nil
+        guard let activity = activity else { return }
+        Task {
+            await activity.end(nil, dismissalPolicy: .immediate)
+        }
     }
 
     // MARK: - Private
@@ -1130,5 +1216,40 @@ final class WakeActivityController: WakeActivityControllerProtocol {
                 dismissalPolicy: .after(Date().addingTimeInterval(8))
             )
         }
+    }
+}
+
+/// A value shared between threads (the push watchdog and Rust's return).
+final class LockedBox<T> {
+    private let lock = NSLock()
+    private var _value: T
+
+    init(_ value: T) {
+        _value = value
+    }
+
+    var value: T {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); _value = newValue; lock.unlock() }
+    }
+}
+
+extension BlockNotificationRecord {
+    /// The same record under another id.
+    func replacing(id: UUID) -> BlockNotificationRecord {
+        var copy = BlockNotificationRecord(
+            id: id,
+            height: height,
+            blockHash: blockHash,
+            timestamp: timestamp,
+            timestampHuman: timestampHuman,
+            validated: validated,
+            headerValidated: headerValidated,
+            receivedAt: receivedAt,
+            source: source,
+            validationError: validationError
+        )
+        copy.wakeTimings = wakeTimings
+        return copy
     }
 }

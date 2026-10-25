@@ -445,6 +445,9 @@ pub struct HeaderSync {
     peers_db_path: Option<String>,
     mempool: Mutex<Mempool>,
     validation_paused: Arc<AtomicBool>,
+    /// Stop flag for `sync()` / `stop_sync()` (tests). The app's sessions
+    /// pass their own token to `run_sync` (ticket 028).
+    #[cfg(test)]
     shutdown_requested: Arc<AtomicBool>,
     /// The Tor client, once it is up. Set at construction, or later by
     /// `attach_tor` when the node opened without waiting for bootstrap
@@ -635,6 +638,7 @@ impl HeaderSync {
             peers_db_path,
             mempool: Mutex::new(Mempool::with_params(params)),
             validation_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             regular_peers_over_tor: tor_required,
             tor,
@@ -1407,18 +1411,10 @@ impl HeaderSync {
 
     /// Request the sync loop to stop. The loop will exit cleanly on its
     /// next iteration, returning Ok(()) from `sync()`.
+    #[cfg(test)]
     pub fn stop_sync(&self) {
         self.shutdown_requested.store(true, Ordering::Relaxed);
         info!("Sync stop requested");
-    }
-
-    /// Forget an earlier stop request (start of a new foreground session).
-    pub fn clear_stop(&self) {
-        self.shutdown_requested.store(false, Ordering::Relaxed);
-    }
-
-    pub fn stop_requested(&self) -> bool {
-        self.shutdown_requested.load(Ordering::Relaxed)
     }
 
     /// Tor mode with the client still bootstrapping: peer sessions are
@@ -1472,6 +1468,7 @@ impl HeaderSync {
         active_addr: &str,
         active_first_hash: BlockHash,
         strict: bool,
+        deadline: Option<Instant>,
     ) -> HeaderCrossCheck {
         // Step 1: pick an independent witness peer.
         let witness_addr = match pool.peer_addr_other_than(active_addr) {
@@ -1492,7 +1489,7 @@ impl HeaderSync {
             }
         };
 
-        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator) {
+        let witness_first = match self.fetch_first_header_hash(pool, &witness_addr, locator, deadline) {
             Some(h) => h,
             None if strict => {
                 // Same "can't conclude" case, but during initial sync we
@@ -1531,7 +1528,7 @@ impl HeaderSync {
         let tiebreaker_addr = pool.peer_addr_excluding(&exclude);
 
         if let Some(tb_addr) = tiebreaker_addr {
-            if let Some(tb_first) = self.fetch_first_header_hash(pool, &tb_addr, locator) {
+            if let Some(tb_first) = self.fetch_first_header_hash(pool, &tb_addr, locator, deadline) {
                 if tb_first == active_first_hash {
                     // Active + tiebreaker agree → witness is the liar.
                     warn!(
@@ -1573,15 +1570,18 @@ impl HeaderSync {
     /// Send a `getheaders` to a specific peer and return the first header
     /// hash from its response, or `None` on any failure (network, empty
     /// response, peer no longer in pool). This wraps the peer checkout/return
-    /// dance so the cross-check helper stays readable.
+    /// dance so the cross-check helper stays readable. `deadline` bounds the
+    /// whole exchange (wake budgets, ticket 028).
     fn fetch_first_header_hash(
         &self,
         pool: &mut PeerPool,
         addr: &str,
         locator: &[BlockHash],
+        deadline: Option<Instant>,
     ) -> Option<BlockHash> {
         let mut peer = pool.checkout_peer_by_addr(addr)?;
-        let result = peer.get_headers(locator.to_vec(), BlockHash::all_zeros());
+        let limit = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let result = peer.get_headers_within(locator.to_vec(), BlockHash::all_zeros(), limit);
         match result {
             Ok(headers) => {
                 pool.return_peer(peer);
@@ -1628,14 +1628,15 @@ impl HeaderSync {
     {
         // Reset shutdown flag so sync can be restarted after a stop
         self.shutdown_requested.store(false, Ordering::Relaxed);
-        self.run_sync(on_progress)
+        self.run_sync(&self.shutdown_requested, on_progress)
     }
 
-    /// `sync` without clearing a pending stop request. The FFI clears it
-    /// when its session begins, before waiting for transport and for the
-    /// node's session lock, so a Stop issued during those waits isn't lost
-    /// (ticket 028).
-    pub fn run_sync<F>(&self, on_progress: F) -> Result<(), SyncError>
+    /// `sync`, stopped by `stop` instead of the shared `stop_sync` flag.
+    /// The FFI gives every foreground session its own token (ticket 028):
+    /// a stop aimed at one session can't leak into the next, and a stop
+    /// issued while the session waits for transport or the node's session
+    /// lock still counts.
+    pub fn run_sync<F>(&self, stop: &AtomicBool, on_progress: F) -> Result<(), SyncError>
     where
         F: Fn(SyncStatus),
     {
@@ -1687,7 +1688,7 @@ impl HeaderSync {
 
         loop {
             // Check for shutdown request
-            if self.shutdown_requested.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
                 info!("Sync shutting down cleanly");
                 return Ok(());
             }
@@ -2011,7 +2012,7 @@ impl HeaderSync {
                 self.new_block_announced.store(false, Ordering::Relaxed);
 
                 while monitor_start.elapsed() < MONITOR_INTERVAL {
-                    if self.shutdown_requested.load(Ordering::Relaxed) {
+                    if stop.load(Ordering::Relaxed) {
                         break;
                     }
 
@@ -2166,6 +2167,7 @@ impl HeaderSync {
                 &active_addr,
                 active_first_hash,
                 strict,
+                None,
             ) {
                 HeaderCrossCheck::Accept => {}
                 HeaderCrossCheck::Reject => {
@@ -3047,10 +3049,18 @@ impl HeaderSync {
         let mut peer = peer.unwrap();
         let peer_addr = peer.addr().to_string();
 
-        let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
+        let headers = match peer.get_headers_within(
+            vec![tip_hash],
+            BlockHash::all_zeros(),
+            Some(budget.remaining()),
+        ) {
             Ok(h) => {
                 pool.return_peer(peer);
                 h
+            }
+            // Out of budget waiting for headers: nothing learned.
+            Err(_) if budget.should_stop() => {
+                return Ok(BlockNotification::no_update(tip_height, &tip_header));
             }
             Err(e) => {
                 return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
@@ -3279,10 +3289,18 @@ impl HeaderSync {
             .ok_or_else(|| SyncError::Peer("no peers available".into()))?;
         let peer_addr = peer.addr().to_string();
 
-        let headers = match peer.get_headers(vec![tip_hash], BlockHash::all_zeros()) {
+        let headers = match peer.get_headers_within(
+            vec![tip_hash],
+            BlockHash::all_zeros(),
+            Some(budget.remaining()),
+        ) {
             Ok(h) => {
                 pool.return_peer(peer);
                 h
+            }
+            // Out of budget waiting for headers: headers stay unchecked.
+            Err(_) if budget.should_stop() => {
+                return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
             }
             Err(e) => {
                 return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
@@ -3316,9 +3334,18 @@ impl HeaderSync {
                 &peer_addr,
                 active_first_hash,
                 strict,
+                Some(budget.deadline()),
             ) {
                 HeaderCrossCheck::Accept => {}
+                // The witness ran into our deadline: inconclusive, not an
+                // eclipse signal. Headers stay unchecked.
+                HeaderCrossCheck::Reject if budget.should_stop() => {
+                    info!("catch_up_blocks: budget spent during header cross-check");
+                    return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
+                }
                 HeaderCrossCheck::Reject => {
+                    // Headers were checked: peers disagree (possible eclipse).
+                    budget.mark(WakePhase::HeadersChecked);
                     warn!("catch_up_blocks: header cross-check rejected batch from {}", peer_addr);
                     let mut status = self.make_catchup_status(
                         false,
@@ -3688,6 +3715,19 @@ mod tests {
             Some(100 - BLOCK_NOT_RECEIVED_PENALTY as i32)
         );
         assert_eq!(pool.get_score(&servers[1].0), Some(100));
+    }
+
+    #[test]
+    fn fetch_requested_block_does_not_penalize_a_peer_our_deadline_cut_off() {
+        // A silent peer and a 200 ms budget: our deadline ends the request,
+        // which says nothing about the peer (ticket 028).
+        let (mut pool, servers) = loopback_pool(1);
+        let wanted_hash = synthetic_block(1).block_hash();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(200);
+        assert!(fetch_requested_block(&mut pool, wanted_hash, deadline).is_none());
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        assert_eq!(pool.get_score(&servers[0].0), Some(100));
     }
 
     #[test]

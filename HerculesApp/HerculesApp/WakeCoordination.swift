@@ -63,9 +63,9 @@ final class NodeSessionState {
     private var foregroundSessions = 0
     private var foregroundPreempted = false
     private var wakes: [ObjectIdentifier: WakeCancellable] = [:]
-    /// Wakes cancelled because foreground sync started, so their records
-    /// say "foreground" rather than "ran out of time".
-    private var cancelledByForeground: Set<ObjectIdentifier> = []
+    /// Why we (not iOS) cancelled a wake, so its record says "foreground"
+    /// or "reset" rather than "ran out of time".
+    private var cancelReasons: [ObjectIdentifier: WakeCancelReason] = [:]
 
     var isForegroundActive: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -77,9 +77,9 @@ final class NodeSessionState {
         return wakes.count
     }
 
-    func admitWake(_ token: WakeCancellable, appIsActive: Bool) -> Admission {
+    func admitWake(_ token: WakeCancellable, appInForeground: Bool) -> Admission {
         lock.lock(); defer { lock.unlock() }
-        if foregroundSessions > 0 && appIsActive {
+        if foregroundSessions > 0 && appInForeground {
             return .foregroundActive
         }
         wakes[ObjectIdentifier(token)] = token
@@ -95,16 +95,16 @@ final class NodeSessionState {
     /// The wake returned. `stoppedForegroundSync` is Rust's report. If it
     /// didn't have to stop a sync loop (the session was between Rust calls,
     /// e.g. downloading the snapshot), nothing needs restarting. Returns
-    /// true if foreground sync starting is what cancelled the wake.
+    /// why we cancelled the wake, if we did.
     @discardableResult
-    func finishWake(_ token: WakeCancellable, stoppedForegroundSync: Bool) -> Bool {
+    func finishWake(_ token: WakeCancellable, stoppedForegroundSync: Bool) -> WakeCancelReason {
         lock.lock(); defer { lock.unlock() }
         let id = ObjectIdentifier(token)
         wakes.removeValue(forKey: id)
         if !stoppedForegroundSync && wakes.isEmpty {
             foregroundPreempted = false
         }
-        return cancelledByForeground.remove(id) != nil
+        return cancelReasons.removeValue(forKey: id) ?? .none
     }
 
     /// Foreground sync is starting. Cancels in-flight wakes so the node's
@@ -114,7 +114,9 @@ final class NodeSessionState {
         foregroundSessions += 1
         foregroundPreempted = false
         let running = Array(wakes.values)
-        cancelledByForeground.formUnion(wakes.keys)
+        for id in wakes.keys where cancelReasons[id] == nil {
+            cancelReasons[id] = .foregroundStarted
+        }
         lock.unlock()
         running.forEach { $0.cancel() }
     }
@@ -129,10 +131,90 @@ final class NodeSessionState {
         return preempted
     }
 
+    /// The node is being reset: cancel every wake.
     func cancelAllWakes() {
         lock.lock()
         let running = Array(wakes.values)
+        for id in wakes.keys where cancelReasons[id] == nil {
+            cancelReasons[id] = .reset
+        }
         lock.unlock()
         running.forEach { $0.cancel() }
+    }
+}
+
+/// Why the app cancelled a wake (iOS cancelling it is `.none`).
+enum WakeCancelReason: Equatable {
+    case none
+    case foregroundStarted
+    case reset
+}
+
+/// What to do when a foreground sync session ends (ticket 028).
+enum ForegroundRestart: Equatable {
+    case none
+    /// Start sync again now (the app is on screen).
+    case now
+    /// Start sync again when the app next becomes active.
+    case whenActive
+
+    /// A background wake stopped the session (`preempted`). Its loop
+    /// either returned cleanly or, commonly after a long suspension with
+    /// dead sockets, with an error such as "all peers disconnected". Either
+    /// way it restarts, unless the user stopped it. The error from a
+    /// preempted session isn't shown.
+    static func decide(preempted: Bool, userStopped: Bool, appInForeground: Bool) -> ForegroundRestart {
+        guard preempted && !userStopped else { return .none }
+        return appInForeground ? .now : .whenActive
+    }
+}
+
+/// One foreground sync session's flags, readable from its background
+/// thread. `stopped`: the user pressed Stop; `retired`: a reset owns the
+/// node now, so this session must stop touching the UI and cancel what it
+/// can (a snapshot import).
+final class SyncSessionToken {
+    let generation: Int
+    private let lock = NSLock()
+    private var _stopped = false
+    private var _retired = false
+    private var _ended = false
+
+    init(generation: Int) {
+        self.generation = generation
+    }
+
+    var stopped: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _stopped
+    }
+
+    var retired: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _retired
+    }
+
+    /// Stopped or retired: don't start anything new.
+    var isOver: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _stopped || _retired
+    }
+
+    func stop() {
+        lock.lock(); _stopped = true; lock.unlock()
+    }
+
+    func retire() {
+        lock.lock(); _retired = true; lock.unlock()
+    }
+
+    /// The session's thread has returned.
+    var ended: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _ended
+    }
+
+    func markEnded() {
+        lock.lock(); _ended = true; lock.unlock()
     }
 }

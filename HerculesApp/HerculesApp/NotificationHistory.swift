@@ -13,6 +13,15 @@ enum NotificationSource: String, Codable {
     case transportSlow      // Transport not up with enough budget left for a block
     case wakeBusy           // Node busy (e.g. snapshot import) for the whole budget
     case wakeCancelled      // BG task expired or the push watchdog fired
+    case nodeReset          // Wake skipped or cancelled: the node is being reset
+    /// A source written by a newer version of the app. Decoding never fails
+    /// on one, so a downgrade keeps the history.
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = NotificationSource(rawValue: raw) ?? .unknown
+    }
 }
 
 /// Where a wake's time went, in milliseconds since it arrived (ticket 028).
@@ -69,6 +78,10 @@ enum NotificationHistory {
     /// (e.g. a push wake after reboot before first unlock — the file is
     /// `completeUntilFirstUserAuthentication`). Lets the caller avoid
     /// overwriting real history with an empty in-memory copy (ticket 030).
+    ///
+    /// Records are decoded one at a time and bad ones dropped, so one record
+    /// from a newer version doesn't cost the rest. If the file as a whole
+    /// doesn't parse, nil as well: the caller must not overwrite it.
     static func loadIfReadable() -> [BlockNotificationRecord]? {
         let data: Data
         do {
@@ -76,7 +89,23 @@ enum NotificationHistory {
         } catch {
             return FileManager.default.fileExists(atPath: filePath.path) ? nil : []
         }
-        return (try? JSONDecoder().decode([BlockNotificationRecord].self, from: data)) ?? []
+        return decode(data)
+    }
+
+    /// Lenient decode of a history file's contents (see `loadIfReadable`).
+    static func decode(_ data: Data) -> [BlockNotificationRecord]? {
+        guard let entries = try? JSONDecoder().decode([LossyRecord].self, from: data) else {
+            return nil
+        }
+        return entries.compactMap(\.record)
+    }
+
+    private struct LossyRecord: Decodable {
+        let record: BlockNotificationRecord?
+
+        init(from decoder: Decoder) throws {
+            record = try? BlockNotificationRecord(from: decoder)
+        }
     }
 
     static func save(_ records: [BlockNotificationRecord]) {

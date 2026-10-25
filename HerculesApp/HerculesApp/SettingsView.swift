@@ -116,6 +116,12 @@ struct SettingsView: View {
                     switchButton(to: .fromGenesis, label: "Switch to Genesis")
                 }
 
+                if snapshotBusy {
+                    Text("Switching is available once the snapshot has finished loading.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+
                 if let err = switchModeError {
                     Text(err)
                         .font(.system(size: 11, design: .monospaced))
@@ -143,7 +149,13 @@ struct SettingsView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
-        .disabled(isCurrent || viewModel.isResetting)
+        // Not mid-snapshot: an import can't be interrupted cleanly, and a
+        // reset would sit waiting for it (ticket 028).
+        .disabled(isCurrent || viewModel.isResetting || snapshotBusy)
+    }
+
+    private var snapshotBusy: Bool {
+        viewModel.isLoadingSnapshot || viewModel.isDownloadingSnapshot
     }
 
     // MARK: - Header
@@ -761,6 +773,8 @@ struct SettingsView: View {
         case .transportSlow: return "tortoise.fill"
         case .wakeBusy: return "hourglass"
         case .wakeCancelled: return "clock.badge.xmark"
+        case .nodeReset: return "arrow.counterclockwise"
+        case .unknown: return "questionmark.circle"
         }
     }
 
@@ -776,6 +790,8 @@ struct SettingsView: View {
         case .transportSlow: return Theme.warning
         case .wakeBusy: return Theme.textSecondary
         case .wakeCancelled: return Theme.error
+        case .nodeReset: return Theme.textSecondary
+        case .unknown: return Theme.textSecondary
         }
     }
 
@@ -791,6 +807,8 @@ struct SettingsView: View {
         case .transportSlow: return "Transport Slow"
         case .wakeBusy: return "Busy"
         case .wakeCancelled: return "Timed Out"
+        case .nodeReset: return "Reset"
+        case .unknown: return "Other"
         }
     }
 }

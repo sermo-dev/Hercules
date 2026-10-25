@@ -5,5 +5,7 @@
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
-swiftc -O "$HERE/../../HerculesApp/WakeCoordination.swift" "$HERE/main.swift" -o "$TMP/nodehosttest"
+trap 'rm -rf "$TMP"' EXIT
+swiftc -O "$HERE/../../HerculesApp/WakeCoordination.swift" "$HERE/../../HerculesApp/NotificationHistory.swift" \
+    "$HERE/main.swift" -o "$TMP/nodehosttest"
 "$TMP/nodehosttest"
