@@ -84,9 +84,10 @@ class SnapshotDownloader: NSObject, ObservableObject {
         get { taskLock.lock(); defer { taskLock.unlock() }; return _activeTask }
         set { taskLock.lock(); defer { taskLock.unlock() }; _activeTask = newValue }
     }
-    /// The task `cancel()` cancelled, so its `NSURLErrorCancelled` isn't
-    /// taken for iOS cancelling the download (ticket 051). Under `taskLock`.
-    private var userCancelledTaskID: Int?
+    /// Tasks `cancel()` cancelled, so their completion isn't taken for iOS
+    /// cancelling the download or for a failure worth resuming (ticket
+    /// 051). Under `taskLock`.
+    private var userCancelledTaskIDs = Set<Int>()
 
     private override init() {
         super.init()
@@ -232,7 +233,7 @@ class SnapshotDownloader: NSObject, ObservableObject {
         let task = _activeTask
         _activeTask = nil
         if let task = task {
-            userCancelledTaskID = task.taskIdentifier
+            userCancelledTaskIDs.insert(task.taskIdentifier)
         }
         taskLock.unlock()
         task?.cancel()
@@ -313,9 +314,13 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
             return
         }
 
-        // Validate HTTP status — R2 returns 200 on success, 403/404 on missing.
-        if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
+        // Validate HTTP status — R2 returns 200 on success (206 when the
+        // download was resumed from resume data), 403/404 on missing.
+        if let http = downloadTask.response as? HTTPURLResponse,
+           http.statusCode != 200 && http.statusCode != 206 {
             try? fm.removeItem(at: dest)
+            // Resuming would only replay the same error response forever.
+            Self.deleteResumeData()
             DispatchQueue.main.async {
                 self.status = .failed("Server returned HTTP \(http.statusCode)")
                 self.activeTask = nil
@@ -342,23 +347,38 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         guard let error = error else { return }   // success path handled above
         let nsErr = error as NSError
         // User-initiated cancel — already handled by `cancel()`, which also
-        // wipes the resume data blob. Nothing to do here. Any other cancel
-        // is iOS's own (force-quit, Background App Refresh turned off, low
-        // resources: `NSURLErrorBackgroundTaskCancelledReasonKey`); it
-        // carries resume data and is handled as a failure below, which also
-        // releases a waiting `awaitSnapshotDownload` (ticket 051).
-        if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled
-            && consumeUserCancel(of: task) {
+        // wipes the resume data blob and reports the cancel. Nothing to do
+        // here, whatever the error (it may end with a network error rather
+        // than NSURLErrorCancelled; saving its resume data would undo the
+        // wipe). Any other cancel is iOS's own (force-quit, Background App
+        // Refresh turned off, low resources:
+        // `NSURLErrorBackgroundTaskCancelledReasonKey`); it carries resume
+        // data and is handled as a failure below, which also releases a
+        // waiting `awaitSnapshotDownload` (ticket 051).
+        if consumeUserCancel(of: task) {
             return
         }
+
+        // A task that is no longer ours (a new download has started since)
+        // must not clear the new one or fail its waiter. Its resume data is
+        // still kept if nothing else is running, e.g. a task from the
+        // previous process reporting after relaunch.
+        taskLock.lock()
+        let isActive = _activeTask === task
+        let noneActive = _activeTask == nil
+        if isActive {
+            _activeTask = nil
+        }
+        taskLock.unlock()
+        guard isActive || noneActive else { return }
 
         // Network/server failure, app force-quit, or a system cancel.
         // Capture the resume data blob (if any) so the next start() picks
         // up where we left off via an HTTP Range request. Without fresh
         // resume data, a lost network or a system cancel keeps the previous
-        // blob (still the best place to resume from); anything else (e.g. the blob
-        // itself was stale) wipes it so we don't try to resume into a
-        // now-broken state.
+        // blob (still the best place to resume from); anything else (e.g.
+        // the blob itself was stale) wipes it so we don't try to resume
+        // into a now-broken state.
         let suffix: String
         if let resumeData = nsErr.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
             Self.saveResumeData(resumeData)
@@ -369,18 +389,16 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
             Self.deleteResumeData()
             suffix = ""
         }
+        guard isActive else { return }
         DispatchQueue.main.async {
             self.status = .failed("Download failed: \(error.localizedDescription)\(suffix)")
-            self.activeTask = nil
         }
     }
 
-    /// True (once) if `task` is the one `cancel()` cancelled.
+    /// True (once) if `cancel()` cancelled `task`.
     private func consumeUserCancel(of task: URLSessionTask) -> Bool {
         taskLock.lock(); defer { taskLock.unlock() }
-        guard userCancelledTaskID == task.taskIdentifier else { return false }
-        userCancelledTaskID = nil
-        return true
+        return userCancelledTaskIDs.remove(task.taskIdentifier) != nil
     }
 
     /// The network went away mid-download, or iOS cancelled the task, as
