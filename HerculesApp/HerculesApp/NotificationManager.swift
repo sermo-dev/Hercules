@@ -515,10 +515,13 @@ class NotificationManager: ObservableObject {
                     fetchResult: .noData,
                     notify: false
                 )
-            case let .ran(report, nodeReadyMs, nodeReused, peerCount):
+            case let .ran(report, nodeReadyMs, nodeReused, peerCount, cancelledByForeground):
                 let timings = Self.timings(report, trigger: trigger, nodeReadyMs: nodeReadyMs, nodeReused: nodeReused)
                 switch report.outcome {
-                case .completed, .cancelled:
+                case .completed, .cancelled, .timedOut:
+                    // A status counts only if headers were checked against
+                    // peers (completed) or blocks were actually validated;
+                    // otherwise it is just the local tip.
                     if let status = report.status, report.outcome == .completed || status.blocksValidated > 0 {
                         var record = Self.makeRecord(from: status, receivedAt: receivedAt)
                         record.wakeTimings = timings
@@ -528,9 +531,18 @@ class NotificationManager: ObservableObject {
                             notify: true
                         )
                     }
+                    if cancelledByForeground {
+                        // Foreground sync started and took over the node.
+                        return WakeRun(
+                            record: fromPayload(.foregroundActive, nil, timings),
+                            fetchResult: .noData, notify: false
+                        )
+                    }
+                    let why = report.outcome == .timedOut
+                        ? (report.error ?? "Budget spent before peers answered")
+                        : "Cancelled at \(report.elapsedMs) ms"
                     return WakeRun(
-                        record: fromPayload(.wakeCancelled, "Cancelled at \(report.elapsedMs) ms", timings),
-                        status: report.status, peerCount: peerCount,
+                        record: fromPayload(.wakeCancelled, why, timings),
                         fetchResult: .failed, notify: pushBlock != nil
                     )
                 case .transportSlow:
@@ -850,11 +862,13 @@ class NotificationManager: ObservableObject {
                 budget: budget, receivedAt: receivedAt, pushBlock: nil,
                 appIsActive: Self.appIsActiveNow(), trigger: "refresh"
             )
+            // Published even if expiration already completed the task, so a
+            // late result still reaches history and the widget.
+            self.publish(
+                run, budget: budget, pushBlock: nil, activity: NoopWakeActivityController(),
+                initialHeight: 0, initialPeers: 0, isPush: false
+            )
             gate.fire {
-                self.publish(
-                    run, budget: budget, pushBlock: nil, activity: NoopWakeActivityController(),
-                    initialHeight: 0, initialPeers: 0, isPush: false
-                )
                 task.setTaskCompleted(success: run.status != nil)
             }
         }

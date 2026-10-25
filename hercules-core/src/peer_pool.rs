@@ -643,6 +643,20 @@ impl PeerPool {
         params: &'static ChainParams,
         source: PeerSource,
     ) -> Result<PeerPool, PeerError> {
+        PeerPool::new_until(our_height, tor, peers_db_path, params, source, None)
+    }
+
+    /// `new`, but the initial connect pass starts no new connection after
+    /// `connect_deadline` (ticket 028: a wake's budget). An attempt already
+    /// in flight runs to its own connect timeout.
+    pub fn new_until(
+        our_height: u32,
+        tor: Option<Arc<TorManager>>,
+        peers_db_path: Option<&str>,
+        params: &'static ChainParams,
+        source: PeerSource,
+        connect_deadline: Option<Instant>,
+    ) -> Result<PeerPool, PeerError> {
         // Open the persistence store and hydrate any existing bans + known
         // addresses. Failures are logged but non-fatal — the pool still works
         // without persistence (just slower to find peers on first launch).
@@ -721,7 +735,7 @@ impl PeerPool {
             source,
         };
 
-        pool.maintain();
+        pool.maintain_until(connect_deadline);
 
         let count = pool.slots.lock().unwrap().len();
         if count == 0 {
@@ -734,6 +748,11 @@ impl PeerPool {
 
     /// Try to fill the pool up to `MAX_OUTBOUND` connections.
     pub fn maintain(&mut self) {
+        self.maintain_until(None)
+    }
+
+    /// `maintain`, starting no new connection after `connect_deadline`.
+    fn maintain_until(&mut self, connect_deadline: Option<Instant>) {
         // Expire old bans and enforce max size
         let now = Instant::now();
         let expired: Vec<String> = self
@@ -886,6 +905,10 @@ impl PeerPool {
 
         for addr in candidates {
             if connected >= needed {
+                break;
+            }
+            if connect_deadline.is_some_and(|d| Instant::now() >= d) {
+                info!("PeerPool: connect deadline reached after {} new connections", connected);
                 break;
             }
             if refill_started.elapsed() >= REFILL_BUDGET {

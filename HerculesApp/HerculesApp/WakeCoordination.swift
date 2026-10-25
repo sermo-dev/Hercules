@@ -63,6 +63,9 @@ final class NodeSessionState {
     private var foregroundSessions = 0
     private var foregroundPreempted = false
     private var wakes: [ObjectIdentifier: WakeCancellable] = [:]
+    /// Wakes cancelled because foreground sync started, so their records
+    /// say "foreground" rather than "ran out of time".
+    private var cancelledByForeground: Set<ObjectIdentifier> = []
 
     var isForegroundActive: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -91,13 +94,17 @@ final class NodeSessionState {
 
     /// The wake returned. `stoppedForegroundSync` is Rust's report. If it
     /// didn't have to stop a sync loop (the session was between Rust calls,
-    /// e.g. downloading the snapshot), nothing needs restarting.
-    func finishWake(_ token: WakeCancellable, stoppedForegroundSync: Bool) {
+    /// e.g. downloading the snapshot), nothing needs restarting. Returns
+    /// true if foreground sync starting is what cancelled the wake.
+    @discardableResult
+    func finishWake(_ token: WakeCancellable, stoppedForegroundSync: Bool) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        wakes.removeValue(forKey: ObjectIdentifier(token))
+        let id = ObjectIdentifier(token)
+        wakes.removeValue(forKey: id)
         if !stoppedForegroundSync && wakes.isEmpty {
             foregroundPreempted = false
         }
+        return cancelledByForeground.remove(id) != nil
     }
 
     /// Foreground sync is starting. Cancels in-flight wakes so the node's
@@ -107,6 +114,7 @@ final class NodeSessionState {
         foregroundSessions += 1
         foregroundPreempted = false
         let running = Array(wakes.values)
+        cancelledByForeground.formUnion(wakes.keys)
         lock.unlock()
         running.forEach { $0.cancel() }
     }

@@ -69,6 +69,7 @@ enum WakeOutcome {
     "TransportSlow",
     "Busy",
     "Cancelled",
+    "TimedOut",
     "Failed",
 };
 
@@ -166,6 +167,10 @@ interface HerculesNode {
 
     WakeReport wake_catch_up(WakeBudget budget, u32 max_blocks, u32 min_block_ms);
 
+    // Shut down for good (before a reset). True if the running session
+    // ended within the timeout.
+    boolean close(u32 timeout_ms);
+
     [Throws=HerculesError]
     SyncStatus get_status();
 
@@ -225,6 +230,7 @@ interface HerculesError {
     NetworkError(string msg);
     TorError(string msg);
     SnapshotInvalid(string msg);
+    NodeOpen(string msg);
 };
 
 [Error]

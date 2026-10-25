@@ -130,12 +130,13 @@ const POLL: Duration = Duration::from_millis(50);
 /// Wait until `try_acquire` succeeds, polling every 50 ms. Stops when the
 /// budget is spent or cancelled, or when less than `floor` would be left
 /// (not enough to do anything useful). `on_busy` runs before each retry;
-/// the node uses it to ask a running sync loop to stop.
+/// the node uses it to ask a running sync loop to stop, and returns false
+/// to give up at once (the holder won't let go within a wake budget).
 pub fn acquire_within<T>(
     budget: &WakeBudget,
     floor: Duration,
     mut try_acquire: impl FnMut() -> Option<T>,
-    mut on_busy: impl FnMut(),
+    mut on_busy: impl FnMut() -> bool,
 ) -> Option<T> {
     loop {
         if let Some(t) = try_acquire() {
@@ -144,7 +145,9 @@ pub fn acquire_within<T>(
         if budget.should_stop() || budget.remaining() < floor {
             return None;
         }
-        on_busy();
+        if !on_busy() {
+            return None;
+        }
         std::thread::sleep(POLL.min(budget.remaining()));
     }
 }
@@ -365,10 +368,22 @@ mod tests {
             &b,
             Duration::ZERO,
             || (tries.fetch_add(1, Ordering::SeqCst) >= 3).then_some(7),
-            || busy_calls += 1,
+            || {
+                busy_calls += 1;
+                true
+            },
         );
         assert_eq!(got, Some(7));
         assert_eq!(busy_calls, 3);
+    }
+
+    #[test]
+    fn acquire_within_gives_up_when_on_busy_says_so() {
+        let b = WakeBudget::new(60_000);
+        let start = Instant::now();
+        let got: Option<()> = acquire_within(&b, Duration::ZERO, || None, || false);
+        assert!(got.is_none());
+        assert!(start.elapsed() < Duration::from_millis(20));
     }
 
     #[test]
@@ -376,7 +391,7 @@ mod tests {
         // 300 ms budget, 200 ms floor: gives up after ~100 ms.
         let b = WakeBudget::new(300);
         let start = Instant::now();
-        let got: Option<()> = acquire_within(&b, Duration::from_millis(200), || None, || {});
+        let got: Option<()> = acquire_within(&b, Duration::from_millis(200), || None, || true);
         assert!(got.is_none());
         let waited = start.elapsed();
         assert!(waited >= Duration::from_millis(90), "{:?}", waited);
@@ -389,7 +404,7 @@ mod tests {
             b2.cancel();
         });
         let start = Instant::now();
-        let got: Option<()> = acquire_within(&b, Duration::ZERO, || None, || {});
+        let got: Option<()> = acquire_within(&b, Duration::ZERO, || None, || true);
         canceller.join().unwrap();
         assert!(got.is_none());
         assert!(start.elapsed() < Duration::from_secs(2));

@@ -85,6 +85,14 @@ pub fn hercules_version() -> String {
 /// this `db_path` before calling this — open file handles will silently keep
 /// the inodes alive on POSIX, leaving stale state behind.
 pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
+    // Ticket 028: never unlink files under a live node. Its LMDB env would
+    // keep the deleted inodes, and heed would hand that stale env to the
+    // next open of the same path.
+    if PathClaim::is_claimed(&db_path) {
+        return Err(HerculesError::NodeOpen {
+            msg: format!("a node is still open for {}", db_path),
+        });
+    }
     // Mirror the path-derivation logic in `HeaderSync::new`. Keep in sync.
     let utxo_dir = sync::derive_sibling_path(&db_path, "utxo-lmdb");
     let blocks_path = sync::derive_sibling_path(&db_path, "blocks.sqlite3");
@@ -274,6 +282,9 @@ pub enum WakeOutcome {
     /// The budget was cancelled. `status` has partial progress if
     /// catch-up had started.
     Cancelled,
+    /// The budget ran out before headers were checked against any peer
+    /// (e.g. slow connects). `status` reflects only the local tip.
+    TimedOut,
     /// Catch-up or transport failed; see `error`.
     Failed,
 }
@@ -366,6 +377,10 @@ pub enum HerculesError {
     TorError { msg: String },
     #[error("Snapshot rejected: {msg}")]
     SnapshotInvalid { msg: String },
+    /// Another `HerculesNode` for this database is still alive in this
+    /// process (ticket 028), or this node was closed.
+    #[error("Node open: {msg}")]
+    NodeOpen { msg: String },
 }
 
 pub trait SyncCallback: Send + Sync {
@@ -384,6 +399,22 @@ fn map_sync_error(e: sync::SyncError) -> HerculesError {
     }
 }
 
+/// Removes a wake's budget from `HerculesNode::wakes` when it returns.
+struct WakeRegistration<'a> {
+    node: &'a HerculesNode,
+    budget: &'a Arc<WakeBudget>,
+}
+
+impl Drop for WakeRegistration<'_> {
+    fn drop(&mut self) {
+        self.node
+            .wakes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|b| !Arc::ptr_eq(b, self.budget));
+    }
+}
+
 /// How long the blocking paths (the legacy constructor, foreground sync)
 /// wait for Tor. Arti gives up on its own after 120 s.
 const FOREGROUND_TRANSPORT_WAIT: Duration = Duration::from_secs(150);
@@ -391,12 +422,54 @@ const FOREGROUND_TRANSPORT_WAIT: Duration = Duration::from_secs(150);
 /// Tor client that bootstraps in the background (ticket 028).
 type TorGate = TransportGate<Arc<TorManager>>;
 
-/// Clears `HerculesNode::sync_running` when `start_header_sync` returns.
-struct SyncRunning<'a>(&'a AtomicBool);
+/// Sets a flag for as long as it lives (`sync_running`, `snapshot_loading`).
+struct FlagGuard<'a>(&'a AtomicBool);
 
-impl Drop for SyncRunning<'_> {
+impl<'a> FlagGuard<'a> {
+    fn set(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        FlagGuard(flag)
+    }
+}
+
+impl Drop for FlagGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Database paths with a live `HerculesNode` in this process.
+static OPEN_NODES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// One node per database per process (ticket 028). Held by the node and
+/// released when it is dropped, after its stores have closed.
+struct PathClaim(String);
+
+impl PathClaim {
+    fn take(db_path: &str) -> Result<PathClaim, HerculesError> {
+        let mut open = OPEN_NODES.lock().unwrap_or_else(|e| e.into_inner());
+        if open.iter().any(|p| p == db_path) {
+            return Err(HerculesError::NodeOpen {
+                msg: format!("a node is already open for {}", db_path),
+            });
+        }
+        open.push(db_path.to_string());
+        Ok(PathClaim(db_path.to_string()))
+    }
+
+    fn is_claimed(db_path: &str) -> bool {
+        OPEN_NODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|p| p == db_path)
+    }
+}
+
+impl Drop for PathClaim {
+    fn drop(&mut self) {
+        let mut open = OPEN_NODES.lock().unwrap_or_else(|e| e.into_inner());
+        open.retain(|p| p != &self.0);
     }
 }
 
@@ -419,11 +492,31 @@ pub struct HerculesNode {
     /// True while `start_header_sync` holds `session`, so a wake knows a
     /// stop request will free it.
     sync_running: AtomicBool,
+    /// True while `load_snapshot` holds `session`. It can't be preempted,
+    /// so a wake gives up at once rather than wait out its budget.
+    snapshot_loading: AtomicBool,
+    /// Set by `close`: every later session is refused.
+    closed: AtomicBool,
+    /// Budgets of the wakes running now, so `close` can cancel them.
+    wakes: Mutex<Vec<Arc<WakeBudget>>>,
     wallet_rpc: Mutex<Option<WalletRpcHandle>>,
     /// Persisted auth token for wallet API connections.
     wallet_auth_token: Mutex<Option<String>>,
     /// Path to the directory where we persist wallet API secrets.
     data_dir: String,
+    /// Last field, so it is released after the stores above have closed.
+    _claim: PathClaim,
+}
+
+impl Drop for HerculesNode {
+    fn drop(&mut self) {
+        // The wallet RPC thread holds the syncer; stop it so the stores
+        // close with the node.
+        let running = self.wallet_rpc.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if running {
+            self.stop_wallet_api();
+        }
+    }
 }
 
 impl HerculesNode {
@@ -447,6 +540,9 @@ impl HerculesNode {
     /// on a background thread. Peer sessions wait for it (bounded by
     /// their budget) and never fall back to clearnet.
     pub fn open(db_path: String, tor_data_dir: Option<String>) -> Result<Self, HerculesError> {
+        // Before any store opens: a second node on these files would share
+        // the first one's LMDB env (heed returns it) and race it.
+        let claim = PathClaim::take(&db_path)?;
         let mut syncer =
             sync::HeaderSync::new(&db_path, None).map_err(|e| HerculesError::StorageError {
                 msg: format!("{}", e),
@@ -498,10 +594,54 @@ impl HerculesNode {
             tor,
             session: Mutex::new(()),
             sync_running: AtomicBool::new(false),
+            snapshot_loading: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            wakes: Mutex::new(Vec::new()),
             wallet_rpc: Mutex::new(None),
             wallet_auth_token: Mutex::new(None),
             data_dir,
+            _claim: claim,
         })
+    }
+
+    /// Shut the node down for good, e.g. before a reset (ticket 028).
+    /// Stops the sync loop, cancels running wakes, ends transport waits,
+    /// stops the wallet API, and refuses every later session. Waits up to
+    /// `timeout_ms` for the running session to end; true if it did.
+    ///
+    /// The files stay open until the last reference to the node is
+    /// dropped; `reset_database` refuses until then.
+    pub fn close(&self, timeout_ms: u32) -> bool {
+        self.closed.store(true, Ordering::SeqCst);
+        log::info!("HerculesNode: closing");
+        for budget in self.wakes.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            budget.cancel();
+        }
+        if self.wallet_rpc.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            self.stop_wallet_api();
+        }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        loop {
+            self.syncer.stop_sync();
+            if self.try_lock_session().is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                log::warn!("HerculesNode: session still busy after {} ms", timeout_ms);
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn closed_error() -> HerculesError {
+        HerculesError::NodeOpen {
+            msg: "node closed".into(),
+        }
     }
 
     fn lock_session(&self) -> MutexGuard<'_, ()> {
@@ -530,14 +670,19 @@ impl HerculesNode {
     /// Wait up to `timeout_ms` for the transport. True when it's up (always,
     /// for clearnet), false on timeout; a failed Tor bootstrap is an error
     /// (the next wait retries it).
+    /// Returns early with `NodeOpen` if the node is closed meanwhile.
     pub fn wait_for_transport(&self, timeout_ms: u32) -> Result<bool, HerculesError> {
+        if self.is_closed() {
+            return Err(Self::closed_error());
+        }
         let Some(ref gate) = self.tor else {
             return Ok(true);
         };
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-        match gate.wait_until(deadline, Duration::ZERO, || false) {
+        match gate.wait_until(deadline, Duration::ZERO, || self.is_closed()) {
             Ok(_) => Ok(true),
             Err(TransportWait::Slow) => Ok(false),
+            Err(TransportWait::Cancelled) => Err(Self::closed_error()),
             Err(e) => Err(HerculesError::TorError {
                 msg: transport_wait_message(&e),
             }),
@@ -564,6 +709,15 @@ impl HerculesNode {
         min_block_ms: u32,
     ) -> WakeReport {
         let floor = Duration::from_millis(min_block_ms as u64);
+        // Registered so `close` can cancel it; a closed node cancels at once.
+        self.wakes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::clone(&budget));
+        let _registered = WakeRegistration { node: self, budget: &budget };
+        if self.is_closed() {
+            budget.cancel();
+        }
         let report = |outcome, status: Option<CatchUpStatus>, preempted_sync, error| WakeReport {
             outcome,
             status,
@@ -588,6 +742,10 @@ impl HerculesNode {
             floor,
             || self.try_lock_session(),
             || {
+                if self.snapshot_loading.load(Ordering::SeqCst) {
+                    // Can't be stopped, and outlasts any wake budget.
+                    return false;
+                }
                 if self.sync_running.load(Ordering::SeqCst) {
                     if !preempted {
                         log::info!("wake: stopping the running sync loop");
@@ -595,6 +753,7 @@ impl HerculesNode {
                     preempted = true;
                     self.syncer.stop_sync();
                 }
+                true
             },
         );
         let Some(_session) = session else {
@@ -644,6 +803,14 @@ impl HerculesNode {
         }
 
         match self.syncer.catch_up_blocks_in(max_blocks, &budget) {
+            // Out of budget before any peer answered for the headers: the
+            // status only reflects the local tip, so it is no "Validated".
+            Ok(status) if budget.marks().headers_checked_ms.is_none() => report(
+                cancelled_or(WakeOutcome::TimedOut),
+                Some(status.into()),
+                preempted,
+                Some("budget spent before headers were checked".into()),
+            ),
             Ok(status) => report(
                 cancelled_or(WakeOutcome::Completed),
                 Some(status.into()),
@@ -672,17 +839,27 @@ impl HerculesNode {
     /// Run the foreground sync loop. Blocks until stopped (or a wake
     /// preempts it in the background). Waits for the transport first, then
     /// for any wake still holding the node.
+    ///
+    /// A `stop_sync` issued while it waits is honored: the stop flag is
+    /// cleared here, at the start, not when the loop begins.
     pub fn start_header_sync(&self, callback: Box<dyn SyncCallback>) -> Result<(), HerculesError> {
+        self.syncer.clear_stop();
         if !self.wait_for_transport(FOREGROUND_TRANSPORT_WAIT.as_millis() as u32)? {
             return Err(HerculesError::TorError {
                 msg: "Tor bootstrap timed out".into(),
             });
         }
         let _session = self.lock_session();
-        self.sync_running.store(true, Ordering::SeqCst);
-        let _running = SyncRunning(&self.sync_running);
+        if self.is_closed() {
+            return Err(Self::closed_error());
+        }
+        if self.syncer.stop_requested() {
+            log::info!("Sync stopped before it started");
+            return Ok(());
+        }
+        let _running = FlagGuard::set(&self.sync_running);
         self.syncer
-            .sync(|status| {
+            .run_sync(|status| {
                 callback.on_progress(status.into());
             })
             .map_err(map_sync_error)
@@ -730,6 +907,10 @@ impl HerculesNode {
         callback: Box<dyn SnapshotCallback>,
     ) -> Result<SnapshotInfo, HerculesError> {
         let _session = self.lock_session();
+        if self.is_closed() {
+            return Err(Self::closed_error());
+        }
+        let _loading = FlagGuard::set(&self.snapshot_loading);
         let meta = self
             .syncer
             .load_snapshot(&snapshot_path, |loaded, total| {
@@ -776,6 +957,9 @@ impl HerculesNode {
     ) -> Result<BlockNotification, HerculesError> {
         let budget = WakeBudget::new(timeout_secs.saturating_mul(1000));
         let _session = self.try_lock_session().ok_or_else(Self::busy_error)?;
+        if self.is_closed() {
+            return Err(Self::closed_error());
+        }
         self.wait_transport_for(&budget)?;
         self.syncer
             .validate_latest_block_in(&budget)
@@ -795,6 +979,9 @@ impl HerculesNode {
     ) -> Result<CatchUpStatus, HerculesError> {
         let budget = WakeBudget::new(budget_secs.saturating_mul(1000));
         let _session = self.try_lock_session().ok_or_else(Self::busy_error)?;
+        if self.is_closed() {
+            return Err(Self::closed_error());
+        }
         self.wait_transport_for(&budget)?;
         self.syncer
             .catch_up_blocks_in(max_blocks, &budget)

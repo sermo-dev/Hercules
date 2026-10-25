@@ -91,5 +91,20 @@ check(s.inFlightWakes == 0, "s9 every wake deregistered")
 _ = s.endForeground()
 check(!s.isForegroundActive, "s9 foreground ended")
 
+// 10. a wake cancelled by foreground starting is attributed to it (so its
+//     record says "foreground", not "ran out of time"); others are not
+s = NodeSessionState()
+let early = Token(), late = Token()
+_ = s.admitWake(early, appIsActive: false)
+s.beginForeground()
+check(s.finishWake(early, stoppedForegroundSync: false), "s10 wake cancelled by foreground start is attributed")
+_ = s.endForeground()
+_ = s.admitWake(late, appIsActive: false)
+check(!s.finishWake(late, stoppedForegroundSync: false), "s10 later wake not attributed")
+let reset = Token()
+_ = s.admitWake(reset, appIsActive: false)
+s.cancelAllWakes()
+check(!s.finishWake(reset, stoppedForegroundSync: false) && reset.cancels == 1, "s10 reset cancel is not foreground")
+
 print(fails == 0 ? "ALL PASS" : "\(fails) FAILED")
 exit(fails == 0 ? 0 : 1)

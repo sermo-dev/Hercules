@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::block::Block;
 use bitcoin::consensus::{Decodable, Encodable};
@@ -91,6 +91,34 @@ impl Read for PeerStream {
             PeerStream::Direct(tcp) => tcp.read(buf),
             PeerStream::Tor(tor) => tor.read(buf),
         }
+    }
+}
+
+/// An absolute read deadline (ticket 028): every `read` gets the time left
+/// until `at`, capped at `cap`, so a peer trickling bytes can't stretch one
+/// message (or a run of them) past the deadline.
+#[derive(Clone, Copy)]
+struct ReadDeadline {
+    at: Instant,
+    cap: Duration,
+}
+
+/// `PeerStream` reads bounded by a `ReadDeadline`.
+struct DeadlineReader<'a> {
+    stream: &'a mut PeerStream,
+    deadline: ReadDeadline,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.deadline.at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "read deadline passed"));
+        }
+        // A zero timeout means "block forever" to the socket API.
+        let timeout = left.min(self.deadline.cap).max(Duration::from_millis(1));
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.read(buf)
     }
 }
 
@@ -470,9 +498,20 @@ impl Peer {
     /// matching Bitcoin Core). Returns `PeerError::Timeout` on read timeout
     /// for reliable detection by `poll_message()`.
     pub fn receive(&mut self) -> Result<NetworkMessage, PeerError> {
+        self.receive_until(None)
+    }
+
+    /// `receive` with every read bounded by `deadline`, if set.
+    fn receive_until(&mut self, deadline: Option<ReadDeadline>) -> Result<NetworkMessage, PeerError> {
+        let stream = &mut self.stream;
+        let mut read_exact = |buf: &mut [u8]| match deadline {
+            Some(deadline) => DeadlineReader { stream: &mut *stream, deadline }.read_exact(buf),
+            None => stream.read_exact(buf),
+        };
+
         // Read the 24-byte P2P message header
         let mut header = [0u8; 24];
-        self.stream.read_exact(&mut header).map_err(|e| {
+        read_exact(&mut header).map_err(|e| {
             if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
                 PeerError::Timeout
             } else {
@@ -492,7 +531,7 @@ impl Peer {
         // Read the payload
         let mut payload = vec![0u8; payload_len as usize];
         if payload_len > 0 {
-            self.stream.read_exact(&mut payload).map_err(|e| {
+            read_exact(&mut payload).map_err(|e| {
                 if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
                     PeerError::Timeout
                 } else {
@@ -557,9 +596,10 @@ impl Peer {
         self.get_block_within(block_hash, None)
     }
 
-    /// `get_block` with the read timeout clamped to `limit` (ticket 028):
-    /// a wake passes the time left in its budget so one slow peer can't
-    /// hold the request past the iOS window. Clamped to at least 1 s.
+    /// `get_block` bounded by `limit` (ticket 028): a wake passes the time
+    /// left in its budget so one slow peer can't hold the request past the
+    /// iOS window. The limit is an absolute deadline across every read of
+    /// the request, not a per-read timeout. At least 1 s.
     pub fn get_block_within(
         &mut self,
         block_hash: BlockHash,
@@ -570,10 +610,10 @@ impl Peer {
             PeerStream::Direct(_) => BLOCK_DOWNLOAD_TIMEOUT,
             PeerStream::Tor(_) => TOR_BLOCK_DOWNLOAD_TIMEOUT,
         };
-        let download_timeout = match limit {
-            Some(l) => download_timeout.min(l.max(Duration::from_secs(1))),
-            None => download_timeout,
-        };
+        let deadline = limit.map(|l| ReadDeadline {
+            at: Instant::now() + l.max(Duration::from_secs(1)),
+            cap: download_timeout,
+        });
         let normal_timeout = match &self.stream {
             PeerStream::Direct(_) => READ_TIMEOUT,
             PeerStream::Tor(_) => TOR_READ_TIMEOUT,
@@ -586,7 +626,7 @@ impl Peer {
         let inv = vec![Inventory::WitnessBlock(block_hash)];
         self.send(NetworkMessage::GetData(inv))?;
 
-        let result = self.receive_block(block_hash);
+        let result = self.receive_block(block_hash, deadline);
 
         // Restore normal read timeout
         self.stream
@@ -604,10 +644,14 @@ impl Peer {
     /// never be mistaken for the requested one. Running out of the message
     /// bound, skipping more than `MAX_UNREQUESTED_BLOCKS`, or hitting the
     /// read timeout yields `BlockNotReceived`.
-    fn receive_block(&mut self, expected: BlockHash) -> Result<Block, PeerError> {
+    fn receive_block(
+        &mut self,
+        expected: BlockHash,
+        deadline: Option<ReadDeadline>,
+    ) -> Result<Block, PeerError> {
         let mut skipped_blocks = 0;
         for _ in 0..20 {
-            let msg = match self.receive() {
+            let msg = match self.receive_until(deadline) {
                 Ok(m) => m,
                 Err(PeerError::Timeout) => {
                     return Err(PeerError::BlockNotReceived { expected });
@@ -1251,11 +1295,41 @@ pub(crate) mod tests {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set timeout");
 
-        match peer.receive_block(wanted_hash) {
+        match peer.receive_block(wanted_hash, None) {
             Err(PeerError::BlockNotReceived { expected }) => assert_eq!(expected, wanted_hash),
             Ok(b) => panic!("returned wrong block {}", b.block_hash()),
             Err(e) => panic!("expected BlockNotReceived, got {}", e),
         }
+    }
+
+    #[test]
+    fn get_block_within_bounds_a_trickling_peer() {
+        // The peer drips the block a few bytes at a time, each chunk well
+        // inside any per-read timeout. Only an absolute deadline stops it.
+        let (mut peer, mut server) = loopback_peer_pair();
+        let block = synthetic_block(1);
+        let hash = block.block_hash();
+        let mut bytes = Vec::new();
+        RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::Block(block))
+            .consensus_encode(&mut bytes)
+            .unwrap();
+        let dripper = std::thread::spawn(move || {
+            for chunk in bytes.chunks(4) {
+                if server.write_all(chunk).and_then(|_| server.flush()).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let start = Instant::now();
+        let result = peer.get_block_within(hash, Some(Duration::from_secs(1)));
+        let took = start.elapsed();
+        assert!(result.is_err(), "block can't arrive in time");
+        // Unbounded, this takes ~(bytes / 4) * 100 ms, several seconds.
+        assert!(took < Duration::from_millis(1_800), "took {:?}", took);
+        drop(peer);
+        dripper.join().unwrap();
     }
 
     #[test]

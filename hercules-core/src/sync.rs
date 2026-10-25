@@ -1367,15 +1367,26 @@ impl HeaderSync {
     /// Open a fresh `PeerPool` for one sync session, using this node's chain
     /// params and peer source.
     fn open_pool(&self, our_height: u32) -> Result<PeerPool, SyncError> {
+        self.open_pool_until(our_height, None)
+    }
+
+    /// `open_pool` that stops dialing new peers at `connect_deadline`
+    /// (wake paths, ticket 028).
+    fn open_pool_until(
+        &self,
+        our_height: u32,
+        connect_deadline: Option<Instant>,
+    ) -> Result<PeerPool, SyncError> {
         if self.tor_required && self.tor().is_none() {
             return Err(SyncError::Peer("Tor transport not ready".into()));
         }
-        PeerPool::new(
+        PeerPool::new_until(
             our_height,
             self.tor().cloned(),
             self.peers_db_path.as_deref(),
             self.params,
             self.peer_source.clone(),
+            connect_deadline,
         )
         .map_err(|e| {
             if format!("{}", e).contains("no peers discovered") {
@@ -1399,6 +1410,15 @@ impl HeaderSync {
     pub fn stop_sync(&self) {
         self.shutdown_requested.store(true, Ordering::Relaxed);
         info!("Sync stop requested");
+    }
+
+    /// Forget an earlier stop request (start of a new foreground session).
+    pub fn clear_stop(&self) {
+        self.shutdown_requested.store(false, Ordering::Relaxed);
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Relaxed)
     }
 
     /// Tor mode with the client still bootstrapping: peer sessions are
@@ -1600,13 +1620,25 @@ impl HeaderSync {
     /// Run header sync continuously. Calls `on_progress` with status updates.
     /// This is a blocking call that syncs to the chain tip and then monitors
     /// for new blocks every 30 seconds. It only returns on unrecoverable errors.
+    /// The app goes through `run_sync` (via `HerculesNode::start_header_sync`).
+    #[cfg(test)]
     pub fn sync<F>(&self, on_progress: F) -> Result<(), SyncError>
     where
         F: Fn(SyncStatus),
     {
         // Reset shutdown flag so sync can be restarted after a stop
         self.shutdown_requested.store(false, Ordering::Relaxed);
+        self.run_sync(on_progress)
+    }
 
+    /// `sync` without clearing a pending stop request. The FFI clears it
+    /// when its session begins, before waiting for transport and for the
+    /// node's session lock, so a Stop issued during those waits isn't lost
+    /// (ticket 028).
+    pub fn run_sync<F>(&self, on_progress: F) -> Result<(), SyncError>
+    where
+        F: Fn(SyncStatus),
+    {
         // Get our current height to report to peers
         let our_height = self
             .store
@@ -3000,7 +3032,7 @@ impl HeaderSync {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
-        let mut pool = self.open_pool(our_height)?;
+        let mut pool = self.open_pool_until(our_height, Some(budget.deadline()))?;
         budget.mark(WakePhase::PeersReady);
 
         // Get headers from best peer
@@ -3226,27 +3258,20 @@ impl HeaderSync {
             budget.remaining_ms()
         );
 
-        // Connect to peers
+        // Connect to peers. Until headers have been checked against peers
+        // the local tip says nothing about the network's, so the early
+        // returns below never report caught_up.
         if budget.should_stop() {
-            return Ok(self.make_catchup_status(
-                validated_height >= tip_height,
-                0,
-                validated_height,
-                tip_height,
-            ));
+            return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
         }
 
-        let mut pool = self.open_pool(our_height)?;
+        // Stop dialing new peers at the deadline (ticket 028).
+        let mut pool = self.open_pool_until(our_height, Some(budget.deadline()))?;
         budget.mark(WakePhase::PeersReady);
 
         // Sync headers to tip
         if budget.should_stop() {
-            return Ok(self.make_catchup_status(
-                validated_height >= tip_height,
-                0,
-                validated_height,
-                tip_height,
-            ));
+            return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
         }
 
         let mut peer = pool

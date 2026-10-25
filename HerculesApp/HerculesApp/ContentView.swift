@@ -279,7 +279,8 @@ class NodeViewModel: ObservableObject {
     /// running node, drops the open SQLite handles, deletes the headers /
     /// utxo / blocks DB files via Rust's `reset_database`, persists the new
     /// mode, then re-runs `startSync`. Any in-progress snapshot download is
-    /// also cancelled and its cached file removed.
+    /// also cancelled and its cached file removed. Safe at any point of a
+    /// running `startSync`, including while it waits for Tor (ticket 028).
     ///
     /// `completion` is invoked on the main queue after the wipe finishes
     /// (success) or with the error that aborted it (failure). It runs
@@ -295,37 +296,28 @@ class NodeViewModel: ObservableObject {
             SnapshotDownloader.shared.cancel()
             SnapshotDownloader.deleteDownloadedFile()
 
-            // 2. Ask the running sync loop to stop. This sets a flag the loop
-            // checks on its next iteration — it does NOT block.
-            if let node = self.node {
-                node.stopSync()
+            // 2. Retire the current sync session: its callbacks stop
+            // touching the UI, and a wake preemption won't restart it.
+            DispatchQueue.main.sync {
+                self.syncGeneration += 1
+                self.resumeSyncWhenActive = false
             }
 
-            // 3. Spin until the sync loop has actually returned (isSyncRunning
-            // flips to false in the catch/finally of startSync's background
-            // task). Cap the wait so a wedged loop can't deadlock the user.
-            let deadline = Date().addingTimeInterval(15)
-            while Date() < deadline {
-                var stillRunning = true
-                DispatchQueue.main.sync { stillRunning = self.isSyncRunning }
-                if !stillRunning { break }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-
-            // 4. Drop the HerculesNode reference so its open SQLite handles
-            // are released BEFORE we try to delete the files. On POSIX an
-            // open inode survives unlink, which would leave stale state.
-            // NodeHost owns the node; discarding it cancels any wake.
+            // 3. Drop our handle, then have NodeHost close the node and wipe
+            // the on-disk DBs (ticket 028). NodeHost refuses to reopen the
+            // node until it's done, and the close stops the sync loop, ends
+            // a Tor-bootstrap wait and cancels wakes. Nothing is deleted
+            // until every holder has let go of the old node: on POSIX an
+            // open inode survives unlink, and LMDB would keep using it.
             self.node = nil
-            NodeHost.shared.discard()
-
-            // 5. Wipe the on-disk DBs via Rust.
             do {
-                try StoragePaths.prepareForNodeOpen()
-                try resetDatabase(dbPath: StoragePaths.headersDBPath)
+                try NodeHost.shared.reset()
             } catch {
                 DispatchQueue.main.async {
                     self.isResetting = false
+                    self.isSyncRunning = false
+                    self.isConnecting = false
+                    self.isBootstrappingTor = false
                     completion(error)
                 }
                 return
@@ -344,6 +336,10 @@ class NodeViewModel: ObservableObject {
                 self.mempoolStatus = nil
                 self.nodeStatus = nil
                 self.isResetting = false
+                // The retired session's own callbacks are ignored (step 2).
+                self.isSyncRunning = false
+                self.isConnecting = false
+                self.isBootstrappingTor = false
 
                 completion(nil)
 
@@ -374,6 +370,8 @@ class NodeViewModel: ObservableObject {
                 // storage preparation before opening it. Opening doesn't wait
                 // for Tor, so wait here to keep the bootstrapping UI.
                 let (node, reused) = try NodeHost.shared.node()
+                // Set before waiting, so Stop can reach this session.
+                self?.node = node
                 if try !node.waitForTransport(timeoutMs: 150_000) {
                     throw HerculesError.TorError(msg: "Tor bootstrap timed out")
                 }
@@ -389,7 +387,6 @@ class NodeViewModel: ObservableObject {
                         self?.isBootstrappingTor = false
                     }
                 }
-                self?.node = node
                 let nodePaused = node.isValidationPaused()
                 DispatchQueue.main.async {
                     if reused {
@@ -533,6 +530,8 @@ class NodeViewModel: ObservableObject {
             } catch {
                 _ = NodeHost.shared.sessions.endForeground()
                 DispatchQueue.main.async {
+                    // Retired (reset) or superseded: not ours to report.
+                    guard generation == self?.syncGeneration else { return }
                     // Storage errors carry user-facing copy and the low-disk
                     // case already has its own banner.
                     if let storageError = error as? StorageError {
