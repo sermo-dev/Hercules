@@ -197,6 +197,152 @@ pub fn validate_block(
     Ok(())
 }
 
+/// Witness commitment output prefix: OP_RETURN, push 36, 0xaa21a9ed (BIP 141).
+const WITNESS_COMMITMENT_MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+
+/// Bitcoin Core's `IsBlockMutated`: does this block's transaction data fail
+/// to match what its header commits to? The block hash covers only the
+/// 80-byte header, so a peer can strip witnesses, pad them, or duplicate
+/// transactions (CVE-2012-2459) and the hash still matches. Such a block
+/// says nothing about the real one, so callers must treat a failure here as
+/// a bad *delivery* (penalize the peer, fetch it elsewhere), never as proof
+/// the block is invalid (ticket 024). Run it before `validate_block` and
+/// script validation: a stripped witness would otherwise surface there as a
+/// script failure, indistinguishable from a consensus-invalid block.
+///
+/// Checks the merkle root (including Core's duplicate-subtree mutation) and
+/// Core's `CheckWitnessMalleation`: once SegWit is active, a coinbase
+/// witness commitment, if present, must match the witness data (with a
+/// single 32-byte reserved value); without one, no transaction may carry
+/// witness data. Before activation no witness data is allowed at all.
+pub fn check_block_mutation(
+    block: &Block,
+    height: u32,
+    params: &ChainParams,
+) -> Result<(), BlockValidationError> {
+    if block.txdata.is_empty() {
+        return Err(BlockValidationError::EmptyBlock { height });
+    }
+    if !block.check_merkle_root() {
+        return Err(BlockValidationError::BadMerkleRoot { height });
+    }
+    if merkle_tree_mutated(block) {
+        return Err(BlockValidationError::MutatedMerkleTree { height });
+    }
+    let coinbase = &block.txdata[0];
+    if !coinbase.is_coinbase() {
+        // Invalid either way, but Core counts a block like this as mutated
+        // when a 64-byte transaction lets an attacker forge a merkle branch
+        // (CVE-2017-12842). Treating every no-coinbase copy as a bad
+        // delivery is safe and never condemns a block hash.
+        return Err(BlockValidationError::NoCoinbase { height });
+    }
+
+    if height >= params.segwit_height {
+        let commitment = coinbase.output.iter().rposition(|o| {
+            o.script_pubkey.len() >= 38
+                && o.script_pubkey.as_bytes()[..6] == WITNESS_COMMITMENT_MAGIC
+        });
+        if let Some(pos) = commitment {
+            use bitcoin::hashes::Hash as _;
+            let reserved: Vec<&[u8]> = coinbase.input[0].witness.iter().collect();
+            if reserved.len() != 1 || reserved[0].len() != 32 {
+                return Err(BlockValidationError::BadWitnessCommitment { height });
+            }
+            let committed = &coinbase.output[pos].script_pubkey.as_bytes()[6..38];
+            let matches = block.witness_root().is_some_and(|root| {
+                let computed = Block::compute_witness_commitment(&root, reserved[0]);
+                computed.as_byte_array()[..] == *committed
+            });
+            if !matches {
+                return Err(BlockValidationError::BadWitnessCommitment { height });
+            }
+            return Ok(());
+        }
+    }
+
+    if block
+        .txdata
+        .iter()
+        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()))
+    {
+        return Err(BlockValidationError::UnexpectedWitness { height });
+    }
+    Ok(())
+}
+
+/// Core's `ComputeMerkleRoot` mutation flag: two identical adjacent hashes
+/// at any level of the tree. Duplicating the last transaction(s) of a block
+/// this way (CVE-2012-2459) leaves the merkle root unchanged.
+fn merkle_tree_mutated(block: &Block) -> bool {
+    use bitcoin::hashes::{sha256d, Hash};
+    let mut level: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .map(|tx| tx.compute_txid().to_byte_array())
+        .collect();
+    while level.len() > 1 {
+        if level.chunks_exact(2).any(|pair| pair[0] == pair[1]) {
+            return true;
+        }
+        if level.len() % 2 == 1 {
+            level.push(*level.last().unwrap());
+        }
+        level = level
+            .chunks_exact(2)
+            .map(|pair| {
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&pair[0]);
+                buf[32..].copy_from_slice(&pair[1]);
+                sha256d::Hash::hash(&buf).to_byte_array()
+            })
+            .collect();
+    }
+    false
+}
+
+/// Map a script-verifier failure to a `BlockValidationError`: the single
+/// seam where ticket 024 decides what the verifier's errors mean. Only a
+/// script that evaluated to false (`ScriptFailed`, from either backend) is
+/// a consensus failure. Everything else is our own bug, API misuse or a
+/// library fault, and must never mark a block invalid:
+/// - `InvalidFlags`: we computed the flags (`ChainParams::script_flags`).
+/// - `SpentOutputsMismatch`: we built the spent-output list from our UTXO set.
+/// - `NoInputs`: `validate_block` rejects input-less transactions first
+///   (`EmptyInputs`), so reaching the verifier with one is our bug.
+/// - `TxDeserialize`: we serialized the tx ourselves from a parsed
+///   `Transaction`; the library failing to read it back is a library or
+///   serialization fault, not proof the block is invalid.
+/// - `Library`: an FFI/kernel object-creation or status failure.
+///
+/// Exhaustive on purpose: a new `ScriptVerifyError` must be classified here.
+fn script_error(
+    height: u32,
+    tx_index: usize,
+    f: script_verify::ScriptVerifyFailure,
+) -> BlockValidationError {
+    use script_verify::ScriptVerifyError as E;
+    let script_verify::ScriptVerifyFailure { input_index, error } = f;
+    match error {
+        E::ScriptFailed => BlockValidationError::ScriptFailure {
+            height,
+            tx_index,
+            input_index,
+            error: error.to_string(),
+        },
+        E::InvalidFlags(_)
+        | E::SpentOutputsMismatch { .. }
+        | E::NoInputs
+        | E::TxDeserialize
+        | E::Library(_) => BlockValidationError::ScriptVerifierError {
+            height,
+            tx_index,
+            input_index,
+            error: error.to_string(),
+        },
+    }
+}
+
 /// Coinbase outputs cannot be spent until this many blocks have passed.
 const COINBASE_MATURITY: u32 = 100;
 
@@ -308,15 +454,10 @@ pub fn validate_block_scripts(
             }
 
             // Phase B: verify each input's script. `script_verify` picks the
-            // library (libbitcoinkernel by default; ticket 047).
-            script_verify::verify_transaction(tx, &spent, flags).map_err(|f| {
-                BlockValidationError::ScriptFailure {
-                    height,
-                    tx_index: tx_idx,
-                    input_index: f.input_index,
-                    error: f.error.to_string(),
-                }
-            })?;
+            // library (libbitcoinkernel by default; ticket 047), and
+            // `script_error` decides what its failure means (ticket 024).
+            script_verify::verify_transaction(tx, &spent, flags)
+                .map_err(|f| script_error(height, tx_idx, f))?;
 
             let output_sum: u64 = tx
                 .output
@@ -486,6 +627,90 @@ pub enum BlockValidationError {
         sigops: u64,
         max: u64,
     },
+    /// Duplicate adjacent subtree in the merkle tree (CVE-2012-2459).
+    MutatedMerkleTree {
+        height: u32,
+    },
+    /// Witness data in a block that does not commit to it.
+    UnexpectedWitness {
+        height: u32,
+    },
+    /// The script verifier itself failed (not a script evaluating to
+    /// false): a local fault, see `script_error`.
+    ScriptVerifierError {
+        height: u32,
+        tx_index: usize,
+        input_index: usize,
+        error: String,
+    },
+}
+
+impl BlockValidationError {
+    /// True when the error shows only that *this copy* of the block is not
+    /// what its header commits to (a mutated or corrupted delivery), not
+    /// that the block itself is invalid. The sync loop penalizes the peer
+    /// and fetches the block elsewhere for these, and marks the block
+    /// permanently failed for everything else (ticket 024). Deliberately an
+    /// exhaustive match: a new variant must be classified here.
+    pub fn is_mutation(&self) -> bool {
+        match self {
+            Self::EmptyBlock { .. }
+            | Self::NoCoinbase { .. }
+            | Self::BadMerkleRoot { .. }
+            | Self::MutatedMerkleTree { .. }
+            | Self::BadWitnessCommitment { .. }
+            | Self::UnexpectedWitness { .. } => true,
+            Self::MultipleCoinbase { .. }
+            | Self::ExcessiveWeight { .. }
+            | Self::EmptyInputs { .. }
+            | Self::EmptyOutputs { .. }
+            | Self::DuplicateTx { .. }
+            | Self::CoinbaseOverpayment { .. }
+            | Self::BadCoinbaseHeight { .. }
+            | Self::MissingUtxo { .. }
+            | Self::PrematureCoinbaseSpend { .. }
+            | Self::ScriptFailure { .. }
+            | Self::InsufficientInputValue { .. }
+            | Self::ValueOverflow { .. }
+            | Self::UtxoError { .. }
+            | Self::OutputExceedsMaxMoney { .. }
+            | Self::DuplicateSpend { .. }
+            | Self::ExcessiveSigops { .. }
+            | Self::ScriptVerifierError { .. } => false,
+        }
+    }
+
+    /// True only when the block itself breaks a consensus rule, so it may
+    /// be recorded as permanently invalid (ticket 024). False for
+    /// mutations (`is_mutation`) and for local faults: the UTXO store or
+    /// the script verifier failing. Exhaustive for the same reason.
+    pub fn is_consensus_failure(&self) -> bool {
+        match self {
+            Self::UtxoError { .. } | Self::ScriptVerifierError { .. } => false,
+            e if e.is_mutation() => false,
+            Self::EmptyBlock { .. }
+            | Self::NoCoinbase { .. }
+            | Self::BadMerkleRoot { .. }
+            | Self::MutatedMerkleTree { .. }
+            | Self::BadWitnessCommitment { .. }
+            | Self::UnexpectedWitness { .. }
+            | Self::MultipleCoinbase { .. }
+            | Self::ExcessiveWeight { .. }
+            | Self::EmptyInputs { .. }
+            | Self::EmptyOutputs { .. }
+            | Self::DuplicateTx { .. }
+            | Self::CoinbaseOverpayment { .. }
+            | Self::BadCoinbaseHeight { .. }
+            | Self::MissingUtxo { .. }
+            | Self::PrematureCoinbaseSpend { .. }
+            | Self::ScriptFailure { .. }
+            | Self::InsufficientInputValue { .. }
+            | Self::ValueOverflow { .. }
+            | Self::OutputExceedsMaxMoney { .. }
+            | Self::DuplicateSpend { .. }
+            | Self::ExcessiveSigops { .. } => true,
+        }
+    }
 }
 
 impl std::fmt::Display for BlockValidationError {
@@ -603,6 +828,22 @@ impl std::fmt::Display for BlockValidationError {
                 "block {} has {} legacy sigops, exceeds max {}",
                 height, sigops, max
             ),
+            Self::MutatedMerkleTree { height } => {
+                write!(f, "block {} has a mutated (duplicated) merkle tree", height)
+            }
+            Self::UnexpectedWitness { height } => {
+                write!(f, "block {} has witness data without a witness commitment", height)
+            }
+            Self::ScriptVerifierError {
+                height,
+                tx_index,
+                input_index,
+                error,
+            } => write!(
+                f,
+                "block {} tx {} input {} script verifier error: {}",
+                height, tx_index, input_index, error
+            ),
         }
     }
 }
@@ -668,6 +909,34 @@ mod tests {
             .push_opcode(OP_CHECKMULTISIG)
             .into_script();
         assert_eq!(count_script_sigops(&script), 20);
+    }
+
+    /// Ticket 024: only a script evaluating to false is a consensus
+    /// failure; every other verifier error (and UTXO store errors) is local.
+    #[test]
+    fn only_script_failures_are_consensus_failures() {
+        use script_verify::{ScriptVerifyError as E, ScriptVerifyFailure};
+        let fail = |error| ScriptVerifyFailure { input_index: 2, error };
+        let e = script_error(5, 1, fail(E::ScriptFailed));
+        assert!(
+            matches!(e, BlockValidationError::ScriptFailure { input_index: 2, .. }),
+            "{:?}",
+            e
+        );
+        assert!(e.is_consensus_failure() && !e.is_mutation());
+        for other in [
+            E::InvalidFlags(0xffff_ffff),
+            E::SpentOutputsMismatch { inputs: 2, spent: 1 },
+            E::NoInputs,
+            E::TxDeserialize,
+            E::Library("btck_script_pubkey_verify status 2".into()),
+        ] {
+            let e = script_error(5, 1, fail(other));
+            assert!(matches!(e, BlockValidationError::ScriptVerifierError { .. }), "{:?}", e);
+            assert!(!e.is_consensus_failure() && !e.is_mutation(), "{:?}", e);
+        }
+        let utxo = BlockValidationError::UtxoError { height: 5, msg: "disk".into() };
+        assert!(!utxo.is_consensus_failure() && !utxo.is_mutation());
     }
 
     #[test]

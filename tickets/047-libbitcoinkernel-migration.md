@@ -394,3 +394,9 @@ cd spike/kernel-spike && cargo run --release --bin kernel-bench -- run /tmp/ks &
 6. Paste the JSON lines into this ticket.
 
 The harness only covers the regtest chainstate and script verification. Mainnet chainstate numbers need a synced kernel datadir, and kernel can't produce one on a phone (no snapshot, no prune).
+
+### Merge with ticket 024 (2026-10-26)
+
+- `block_validation::script_error` now maps `script_verify::ScriptVerifyFailure` (backend-independent) instead of `bitcoinconsensus::Error`. Only `ScriptFailed` is `ScriptFailure` (consensus-invalid). `InvalidFlags`, `SpentOutputsMismatch`, `NoInputs`, `TxDeserialize` and `Library` (kernel/FFI faults) are `ScriptVerifierError`: a local fault that never marks a block failed or penalizes a peer. The match is exhaustive, so a new `ScriptVerifyError` must be classified there.
+- `VALIDATION_RULES_VERSION` bumped to 2 (the script interpreter changed), and `rules_tag` now includes the active script backend, so switching between kernel and legacy in either direction drops `failed_blocks` rows recorded by the other.
+- The mempool path is unchanged: every `ScriptVerifyError` still surfaces as `MempoolError::ScriptFailure` (no peer penalty is attached to mempool rejections).

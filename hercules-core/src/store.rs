@@ -13,10 +13,17 @@ pub struct HeaderStore {
     conn: Mutex<Connection>,
 }
 
+/// How long a SQLite write waits on another connection's lock before
+/// failing with `SQLITE_BUSY` (ticket 028). One node per process means
+/// there is normally no other connection; this is defense in depth.
+pub(crate) const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl HeaderStore {
     /// Open or create a header store at the given path.
     pub fn open(path: &str) -> Result<HeaderStore, StoreError> {
         let conn = Connection::open(path).map_err(|e| StoreError(format!("open: {}", e)))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|e| StoreError(format!("set busy_timeout: {}", e)))?;
 
         // Set WAL journal mode before any writes so that table creation
         // also benefits from WAL's crash-recovery semantics.
@@ -39,6 +46,60 @@ impl HeaderStore {
 ",
         )
         .map_err(|e| StoreError(format!("create tables: {}", e)))?;
+
+        // Ticket 024's failed-block tables. A development build briefly
+        // created `failed_blocks` without the `rules` column; such rows have
+        // no known rules version, so they are dropped like any other stale
+        // row would be.
+        if conn.prepare("SELECT rules FROM failed_blocks LIMIT 0").is_err() {
+            conn.execute_batch("DROP TABLE IF EXISTS failed_blocks;")
+                .map_err(|e| StoreError(format!("drop old failed_blocks: {}", e)))?;
+        }
+        // Development builds keyed `failed_block_bans` on `addr` alone, so a
+        // peer banned for two failed blocks kept only the last; rekey it on
+        // (addr, hash), keeping the rows, in one transaction so a kill
+        // midway can't lose the table.
+        let old_bans_schema: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'failed_block_bans'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if old_bans_schema.is_some_and(|sql| sql.contains("addr TEXT PRIMARY KEY")) {
+            conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE failed_block_bans RENAME TO failed_block_bans_old;
+                CREATE TABLE failed_block_bans (
+                    addr TEXT NOT NULL,
+                    hash BLOB NOT NULL,
+                    PRIMARY KEY (addr, hash)
+                );
+                INSERT INTO failed_block_bans (addr, hash)
+                    SELECT addr, hash FROM failed_block_bans_old;
+                DROP TABLE failed_block_bans_old;
+                COMMIT;
+                ",
+            )
+            .map_err(|e| StoreError(format!("rekey failed_block_bans: {}", e)))?;
+        }
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS failed_blocks (
+                hash BLOB PRIMARY KEY,
+                height INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                rules TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS failed_block_bans (
+                addr TEXT NOT NULL,
+                hash BLOB NOT NULL,
+                PRIMARY KEY (addr, hash)
+            );
+            ",
+        )
+        .map_err(|e| StoreError(format!("create failed-block tables: {}", e)))?;
 
         let store = HeaderStore {
             conn: Mutex::new(conn),
@@ -386,6 +447,121 @@ impl HeaderStore {
             .collect()
     }
 
+    /// Record a block that failed consensus validation (ticket 024), so its
+    /// headers are refused and it is never requested again, across
+    /// restarts. Descendants need no entry: they can only connect through
+    /// it. `rules` names the validation rules that rejected it (see
+    /// `prune_failed_blocks`).
+    pub fn mark_failed(
+        &self,
+        hash: BlockHash,
+        height: u32,
+        reason: &str,
+        rules: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO failed_blocks (hash, height, reason, rules)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![hash.to_byte_array().as_slice(), height, reason, rules],
+        )
+        .map_err(|e| StoreError(format!("mark failed: {}", e)))?;
+        Ok(())
+    }
+
+    /// Remember that `addr` was banned for announcing failed block `hash`,
+    /// so the ban can be lifted if the block is reconsidered.
+    pub fn record_failed_block_ban(&self, addr: &str, hash: BlockHash) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO failed_block_bans (addr, hash) VALUES (?1, ?2)",
+            params![addr, hash.to_byte_array().as_slice()],
+        )
+        .map_err(|e| StoreError(format!("record failed-block ban: {}", e)))?;
+        Ok(())
+    }
+
+    /// Drop failed blocks recorded under any rules version other than
+    /// `rules`, so an update that fixes a validation bug reconsiders them.
+    /// Returns the peers banned because of the dropped blocks; the caller
+    /// lifts those bans.
+    pub fn prune_failed_blocks(&self, rules: &str) -> Result<Vec<String>, StoreError> {
+        self.delete_failed_where("rules != ?1", rules)
+    }
+
+    /// Forget every failed block ("reconsider invalid blocks"). Returns the
+    /// peers banned because of them.
+    pub fn clear_failed_blocks(&self) -> Result<Vec<String>, StoreError> {
+        // `?1 = ?1` is always true; the shared query binds one parameter.
+        self.delete_failed_where("?1 = ?1", "")
+    }
+
+    /// Delete the failed blocks matching `cond` (one parameter, `?1`) and
+    /// their recorded bans, returning the addresses whose bans can now be
+    /// lifted: those with no ban left for any other still-failed block.
+    fn delete_failed_where(&self, cond: &str, param: &str) -> Result<Vec<String>, StoreError> {
+        let mut conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError(format!("begin tx: {}", e)))?;
+        let stale = format!("SELECT hash FROM failed_blocks WHERE {}", cond);
+        let addrs: Vec<String> = {
+            let sql = format!("SELECT addr FROM failed_block_bans WHERE hash IN ({})", stale);
+            let mut stmt = tx
+                .prepare(&sql)
+                .map_err(|e| StoreError(format!("prepare failed bans: {}", e)))?;
+            let rows = stmt
+                .query_map(params![param], |row| row.get::<_, String>(0))
+                .map_err(|e| StoreError(format!("query failed bans: {}", e)))?;
+            rows.collect::<Result<_, _>>()
+                .map_err(|e| StoreError(format!("row failed bans: {}", e)))?
+        };
+        let del_bans = format!("DELETE FROM failed_block_bans WHERE hash IN ({})", stale);
+        let del_blocks = format!("DELETE FROM failed_blocks WHERE {}", cond);
+        for sql in [&del_bans, &del_blocks] {
+            tx.execute(sql, params![param])
+                .map_err(|e| StoreError(format!("delete failed blocks: {}", e)))?;
+        }
+        // Still banned for another failed block: keep that ban.
+        let mut lift = Vec::new();
+        for addr in addrs {
+            let remaining: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM failed_block_bans WHERE addr = ?1",
+                    params![addr],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StoreError(format!("count remaining bans: {}", e)))?;
+            if remaining == 0 && !lift.contains(&addr) {
+                lift.push(addr);
+            }
+        }
+        tx.commit()
+            .map_err(|e| StoreError(format!("commit: {}", e)))?;
+        Ok(lift)
+    }
+
+    /// Hashes of every block recorded by `mark_failed`. The set is tiny (a
+    /// consensus-invalid block with valid proof-of-work is rare and
+    /// expensive), so callers check whole header batches against it.
+    pub fn failed_hashes(&self) -> Result<std::collections::HashSet<BlockHash>, StoreError> {
+        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let mut stmt = conn
+            .prepare("SELECT hash FROM failed_blocks")
+            .map_err(|e| StoreError(format!("prepare failed: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|e| StoreError(format!("query failed: {}", e)))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let bytes = row.map_err(|e| StoreError(format!("row failed: {}", e)))?;
+            let hash = BlockHash::from_slice(&bytes)
+                .map_err(|e| StoreError(format!("parse failed hash: {}", e)))?;
+            out.insert(hash);
+        }
+        Ok(out)
+    }
+
     /// Get the total number of stored headers.
     pub fn count(&self) -> Result<u32, StoreError> {
         let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
@@ -612,6 +788,40 @@ mod tests {
     }
 
     #[test]
+    fn ban_for_two_failed_blocks_lasts_until_both_are_reconsidered() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let (h1, h2) = (BlockHash::from_byte_array([1; 32]), BlockHash::from_byte_array([2; 32]));
+        store.mark_failed(h1, 10, "bad", "old").unwrap();
+        store.mark_failed(h2, 20, "bad", "new").unwrap();
+        store.record_failed_block_ban("peer:8333", h1).unwrap();
+        store.record_failed_block_ban("peer:8333", h2).unwrap();
+        // h1 reconsidered: the ban still stands for h2.
+        assert!(store.prune_failed_blocks("new").unwrap().is_empty());
+        assert_eq!(store.clear_failed_blocks().unwrap(), vec!["peer:8333".to_string()]);
+    }
+
+    #[test]
+    fn failed_block_bans_keyed_on_addr_alone_are_rekeyed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("h.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE failed_block_bans (addr TEXT PRIMARY KEY, hash BLOB NOT NULL);
+                 INSERT INTO failed_block_bans VALUES ('peer:8333', x'01');",
+            )
+            .unwrap();
+        }
+        let store = HeaderStore::open(path.to_str().unwrap()).unwrap();
+        store.record_failed_block_ban("peer:8333", BlockHash::from_byte_array([2; 32])).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM failed_block_bans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
     fn delete_headers_above_removes_correct_headers() {
         let store = HeaderStore::open(":memory:").unwrap();
         let genesis = genesis_header();
@@ -686,5 +896,45 @@ mod tests {
         assert_eq!(header1.time, block1.time);
 
         assert!(store.get_header_at_height(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_blocks_persist_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("headers.sqlite3");
+        let path = path.to_str().unwrap();
+        let hash = block1_header().block_hash();
+        {
+            let store = HeaderStore::open(path).unwrap();
+            assert!(store.failed_hashes().unwrap().is_empty());
+            store.mark_failed(hash, 1, "test", "v1").unwrap();
+            // Idempotent.
+            store.mark_failed(hash, 1, "test again", "v1").unwrap();
+        }
+        let store = HeaderStore::open(path).unwrap();
+        let failed = store.failed_hashes().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed.contains(&hash));
+    }
+
+    #[test]
+    fn prune_failed_blocks_drops_other_rules_versions_and_their_bans() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let old = block1_header().block_hash();
+        let new = genesis_header().block_hash();
+        store.mark_failed(old, 1, "old rules", "v1").unwrap();
+        store.mark_failed(new, 2, "new rules", "v2").unwrap();
+        store.record_failed_block_ban("1.1.1.1:8333", old).unwrap();
+        store.record_failed_block_ban("2.2.2.2:8333", new).unwrap();
+
+        let unbanned = store.prune_failed_blocks("v2").unwrap();
+        assert_eq!(unbanned, vec!["1.1.1.1:8333".to_string()]);
+        let failed = store.failed_hashes().unwrap();
+        assert!(!failed.contains(&old) && failed.contains(&new));
+
+        let unbanned = store.clear_failed_blocks().unwrap();
+        assert_eq!(unbanned, vec!["2.2.2.2:8333".to_string()]);
+        assert!(store.failed_hashes().unwrap().is_empty());
+        assert!(store.clear_failed_blocks().unwrap().is_empty());
     }
 }

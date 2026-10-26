@@ -24,6 +24,8 @@ impl BlockStore {
     pub fn open(path: &str) -> Result<BlockStore, BlockStoreError> {
         let conn =
             Connection::open(path).map_err(|e| BlockStoreError(format!("open: {}", e)))?;
+        conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT)
+            .map_err(|e| BlockStoreError(format!("set busy_timeout: {}", e)))?;
 
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| BlockStoreError(format!("set WAL: {}", e)))?;

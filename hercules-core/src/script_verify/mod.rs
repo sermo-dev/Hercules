@@ -147,7 +147,6 @@ impl Backend {
         Backend::ConsensusLegacy,
     ];
 
-    #[cfg_attr(not(feature = "script-differential"), allow(dead_code))]
     pub fn name(self) -> &'static str {
         match self {
             #[cfg(feature = "script-kernel")]
@@ -187,6 +186,22 @@ impl Backend {
     ) -> Result<(), ScriptVerifyFailure> {
         precheck(tx, spent, flags)?;
         first_failure(self.verify_inputs(&serialize(tx), spent, flags, true))
+    }
+}
+
+/// The library whose verdicts this build acts on. Part of the rules tag
+/// stored with `failed_blocks` rows (`sync::rules_tag`), so switching
+/// backends in either direction reconsiders blocks the other one failed.
+/// Differential builds act on the kernel's result (and abort on any
+/// disagreement), so they report the kernel.
+pub fn active_backend_name() -> &'static str {
+    #[cfg(feature = "script-kernel")]
+    {
+        Backend::Kernel.name()
+    }
+    #[cfg(not(feature = "script-kernel"))]
+    {
+        Backend::ConsensusLegacy.name()
     }
 }
 

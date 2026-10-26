@@ -653,20 +653,75 @@ fn handle_get_node_info(syncer: &HeaderSync, id: serde_json::Value) -> RpcRespon
 
 // ── Server ──────────────────────────────────────────────────────────
 
+/// How often an idle keep-alive connection checks for server shutdown
+/// (ticket 028: stopping the server must not wait out the 30 s idle
+/// timeout).
+const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A stream the RPC server can serve: Tor in production, TCP in tests.
+trait RpcStream: Read + Write {
+    fn set_rpc_read_timeout(&mut self, timeout: std::time::Duration);
+}
+
+impl RpcStream for crate::tor::TorStream {
+    fn set_rpc_read_timeout(&mut self, timeout: std::time::Duration) {
+        self.set_read_timeout(Some(timeout));
+    }
+}
+
+#[cfg(test)]
+impl RpcStream for std::net::TcpStream {
+    fn set_rpc_read_timeout(&mut self, timeout: std::time::Duration) {
+        let _ = self.set_read_timeout(Some(timeout));
+    }
+}
+
+/// Wait until the next request's first bytes arrive. False if the client
+/// went away, stayed idle past the keep-alive timeout, or the server is
+/// shutting down.
+fn await_next_request<S: RpcStream>(reader: &mut BufReader<&mut S>, shutdown: &AtomicBool) -> bool {
+    let idle_since = std::time::Instant::now();
+    reader.get_mut().set_rpc_read_timeout(SHUTDOWN_POLL);
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
+        match reader.fill_buf() {
+            Ok(buf) if buf.is_empty() => return false, // disconnected
+            Ok(_) => break,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                if idle_since.elapsed() >= std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    // A request is arriving: give it the full timeout to finish.
+    reader
+        .get_mut()
+        .set_rpc_read_timeout(std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS));
+    true
+}
+
 /// Handle an inbound wallet connection. Supports HTTP/1.1 keepalive:
 /// multiple JSON-RPC requests can be sent on the same Tor stream,
 /// matching Bitcoin Core's RPC server behavior. The connection closes
-/// on idle timeout (30s), auth failure, or `Connection: close` from
-/// the client.
-fn handle_connection(
+/// on idle timeout (30s), auth failure, `Connection: close` from the
+/// client, or server shutdown (checked while idle and between requests).
+fn handle_connection<S: RpcStream>(
     syncer: &HeaderSync,
-    mut stream: crate::tor::TorStream,
+    mut stream: S,
     auth_token: &str,
+    shutdown: &AtomicBool,
 ) {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS)));
     let mut reader = BufReader::new(&mut stream);
 
     loop {
+        if !await_next_request(&mut reader, shutdown) {
+            break;
+        }
+
         // ── Read one HTTP request ──────────────────────────────────
         let (method, _path, headers, body) = match read_http_request(&mut reader) {
             Ok(r) => r,
@@ -776,7 +831,7 @@ impl WalletRpcServer {
                     warn!("wallet_rpc: rate limit exceeded, dropping connection");
                     continue;
                 }
-                handle_connection(&self.syncer, stream, &self.auth_token);
+                handle_connection(&self.syncer, stream, &self.auth_token, &self.shutdown);
             } else {
                 // No pending connection — sleep briefly to avoid busy-wait.
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -910,6 +965,51 @@ mod tests {
         assert!(json.contains("\"code\":-32601"));
         assert!(json.contains("\"not found\""));
         assert!(!json.contains("\"result\""));
+    }
+
+    /// A loopback connection served by `handle_connection` on a thread.
+    fn served_connection(
+        shutdown: Arc<AtomicBool>,
+    ) -> (std::net::TcpStream, std::thread::JoinHandle<()>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("headers.sqlite3").to_string_lossy().into_owned();
+        let hs = HeaderSync::new(&db, None).unwrap();
+        let listener = std::net::TcpListener::bind(crate::testkit::loopback_bind()).unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let handle = std::thread::spawn(move || handle_connection(&hs, server, "token", &shutdown));
+        (client, handle, dir)
+    }
+
+    #[test]
+    fn idle_keepalive_connection_ends_on_shutdown() {
+        // Ticket 028: stopping the wallet API must not wait out the 30 s
+        // keep-alive read on an idle client.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (_client, handle, _dir) = served_connection(Arc::clone(&shutdown));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let start = Instant::now();
+        shutdown.store(true, Ordering::Relaxed);
+        while !handle.is_finished() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(2), "connection outlived shutdown");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn connection_still_serves_requests_with_shutdown_polling() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (mut client, handle, _dir) = served_connection(shutdown);
+        // Arrive after a few idle polls; wrong token gets a 401 and a close.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        client
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\nAuthorization: Bearer nope\r\n\r\n{}")
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 401"), "{}", response);
+        handle.join().unwrap();
     }
 
     #[test]

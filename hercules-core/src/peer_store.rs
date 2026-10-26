@@ -54,6 +54,8 @@ impl PeerStore {
     pub fn open(path: &str) -> Result<PeerStore, PeerStoreError> {
         let conn =
             Connection::open(path).map_err(|e| PeerStoreError(format!("open: {}", e)))?;
+        conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT)
+            .map_err(|e| PeerStoreError(format!("set busy_timeout: {}", e)))?;
 
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| PeerStoreError(format!("set WAL: {}", e)))?;

@@ -318,13 +318,9 @@ impl FixtureChain {
     /// Same header (so same hash), non-coinbase witnesses removed: a mutated
     /// delivery that fails the witness commitment.
     ///
-    /// The coinbase's witness reserved value is kept on purpose. Stripping
-    /// it too leaves a block with no witness data at all, which rust-bitcoin's
-    /// `check_witness_commitment` (and so Hercules' `validate_block`)
-    /// accepts even though the coinbase still carries a commitment — Core's
-    /// `CheckWitnessMalleation` flags that as mutated. Hercules then fails it
-    /// later, in script validation, which ticket 024 would misclassify as a
-    /// consensus failure rather than a bad delivery.
+    /// The coinbase's witness reserved value is kept, so the commitment
+    /// check sees witness data that doesn't match. `strip_all_witness`
+    /// covers the other shape.
     pub fn strip_witness(block: &Block) -> Block {
         let mut b = block.clone();
         for tx in b.txdata.iter_mut().skip(1) {
@@ -332,6 +328,34 @@ impl FixtureChain {
                 input.witness = Witness::new();
             }
         }
+        b
+    }
+
+    /// Same header (so same hash), *all* witnesses removed, the coinbase's
+    /// reserved value included: a block with no witness data at all that
+    /// still carries a witness commitment. rust-bitcoin's
+    /// `check_witness_commitment` (and so `validate_block`) accepts that
+    /// shape; Core's `CheckWitnessMalleation`, which Hercules' sync paths
+    /// now run first as `check_block_mutation`, flags it as mutated. Without
+    /// that check it would only fail in script validation and be mistaken
+    /// for a consensus-invalid block (ticket 024).
+    pub fn strip_all_witness(block: &Block) -> Block {
+        let mut b = block.clone();
+        for tx in b.txdata.iter_mut() {
+            for input in &mut tx.input {
+                input.witness = Witness::new();
+            }
+        }
+        b
+    }
+
+    /// Same header (so same hash), the last transaction repeated so the
+    /// merkle root is unchanged (CVE-2012-2459). Only meaningful when the
+    /// block has an odd number of transactions.
+    pub fn duplicate_last_tx(block: &Block) -> Block {
+        let mut b = block.clone();
+        let last = b.txdata.last().unwrap().clone();
+        b.txdata.push(last);
         b
     }
 
@@ -450,7 +474,9 @@ fn coinbase_script(height: u32, salt: u32) -> ScriptBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_validation::{validate_block, validate_block_scripts, BlockValidationError};
+    use crate::block_validation::{
+        check_block_mutation, validate_block, validate_block_scripts, BlockValidationError,
+    };
     use crate::utxo::UtxoSet;
     use crate::validation::validate_headers;
     use tempfile::TempDir;
@@ -579,6 +605,102 @@ mod tests {
             validate_block(&wrong, 102, p),
             Err(BlockValidationError::BadMerkleRoot { .. })
         ));
+    }
+
+    /// Ticket 024: every mutation of a valid block is caught by
+    /// `check_block_mutation` and classified as a mutation; every invalid
+    /// variant passes it and fails later with a non-mutation error.
+    #[test]
+    fn mutations_are_detected_before_validation() {
+        let p = FixtureChain::params();
+        let c = chain_with_spends();
+        for h in 1..=c.tip_height() {
+            check_block_mutation(c.block(h), h, p).expect("honest block flagged as mutated");
+        }
+
+        // Block 102 spends with witnesses; build an odd-length block (3 txs)
+        // for the duplicate-tx mutation.
+        let mut odd = c.prefix(101);
+        let cb = odd.coinbase_outpoint(1);
+        let v = odd.outputs[&cb].value;
+        let parent = odd.spend(
+            &[cb],
+            vec![TxOut { value: v - Amount::from_sat(1_000), script_pubkey: odd.p2wpkh_script() }],
+        );
+        let mut scratch = odd.clone();
+        scratch.mine_block(vec![parent.clone()]);
+        let child = scratch.spend(
+            &[OutPoint::new(parent.compute_txid(), 0)],
+            vec![TxOut { value: v - Amount::from_sat(2_000), script_pubkey: odd.p2wpkh_script() }],
+        );
+        let three = odd.mine_block(vec![parent, child]);
+        assert_eq!(three.txdata.len(), 3);
+
+        let good = c.block(102);
+        for (name, mutated, original) in [
+            ("strip_witness", FixtureChain::strip_witness(good), good),
+            ("strip_all_witness", FixtureChain::strip_all_witness(good), good),
+            ("wrong_merkle", FixtureChain::wrong_merkle(good), good),
+            ("duplicate_last_tx", FixtureChain::duplicate_last_tx(&three), &three),
+        ] {
+            assert_eq!(mutated.block_hash(), original.block_hash(), "{}", name);
+            let err = check_block_mutation(&mutated, 102, p)
+                .err()
+                .unwrap_or_else(|| panic!("{}: mutation not detected", name));
+            assert!(err.is_mutation(), "{}: {:?} not classified as mutation", name, err);
+        }
+
+        let mut base = FixtureChain::new();
+        base.mine(101);
+        for kind in [Invalid::CoinbaseOverpay, Invalid::SpendMissingInput, Invalid::BadSignature] {
+            let mut c = base.clone();
+            let bad = c.mine_invalid(kind);
+            check_block_mutation(&bad, 102, p)
+                .unwrap_or_else(|e| panic!("{:?}: flagged as mutated: {}", kind, e));
+            let err = validate_all(&c).err().expect("invalid block validated");
+            assert!(!err.is_mutation(), "{:?}: {:?} classified as mutation", kind, err);
+        }
+    }
+
+    /// Witness data without a commitment (after activation), any witness
+    /// data before activation, and a block without a coinbase are all
+    /// mutations (bad deliveries), never consensus verdicts.
+    #[test]
+    fn witness_and_coinbase_mutations_are_classified_as_delivery() {
+        let p = FixtureChain::params();
+        let c = chain_with_spends();
+        let good = c.block(102);
+        let reseal = |mut b: Block| {
+            b.header.merkle_root = b.compute_merkle_root().unwrap();
+            b
+        };
+
+        // Commitment output and reserved value removed, spend witnesses kept.
+        let mut no_commit = good.clone();
+        no_commit.txdata[0].output.retain(|o| {
+            !(o.script_pubkey.len() >= 38 && o.script_pubkey.as_bytes()[..2] == [0x6a, 0x24])
+        });
+        no_commit.txdata[0].input[0].witness = Witness::new();
+        let err = check_block_mutation(&reseal(no_commit), 102, p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::UnexpectedWitness { .. }), "{:?}", err);
+        assert!(err.is_mutation() && !err.is_consensus_failure());
+
+        // Before SegWit activation no witness data is allowed at all, even
+        // with a valid commitment; a witness-free block is fine.
+        let pre_segwit: &'static ChainParams = Box::leak(Box::new(ChainParams {
+            segwit_height: 1_000,
+            ..*ChainParams::regtest()
+        }));
+        let err = check_block_mutation(good, 102, pre_segwit).unwrap_err();
+        assert!(matches!(err, BlockValidationError::UnexpectedWitness { .. }), "{:?}", err);
+        check_block_mutation(c.block(101), 101, pre_segwit).expect("witness-free block");
+
+        // No coinbase: invalid either way, but blamed on the delivery.
+        let mut no_coinbase = good.clone();
+        no_coinbase.txdata.remove(0);
+        let err = check_block_mutation(&reseal(no_coinbase), 102, p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::NoCoinbase { .. }), "{:?}", err);
+        assert!(err.is_mutation() && !err.is_consensus_failure());
     }
 
     #[test]
