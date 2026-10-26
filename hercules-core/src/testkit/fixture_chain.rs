@@ -352,11 +352,11 @@ impl FixtureChain {
     /// Same header (so same hash), *all* witnesses removed, the coinbase's
     /// reserved value included: a block with no witness data at all that
     /// still carries a witness commitment. rust-bitcoin's
-    /// `check_witness_commitment` (and so `validate_block`) accepts that
-    /// shape; Core's `CheckWitnessMalleation`, which Hercules' sync paths
-    /// now run first as `check_block_mutation`, flags it as mutated. Without
-    /// that check it would only fail in script validation and be mistaken
-    /// for a consensus-invalid block (ticket 024).
+    /// `check_witness_commitment` accepts that shape; Core's
+    /// `CheckWitnessMalleation`, which Hercules runs as
+    /// `check_block_mutation` (and inside `validate_block`), flags it as
+    /// mutated. Without that check it would only fail in script validation
+    /// and be mistaken for a consensus-invalid block (ticket 024).
     pub fn strip_all_witness(block: &Block) -> Block {
         let mut b = block.clone();
         for tx in b.txdata.iter_mut() {

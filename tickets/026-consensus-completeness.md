@@ -29,6 +29,11 @@ This ticket collects the missing rules into one module with tests for each rule.
   - Mempool re-checking of finality/BIP68 after a reorg (Core's `removeForReorg`).
 - **Mainnet check.** The ignored test `mainnet_blocks_pass_contextual_rules` (data from `tools/fetch_mainnet_context.py`) passed on blocks 972818, 972962 and 973011–973013. It used real MTP and real coin heights for 265 BIP68-constrained inputs. Zero rejections.
 
+## Follow-up after merging main (2026-10-26)
+
+- **024 classes for the new errors.** `BadCoinbaseLength`, `NonFinalTx`, `SequenceLockNotMet` and `ExcessiveSigopCost` are consensus failures. `MissingContext` is a local fault, so a block is never marked invalid because *we* lack header times. `VALIDATION_RULES_VERSION` is now 2, so `failed_blocks` rows recorded under v1 are reconsidered.
+- **Witness commitment matches Core's `CheckWitnessMalleation`.** `validate_block` no longer calls rust-bitcoin's `Block::check_witness_commitment`, which returns true early when no transaction has witness data. Because of that early return, it accepted a commitment with an empty coinbase witness. It also never checked witnesses before SegWit. `validate_block` and `check_block_mutation` now share `check_witness_malleation`, and every failure in it counts as a mutation (bad delivery), as with Core's `BLOCK_MUTATED`.
+
 ## Background: what we check today
 
 `validate_block` (`hercules-core/src/block_validation.rs:62`) checks:

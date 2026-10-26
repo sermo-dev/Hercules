@@ -165,14 +165,16 @@ pub fn validate_block(
         });
     }
 
-    // 10. Witness commitment (post-SegWit)
-    if height >= params.segwit_height {
-        // check_witness_commitment returns true if commitment is valid
-        // OR if the block has no witness data (pre-segwit txs only)
-        if !block.check_witness_commitment() {
-            return Err(BlockValidationError::BadWitnessCommitment { height });
-        }
-    }
+    // 10. Witness data must match the witness commitment, exactly as
+    // Core's `CheckWitnessMalleation`. Not rust-bitcoin's
+    // `Block::check_witness_commitment`: that returns true early whenever
+    // no transaction has witness data, so it accepts a commitment with an
+    // empty coinbase witness (Core: `bad-witness-nonce-size`), and it never
+    // looks at witnesses before SegWit activation (Core:
+    // `unexpected-witness`). `check_block_mutation` runs the same check
+    // first on the sync paths; it is repeated here so `validate_block`
+    // alone is never more lenient than Core.
+    check_witness_malleation(block, height, params)?;
 
     Ok(())
 }
@@ -218,6 +220,26 @@ pub fn check_block_mutation(
         return Err(BlockValidationError::NoCoinbase { height });
     }
 
+    check_witness_malleation(block, height, params)
+}
+
+/// Core's `CheckWitnessMalleation` (with `GetWitnessCommitmentIndex`).
+/// Once SegWit is active, if the coinbase has a witness commitment output
+/// (the last one carrying the magic), the coinbase witness must be exactly
+/// one 32-byte item (the reserved value) and the commitment must equal
+/// `SHA256d(witness merkle root || reserved value)`. With no commitment, or
+/// before activation, no transaction (the coinbase included) may carry
+/// witness data. Core returns `BLOCK_MUTATED` for every failure here, and
+/// so do we (`is_mutation`): witnesses aren't covered by the block hash, so
+/// a relaying peer can produce any of these failures from a valid block.
+///
+/// Requires a non-empty block whose first transaction is a coinbase.
+fn check_witness_malleation(
+    block: &Block,
+    height: u32,
+    params: &ChainParams,
+) -> Result<(), BlockValidationError> {
+    let coinbase = &block.txdata[0];
     if height >= params.segwit_height {
         let commitment = coinbase.output.iter().rposition(|o| {
             o.script_pubkey.len() >= 38
@@ -225,10 +247,12 @@ pub fn check_block_mutation(
         });
         if let Some(pos) = commitment {
             use bitcoin::hashes::Hash as _;
+            // `bad-witness-nonce-size`
             let reserved: Vec<&[u8]> = coinbase.input[0].witness.iter().collect();
             if reserved.len() != 1 || reserved[0].len() != 32 {
                 return Err(BlockValidationError::BadWitnessCommitment { height });
             }
+            // `bad-witness-merkle-match`
             let committed = &coinbase.output[pos].script_pubkey.as_bytes()[6..38];
             let matches = block.witness_root().is_some_and(|root| {
                 let computed = Block::compute_witness_commitment(&root, reserved[0]);
@@ -241,6 +265,7 @@ pub fn check_block_mutation(
         }
     }
 
+    // `unexpected-witness`
     if block
         .txdata
         .iter()
@@ -1484,6 +1509,197 @@ mod tests {
         // negative tests above.
         let block = wrap_block(vec![synth_coinbase(50)]);
         validate_block(&block, 1, ChainParams::mainnet()).expect("minimal coinbase block should validate");
+    }
+
+    // ── Witness malleation (Core's CheckWitnessMalleation) ───────────
+
+    /// SegWit active from genesis, BIP 34 never, so the synthetic blocks
+    /// need no height in their coinbase.
+    fn segwit_params() -> ChainParams {
+        ChainParams {
+            segwit_height: 0,
+            bip34_height: u32::MAX,
+            ..*ChainParams::mainnet()
+        }
+    }
+
+    fn witness_of(items: &[&[u8]]) -> bitcoin::Witness {
+        bitcoin::Witness::from_slice(items)
+    }
+
+    /// `txdata` with a commitment output appended to the coinbase,
+    /// committing to `txdata`'s witness root and `reserved`. The coinbase
+    /// witness is left as given, so tests can make it disagree.
+    fn with_commitment(mut txdata: Vec<bitcoin::Transaction>, reserved: &[u8; 32]) -> Block {
+        use bitcoin::hashes::Hash as _;
+        let root = wrap_block(txdata.clone()).witness_root().unwrap();
+        let commitment = Block::compute_witness_commitment(&root, reserved);
+        let mut spk = WITNESS_COMMITMENT_MAGIC.to_vec();
+        spk.extend_from_slice(commitment.as_byte_array());
+        txdata[0].output.push(bitcoin::TxOut {
+            value: Amount::ZERO,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(spk),
+        });
+        wrap_block(txdata)
+    }
+
+    /// Run both entry points: they must agree, and every failure must be a
+    /// mutation (bad delivery, Core's `BLOCK_MUTATED`), never a consensus
+    /// verdict.
+    fn malleation_verdict(block: &Block, height: u32, params: &ChainParams) -> Result<(), BlockValidationError> {
+        let via_mutation = check_block_mutation(block, height, params);
+        let via_validate = validate_block(block, height, params);
+        assert_eq!(
+            format!("{:?}", via_mutation),
+            format!("{:?}", via_validate),
+            "check_block_mutation and validate_block disagree"
+        );
+        if let Err(e) = &via_validate {
+            assert!(e.is_mutation() && !e.is_consensus_failure(), "{:?}", e);
+        }
+        via_validate
+    }
+
+    const RESERVED: [u8; 32] = [0u8; 32];
+
+    #[test]
+    fn witness_no_commitment_no_witness_is_valid() {
+        let p = segwit_params();
+        let block = wrap_block(vec![synth_coinbase(50), synth_noncoinbase(1)]);
+        malleation_verdict(&block, 1, &p).expect("witness-free block without commitment");
+    }
+
+    #[test]
+    fn witness_no_commitment_rejects_coinbase_witness() {
+        let p = segwit_params();
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&RESERVED]);
+        let block = wrap_block(vec![cb, synth_noncoinbase(1)]);
+        let err = malleation_verdict(&block, 1, &p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::UnexpectedWitness { .. }), "{:?}", err);
+    }
+
+    #[test]
+    fn witness_no_commitment_rejects_spend_witness() {
+        let p = segwit_params();
+        let mut tx = synth_noncoinbase(1);
+        tx.input[0].witness = witness_of(&[&[0x01; 72], &[0x02; 33]]);
+        let block = wrap_block(vec![synth_coinbase(50), tx]);
+        let err = malleation_verdict(&block, 1, &p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::UnexpectedWitness { .. }), "{:?}", err);
+    }
+
+    /// The rust-bitcoin gap: no transaction has witness data, so
+    /// `Block::check_witness_commitment` returns true early, but the
+    /// coinbase commits and has no reserved value (`bad-witness-nonce-size`).
+    #[test]
+    fn witness_commitment_without_reserved_value_is_rejected() {
+        let p = segwit_params();
+        let block = with_commitment(vec![synth_coinbase(50), synth_noncoinbase(1)], &RESERVED);
+        assert!(block.check_witness_commitment(), "rust-bitcoin accepts this shape");
+        let err = malleation_verdict(&block, 1, &p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::BadWitnessCommitment { .. }), "{:?}", err);
+    }
+
+    #[test]
+    fn witness_commitment_with_no_spend_witnesses_is_valid() {
+        let p = segwit_params();
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&RESERVED]);
+        let block = with_commitment(vec![cb, synth_noncoinbase(1)], &RESERVED);
+        malleation_verdict(&block, 1, &p).expect("commitment over witness-free txs");
+    }
+
+    #[test]
+    fn witness_commitment_with_spend_witnesses_is_valid() {
+        let p = segwit_params();
+        let reserved = [7u8; 32];
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&reserved]);
+        let mut tx = synth_noncoinbase(1);
+        tx.input[0].witness = witness_of(&[&[0x01; 72], &[0x02; 33]]);
+        let block = with_commitment(vec![cb, tx], &reserved);
+        malleation_verdict(&block, 1, &p).expect("matching commitment");
+    }
+
+    #[test]
+    fn witness_commitment_rejects_wrong_reserved_value_shape() {
+        let p = segwit_params();
+        let bad_stacks: [&[&[u8]]; 3] = [
+            &[&RESERVED, &RESERVED], // two items
+            &[&[0u8; 31]],           // short
+            &[&[0u8; 33]],           // long
+        ];
+        for stack in bad_stacks {
+            let mut cb = synth_coinbase(50);
+            cb.input[0].witness = witness_of(stack);
+            let block = with_commitment(vec![cb, synth_noncoinbase(1)], &RESERVED);
+            let err = malleation_verdict(&block, 1, &p).unwrap_err();
+            assert!(matches!(err, BlockValidationError::BadWitnessCommitment { .. }), "{:?}", err);
+        }
+    }
+
+    #[test]
+    fn witness_commitment_mismatch_is_rejected() {
+        let p = segwit_params();
+        // Reserved value differs from the one committed to.
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&[1u8; 32]]);
+        let block = with_commitment(vec![cb, synth_noncoinbase(1)], &RESERVED);
+        let err = malleation_verdict(&block, 1, &p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::BadWitnessCommitment { .. }), "{:?}", err);
+
+        // A spend witness changed after committing (a mangled relay).
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&RESERVED]);
+        let mut tx = synth_noncoinbase(1);
+        tx.input[0].witness = witness_of(&[&[0x01; 72]]);
+        let mut block = with_commitment(vec![cb, tx], &RESERVED);
+        block.txdata[1].input[0].witness = witness_of(&[&[0x03; 72]]);
+        let err = malleation_verdict(&block, 1, &p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::BadWitnessCommitment { .. }), "{:?}", err);
+    }
+
+    /// Core uses the *last* output carrying the magic; an earlier, stale
+    /// commitment is ignored.
+    #[test]
+    fn witness_commitment_uses_last_magic_output() {
+        let p = segwit_params();
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&RESERVED]);
+        let mut stale = WITNESS_COMMITMENT_MAGIC.to_vec();
+        stale.extend_from_slice(&[0xee; 32]);
+        cb.output.push(bitcoin::TxOut {
+            value: Amount::ZERO,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(stale),
+        });
+        let block = with_commitment(vec![cb.clone(), synth_noncoinbase(1)], &RESERVED);
+        malleation_verdict(&block, 1, &p).expect("last commitment matches");
+
+        // And the other way round: a good commitment followed by a bad one.
+        let mut block = block;
+        let good = block.txdata[0].output.pop().unwrap();
+        let bad = block.txdata[0].output.pop().unwrap();
+        block.txdata[0].output.push(good);
+        block.txdata[0].output.push(bad);
+        let block = wrap_block(block.txdata);
+        let err = malleation_verdict(&block, 1, &p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::BadWitnessCommitment { .. }), "{:?}", err);
+    }
+
+    /// Before SegWit activation a commitment output is just an OP_RETURN,
+    /// and any witness data at all is unexpected.
+    #[test]
+    fn witness_rules_before_segwit_activation() {
+        let p = ChainParams::mainnet(); // height 1: pre-SegWit, pre-BIP 34
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&RESERVED]);
+        let committed = with_commitment(vec![cb, synth_noncoinbase(1)], &RESERVED);
+        let err = malleation_verdict(&committed, 1, p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::UnexpectedWitness { .. }), "{:?}", err);
+
+        let no_witness = with_commitment(vec![synth_coinbase(50), synth_noncoinbase(1)], &RESERVED);
+        malleation_verdict(&no_witness, 1, p).expect("commitment output alone is fine pre-SegWit");
     }
 
     /// Ticket 024 classes for the ticket 026 variants: `MissingContext` is
