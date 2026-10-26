@@ -246,6 +246,7 @@ pub struct CatchUpStatus {
     pub tip_timestamp: u32,
     pub error: Option<String>,
     pub tip_disagreement: bool,
+    pub invalid_chain_detected: bool,
 }
 
 impl From<sync::CatchUpStatus> for CatchUpStatus {
@@ -259,6 +260,7 @@ impl From<sync::CatchUpStatus> for CatchUpStatus {
             tip_timestamp: s.tip_timestamp,
             error: s.error,
             tip_disagreement: s.tip_disagreement,
+            invalid_chain_detected: s.invalid_chain_detected,
         }
     }
 }
@@ -1197,6 +1199,18 @@ impl HerculesNode {
     /// Get node serving/relay statistics.
     pub fn get_node_status(&self) -> NodeStatus {
         self.syncer.get_node_status()
+    }
+
+    /// Forget every block recorded as consensus-invalid and lift the peer
+    /// bans recorded because of them (ticket 024), e.g. from a Settings
+    /// action after an update or a suspected false rejection. Returns the
+    /// number of bans lifted.
+    pub fn reconsider_invalid_blocks(&self) -> Result<u32, HerculesError> {
+        self.syncer
+            .reconsider_invalid_blocks()
+            .map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })
     }
 
     pub fn get_trust_info(&self) -> Result<TrustInfo, HerculesError> {

@@ -542,10 +542,12 @@ class NotificationManager: ObservableObject {
                 case .completed, .cancelled, .timedOut:
                     // A status counts only if headers were checked against
                     // peers (completed), blocks were actually validated, or
-                    // peers disagreed (the eclipse alert survives a cancel);
-                    // otherwise it is just the local tip.
+                    // peers disagreed or served an invalid block (those
+                    // alerts survive a cancel); otherwise it is just the
+                    // local tip.
                     if let status = report.status,
-                       report.outcome == .completed || status.blocksValidated > 0 || status.tipDisagreement {
+                       report.outcome == .completed || status.blocksValidated > 0
+                        || status.tipDisagreement || status.invalidChainDetected {
                         var record = Self.makeRecord(from: status, receivedAt: receivedAt)
                         record.wakeTimings = timings
                         return WakeRun(
@@ -746,7 +748,9 @@ class NotificationManager: ObservableObject {
 
     private static func makeRecord(from status: CatchUpStatus, receivedAt: Date = Date()) -> BlockNotificationRecord {
         let source: NotificationSource
-        if status.tipDisagreement {
+        if status.invalidChainDetected {
+            source = .invalidChain
+        } else if status.tipDisagreement {
             source = .tipDisagreement
         } else if status.caughtUp {
             source = .fullValidation
@@ -827,6 +831,9 @@ class NotificationManager: ObservableObject {
         case .tipDisagreement:
             content.title = "Chain Tip Disagreement"
             content.body = "Peers disagree on the chain tip at block #\(record.height). Retrying next wake."
+        case .invalidChain:
+            content.title = "Invalid Block Rejected"
+            content.body = "A peer relayed a block that breaks consensus rules after #\(record.height). Hercules rejected it and keeps following the valid chain."
         case .headerOnly:
             content.title = "Block #\(record.height) Header Verified"
             content.body = "PoW validated, full block validation pending"

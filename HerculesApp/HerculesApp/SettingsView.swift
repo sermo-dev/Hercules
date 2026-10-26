@@ -766,6 +766,7 @@ struct SettingsView: View {
         case .fullValidation: return "checkmark.shield.fill"
         case .catchUpProgress: return "arrow.triangle.2.circlepath"
         case .tipDisagreement: return "exclamationmark.triangle.fill"
+        case .invalidChain: return "xmark.octagon.fill"
         case .headerOnly: return "checkmark.circle.fill"
         case .pushPayload: return "bell.fill"
         case .networkPolicyPaused: return "pause.circle.fill"
@@ -783,6 +784,7 @@ struct SettingsView: View {
         case .fullValidation: return Theme.success
         case .catchUpProgress: return Theme.accent
         case .tipDisagreement: return .purple
+        case .invalidChain: return Theme.error
         case .headerOnly: return Theme.warning
         case .pushPayload: return Theme.textSecondary
         case .networkPolicyPaused: return Theme.warning
@@ -800,6 +802,7 @@ struct SettingsView: View {
         case .fullValidation: return "Validated"
         case .catchUpProgress: return "Catching Up"
         case .tipDisagreement: return "Tip Disagreement"
+        case .invalidChain: return "Invalid Chain"
         case .headerOnly: return "Header"
         case .pushPayload: return "Unverified"
         case .networkPolicyPaused: return "Paused"

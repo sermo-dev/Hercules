@@ -60,6 +60,7 @@ dictionary CatchUpStatus {
     u32 tip_timestamp;
     string? error;
     boolean tip_disagreement;
+    boolean invalid_chain_detected;
 };
 
 // Ticket 028: background wakes.
@@ -201,6 +202,9 @@ interface HerculesNode {
 
     [Throws=HerculesError]
     TrustInfo get_trust_info();
+
+    [Throws=HerculesError]
+    u32 reconsider_invalid_blocks();
 
     [Throws=HerculesError]
     string start_wallet_api();
