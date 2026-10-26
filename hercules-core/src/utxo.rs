@@ -252,6 +252,24 @@ const META_KEY_MUHASH: &[u8] = b"muhash";
 /// verified with, even if a later app release bumps the compiled anchor.
 const META_KEY_SNAPSHOT_BLOCK_HASH: &[u8] = b"snapshot_block_hash";
 
+/// Key inside the `meta` DB for the block the UTXO set is currently at:
+/// height (4 LE) || block hash (32, internal order). Written in the same
+/// txn as every `apply_block`, `rollback_block_to` and snapshot load, so it
+/// can never disagree with the UTXO rows themselves (ticket 024). The sync
+/// layer compares it with its header chain before trusting a validation
+/// failure, and uses it to repair `validated_height` after a crash between
+/// a UTXO write and the matching header-store update. Absent on databases
+/// written before it existed, and after a test-only `rollback_block`.
+const META_KEY_BEST_BLOCK: &[u8] = b"best_block";
+
+/// `META_KEY_BEST_BLOCK` value: height (4 LE) || hash (32).
+fn encode_best_block(height: u32, hash: &[u8; 32]) -> [u8; 36] {
+    let mut v = [0u8; 36];
+    v[..4].copy_from_slice(&height.to_le_bytes());
+    v[4..].copy_from_slice(hash);
+    v
+}
+
 /// LMDB key length for the `height_index` DB: height (4 BE) + txid (32) + vout (4 BE).
 const HEIGHT_INDEX_KEY_LEN: usize = 40;
 
@@ -794,9 +812,37 @@ impl UtxoSet {
             }
         }
 
+        let best = encode_best_block(height, &block.block_hash().to_byte_array());
+        self.meta
+            .put(&mut wtxn, META_KEY_BEST_BLOCK, &best)
+            .map_err(lmdb("put best_block"))?;
+
         wtxn.commit()
             .map_err(lmdb("commit"))?;
         Ok(())
+    }
+
+    /// The block the UTXO set is at, as `(height, block hash)`, or `None`
+    /// if unknown (see `META_KEY_BEST_BLOCK`).
+    pub fn best_block(&self) -> Result<Option<(u32, [u8; 32])>, UtxoError> {
+        let _gate = self.read_gate()?;
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let bytes = self
+            .meta
+            .get(&rtxn, META_KEY_BEST_BLOCK)
+            .map_err(|e| UtxoError(format!("read best_block: {}", e)))?;
+        match bytes {
+            Some(b) if b.len() == 36 => {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&b[4..]);
+                Ok(Some((u32::from_le_bytes(b[..4].try_into().unwrap()), hash)))
+            }
+            Some(b) => Err(UtxoError(format!("corrupt best_block: len {}", b.len()))),
+            None => Ok(None),
+        }
     }
 
     /// Highest block height covered by the most-recently loaded UTXO snapshot,
@@ -895,7 +941,25 @@ impl UtxoSet {
     /// `assume_valid_floor` for the rationale.
     ///
     /// Retried after growing the map on `MDB_MAP_FULL`, like `apply_block`.
+    ///
+    /// Leaves the best-block marker unknown; production rollbacks use
+    /// `rollback_block_to`, which knows the parent's hash. Test-only.
+    #[cfg(test)]
     pub fn rollback_block(&self, height: u32) -> Result<(), UtxoError> {
+        self.rollback_block_inner(height, None)
+    }
+
+    /// `rollback_block`, recording `parent_hash` (the block at `height - 1`)
+    /// as the new best block in the same txn.
+    pub fn rollback_block_to(&self, height: u32, parent_hash: [u8; 32]) -> Result<(), UtxoError> {
+        self.rollback_block_inner(height, Some(parent_hash))
+    }
+
+    fn rollback_block_inner(
+        &self,
+        height: u32,
+        parent_hash: Option<[u8; 32]>,
+    ) -> Result<(), UtxoError> {
         let floor = self.assume_valid_floor()?;
         if height <= floor && floor > 0 {
             return Err(UtxoError(format!(
@@ -906,7 +970,7 @@ impl UtxoSet {
         }
         let mut attempt = 0;
         loop {
-            match self.rollback_block_txn(height) {
+            match self.rollback_block_txn(height, parent_hash) {
                 Ok(()) => return Ok(()),
                 Err(WriteError::Other(e)) => return Err(e),
                 Err(WriteError::MapFull(msg)) => {
@@ -920,7 +984,11 @@ impl UtxoSet {
         }
     }
 
-    fn rollback_block_txn(&self, height: u32) -> Result<(), WriteError> {
+    fn rollback_block_txn(
+        &self,
+        height: u32,
+        parent_hash: Option<[u8; 32]>,
+    ) -> Result<(), WriteError> {
 
         let _gate = self.read_gate()?;
         let mut wtxn = self
@@ -990,6 +1058,18 @@ impl UtxoSet {
             self.undo
                 .delete(&mut wtxn, undo_k.as_slice())
                 .map_err(lmdb("delete undo"))?;
+        }
+
+        match parent_hash {
+            Some(hash) => self
+                .meta
+                .put(&mut wtxn, META_KEY_BEST_BLOCK, &encode_best_block(height.saturating_sub(1), &hash))
+                .map_err(lmdb("put best_block"))?,
+            None => {
+                self.meta
+                    .delete(&mut wtxn, META_KEY_BEST_BLOCK)
+                    .map_err(lmdb("delete best_block"))?;
+            }
         }
 
         wtxn.commit()
@@ -1502,6 +1582,9 @@ impl UtxoSet {
             self.meta
                 .put(&mut wtxn, META_KEY_SNAPSHOT_BLOCK_HASH, &block_hash)
                 .map_err(|e| UtxoError(format!("put snapshot_block_hash: {}", e)))?;
+            self.meta
+                .put(&mut wtxn, META_KEY_BEST_BLOCK, &encode_best_block(height, &block_hash))
+                .map_err(|e| UtxoError(format!("put best_block: {}", e)))?;
 
             // Persist the MuHash for UI display and independent verification.
             self.meta
@@ -1599,8 +1682,10 @@ impl UtxoSet {
     }
 
     /// Check if any UTXOs exist at the given block height.
-    /// Used for crash recovery: if UTXOs from a block exist but validated_height
-    /// wasn't updated, the block was already applied.
+    /// Crash-recovery fallback for legacy databases only (no best-block
+    /// marker, see `HeaderSync::utxo_has_block`): it can't tell two blocks
+    /// at one height apart, and misses blocks whose outputs are all
+    /// OP_RETURN or spent in-block.
     pub fn has_utxos_at_height(&self, height: u32) -> Result<bool, UtxoError> {
         let _gate = self.read_gate()?;
         let rtxn = self
@@ -2310,6 +2395,30 @@ mod tests {
     }
 
     #[test]
+    fn best_block_tracks_apply_and_rollback() {
+        let (utxo, _dir) = fresh();
+        assert_eq!(utxo.best_block().unwrap(), None, "fresh set has no best block");
+        let genesis = genesis_block();
+        let hash = genesis.block_hash().to_byte_array();
+        utxo.apply_block(&genesis, 0).unwrap();
+        assert_eq!(utxo.best_block().unwrap(), Some((0, hash)));
+
+        utxo.test_insert_utxo([2u8; 32], 0, UtxoEntry {
+            amount: 500,
+            script_pubkey: vec![0x51],
+            height: 1,
+            is_coinbase: false,
+        })
+        .unwrap();
+        utxo.rollback_block_to(1, hash).unwrap();
+        assert_eq!(utxo.best_block().unwrap(), Some((0, hash)));
+
+        // The test-only rollback can't name the parent: marker becomes unknown.
+        utxo.rollback_block(0).unwrap();
+        assert_eq!(utxo.best_block().unwrap(), None);
+    }
+
+    #[test]
     fn apply_and_rollback_roundtrip() {
         let (utxo, _dir) = fresh();
         let genesis = genesis_block();
@@ -2589,6 +2698,7 @@ mod tests {
         assert_eq!(loaded.height, 0);
         assert_eq!(loaded.utxo_count, 1);
         assert_eq!(utxo2.count().unwrap(), 1);
+        assert_eq!(utxo2.best_block().unwrap(), Some((0, block_hash)), "snapshot sets best block");
 
         let coinbase_txid = genesis.txdata[0].compute_txid();
         let entry = utxo2.get(&coinbase_txid, 0).unwrap().unwrap();

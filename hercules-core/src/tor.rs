@@ -136,9 +136,17 @@ pub struct TorManager {
     /// start/stop/accept can take `&self` (required because TorManager
     /// lives behind Arc in HerculesNode).
     wallet_state: std::sync::Mutex<WalletOnionState>,
+    /// Kept alive exactly as long as this client (ticket 028: the claim on
+    /// the Arti state directory, so no second client starts on it).
+    _held: Vec<Box<dyn Send + Sync>>,
 }
 
 impl TorManager {
+    /// Keep `token` alive for as long as this client is.
+    pub fn hold(&mut self, token: Box<dyn Send + Sync>) {
+        self._held.push(token);
+    }
+
     /// Bootstrap the Tor client. This blocks until connected to the Tor
     /// network (typically 5-15 seconds on a good connection).
     pub fn bootstrap(data_dir: &Path) -> Result<Self, TorError> {
@@ -195,6 +203,7 @@ impl TorManager {
                 inbound_rx: None,
                 handle: None,
             }),
+            _held: Vec::new(),
         })
     }
 

@@ -12,3 +12,15 @@ mod consensus_rules;
 
 pub use fixture_chain::{FixtureChain, Invalid};
 pub use mock_peer::{Behavior, MockPeer};
+
+/// Address test listeners bind to: `HERCULES_TEST_LOOPBACK` (e.g. `::1`
+/// when a host has run out of IPv4 loopback ports), default 127.0.0.1.
+/// Returns a `host:0` string for `TcpListener::bind`.
+pub fn loopback_bind() -> String {
+    let host = std::env::var("HERCULES_TEST_LOOPBACK").unwrap_or_else(|_| "127.0.0.1".into());
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:0", host)
+    } else {
+        format!("{}:0", host)
+    }
+}

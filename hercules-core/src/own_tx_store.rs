@@ -376,6 +376,7 @@ impl OwnTxStore {
     /// Open or create the tracker at `path` (`":memory:"` for tests).
     pub fn open(path: &str) -> Result<OwnTxStore, OwnTxStoreError> {
         let conn = Connection::open(path).map_err(db_err)?;
+        conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT).map_err(db_err)?;
         if path != ":memory:" {
             conn.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
         }
