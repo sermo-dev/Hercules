@@ -239,7 +239,7 @@ Through Phase 4, Hercules downloads and validates but never gives anything back 
 
 **Phase 5a — AssumeUTXO Download & Bootstrap**
 - Automatic download of an AssumeUTXO snapshot over WiFi (~8.8 GB compressed)
-- Hardcoded snapshot hash (`ASSUMEUTXO_HASH`, a SHA-256 over the Hercules-format UTXO entries; it is not Core's `hash_serialized` and does not appear in Core's `chainparams.cpp`) — download source is untrusted, hash commitment is trusted. The Core-comparable value is the set's MuHash (`gettxoutsetinfo muhash`), which has not yet been compared with Core for the 943,500 snapshot
+- Hardcoded snapshot hash (`ASSUMEUTXO_HASH`, a SHA-256 over the Hercules-format UTXO entries; it is not Core's `hash_serialized` and does not appear in Core's `chainparams.cpp`) — download source is untrusted, hash commitment is trusted. The Core-comparable value is the set's MuHash (`gettxoutsetinfo muhash`); for the 973,303 snapshot it was checked equal to Bitcoin Core 29.3's before release
 - One-tap onboarding: download, verify, load into UTXO set, begin validating forward
 - Temporary: host Hercules-format snapshot on CDN; long-term: BitTorrent/IPFS distribution
 

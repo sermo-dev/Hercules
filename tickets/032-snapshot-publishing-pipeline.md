@@ -22,18 +22,18 @@ This ticket builds a server-side pipeline that regularly produces, verifies, and
 ## Background (verified)
 
 **Pinned anchor.** `hercules-core/src/assumeutxo.rs` pins:
-- `ASSUMEUTXO_HEIGHT = 943_500` (`:16`)
-- `ASSUMEUTXO_HASH`, the SHA256 over the HUTX entries (`:27`): `a65fdd39…1bf734` since PR #27
+- `ASSUMEUTXO_HEIGHT = 973_303` (`:16`)
+- `ASSUMEUTXO_HASH`, the SHA256 over the HUTX entries (`:27`): `8618c18a…79e677` since PR #27
 - `RETRACTED_SNAPSHOT_HASHES` (`:42`): `705528fe…2d133e`, the first 943,500 file. Its converter wrote 34,336 uncompressed-P2PK coins as compressed-key scripts; sets imported from it are wiped on open
-- `ASSUMEUTXO_UTXO_COUNT = 165_208_261` (`:57`), checked exactly against the header
+- `ASSUMEUTXO_UTXO_COUNT = 164_515_974` (`:57`), checked exactly against the header
 - `ASSUMEUTXO_BLOCK_HASH` (`:61`)
 - `SNAPSHOT_DOWNLOAD_URL` (`:115`)
-- `SNAPSHOT_DOWNLOAD_SIZE` = 8,781,448,895 bytes compressed (`:119`)
+- `SNAPSHOT_DOWNLOAD_SIZE` = 8,720,212,870 bytes compressed (`:119`)
 
 The file was committed 2026-04-06. Around 28,000 blocks have been mined since, so a new user today downloads roughly 40+ GB of blocks after the snapshot and validates them before reaching the tip. That's the opposite of "install and go".
 
 **Hosting.**
-- `SnapshotDownloader.swift:20-22` hardcodes `https://pub-341db…r2.dev/hercules-943500-utxo-v2.hutx.gz` (was `hercules-utxo.hutx.gz`, the retracted file). Local download/resume file names derive from that object name.
+- `SnapshotDownloader.swift:20-22` hardcodes `https://pub-341db…r2.dev/hercules-973303-utxo.hutx.gz` (was `hercules-utxo.hutx.gz`, the retracted 943,500 file). Local download/resume file names derive from that object name.
 - `r2.dev` public URLs are rate-limited and Cloudflare documents them as not for production.
 
 **Conversion.**
@@ -89,7 +89,7 @@ The file was committed 2026-04-06. Around 28,000 blocks have been mined since, s
 
 The snapshot's MuHash, as Hercules computes it (the value `load_snapshot` stores and TrustInfo shows), **must equal** Bitcoin Core's `bitcoin-cli gettxoutsetinfo muhash <height>` on an independent, fully validating Core node, and the UTXO count must equal Core's `txouts`. No snapshot hash is baked into a release, and no file is uploaded, until this holds. The entries SHA256 only proves the file is the one we converted, not that the conversion was right: the 943,500 file shipped with a converter bug (uncompressed P2PK) that a MuHash comparison would have caught.
 
-Current 943,500 file: Hercules MuHash `73877c075918cdf010b181b7cedb99715df424f70d52d412b0c8d78175d2de4c`. **Not yet compared with Core.**
+Current 973,303 file: Hercules MuHash `3e9000d718babdce2355667017ed5aac5fc9a8154d224d46c23f62c1af82e11a`. **Equal to Bitcoin Core 29.3's `gettxoutsetinfo muhash`** at that block (2026-10-26, network paused during dump and MuHash), with matching txouts (164,515,974) and total_amount. This was a manual run of the gate the pipeline must automate.
 
 ## Pipeline design
 

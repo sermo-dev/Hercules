@@ -8,8 +8,8 @@ The AssumeUTXO snapshot bootstrap (Phase 5a) downloads ~8.8 GB from a Cloudflare
 
 Hercules is a privacy-preserving Bitcoin node — Arti routes every P2P connection through Tor by default. Phase 5a added one-tap bootstrap by downloading a hash-anchored UTXO snapshot from R2:
 
-- URL: `https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-943500-utxo-v2.hutx.gz` (`SNAPSHOT_DOWNLOAD_URL` / `SnapshotDownloader.downloadURL`)
-- Size: ~8.8 GB compressed (8,781,448,895 bytes)
+- URL: `https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-973303-utxo.hutx.gz` (`SNAPSHOT_DOWNLOAD_URL` / `SnapshotDownloader.downloadURL`)
+- Size: ~8.7 GB compressed (8,720,212,870 bytes)
 - Trust model: hash baked into `assumeutxo.rs::ASSUMEUTXO_HASH`, verified by `utxo.rs::load_snapshot` before any data touches the database. The hoster cannot tamper with the bytes undetected.
 
 The snapshot trust model is solid, but the **delivery channel** leaks metadata that the rest of the node carefully hides.

@@ -18,13 +18,13 @@ class SnapshotDownloader: NSObject, ObservableObject {
     // The R2 public URL. Must match `ASSUMEUTXO_HASH` baked into hercules-core,
     // which verifies the file before applying it to the database.
     static let downloadURL = URL(string:
-        "https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-943500-utxo-v2.hutx.gz"
+        "https://pub-341db11a2808417d91d4fcabc62a2260.r2.dev/hercules-973303-utxo.hutx.gz"
     )!
 
     // Approximate compressed size (matches `SNAPSHOT_DOWNLOAD_SIZE` in assumeutxo.rs).
     // Used as a fallback for progress UI when the server hasn't returned
     // Content-Length yet.
-    static let expectedBytes: Int64 = 8_781_448_895
+    static let expectedBytes: Int64 = 8_720_212_870
 
     /// `SNAPSHOT_SESSION_ID` in Config/Shared.xcconfig.
     private static let backgroundSessionId = AppIdentifiers.snapshotSessionID
@@ -99,7 +99,7 @@ class SnapshotDownloader: NSObject, ObservableObject {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
     }
 
-    /// Object name of the current snapshot, e.g. `hercules-943500-utxo-v2`.
+    /// Object name of the current snapshot, e.g. `hercules-973303-utxo`.
     /// Local file names derive from it so a file, or resume data, from a
     /// different snapshot can never be mistaken for this one.
     private static var snapshotName: String {
