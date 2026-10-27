@@ -78,6 +78,12 @@ pub fn hercules_version() -> String {
     "Hercules v0.1.0".to_string()
 }
 
+/// The script verification library this build uses (ticket 047), e.g.
+/// "libbitcoinkernel v32.0" or the legacy libbitcoinconsensus v26.
+pub fn script_backend() -> String {
+    script_verify::active_backend_name().to_string()
+}
+
 /// Wipe all on-disk state for a Hercules node so the next launch starts from a
 /// clean genesis. Deletes the headers DB plus the derived block-store and
 /// peers SQLite files (and their -wal/-shm sidecars), and recursively removes

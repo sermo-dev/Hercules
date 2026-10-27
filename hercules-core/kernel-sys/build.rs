@@ -6,7 +6,8 @@
 //!    tree and a clean working tree; a stale or partial copy is refetched.
 //!    `$HERCULES_BITCOIN_CORE_SRC` overrides it (offline builds, or a
 //!    checkout you are bumping); an override that doesn't verify builds with
-//!    a loud warning and an "unverified" library label.
+//!    a loud warning and an "unverified" library label on the host, and is
+//!    refused outright for an iOS release build.
 //! 2. cmake configure + build + install into `OUT_DIR`, with the iOS
 //!    cross-compile flags the upstream `libbitcoinkernel-sys` build.rs lacks
 //!    (without them cmake silently produces a macOS archive for iOS targets;
@@ -224,6 +225,20 @@ fn override_source(dir: PathBuf) -> (PathBuf, String) {
     match verify_checkout(&dir) {
         Ok(()) => (dir, CORE_TAG.into()),
         Err(e) => {
+            // Never ship it: an iOS release build (what build-ios.sh makes)
+            // from an unverified tree is refused outright. Host builds
+            // (tests, benchmarks, bumping Core) only warn.
+            let ios = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios");
+            let release = env::var("PROFILE").as_deref() == Ok("release");
+            if ios && release {
+                panic!(
+                    "refusing an iOS release build from unverified Bitcoin Core source: \
+                     HERCULES_BITCOIN_CORE_SRC={} is not a clean checkout of the pinned \
+                     {CORE_TAG} ({CORE_COMMIT}): {e}. Unset HERCULES_BITCOIN_CORE_SRC to build \
+                     the pinned release, or use it for host test builds only.",
+                    dir.display()
+                );
+            }
             for line in [
                 "**************************************************************".to_string(),
                 format!("UNVERIFIED Bitcoin Core source: HERCULES_BITCOIN_CORE_SRC={}", dir.display()),
@@ -239,8 +254,8 @@ fn override_source(dir: PathBuf) -> (PathBuf, String) {
 }
 
 /// Ok if `dir` is its own git checkout of `CORE_COMMIT` (tree `CORE_TREE`)
-/// with no modified, deleted or untracked files (the `.fetched` marker
-/// aside).
+/// with no modified, deleted, untracked or ignored files (the `.fetched`
+/// marker aside).
 fn verify_checkout(dir: &Path) -> Result<(), String> {
     if !dir.join(".git").exists() {
         return Err("not a git checkout (no .git), so its contents can't be verified".into());
@@ -269,7 +284,18 @@ fn verify_checkout(dir: &Path) -> Result<(), String> {
     if tree != CORE_TREE {
         return Err(format!("HEAD's tree is {tree}, expected {CORE_TREE}"));
     }
-    let status = git(&["status", "--porcelain", "--untracked-files=all", "--", ".", ":!.fetched"])?;
+    // `--ignored`: a gitignored file (Core ignores build dirs, generated
+    // headers and more) can change what cmake compiles just as well as an
+    // untracked one. Our own build outputs live in OUT_DIR, never here.
+    let status = git(&[
+        "status",
+        "--porcelain",
+        "--ignored",
+        "--untracked-files=all",
+        "--",
+        ".",
+        ":!.fetched",
+    ])?;
     if !status.is_empty() {
         let first: Vec<&str> = status.lines().take(5).collect();
         return Err(format!("working tree differs from the commit: {}", first.join("; ")));

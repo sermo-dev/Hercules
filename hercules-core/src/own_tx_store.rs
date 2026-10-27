@@ -148,6 +148,8 @@ impl SubmitError {
                 "already in mempool (should be handled by caller)".into(),
             ),
             M::UtxoLookup(s) => SubmitError::Internal(s),
+            // Our verifier failed, not the transaction (ticket 047).
+            M::ScriptVerifierError { .. } => SubmitError::Internal(msg),
         }
     }
 
@@ -1112,6 +1114,10 @@ mod tests {
         assert!(matches!(
             c(MempoolError::ScriptFailure { input_index: 0, error: "x".into() }),
             SubmitError::Consensus(_)
+        ));
+        assert!(matches!(
+            c(MempoolError::ScriptVerifierError { input_index: 0, error: "x".into() }),
+            SubmitError::Internal(_)
         ));
         assert!(matches!(
             c(MempoolError::DustOutput { index: 0, amount: 1 }),

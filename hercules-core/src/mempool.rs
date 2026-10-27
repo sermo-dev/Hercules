@@ -479,12 +479,8 @@ impl Mempool {
         }
 
         if !skip_consensus {
-            script_verify::verify_transaction(&tx, &spent, flags).map_err(|f| {
-                MempoolError::ScriptFailure {
-                    input_index: f.input_index,
-                    error: f.error.to_string(),
-                }
-            })?;
+            script_verify::verify_transaction(&tx, &spent, flags)
+                .map_err(MempoolError::from_script_verify)?;
         }
 
         // ── Phase 3: value math + fee bounds ────────────────────────────
@@ -1448,6 +1444,10 @@ pub enum MempoolError {
     PolicyRejection(crate::relay_policy::PolicyRejection),
     NonFinal { lock_time: u32, current_height: u32 },
     UtxoLookup(String),
+    /// The script verifier itself failed (bad flags, mismatched spent
+    /// outputs, a tx it could not parse back, a kernel/FFI fault): our
+    /// fault, not proof the transaction is invalid. See `from_script_verify`.
+    ScriptVerifierError { input_index: usize, error: String },
     // CPFP / ancestor tracking (ticket 010)
     TooManyAncestors { count: usize, limit: usize },
     AncestorSetTooLarge { vbytes: u64, limit: u64 },
@@ -1461,6 +1461,31 @@ pub enum MempoolError {
         evicted_fee_total: u64,
         relay_surcharge: u64,
     },
+}
+
+impl MempoolError {
+    /// Classify a script-verifier failure, as `block_validation::script_error`
+    /// does for blocks (ticket 024): only a script that evaluated to false
+    /// is `ScriptFailure`. Exhaustive so a new `ScriptVerifyError` must be
+    /// classified here.
+    fn from_script_verify(f: script_verify::ScriptVerifyFailure) -> MempoolError {
+        use script_verify::ScriptVerifyError as E;
+        let script_verify::ScriptVerifyFailure { input_index, error } = f;
+        match error {
+            E::ScriptFailed => MempoolError::ScriptFailure {
+                input_index,
+                error: error.to_string(),
+            },
+            E::InvalidFlags(_)
+            | E::SpentOutputsMismatch { .. }
+            | E::NoInputs
+            | E::TxDeserialize
+            | E::Library(_) => MempoolError::ScriptVerifierError {
+                input_index,
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for MempoolError {
@@ -1534,6 +1559,9 @@ impl std::fmt::Display for MempoolError {
                 )
             }
             MempoolError::UtxoLookup(e) => write!(f, "UTXO lookup error: {}", e),
+            MempoolError::ScriptVerifierError { input_index, error } => {
+                write!(f, "script verifier error on input {}: {}", input_index, error)
+            }
             MempoolError::TooManyAncestors { count, limit } => {
                 write!(f, "ancestor count {} exceeds limit {}", count, limit)
             }
@@ -2545,5 +2573,31 @@ mod tests {
 
         // A is still in the mempool — the rejection happened pre-mutation.
         assert!(pool.contains(&a_txid));
+    }
+
+    /// Ticket 047 review: only a script evaluating to false rejects the tx
+    /// as a script failure; every verifier fault is local.
+    #[test]
+    fn only_script_failed_is_a_mempool_script_failure() {
+        use crate::script_verify::{ScriptVerifyError as E, ScriptVerifyFailure};
+        let fail = |error| ScriptVerifyFailure { input_index: 1, error };
+        assert!(matches!(
+            MempoolError::from_script_verify(fail(E::ScriptFailed)),
+            MempoolError::ScriptFailure { input_index: 1, .. }
+        ));
+        for other in [
+            E::InvalidFlags(0xffff_ffff),
+            E::SpentOutputsMismatch { inputs: 2, spent: 1 },
+            E::NoInputs,
+            E::TxDeserialize,
+            E::Library("btck_script_pubkey_verify status 2".into()),
+        ] {
+            let e = MempoolError::from_script_verify(fail(other));
+            assert!(
+                matches!(e, MempoolError::ScriptVerifierError { input_index: 1, .. }),
+                "{:?}",
+                e
+            );
+        }
     }
 }
