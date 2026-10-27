@@ -9,7 +9,8 @@ use log::{debug, info};
 
 use crate::chain_params::ChainParams;
 use crate::contextual_checks::{
-    calculate_sequence_locks, evaluate_sequence_locks, is_final_tx, HeaderTimes, MedianTimes,
+    calculate_sequence_locks, evaluate_sequence_locks, is_final_tx, median_time_past, HeaderTimes,
+    MedianTimes,
 };
 use crate::utxo::{UtxoEntry, UtxoSet};
 
@@ -119,6 +120,11 @@ pub struct Mempool {
     max_size: usize,
     /// Chain whose script-flag schedule applies to accepted transactions.
     params: &'static ChainParams,
+    /// Median-time-past of the tip that admission last judged against:
+    /// (height, header hash, MTP). Every relayed tx needs it, and it only
+    /// changes with the tip; keyed by hash so a reorg can't serve a stale
+    /// value.
+    tip_mtp_cache: Option<(u32, [u8; 32], i64)>,
 }
 
 impl Mempool {
@@ -137,6 +143,7 @@ impl Mempool {
             total_size: 0,
             max_size: DEFAULT_MAX_SIZE,
             params,
+            tip_mtp_cache: None,
         }
     }
 
@@ -150,6 +157,7 @@ impl Mempool {
             total_size: 0,
             max_size,
             params: ChainParams::mainnet(),
+            tip_mtp_cache: None,
         }
     }
 
@@ -292,6 +300,21 @@ impl Mempool {
         self.accept_tx_internal(tx, utxo_set, current_height, times, AcceptMode::SkipConsensus)
     }
 
+    /// Median-time-past at `height` (the tip admission judges against),
+    /// cached per tip header hash. Sources that can't identify the header
+    /// (`header_id_at` = None) are read every time.
+    fn tip_mtp(&mut self, height: u32, times: &dyn HeaderTimes) -> Result<i64, MempoolError> {
+        let id = times.header_id_at(height);
+        if let (Some(id), Some((h, cached_id, mtp))) = (id, self.tip_mtp_cache) {
+            if h == height && cached_id == id {
+                return Ok(mtp);
+            }
+        }
+        let mtp = median_time_past(times, height).map_err(MempoolError::ChainContext)?;
+        self.tip_mtp_cache = id.map(|id| (height, id, mtp));
+        Ok(mtp)
+    }
+
     /// Shared accept implementation. See [`AcceptMode`] for what each
     /// mode checks.
     fn accept_tx_internal(
@@ -324,8 +347,8 @@ impl Mempool {
         // `current_height + 1`, time locks against the tip's median-time-
         // past (BIP 113), never the wall clock. Same `IsFinalTx` port as
         // block validation (contextual_checks).
+        let tip_mtp = self.tip_mtp(current_height, times)?;
         let mut mtp = MedianTimes::new(times);
-        let tip_mtp = mtp.at(current_height).map_err(MempoolError::ChainContext)?;
         let next_height = current_height.saturating_add(1);
         if !is_final_tx(&tx, next_height, tip_mtp) {
             return Err(MempoolError::NonFinal {
@@ -2621,6 +2644,56 @@ mod tests {
         tx.lock_time = LockTime::from_consensus(lock_time);
         tx.input[0].sequence = Sequence(sequence);
         (utxo, dir, tx)
+    }
+
+    /// Header source that counts reads and names its tip, for the tip-MTP
+    /// cache.
+    struct CountingTimes {
+        reads: std::cell::Cell<u32>,
+        tip_id: std::cell::Cell<[u8; 32]>,
+    }
+
+    impl HeaderTimes for CountingTimes {
+        fn timestamp_at(&self, height: u32) -> Result<u32, String> {
+            self.reads.set(self.reads.get() + 1);
+            synthetic_times(height)
+        }
+        fn header_id_at(&self, _height: u32) -> Option<[u8; 32]> {
+            Some(self.tip_id.get())
+        }
+    }
+
+    /// The tip's MTP is read once per tip, not once per relayed tx, and a
+    /// different header at the same height (a reorg) is never served the
+    /// old value.
+    #[test]
+    fn tip_mtp_is_cached_per_tip_hash() {
+        let times = CountingTimes {
+            reads: 0.into(),
+            tip_id: [1; 32].into(),
+        };
+        let mut pool = Mempool::new();
+        let (utxo, _d, tx) = locked_tx(tip_mtp() - 1, 0xffff_fffe);
+        pool.accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &times).unwrap();
+        let first = times.reads.get();
+        assert!(first > 0);
+
+        let (utxo, _d, mut tx) = locked_tx(tip_mtp() - 1, 0xffff_fffe);
+        tx.output[0].value = Amount::from_sat(80_000);
+        pool.accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &times).unwrap();
+        assert_eq!(times.reads.get(), first, "same tip: MTP not re-read");
+
+        // A cached MTP 1,000 s later, for a different header at this
+        // height (the branch we reorged away from). Served, it would make
+        // this locktime final; recomputed for the new tip, it is not.
+        times.tip_id.set([2; 32]);
+        let mut pool = Mempool::new();
+        pool.tip_mtp_cache = Some((TEST_HEIGHT, [1; 32], tip_mtp() as i64 + 1_000));
+        let (utxo, _d, tx) = locked_tx(tip_mtp() + 500, 0xffff_fffe);
+        assert!(matches!(
+            pool.accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &times),
+            Err(MempoolError::NonFinal { .. })
+        ));
     }
 
     #[test]

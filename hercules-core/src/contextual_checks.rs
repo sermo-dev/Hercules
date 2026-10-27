@@ -117,6 +117,21 @@ const OP_INVALIDOPCODE: u8 = 0xff;
 /// Timestamps of the headers on the chain being validated, by height.
 pub trait HeaderTimes {
     fn timestamp_at(&self, height: u32) -> Result<u32, String>;
+
+    /// Timestamps for heights `first..=last`, ascending. Implementations
+    /// backed by a database should override this with one range read:
+    /// every block's median-time-past needs 11 of them.
+    fn timestamps_between(&self, first: u32, last: u32) -> Result<Vec<u32>, String> {
+        (first..=last).map(|h| self.timestamp_at(h)).collect()
+    }
+
+    /// Identity of the header at `height` (its hash), if the source can
+    /// give one cheaply. Lets callers cache a value derived from the chain
+    /// up to `height` (the mempool's tip MTP) without missing a reorg.
+    /// `None` means "can't tell": callers must not cache.
+    fn header_id_at(&self, _height: u32) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 impl HeaderTimes for HeaderStore {
@@ -124,6 +139,31 @@ impl HeaderTimes for HeaderStore {
         self.get_timestamp_at(height)
             .map_err(|e| format!("{}", e))?
             .ok_or_else(|| format!("no header at height {}", height))
+    }
+
+    fn timestamps_between(&self, first: u32, last: u32) -> Result<Vec<u32>, String> {
+        let times = self
+            .get_timestamps_between(first, last)
+            .map_err(|e| format!("{}", e))?;
+        let expected = (last - first + 1) as usize;
+        if times.len() != expected {
+            return Err(format!(
+                "headers {}..={}: found {} of {}",
+                first,
+                last,
+                times.len(),
+                expected
+            ));
+        }
+        Ok(times)
+    }
+
+    fn header_id_at(&self, height: u32) -> Option<[u8; 32]> {
+        use bitcoin::hashes::Hash as _;
+        self.get_hash_at_height(height)
+            .ok()
+            .flatten()
+            .map(|h| h.to_byte_array())
     }
 }
 
@@ -137,9 +177,13 @@ impl<F: Fn(u32) -> Result<u32, String>> HeaderTimes for F {
 /// and those of up to 10 ancestors (`CBlockIndex::GetMedianTimePast`).
 pub fn median_time_past(times: &dyn HeaderTimes, height: u32) -> Result<i64, String> {
     let first = height.saturating_sub(MEDIAN_TIME_SPAN - 1);
-    let mut window = Vec::with_capacity(MEDIAN_TIME_SPAN as usize);
-    for h in first..=height {
-        window.push(times.timestamp_at(h)? as i64);
+    let mut window: Vec<i64> = times
+        .timestamps_between(first, height)?
+        .into_iter()
+        .map(i64::from)
+        .collect();
+    if window.is_empty() {
+        return Err(format!("no header timestamps for height {}", height));
     }
     window.sort_unstable();
     Ok(window[window.len() / 2])

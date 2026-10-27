@@ -167,6 +167,35 @@ fn consensus_rejects_are_classified() {
     assert!(queued_own(&hs).is_empty());
 }
 
+/// Ticket 026 review: a timelocked own tx is "not valid yet", not
+/// consensus-invalid. It isn't tracked or sent, and once the lock is
+/// reached the same bytes are accepted.
+#[test]
+fn timelocked_own_tx_is_not_yet_final_then_accepted() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+
+    let mut tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    tx.input[0].sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+    tx.lock_time = bitcoin::absolute::LockTime::from_consensus(VALIDATED + 1);
+    match hs.submit_own_tx(&raw(&tx)) {
+        Err(e @ SubmitError::NotYetFinal { .. }) => {
+            assert_eq!(e.kind(), "not_yet_final");
+            assert!(!e.to_string().contains("consensus"), "{}", e);
+        }
+        other => panic!("expected NotYetFinal, got {:?}", other),
+    }
+    assert!(hs.list_own_txs().unwrap().is_empty(), "timelocked tx not tracked");
+    assert!(queued_own(&hs).is_empty());
+
+    // One more validated block: nLockTime VALIDATED+1 < next height.
+    let genesis = hs.store.tip().unwrap().unwrap().2;
+    let next = bitcoin::block::Header { nonce: VALIDATED + 1, time: genesis.time + 600 * (VALIDATED + 1), ..genesis };
+    hs.store.store_headers(&[next], VALIDATED + 1).unwrap();
+    hs.store.set_validated_height(VALIDATED + 1).unwrap();
+    hs.submit_own_tx(&raw(&tx)).expect("final now");
+}
+
 #[test]
 fn not_synced_without_utxo_set() {
     let dir = TempDir::new().unwrap();

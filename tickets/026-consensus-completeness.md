@@ -34,6 +34,18 @@ This ticket collects the missing rules into one module with tests for each rule.
 - **024 classes for the new errors.** `BadCoinbaseLength`, `NonFinalTx`, `SequenceLockNotMet` and `ExcessiveSigopCost` are consensus failures. `MissingContext` is a local fault, so a block is never marked invalid because *we* lack header times. `VALIDATION_RULES_VERSION` is now 2, so `failed_blocks` rows recorded under v1 are reconsidered.
 - **Witness commitment matches Core's `CheckWitnessMalleation`.** `validate_block` no longer calls rust-bitcoin's `Block::check_witness_commitment`, which returns true early when no transaction has witness data. Because of that early return, it accepted a commitment with an empty coinbase witness. It also never checked witnesses before SegWit. `validate_block` and `check_block_mutation` now share `check_witness_malleation`, and every failure in it counts as a mutation (bad delivery), as with Core's `BLOCK_MUTATED`.
 
+### Review fixes (2026-10-26)
+
+- **MTP cost.** Every block's median-time-past was 11 single-row SQLite reads, each re-preparing its statement under the store mutex (regtest has CSV from height 1, so the eclipse sync tests paid this for ~6,000 blocks). `HeaderTimes::timestamps_between` now reads the window in one cached range query. The mempool caches the tip MTP per tip header hash (`header_id_at`), so a reorg never serves a stale value. Profiling `eclipse_fork_beyond_a_full_batch_of_shared_headers_recovers`: MTP went from ~1,040 samples to ~245. Wall time is now even with main (three alternating runs each: 43.1 s branch, 44.8 s main). Its wall time is dominated by `UtxoSet::apply_block` disk I/O, which swings widely with machine load. The 60 s timeout flakes on main too under load.
+- **Own timelocked txs** are `SubmitError::NotYetFinal` (`not_yet_final`; FFI `BroadcastError::NotYetFinal`), not `Consensus`. The text says the tx is not valid *yet*, names the lock, and mentions the catch-up when the UTXO set lags the headers. The lagging height-lock case is still `NotSynced`.
+- **`validate_block` order.** The witness-malleation check now runs right after the merkle root, before the weight check. A copy padded with junk witness data is then a mutation, not `ExcessiveWeight`.
+
+### Follow-ups
+
+- **Mainnet regression over 288 blocks.** `mainnet_blocks_pass_contextual_rules` still covers 5 blocks; extend `tools/fetch_mainnet_context.py` to the last 288 as the Verification section asks.
+- **`bad-version` on already-stored headers.** The new header rule applies to headers validated after the upgrade; headers stored before it never get the check. Negligible: exploiting it needs a low-version header with real PoW that was already in our store.
+- **Rules version.** PR #25 also bumps `VALIDATION_RULES_VERSION` to 2; whichever lands second bumps to 3.
+
 ## Background: what we check today
 
 `validate_block` (`hercules-core/src/block_validation.rs:62`) checks:

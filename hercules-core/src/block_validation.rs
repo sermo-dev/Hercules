@@ -58,6 +58,21 @@ pub fn validate_block(
         return Err(BlockValidationError::BadMerkleRoot { height });
     }
 
+    // 4b. Witness data must match the witness commitment, exactly as
+    // Core's `CheckWitnessMalleation`. Not rust-bitcoin's
+    // `Block::check_witness_commitment`: that returns true early whenever
+    // no transaction has witness data, so it accepts a commitment with an
+    // empty coinbase witness (Core: `bad-witness-nonce-size`), and it never
+    // looks at witnesses before SegWit activation (Core:
+    // `unexpected-witness`). `check_block_mutation` runs the same check
+    // first on the sync paths; it is repeated here so `validate_block`
+    // alone is never more lenient than Core. It runs before the weight
+    // check, as Core judges a block mutated (`IsBlockMutated`) before
+    // anything else, and checks weight only after witness malleation
+    // (`ContextualCheckBlock`): a copy padded with junk witness data is a
+    // bad delivery, not an overweight (invalid) block.
+    check_witness_malleation(block, height, params)?;
+
     // 5. Block weight must not exceed limit
     let weight = block.weight().to_wu();
     if weight > MAX_BLOCK_WEIGHT {
@@ -164,17 +179,6 @@ pub fn validate_block(
             encoded: block.bip34_block_height().unwrap_or(0),
         });
     }
-
-    // 10. Witness data must match the witness commitment, exactly as
-    // Core's `CheckWitnessMalleation`. Not rust-bitcoin's
-    // `Block::check_witness_commitment`: that returns true early whenever
-    // no transaction has witness data, so it accepts a commitment with an
-    // empty coinbase witness (Core: `bad-witness-nonce-size`), and it never
-    // looks at witnesses before SegWit activation (Core:
-    // `unexpected-witness`). `check_block_mutation` runs the same check
-    // first on the sync paths; it is repeated here so `validate_block`
-    // alone is never more lenient than Core.
-    check_witness_malleation(block, height, params)?;
 
     Ok(())
 }
@@ -1683,6 +1687,25 @@ mod tests {
         block.txdata[0].output.push(good);
         block.txdata[0].output.push(bad);
         let block = wrap_block(block.txdata);
+        let err = malleation_verdict(&block, 1, &p).unwrap_err();
+        assert!(matches!(err, BlockValidationError::BadWitnessCommitment { .. }), "{:?}", err);
+    }
+
+    /// Junk witness data that pushes a block over the weight limit is a
+    /// mutation (the copy doesn't match the commitment), not
+    /// `ExcessiveWeight`: the witness check runs first, as in Core.
+    #[test]
+    fn witness_padding_over_weight_limit_is_a_mutation() {
+        let p = segwit_params();
+        let mut cb = synth_coinbase(50);
+        cb.input[0].witness = witness_of(&[&RESERVED]);
+        let mut tx = synth_noncoinbase(1);
+        tx.input[0].witness = witness_of(&[&[0x01; 72]]);
+        let mut block = with_commitment(vec![cb, tx], &RESERVED);
+        malleation_verdict(&block, 1, &p).expect("honest copy");
+
+        block.txdata[1].input[0].witness = witness_of(&[&vec![0u8; MAX_BLOCK_WEIGHT as usize]]);
+        assert!(block.weight().to_wu() > MAX_BLOCK_WEIGHT);
         let err = malleation_verdict(&block, 1, &p).unwrap_err();
         assert!(matches!(err, BlockValidationError::BadWitnessCommitment { .. }), "{:?}", err);
     }

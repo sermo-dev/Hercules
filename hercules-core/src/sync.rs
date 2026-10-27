@@ -130,7 +130,9 @@ const FORK_FOLLOW_BUDGET: Duration = Duration::from_secs(10 * 60);
 /// validation could flip a verdict, so `failed_blocks` rows recorded under
 /// the old rules are dropped at startup and those blocks reconsidered
 /// (ticket 024). Combined with the crate version in `rules_tag`, so any
-/// app update reconsiders them too.
+/// app update reconsiders them too. No test pins the number (tests go
+/// through `rules_tag()`), so a bump is this one line.
+/// History: 2 = ticket 026 (contextual rules; BIP 34 accepts heights 1..=16).
 const VALIDATION_RULES_VERSION: u32 = 2;
 
 /// Rules tag stored with each `failed_blocks` row.
