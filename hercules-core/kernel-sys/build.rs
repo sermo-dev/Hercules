@@ -8,6 +8,9 @@
 //!    checkout you are bumping); an override that doesn't verify builds with
 //!    a loud warning and an "unverified" library label on the host, and is
 //!    refused outright for an iOS release build.
+//!    "Clean" includes gitignored files (`git status --ignored`), so any
+//!    in-tree build dir (e.g. a manual cmake run inside the cached Core
+//!    tree) makes the next build silently delete and refetch that tree.
 //! 2. cmake configure + build + install into `OUT_DIR`, with the iOS
 //!    cross-compile flags the upstream `libbitcoinkernel-sys` build.rs lacks
 //!    (without them cmake silently produces a macOS archive for iOS targets;
@@ -35,6 +38,16 @@ const CORE_TREE: &str = "cbf24820b3e51bf8a6a00b0a54d394d16dcf3b7d";
 const CORE_REPO: &str = "https://github.com/bitcoin/bitcoin.git";
 
 const BUILD_CONFIG: &str = "Release";
+
+/// macOS deployment target for the host library (tests, uniffi-bindgen)
+/// when `MACOSX_DEPLOYMENT_TARGET` is unset.
+const DEFAULT_MACOS_DEPLOYMENT_TARGET: &str = "11.0";
+
+/// Written into the cmake build dir with the exact configuration it was
+/// built for; a mismatch (or a dir from before this stamp existed) wipes
+/// the dir, since cmake's incremental build keeps objects compiled for a
+/// different platform or deployment target.
+const CONFIG_STAMP: &str = "hercules-config.txt";
 
 /// Everything but the kernel library switched off.
 const BASE_CMAKE_FLAGS: &[&str] = &[
@@ -84,7 +97,19 @@ fn main() {
         .lines()
         .find_map(|l| l.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="))
         .map(PathBuf::from);
-    if configured_src.is_some_and(|s| s != src) {
+    // Likewise for a dir built for another platform or deployment target
+    // (e.g. host objects compiled for iOS before the macOS target was
+    // explicit): cmake would keep the stale objects.
+    let target_args = target_cmake_args();
+    let stamp = format!(
+        "target={}\nsrc={}\nargs={}\n",
+        env::var("TARGET").unwrap(),
+        src.display(),
+        target_args.join(" ")
+    );
+    let stamp_path = build_dir.join(CONFIG_STAMP);
+    let stamp_ok = std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str());
+    if configured_src.is_some_and(|s| s != src) || (build_dir.exists() && !stamp_ok) {
         let _ = std::fs::remove_dir_all(&build_dir);
         let _ = std::fs::remove_dir_all(&install_dir);
     }
@@ -98,12 +123,14 @@ fn main() {
         .arg(format!("-DCMAKE_BUILD_TYPE={BUILD_CONFIG}"))
         .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install_dir.display()))
         .args(BASE_CMAKE_FLAGS)
-        .args(target_cmake_args());
+        .args(&target_args);
+    strip_foreign_deployment_targets(&mut configure);
     run(&mut configure, "cmake configure");
+    std::fs::write(&stamp_path, &stamp).unwrap();
 
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "4".into());
     run(
-        Command::new("cmake")
+        strip_foreign_deployment_targets(&mut Command::new("cmake"))
             .arg("--build")
             .arg(&build_dir)
             .arg("--config")
@@ -114,7 +141,7 @@ fn main() {
         "cmake build",
     );
     run(
-        Command::new("cmake")
+        strip_foreign_deployment_targets(&mut Command::new("cmake"))
             .arg("--install")
             .arg(&build_dir)
             .arg("--config")
@@ -315,11 +342,18 @@ fn target_cmake_args() -> Vec<String> {
     };
     match os.as_str() {
         "macos" => {
-            let mut args = vec![format!("-DCMAKE_OSX_ARCHITECTURES={arch}")];
-            if let Ok(v) = env::var("MACOSX_DEPLOYMENT_TARGET") {
-                args.push(format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={v}"));
-            }
-            args
+            // Always explicit: with no macOS target, Apple clang takes the
+            // platform from IPHONEOS_DEPLOYMENT_TARGET when it is set
+            // (build-ios.sh, Xcode build phases) and emits iOS objects for
+            // the host library (see also `strip_foreign_deployment_targets`).
+            let deploy = env::var("MACOSX_DEPLOYMENT_TARGET")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_MACOS_DEPLOYMENT_TARGET.into());
+            vec![
+                format!("-DCMAKE_OSX_ARCHITECTURES={arch}"),
+                format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={deploy}"),
+            ]
         }
         "ios" => {
             let sim = target.ends_with("-sim") || target.starts_with("x86_64-");
@@ -346,6 +380,24 @@ fn target_cmake_args() -> Vec<String> {
         }
         other => panic!("hercules-kernel-sys: unsupported target OS {other} (macOS and iOS only)"),
     }
+}
+
+/// For a macOS (host) build, remove other Apple platforms' deployment
+/// target variables from a cmake invocation: Apple clang picks its target
+/// platform from them, so an inherited IPHONEOS_DEPLOYMENT_TARGET would make
+/// "host" objects iOS objects that the macOS link then rejects.
+fn strip_foreign_deployment_targets(cmd: &mut Command) -> &mut Command {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        for var in [
+            "IPHONEOS_DEPLOYMENT_TARGET",
+            "TVOS_DEPLOYMENT_TARGET",
+            "WATCHOS_DEPLOYMENT_TARGET",
+            "XROS_DEPLOYMENT_TARGET",
+        ] {
+            cmd.env_remove(var);
+        }
+    }
+    cmd
 }
 
 /// `$BOOST_ROOT`, else Homebrew's boost if installed.
