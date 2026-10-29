@@ -3,9 +3,58 @@
 ## Decisions (2026-10-23)
 
 - **Decided (2026-10-24):** the BIP158 filter-serving phase is dropped from this ticket. Its only consumer was external wallets via ticket 014's custom onion API, which no existing wallet speaks. This ticket is the in-app scanner only. If filter serving is ever wanted, it gets its own ticket.
-- **Note:** a prototype of Phase 1 already exists as uncommitted work on branch `ticket-020-in-app-wallet` (`wallet.rs`, `wallet_store.rs`, `process_block` hooks). Reuse it rather than starting fresh.
+- **Superseded (2026-10-28):** ~~a prototype of Phase 1 exists on branch `ticket-020-in-app-wallet`; reuse it.~~ Don't reuse the code (see Review update). Keep only its ideas, listed there.
 
 - **Added (2026-10-24):** the scanner stores the full funding transaction for every wallet coin it sees in a block, and can fetch a single historical block from an archival peer (height comes from the UTXO entry; verify against our headers + merkle root) when a pre-snapshot coin needs its parent tx for a legacy or hardware-wallet spend (see 034).
+
+## Review update (2026-10-28)
+
+From the wallet-readiness review of main @ 7732755. These corrections take precedence over the design below where they conflict.
+
+**Prerequisites:**
+- **050:** `connect_block`, with `apply_block` returning spent coins, and the prune lock.
+- **025:** disconnect hook and hash-keyed block_store.
+- **054:** a wake's `caught_up` means peers agreed.
+
+The "consolidate three paths" refactor in this ticket's design is done by 050, not here. 033's `on_block_connected` (`sync.rs:2192-2197`) already exists and is the model for the wallet hook.
+
+**Scope is the node half only** (milestone M1). No wallet UI is built until it exists.
+
+**Corrections:**
+
+1. **History start.** "History starts at the snapshot height" is wrong for restore and import on an established node: blocks between the snapshot and the last ~288 are already pruned, so history starts at the oldest stored block. The snapshot-height claim holds only if, on a fresh install, the wallet is registered and walked *at the snapshot height, before catch-up*. Specify that ordering, and show the real starting block in the UI. (Same fix in 039.)
+2. **Gap limit.** Gap-limit discovery can't work from a UTXO walk: the set can't show used-but-now-empty addresses, so "lookahead 20, extend on a hit" misses coins beyond a run of spent addresses. Walk with a large fixed lookahead (≥1,000 per chain per script family); it only costs HashMap entries. Accept that a restored wallet may reuse an address it handed out before.
+3. **Wallet history is not a rebuildable cache on a pruned node.** Keep history rows on a chain-data wipe and reset only the scan checkpoint (fixes 037's "rebuilt by rescan"). 039's transfer bundle must include history and stored funding transactions.
+4. **Hook contract.** The hook receives spent prevouts (from 050) and is delivered at-least-once and idempotently: crash recovery re-runs it (`sync.rs:1741-1758`). The disconnect hook comes from 025. Wallet events go into `WakeReport` so a wake can post "received".
+5. **Chunked UTXO walk.** One long read txn is not an option: every read holds `read_gate` (`utxo.rs:544`) and map growth takes it exclusively (`utxo.rs:566-567`). Walk in chunks with fresh txns, returning `best_block` (height and hash) from the same txn, then rescan blocks applied meanwhile.
+6. **Gated reads.** Reads and the walk refuse until the snapshot is verified and active. Today `rpc_get_utxo` (`sync.rs:1286`, `wallet_rpc.rs:468`) answers mid-import, and its `null` looks like "spent". `rpc_get_block` returns orphaned blocks by hash, so rescans check hashes against the header chain.
+7. **By-height block read.** `block_store.rs:68` only has `get_block_by_hash`.
+8. **Prune lock.** Never prune above the oldest registered wallet's last-scanned height (bounded); otherwise fall back to a UTXO walk. The API comes from 050.
+9. **Silent payments (043).** Scanning in wakes needs the scan *private* key, which conflicts with 036's "wakes never touch key material". Owner decision: classify the scan key as watch-level, or limit SP detection to the foreground.
+
+**Before writing the hook:**
+- Run the walk benchmark on the oldest supported iPhone (~1 day). It decides whether passphrase wallets (038) are usable and whether a script index is needed.
+- Run 048's regtest leg (~1 day).
+
+**t20 WIP verdict: discard the code, keep the ideas.**
+- **Why discard:** it is 85 commits behind, its hook sites no longer exist, and it contradicts later decisions: a single xpub, BIP84 only, hand-parsed SLIP-132 instead of descriptors (034), and an LMDB wallet store where 037 decided SQLite.
+- **Bugs to avoid repeating:**
+  - Balance bug: a coin received and spent in the same block is never marked spent. Spends are looked up (`wallet.rs:283`) before that block's batch is written (`:327`).
+  - One history row per block, using a representative txid.
+  - A single-txn walk with a lookahead of 20.
+  - Hook errors swallowed with `warn!`.
+  - Addresses copied to the shared pasteboard without `localOnly` or expiry.
+- **Keep:**
+  - the `attach_wallet` catch-up policy: walk if the wallet is behind the stored-block window, otherwise replay stored blocks;
+  - the `wallet_store` test cases, as a checklist;
+  - the CoreImage QR snippet.
+
+**Testkit additions:**
+- a test setting that makes pruning run (from 050);
+- MockPeer transaction relay, for 040;
+- wallet-derived scripts paid via `FixtureChain::spend` (`fixture_chain.rs:249`);
+- reorgs via `fork_at` (`:226`);
+- "walk at the anchor, then hook" via the pending-snapshot fixture (`sync_integration.rs:393`).
 
 ## Summary
 
@@ -115,4 +164,4 @@ The block store keeps the last ~288 blocks (`block_store.rs`). Rescan them when 
 
 ## Roadmap position
 
-Right after 034. Blocks 037–040 and 021.
+After the pre-wallet hardening block (**049 → 050 → 053 → 054 → 052 → 025**) and alongside 055's workspace split; this is wallet milestone M1 (node half). Blocks 037–040 and 021.
