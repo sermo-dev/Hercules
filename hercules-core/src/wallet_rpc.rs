@@ -362,7 +362,10 @@ fn handle_get_block_header(
 ) -> RpcResponse {
     // Accept either {"height": N} or {"hash": "hex"}.
     if let Some(height) = params.get("height").and_then(|v| v.as_u64()) {
-        match syncer.rpc_get_header_at_height(height as u32) {
+        let Ok(height) = u32::try_from(height) else {
+            return RpcResponse::err(id, INVALID_PARAMS, format!("height {} out of range", height));
+        };
+        match syncer.rpc_get_header_at_height(height) {
             Ok(Some((hash, header))) => RpcResponse::ok(
                 id,
                 serde_json::json!({
@@ -404,7 +407,10 @@ fn handle_get_block_hash(
     id: serde_json::Value,
 ) -> RpcResponse {
     let height = match params.get("height").and_then(|v| v.as_u64()) {
-        Some(h) => h as u32,
+        Some(h) => match u32::try_from(h) {
+            Ok(h) => h,
+            Err(_) => return RpcResponse::err(id, INVALID_PARAMS, format!("height {} out of range", h)),
+        },
         None => return RpcResponse::err(id, INVALID_PARAMS, "expected {\"height\": N}".into()),
     };
     match syncer.rpc_get_block_hash(height) {
@@ -452,7 +458,10 @@ fn handle_get_utxo(
         }
     };
     let vout = match params.get("vout").and_then(|v| v.as_u64()) {
-        Some(v) => v as u32,
+        Some(v) => match u32::try_from(v) {
+            Ok(v) => v,
+            Err(_) => return RpcResponse::err(id, INVALID_PARAMS, format!("vout {} out of range", v)),
+        },
         None => {
             return RpcResponse::err(
                 id,
@@ -1048,5 +1057,89 @@ mod tests {
         assert_eq!(p2, "/2");
         assert_eq!(h2.get("connection").unwrap(), "close");
         assert_eq!(&b2, b"test");
+    }
+
+    // ══ Request validation and parsing (tests/network-app) ═══════════
+
+    use crate::testkit::{lmdb_slot, FixtureChain, LmdbSlot};
+
+    /// A regtest node with a 12-block chain's headers, blocks 10..=12 in
+    /// the block store, and one UTXO at `UTXO_TXID:0`.
+    struct Rpc {
+        hs: HeaderSync,
+        chain: FixtureChain,
+        _dir: tempfile::TempDir,
+        _slot: LmdbSlot,
+    }
+
+    const UTXO_TXID: [u8; 32] = [0x77; 32];
+
+    fn rpc_node() -> Rpc {
+        let slot = lmdb_slot();
+        let dir = tempfile::TempDir::new().unwrap();
+        let hs = HeaderSync::with_config(crate::sync::SyncConfig {
+            db_path: dir.path().join("headers.sqlite3").to_str().unwrap().to_string(),
+            tor: None,
+            params: crate::chain_params::ChainParams::regtest(),
+            peers: crate::peer_pool::PeerSource::Static(vec![]),
+        })
+        .unwrap();
+        let mut chain = FixtureChain::new();
+        chain.mine(12);
+        let headers: Vec<bitcoin::block::Header> = (1..=12).map(|h| chain.block(h).header).collect();
+        hs.header_store_for_test().store_headers(&headers, 1).unwrap();
+        for h in 10..=12 {
+            hs.block_store_for_test().store_block(chain.block(h), h).unwrap();
+        }
+        hs.utxo_for_test()
+            .test_insert_utxo(
+                UTXO_TXID,
+                0,
+                crate::utxo::UtxoEntry { amount: 4242, script_pubkey: vec![0x51], height: 3, is_coinbase: false },
+            )
+            .unwrap();
+        Rpc { hs, chain, _dir: dir, _slot: slot }
+    }
+
+    impl Rpc {
+        /// Dispatch `method` with `params`; the response as JSON.
+        fn call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            let req = RpcRequest { jsonrpc: Some("2.0".into()), method: method.into(), params, id: serde_json::json!(7) };
+            let v = serde_json::to_value(dispatch(&self.hs, &req)).unwrap();
+            assert_eq!(v["id"], 7, "id not echoed: {}", v);
+            v
+        }
+    }
+
+    fn code(v: &serde_json::Value) -> Option<i64> {
+        v["error"]["code"].as_i64()
+    }
+
+    fn utxo_txid_hex() -> String {
+        bitcoin::Txid::from_byte_array(UTXO_TXID).to_string()
+    }
+
+    use bitcoin::hashes::Hash;
+
+    /// Heights and vouts arrive as JSON u64 and used to be cast with `as
+    /// u32`, so 2^32 + n silently became n: `get_block_hash {"height":
+    /// 4294967296}` answered with genesis, `get_utxo` with `vout`
+    /// 4294967296 returned output 0's coin.
+    #[test]
+    fn out_of_range_heights_and_vouts_are_invalid_params_not_wrapped() {
+        let r = rpc_node();
+        let big = 1u64 << 32;
+        let genesis = r.chain.hash_at(0).to_string();
+        let v = r.call("get_block_hash", serde_json::json!({ "height": big }));
+        assert_eq!(code(&v), Some(INVALID_PARAMS as i64), "{}", v);
+        assert_ne!(v["result"], serde_json::json!(genesis));
+        let v = r.call("get_block_header", serde_json::json!({ "height": big + 5 }));
+        assert_eq!(code(&v), Some(INVALID_PARAMS as i64), "{}", v);
+        let v = r.call("get_utxo", serde_json::json!({ "txid": utxo_txid_hex(), "vout": big }));
+        assert_eq!(code(&v), Some(INVALID_PARAMS as i64), "{}", v);
+        // In range, the same calls answer normally.
+        assert_eq!(r.call("get_block_hash", serde_json::json!({ "height": 0 }))["result"], serde_json::json!(genesis));
+        assert_eq!(r.call("get_utxo", serde_json::json!({ "txid": utxo_txid_hex(), "vout": 0 }))["result"]["value"], 4242);
+        assert!(r.call("get_utxo", serde_json::json!({ "txid": utxo_txid_hex(), "vout": u32::MAX }))["result"].is_null());
     }
 }
