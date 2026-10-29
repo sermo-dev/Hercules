@@ -18,13 +18,46 @@
 //! the threads that drive them).
 
 use std::collections::HashMap;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
 
-/// Threads that may hold live nodes at once. A node holds at most about
-/// two LMDB locks at a time, so this stays under the limit of 10 with
-/// room for the brief locks of LMDB tests outside the harness.
-const SLOTS: usize = 5;
+/// Up to this many concurrent tests, nothing is throttled: a node holds
+/// an LMDB lock only during a write, and the suite has always run at 8
+/// threads (this machine's default) without hitting the limit.
+const UNTHROTTLED_UP_TO: usize = 8;
+
+/// Above that, threads that may hold live harness nodes at once: about
+/// two locks each, leaving room under 10 for LMDB tests outside the
+/// harness.
+const THROTTLED_SLOTS: usize = 4;
+
+/// How many tests this binary runs at once: `--test-threads N` (or `=N`),
+/// else `RUST_TEST_THREADS`, else the core count (libtest's default).
+fn test_threads() -> usize {
+    let args: Vec<String> = std::env::args().collect();
+    let from_args = args.iter().enumerate().find_map(|(i, a)| {
+        a.strip_prefix("--test-threads=")
+            .map(str::to_string)
+            .or_else(|| (a == "--test-threads").then(|| args.get(i + 1).cloned()).flatten())
+    });
+    from_args
+        .or_else(|| std::env::var("RUST_TEST_THREADS").ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// Threads that may hold live nodes at once.
+fn slots() -> usize {
+    static SLOTS: OnceLock<usize> = OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        let threads = test_threads();
+        if threads <= UNTHROTTLED_UP_TO {
+            threads.max(1)
+        } else {
+            THROTTLED_SLOTS
+        }
+    })
+}
 
 struct Gate {
     /// Threads currently holding at least one slot.
@@ -51,7 +84,7 @@ pub fn lmdb_slot() -> LmdbSlot {
             *n += 1;
             break;
         }
-        if gate.threads < SLOTS {
+        if gate.threads < slots() {
             gate.threads += 1;
             gate.held.insert(me, 1);
             break;
@@ -85,8 +118,8 @@ mod tests {
 
     #[test]
     fn nested_slots_on_one_thread_never_wait() {
-        let slots: Vec<LmdbSlot> = (0..SLOTS + 3).map(|_| lmdb_slot()).collect();
-        drop(slots);
+        let held: Vec<LmdbSlot> = (0..slots() + 3).map(|_| lmdb_slot()).collect();
+        drop(held);
     }
 
     #[test]
@@ -120,6 +153,6 @@ mod tests {
         }
         // Other tests in this binary may hold slots too, so only the upper
         // bound is certain.
-        assert!(peak.load(Ordering::SeqCst) <= SLOTS);
+        assert!(peak.load(Ordering::SeqCst) <= slots());
     }
 }
