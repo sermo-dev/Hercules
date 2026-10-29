@@ -2778,4 +2778,88 @@ mod tests {
         }
         assert!(m.candidate_count() >= DNS_FALLBACK_THRESHOLD);
     }
+
+    // ── Address poisoning (tests/network-app) ────────────────────────
+    //
+    // Ticket 011 keeps the address manager deliberately simple (no
+    // new/tried buckets, no per-source limits). What it does promise:
+    // known-good addresses are never evicted, gossip never resets an
+    // entry's history, and known-good ones are dialed first.
+
+    /// Capacity for the flood tests: eviction scans the whole manager per
+    /// insert, so a 10k-entry flood test takes seconds; the policy is the
+    /// same at any size.
+    const FLOOD_CAP: usize = 1_000;
+
+    /// A full manager: `good` known-good, `dns` hour-old untried DNS
+    /// entries, then a gossip flood twice its capacity from one peer.
+    fn flooded(good: usize, dns: usize) -> AddrManager {
+        let mut m = AddrManager::new(FLOOD_CAP);
+        let hour_ago = unix_now() - 3600;
+        for i in 0..good {
+            m.insert(format!("good{}:8333", i), AddrSource::Dns);
+            m.record_success(&format!("good{}:8333", i));
+        }
+        for i in 0..dns {
+            m.insert_from_record(&AddrRecord {
+                addr: format!("dns{}:8333", i),
+                first_seen: hour_ago,
+                last_tried: None,
+                last_success: None,
+                failure_count: 0,
+                source: "dns".into(),
+            });
+        }
+        let flood = (0..2 * FLOOD_CAP as u32).map(|i| format!("{}.{}.{}.{}:8333", 100 + (i >> 16), (i >> 8) & 0xff, i & 0xff, 7));
+        m.insert_many(flood, AddrSource::Gossip);
+        m
+    }
+
+    #[test]
+    fn gossip_flood_never_evicts_known_good_addresses_and_stays_bounded() {
+        let m = flooded(50, 0);
+        assert_eq!(m.len(), FLOOD_CAP);
+        for i in 0..50 {
+            assert!(m.addrs.contains_key(&format!("good{}:8333", i)), "good{} evicted", i);
+        }
+        // Evictions are queued for the on-disk copy too.
+        assert!(!m.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn known_good_addresses_are_dialed_before_a_flood() {
+        let m = flooded(12, 0);
+        let picked = m.pick_candidates(MAX_OUTBOUND, &|_| false);
+        assert_eq!(picked.len(), MAX_OUTBOUND);
+        assert!(picked.iter().all(|a| a.starts_with("good")), "{:?}", picked);
+    }
+
+    #[test]
+    fn gossip_never_resets_an_entrys_history() {
+        let mut m = AddrManager::new(100);
+        m.insert("flaky:8333".into(), AddrSource::Dns);
+        for _ in 0..3 {
+            m.record_failure("flaky:8333");
+        }
+        m.insert("good:8333".into(), AddrSource::Dns);
+        m.record_success("good:8333");
+        // The same addresses gossiped back by a peer.
+        assert_eq!(m.insert_many(["flaky:8333".to_string(), "good:8333".to_string()], AddrSource::Gossip), 0);
+        assert_eq!(m.addrs["flaky:8333"].failure_count, 3);
+        assert!(!m.addrs["flaky:8333"].is_eligible(Instant::now()), "gossip lifted a backoff");
+        assert!(m.addrs["good:8333"].last_success.is_some());
+        assert_eq!(m.addrs["good:8333"].source, AddrSource::Dns);
+    }
+
+    /// One gossiping peer can push every untried DNS-learned address out
+    /// of a full manager (oldest untried go first), leaving only its own
+    /// addresses plus the known-good ones as candidates. Core's per-source
+    /// buckets prevent this; ticket 011 deferred them.
+    #[test]
+    #[ignore = "BUG: no per-source limits (011 deferred bucketing): one peer's addr flood evicts every untried DNS address"]
+    fn one_gossip_source_cannot_evict_all_dns_addresses() {
+        let m = flooded(0, 200);
+        let survivors = (0..200).filter(|i| m.addrs.contains_key(&format!("dns{}:8333", i))).count();
+        assert!(survivors >= 100, "only {} of 200 DNS addresses survived a single peer's flood", survivors);
+    }
 }
