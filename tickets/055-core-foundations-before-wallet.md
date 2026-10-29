@@ -76,7 +76,9 @@ Line numbers are at main 7732755.
 
 - **Wallet FFI objects:** the wallet gets its own UniFFI objects (`WalletManager`, `Wallet`), not more methods on `HerculesNode`. It uses a typed `WalletError`, enums for statuses, and amounts as u64 sats.
 - **Wallet storage:** wallet state lives under `Wallet/` in its own SQLite DB (037), never in the chain LMDB env. A reset or failed import deletes that env wholesale (ticket 020 line 276 proposes otherwise; correct it).
-- **First step:** a mechanical move with no behavior change, done in one PR.
+- **Phasing, to avoid conflicts with the hardening branches** (all of which edit `hercules-core/src`):
+  - **055a, now:** turn the repo into a workspace and add an empty `hercules-wallet` crate beside the unchanged `hercules-core`. Nothing moves, so it conflicts with nothing, and wallet-engine work (M0) can start.
+  - **055b, after 049–054 and 025 merge:** split `hercules-core` into `hercules-node` and `hercules-ffi`. A mechanical move with no behavior change, done in one PR at a quiet point.
 
 ### 2. Panic policy
 
