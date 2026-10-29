@@ -117,6 +117,19 @@ pub fn validate_headers(
             });
         }
 
+        // 6. Reject outdated block versions once BIP 34/66/65 are active
+        // (ContextualCheckBlockHeader, `bad-version`). Signed comparison,
+        // as Core's int32 nVersion. Ticket 026: BIP 34's height-in-coinbase
+        // check used to reject version 1 as a side effect; it is a byte
+        // comparison now, so the version rule lives here as in Core.
+        let version = header.version.to_consensus();
+        if (version < 2 && height >= params.bip34_height)
+            || (version < 3 && height >= params.bip66_height)
+            || (version < 4 && height >= params.bip65_height)
+        {
+            return Err(ValidationError::BadVersion { height, version });
+        }
+
         current_bits = header.bits;
         timestamps.push(header.time);
         expected_prev = block_hash;
@@ -248,11 +261,21 @@ pub enum ValidationError {
         expected: String,
         got: String,
     },
+    /// Block version too low for the active BIP 34/66/65 deployments.
+    BadVersion {
+        height: u32,
+        version: i32,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ValidationError::BadVersion { height, version } => write!(
+                f,
+                "block {} has outdated version 0x{:08x}",
+                height, version
+            ),
             ValidationError::BadPrevHash {
                 height,
                 expected,
@@ -616,6 +639,63 @@ mod tests {
     }
 
     // ── Full header validation ──────────────────────────────────────
+
+    /// Mine a regtest header at height 1 with the given version.
+    fn regtest_header_with_version(version: i32) -> (bitcoin::block::Header, bitcoin::block::Header) {
+        let genesis = ChainParams::regtest().genesis_header();
+        let mut h = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(version),
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: genesis.time + 600,
+            bits: genesis.bits,
+            nonce: 0,
+        };
+        while h.validate_pow(h.target()).is_err() {
+            h.nonce += 1;
+        }
+        (genesis, h)
+    }
+
+    /// ContextualCheckBlockHeader `bad-version` (ticket 026): versions
+    /// below 2/3/4 are rejected once BIP 34/66/65 are active.
+    #[test]
+    fn rejects_outdated_versions_after_activation() {
+        let check = |params: &ChainParams, version: i32| {
+            let (genesis, h) = regtest_header_with_version(version);
+            validate_headers(params, &[h], genesis.block_hash(), 0, &[genesis.time], genesis.bits, &|_| {
+                Err("no retarget".into())
+            })
+        };
+        let all_active = ChainParams::regtest();
+        for v in [1, 2, 3, -1, i32::MIN] {
+            assert!(
+                matches!(check(all_active, v), Err(ValidationError::BadVersion { height: 1, .. })),
+                "version {} must be rejected",
+                v
+            );
+        }
+        for v in [4, 0x2000_0000, 0x3fff_ffff, i32::MAX] {
+            assert!(check(all_active, v).is_ok(), "version {} must be accepted", v);
+        }
+
+        // Each threshold separately.
+        let only = |bip34, bip66, bip65| -> &'static ChainParams {
+            Box::leak(Box::new(ChainParams {
+                bip34_height: bip34,
+                bip66_height: bip66,
+                bip65_height: bip65,
+                ..*ChainParams::regtest()
+            }))
+        };
+        let none = only(100, 100, 100);
+        assert!(check(none, 1).is_ok(), "pre-BIP-34 version 1 is fine");
+        assert!(check(only(1, 100, 100), 1).is_err());
+        assert!(check(only(1, 100, 100), 2).is_ok());
+        assert!(check(only(1, 1, 100), 2).is_err());
+        assert!(check(only(1, 1, 100), 3).is_ok());
+        assert!(check(only(1, 1, 1), 3).is_err());
+    }
 
     #[test]
     fn validate_real_block1() {

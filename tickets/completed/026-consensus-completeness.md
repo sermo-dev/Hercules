@@ -15,6 +15,37 @@ This ticket collects the missing rules into one module with tests for each rule.
 
 - **BIP34 heights 1–16.** Our coinbase-height check can't parse Core's encoding for heights 1–16 (`OP_1`..`OP_16`, plus `OP_0` handling). Unreachable on mainnet (BIP34 activates at 227,931) but a real divergence, and it blocks regtest fixtures that activate BIP34 at low heights. The 027 harness has an `#[ignore]`d test for it.
 
+## Implementation (2026-10-24, branch `ticket-026-consensus-completeness`)
+
+- **New module `contextual_checks.rs`.** These are direct ports of Core v26: `IsFinalTx`, `CalculateSequenceLocks`/`EvaluateSequenceLocks`, `GetMedianTimePast`, `GetLegacySigOpCount`/`GetP2SHSigOpCount`/`CountWitnessSigOps`/`GetTransactionSigOpCost` (with Core's own `GetScriptOp` parser), `bad-cb-length`, and the BIP34 `CScript() << nHeight` prefix check. A `HeaderTimes` trait supplies header timestamps. The header store implements it, and so do the fixture chain and plain closures.
+- **`validate_block`.** Adds the coinbase length check. Legacy sigops are now counted by the ported `GetLegacySigOpCount`. BIP34 is now Core's byte-prefix comparison, so heights 1–16 work and regtest uses `bip34_height = 1` like Core. The comment that called the in-block duplicate-txid check "BIP30" is corrected.
+- **`validate_block_scripts(..., times)`.** Checks finality for every tx using the MTP cutoff (BIP113), then BIP68 per tx once the spent coins are resolved, then the full sigop cost before any script runs.
+- **Header rule `bad-version`** (`validate_headers`). The old BIP34 parser rejected version-1 blocks as a side effect. The new check covers that, plus Core's BIP66 and BIP65 version floors.
+- **Activation heights** are now in `ChainParams`: `bip66_height`, `bip65_height` and `csv_height`. A test pins them to the script-flag table.
+- **Mempool.** Finality now follows `CheckFinalTxAtTip`: it checks for the next block using the tip's MTP. Before, it allowed `nLockTime = tip+1` and compared time locks to the wall clock. BIP68 follows `CheckSequenceLocksAtTip`, with mempool parents counted at tip+1.
+- **BIP30.** `BIP34_IMPLIES_BIP30_LIMIT` is documented, and a compile-time assert fails the build if the snapshot anchor reaches it. `apply_block` writes with `NO_OVERWRITE`; if an overwrite ever happens it logs an error and `debug_assert!`s.
+- **Not done.**
+  - A full adapter over `tx_valid.json`/`tx_invalid.json`. Those vectors exercise the script interpreter (047 Step 1 runs them), not `IsFinalTx`/`SequenceLocks`. Only the coinbase-size vectors are relevant to this ticket, and they are ported.
+  - Mempool re-checking of finality/BIP68 after a reorg (Core's `removeForReorg`).
+- **Mainnet check.** The ignored test `mainnet_blocks_pass_contextual_rules` (data from `tools/fetch_mainnet_context.py`) passed on blocks 972818, 972962 and 973011–973013. It used real MTP and real coin heights for 265 BIP68-constrained inputs. Zero rejections.
+
+## Follow-up after merging main (2026-10-26)
+
+- **024 classes for the new errors.** `BadCoinbaseLength`, `NonFinalTx`, `SequenceLockNotMet` and `ExcessiveSigopCost` are consensus failures. `MissingContext` is a local fault, so a block is never marked invalid because *we* lack header times. `VALIDATION_RULES_VERSION` is now 2, so `failed_blocks` rows recorded under v1 are reconsidered.
+- **Witness commitment matches Core's `CheckWitnessMalleation`.** `validate_block` no longer calls rust-bitcoin's `Block::check_witness_commitment`, which returns true early when no transaction has witness data. Because of that early return, it accepted a commitment with an empty coinbase witness. It also never checked witnesses before SegWit. `validate_block` and `check_block_mutation` now share `check_witness_malleation`, and every failure in it counts as a mutation (bad delivery), as with Core's `BLOCK_MUTATED`.
+
+### Review fixes (2026-10-26)
+
+- **MTP cost.** Every block's median-time-past was 11 single-row SQLite reads, each re-preparing its statement under the store mutex (regtest has CSV from height 1, so the eclipse sync tests paid this for ~6,000 blocks). `HeaderTimes::timestamps_between` now reads the window in one cached range query. The mempool caches the tip MTP per tip header hash (`header_id_at`), so a reorg never serves a stale value. Profiling `eclipse_fork_beyond_a_full_batch_of_shared_headers_recovers`: MTP went from ~1,040 samples to ~245. Wall time is now even with main (three alternating runs each: 43.1 s branch, 44.8 s main). Its wall time is dominated by `UtxoSet::apply_block` disk I/O, which swings widely with machine load. The 60 s timeout flakes on main too under load.
+- **Own timelocked txs** are `SubmitError::NotYetFinal` (`not_yet_final`; FFI `BroadcastError::NotYetFinal`), not `Consensus`. The text says the tx is not valid *yet*, names the lock, and mentions the catch-up when the UTXO set lags the headers. The lagging height-lock case is still `NotSynced`.
+- **`validate_block` order.** The witness-malleation check now runs right after the merkle root, before the weight check. A copy padded with junk witness data is then a mutation, not `ExcessiveWeight`.
+
+### Follow-ups
+
+- **Mainnet regression over 288 blocks.** `mainnet_blocks_pass_contextual_rules` still covers 5 blocks; extend `tools/fetch_mainnet_context.py` to the last 288 as the Verification section asks.
+- **`bad-version` on already-stored headers.** The new header rule applies to headers validated after the upgrade; headers stored before it never get the check. Negligible: exploiting it needs a low-version header with real PoW that was already in our store.
+- **Rules version.** PR #25 also bumps `VALIDATION_RULES_VERSION` to 2; whichever lands second bumps to 3.
+
 ## Background: what we check today
 
 `validate_block` (`hercules-core/src/block_validation.rs:62`) checks:
@@ -107,6 +138,8 @@ The only place `nLockTime` is checked is the **mempool** (`mempool.rs:222-250`).
 
 ## Alternative worth evaluating: libbitcoinkernel
 
+**Decided (2026-10-24, ticket 047):** kernel *script* verification is go (047 Step 1), but full kernel *block* validation is blocked: the API lacks UTXO lookup by outpoint, AssumeUTXO loading, pruning and explicit flush. So the block-level rules in this ticket are implemented in our Rust code, as below. Revisit when Core PRs #36630 (pruning) and #35187 (validate a block against caller-supplied UTXOs) land; the original evaluation follows.
+
 Bitcoin Core has been extracting its validation engine as **libbitcoinkernel**, which has a C API, and community Rust bindings exist. Using it would give whole-block validation with exactly Core's semantics, including every rule above, and it would stay current with Core automatically.
 
 Downsides:
@@ -154,3 +187,11 @@ About 3–4 days. BIP68 with time-based locks and the P2SH/witness sigop countin
 ## Roadmap position
 
 Safety tier: **022 → 023 → 024 → 027 → 025/026**. It can run in parallel with 025 once 027's fixtures exist.
+
+## Status (2026-10-28)
+
+Merged in PR #26 (`1c1e0a2`), on top of the libbitcoinkernel switch (#25). `VALIDATION_RULES_VERSION` = 3.
+
+**Follow-ups:**
+- Not done: re-checking mempool finality and BIP 68 after a reorg (Core's `removeForReorg`). Belongs with ticket 025 (reorg hardening).
+- `mainnet_blocks_pass_contextual_rules` is ignored and needs `tools/fetch_mainnet_context.py` data. Re-run it when the contextual rules change.

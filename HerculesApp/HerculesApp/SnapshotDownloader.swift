@@ -84,6 +84,10 @@ class SnapshotDownloader: NSObject, ObservableObject {
         get { taskLock.lock(); defer { taskLock.unlock() }; return _activeTask }
         set { taskLock.lock(); defer { taskLock.unlock() }; _activeTask = newValue }
     }
+    /// Tasks `cancel()` cancelled, so their completion isn't taken for iOS
+    /// cancelling the download or for a failure worth resuming (ticket
+    /// 051). Under `taskLock`.
+    private var userCancelledTaskIDs = Set<Int>()
 
     private override init() {
         super.init()
@@ -279,8 +283,14 @@ class SnapshotDownloader: NSObject, ObservableObject {
     /// start fresh from byte 0. This matches the user's mental model: tapping
     /// Cancel should mean "throw it all away", not "pause for later".
     func cancel() {
-        activeTask?.cancel()
-        activeTask = nil
+        taskLock.lock()
+        let task = _activeTask
+        _activeTask = nil
+        if let task = task {
+            userCancelledTaskIDs.insert(task.taskIdentifier)
+        }
+        taskLock.unlock()
+        task?.cancel()
         Self.deleteResumeData()
         DispatchQueue.main.async {
             self.progress = 0
@@ -357,7 +367,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         } catch {
             DispatchQueue.main.async {
                 self.status = .failed("Could not save snapshot: \(error.localizedDescription)")
-                self.activeTask = nil
+                self.clearActiveTask(ifIs: downloadTask)
             }
             return
         }
@@ -371,7 +381,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
             Self.deleteResumeData()
             DispatchQueue.main.async {
                 self.status = .failed("Server returned HTTP \(http.statusCode)")
-                self.activeTask = nil
+                self.clearActiveTask(ifIs: downloadTask)
             }
             return
         }
@@ -383,7 +393,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         DispatchQueue.main.async {
             self.progress = 1.0
             self.status = .completed(dest)
-            self.activeTask = nil
+            self.clearActiveTask(ifIs: downloadTask)
         }
     }
 
@@ -398,27 +408,87 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         guard Self.isCurrent(task) else { return }
         let nsErr = error as NSError
         // User-initiated cancel — already handled by `cancel()`, which also
-        // wipes the resume data blob. Nothing to do here.
-        if nsErr.domain == NSURLErrorDomain && nsErr.code == NSURLErrorCancelled {
+        // wipes the resume data blob and reports the cancel. Nothing to do
+        // here, whatever the error (it may end with a network error rather
+        // than NSURLErrorCancelled; saving its resume data would undo the
+        // wipe). Any other cancel is iOS's own (force-quit, Background App
+        // Refresh turned off, low resources:
+        // `NSURLErrorBackgroundTaskCancelledReasonKey`); it carries resume
+        // data and is handled as a failure below, which also releases a
+        // waiting `awaitSnapshotDownload` (ticket 051).
+        if consumeUserCancel(of: task) {
             return
         }
 
-        // Network/server failure or app force-quit. Capture the resume data
-        // blob (if any) so the next start() picks up where we left off via
-        // an HTTP Range request. If the OS didn't give us resume data (e.g.
-        // the failure happened before any bytes landed), wipe any stale blob
-        // so we don't try to resume into a now-broken state.
+        // A task that is no longer ours (a new download has started since)
+        // must not clear the new one or fail its waiter. Its resume data is
+        // still kept if nothing else is running, e.g. a task from the
+        // previous process reporting after relaunch.
+        taskLock.lock()
+        let isActive = _activeTask === task
+        let noneActive = _activeTask == nil
+        if isActive {
+            _activeTask = nil
+        }
+        taskLock.unlock()
+        guard isActive || noneActive else { return }
+
+        // Network/server failure, app force-quit, or a system cancel.
+        // Capture the resume data blob (if any) so the next start() picks
+        // up where we left off via an HTTP Range request. Without fresh
+        // resume data, a lost network or a system cancel keeps the previous
+        // blob (still the best place to resume from); anything else (e.g.
+        // the blob itself was stale) wipes it so we don't try to resume
+        // into a now-broken state.
         let suffix: String
         if let resumeData = nsErr.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
             Self.saveResumeData(resumeData)
             suffix = " — retry will resume"
+        } else if Self.isTransient(nsErr) {
+            suffix = Self.loadResumeData() != nil ? " — retry will resume" : ""
         } else {
             Self.deleteResumeData()
             suffix = ""
         }
+        guard isActive else { return }
         DispatchQueue.main.async {
             self.status = .failed("Download failed: \(error.localizedDescription)\(suffix)")
-            self.activeTask = nil
+        }
+    }
+
+    /// Clear `activeTask` if it is still `task`, under the lock: a task
+    /// that finishes after a newer one started must not clear the newer
+    /// one (ticket 051).
+    private func clearActiveTask(ifIs task: URLSessionTask) {
+        taskLock.lock(); defer { taskLock.unlock() }
+        if _activeTask === task {
+            _activeTask = nil
+        }
+    }
+
+    /// True (once) if `cancel()` cancelled `task`.
+    private func consumeUserCancel(of task: URLSessionTask) -> Bool {
+        taskLock.lock(); defer { taskLock.unlock() }
+        return userCancelledTaskIDs.remove(task.taskIdentifier) != nil
+    }
+
+    /// The network went away mid-download, or iOS cancelled the task, as
+    /// opposed to the server or the resume data being bad.
+    private static func isTransient(_ error: NSError) -> Bool {
+        guard error.domain == NSURLErrorDomain else { return false }
+        switch error.code {
+        case NSURLErrorNotConnectedToInternet,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorTimedOut,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorCannotFindHost,
+             NSURLErrorDNSLookupFailed,
+             NSURLErrorInternationalRoamingOff,
+             NSURLErrorDataNotAllowed,
+             NSURLErrorCancelled:
+            return true
+        default:
+            return false
         }
     }
 

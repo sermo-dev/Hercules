@@ -42,6 +42,11 @@ pub enum Behavior {
     /// Serve the block at this height with its witnesses stripped: same hash,
     /// fails the witness commitment (ticket 024 "delivery" failure).
     ServeMutated(u32),
+    /// Like `ServeMutated`, but strip the coinbase's witness reserved value
+    /// too, so the block carries no witness data at all.
+    ServeWitnessless(u32),
+    /// Answer `getheaders` and `ping` with mainnet magic instead of regtest.
+    WrongMagic,
     /// Sleep this long before every response after the handshake.
     DelayResponses(Duration),
     /// After the handshake, answer the first request with garbage bytes and
@@ -255,6 +260,11 @@ fn run_session(stream: TcpStream, shared: &Shared) -> io::Result<()> {
             return Ok(());
         }
 
+        let magic = if behaviors.iter().any(|b| matches!(b, Behavior::WrongMagic)) {
+            Magic::BITCOIN
+        } else {
+            magic
+        };
         match msg {
             NetworkMessage::Ping(nonce) => send(&writer, magic, NetworkMessage::Pong(nonce))?,
             NetworkMessage::GetHeaders(gh) => {
@@ -313,6 +323,9 @@ fn serve_item(
             }
             Behavior::ServeMutated(h) if *h == height => {
                 reply = FixtureChain::strip_witness(&reply);
+            }
+            Behavior::ServeWitnessless(h) if *h == height => {
+                reply = FixtureChain::strip_all_witness(&reply);
             }
             _ => {}
         }

@@ -298,13 +298,34 @@ class NotificationManager: ObservableObject {
         let budget = WakeBudget(budgetMs: WakeConfig.budgetMs)
         let receivedAt = Date()
 
+        // On a cold launch the network monitor hasn't reported its first
+        // path yet, and `shouldValidate` would read "offline" (ticket 051).
+        // Wait for it, bounded; inline when the process is warm.
+        NetworkPolicy.shared.afterFirstPath {
+            self.runSilentPush(
+                userInfo: userInfo, budget: budget, receivedAt: receivedAt,
+                completionHandler: completionHandler
+            )
+        }
+    }
+
+    /// `handleSilentPush` once the network path is known. Main thread.
+    private func runSilentPush(
+        userInfo: [AnyHashable: Any],
+        budget: WakeBudget,
+        receivedAt: Date,
+        completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
         // Parse block info from push payload (used as fallback if validation fails)
         let pushBlock = parsePushPayload(userInfo)
 
         // Network policy gate: refuse to validate over metered links unless
         // the user has explicitly opted in. Record a paused entry so the
         // user can see in the notification history that we declined the wake.
+        // No path at all (or none reported within the first-path wait) is
+        // recorded as offline, not as a metered-network skip.
         if !NetworkPolicy.shared.shouldValidate {
+            let offline = NetworkPolicy.shared.indicator == .offline
             // Republish shared state with isPaused=true so the home-screen
             // widget flips to its red "paused" indicator without waiting
             // for the user to open the app.
@@ -319,8 +340,10 @@ class NotificationManager: ObservableObject {
                     validated: false,
                     headerValidated: false,
                     receivedAt: receivedAt,
-                    source: .networkPolicyPaused,
-                    validationError: "Validation skipped: metered network without Use Cellular Data opt-in"
+                    source: offline ? .noNetwork : .networkPolicyPaused,
+                    validationError: offline
+                        ? "Validation skipped: no network connection"
+                        : "Validation skipped: metered network without Use Cellular Data opt-in"
                 )
                 DispatchQueue.main.async {
                     self.appendRecord(record)
@@ -511,6 +534,10 @@ class NotificationManager: ObservableObject {
         /// Nothing failed (foreground handled it, node busy, reset): end the
         /// Live Activity without a failure state.
         var neutral = false
+        /// A processing round a push or refresh cancelled before it
+        /// validated anything, or that never started because one was in
+        /// flight (ticket 051): not a stall, run another.
+        var preempted = false
     }
 
     /// Run one wake on the shared node. Blocks; call off the main thread.
@@ -520,7 +547,9 @@ class NotificationManager: ObservableObject {
         receivedAt: Date,
         pushBlock: PushBlockInfo?,
         appInForeground: Bool,
-        trigger: String
+        trigger: String,
+        maxBlocks: UInt32 = WakeConfig.maxBlocks,
+        kind: NodeSessionState.WakeKind = .short
     ) -> WakeRun {
         let fromPayload = { (source: NotificationSource, error: String?, timings: WakeTimings) -> BlockNotificationRecord in
             var record = Self.payloadRecord(pushBlock: pushBlock, receivedAt: receivedAt, source: source, error: error)
@@ -528,7 +557,9 @@ class NotificationManager: ObservableObject {
             return record
         }
         do {
-            switch try NodeHost.shared.runWake(budget: budget, appInForeground: appInForeground) {
+            switch try NodeHost.shared.runWake(
+                budget: budget, appInForeground: appInForeground, maxBlocks: maxBlocks, kind: kind
+            ) {
             case .foregroundActive:
                 return WakeRun(
                     record: fromPayload(.foregroundActive, nil, WakeTimings(trigger: trigger)),
@@ -536,16 +567,21 @@ class NotificationManager: ObservableObject {
                     notify: false,
                     neutral: true
                 )
+            case .yielded:
+                // Processing only: a push or refresh is running. No record.
+                return WakeRun(record: nil, fetchResult: .noData, notify: false, neutral: true, preempted: true)
             case let .ran(report, nodeReadyMs, nodeReused, peerCount, cancelReason):
                 let timings = Self.timings(report, trigger: trigger, nodeReadyMs: nodeReadyMs, nodeReused: nodeReused)
                 switch report.outcome {
                 case .completed, .cancelled, .timedOut:
                     // A status counts only if headers were checked against
                     // peers (completed), blocks were actually validated, or
-                    // peers disagreed (the eclipse alert survives a cancel);
-                    // otherwise it is just the local tip.
+                    // peers disagreed or served an invalid block (those
+                    // alerts survive a cancel); otherwise it is just the
+                    // local tip.
                     if let status = report.status,
-                       report.outcome == .completed || status.blocksValidated > 0 || status.tipDisagreement {
+                       report.outcome == .completed || status.blocksValidated > 0
+                        || status.tipDisagreement || status.invalidChainDetected {
                         var record = Self.makeRecord(from: status, receivedAt: receivedAt)
                         record.wakeTimings = timings
                         return WakeRun(
@@ -565,6 +601,14 @@ class NotificationManager: ObservableObject {
                         return WakeRun(
                             record: fromPayload(.nodeReset, "Cancelled: the node is being reset", timings),
                             fetchResult: .noData, notify: false, neutral: true
+                        )
+                    case .preemptedByWake:
+                        // A processing round gave the node to a push or
+                        // refresh. (A round that validated blocks first
+                        // returned its status above.)
+                        return WakeRun(
+                            record: fromPayload(.wakeCancelled, "Yielded to a block wake", timings),
+                            fetchResult: .noData, notify: false, neutral: true, preempted: true
                         )
                     case .none:
                         break
@@ -653,9 +697,12 @@ class NotificationManager: ObservableObject {
                 )
             }
             activity.finishSuccess(height: status.currentHeight, peerCount: run.peerCount)
-            // If still behind, request a follow-up wake for accelerated catch-up
+            // If still behind, request a follow-up wake for accelerated
+            // catch-up, and a processing window for the rest of a big
+            // backlog (ticket 051).
             if !status.caughtUp && status.blocksValidated > 0 {
                 Self.requestFollowUpWake()
+                Self.scheduleProcessingTask()
             }
         } else if run.neutral {
             SharedNodeStore.markAwake(false)
@@ -746,7 +793,9 @@ class NotificationManager: ObservableObject {
 
     private static func makeRecord(from status: CatchUpStatus, receivedAt: Date = Date()) -> BlockNotificationRecord {
         let source: NotificationSource
-        if status.tipDisagreement {
+        if status.invalidChainDetected {
+            source = .invalidChain
+        } else if status.tipDisagreement {
             source = .tipDisagreement
         } else if status.caughtUp {
             source = .fullValidation
@@ -827,12 +876,18 @@ class NotificationManager: ObservableObject {
         case .tipDisagreement:
             content.title = "Chain Tip Disagreement"
             content.body = "Peers disagree on the chain tip at block #\(record.height). Retrying next wake."
+        case .invalidChain:
+            content.title = "Invalid Block Rejected"
+            content.body = "A peer relayed a block that breaks consensus rules after #\(record.height). Hercules rejected it and keeps following the valid chain."
         case .headerOnly:
             content.title = "Block #\(record.height) Header Verified"
             content.body = "PoW validated, full block validation pending"
         case .pushPayload:
             content.title = record.height > 0 ? "New Block #\(record.height)" : "New Block"
             content.body = "Received from relay (not yet validated)"
+        case .noNetwork:
+            content.title = "\(record.displayTitle) — Not Yet Validated"
+            content.body = "No network connection during the wake. Hercules will validate on the next one."
         case .networkPolicyPaused:
             content.title = "\(record.displayTitle) — Validation Paused"
             content.body = "Skipped to save cellular data. Connect to Wi-Fi or enable Use Cellular Data."
@@ -913,7 +968,10 @@ class NotificationManager: ObservableObject {
             Self.requestFollowUpWake()
         }
 
-        // Respect the same network policy gate as silent push wakes.
+        // Respect the same network policy gate as silent push wakes, once
+        // the monitor has reported (this handler can be the cold launch's
+        // first code, on a background queue; ticket 051).
+        NetworkPolicy.shared.waitForFirstPath()
         guard NetworkPolicy.shared.shouldValidate else {
             gate.fire { task.setTaskCompleted(success: true) }
             return
@@ -960,6 +1018,217 @@ class NotificationManager: ObservableObject {
         } catch {
             // Non-fatal: next natural push wake from APNs will continue catch-up
         }
+    }
+
+    // MARK: - Background Processing Task (ticket 051)
+
+    /// `BGTASK_PROCESSING_ID` in Config/Shared.xcconfig (also generates the
+    /// `BGTaskSchedulerPermittedIdentifiers` entry).
+    static let processingTaskIdentifier = AppIdentifiers.processingTaskID
+
+    /// Ask iOS for a processing window (015 Phase 2, 028 §7): minutes of
+    /// background time to work through a backlog that 25-second wakes
+    /// can't. Only on external power and with a network, so a long
+    /// catch-up costs no battery; the handler still applies the cellular
+    /// policy. Replaces any pending request. Submitted when the app goes to
+    /// the background and when a wake ends still behind; skipped until a
+    /// validation mode has been chosen.
+    static func scheduleProcessingTask() {
+        guard ValidationModePreference.current != nil else { return }
+        let request = BGProcessingTaskRequest(identifier: processingTaskIdentifier)
+        request.requiresExternalPower = true
+        request.requiresNetworkConnectivity = true
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            // Non-fatal (and always the case in the simulator): pushes and
+            // refresh wakes still catch up, a few blocks at a time.
+            StoragePaths.log.notice("processing task not scheduled: \(error.localizedDescription)")
+        }
+    }
+
+    /// Handle a BGProcessingTask: catch up in rounds on the shared node
+    /// until caught up, out of progress, or out of time.
+    func handleProcessingTask(_ task: BGProcessingTask) {
+        // setTaskCompleted exactly once: normal finish or expiration.
+        let gate = OnceGate()
+        let expired = LockedBox(false)
+        let round = LockedBox<WakeBudget?>(nil)
+
+        // Expiration: cancel the running round, complete the task
+        // ourselves, and ask for another window to carry on.
+        task.expirationHandler = {
+            expired.value = true
+            round.value?.cancel()
+            gate.fire {
+                StoragePaths.log.notice("processing task expired")
+                task.setTaskCompleted(success: false)
+            }
+            Self.scheduleProcessingTask()
+        }
+
+        DispatchQueue.global(qos: .utility).async {
+            let startedAt = Date()
+            NetworkPolicy.shared.waitForFirstPath()
+            // Expired while waiting: the handler already completed and
+            // resubmitted the task. Don't open the node or start Tor.
+            if expired.value { return }
+            // Same gate as a refresh wake, before anything opens the node:
+            // opening starts Tor and the onion service, which is network
+            // traffic. Metered or offline now: try again in a later
+            // window (`scheduleProcessingTask` does nothing until a
+            // validation mode has been chosen).
+            guard NetworkPolicy.shared.shouldValidate else {
+                Self.scheduleProcessingTask()
+                gate.fire { task.setTaskCompleted(success: true) }
+                return
+            }
+            guard Self.nodeIsSetUp() else {
+                gate.fire { task.setTaskCompleted(success: true) }
+                return
+            }
+
+            var rounds = 0
+            var yields = 0
+            var totalBlocks: UInt32 = 0
+            // The last round that wasn't cut short by a push: its record
+            // says why the task stopped.
+            var lastRun: WakeRun?
+            var lastStatus: CatchUpStatus?
+            while rounds < WakeConfig.processingMaxRounds && yields < WakeConfig.processingMaxYields {
+                if expired.value || !NetworkPolicy.shared.shouldValidate { break }
+                if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes { break }
+                // Pushes and refreshes go first: they have ~30 s, a round
+                // has minutes. One admitted mid-round cancels the round,
+                // and a round asking while one is in flight is told to
+                // yield (`NodeSessionState.admitWake`, atomically); this
+                // waits them out. They never wait on us, and each is
+                // bounded by its own budget, so this can't deadlock.
+                while NodeHost.shared.sessions.inFlightShortWakes > 0 && !expired.value {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if expired.value { break }
+
+                let budget = WakeBudget(budgetMs: WakeConfig.processingRoundMs)
+                round.value = budget
+                // Expired between the check above and publishing `round`.
+                if expired.value { budget.cancel() }
+                let run = self.performWake(
+                    budget: budget, receivedAt: Date(), pushBlock: nil,
+                    appInForeground: Self.appInForegroundNow(), trigger: "processing",
+                    maxBlocks: WakeConfig.processingMaxBlocks, kind: .processing
+                )
+                if run.preempted {
+                    yields += 1
+                } else {
+                    rounds += 1
+                    lastRun = run
+                }
+                if let status = run.status {
+                    lastStatus = status
+                    // Progress reaches the widget round by round, not
+                    // only at the end. Blocks are committed one at a time,
+                    // so a preempted round's progress is kept too.
+                    if status.blocksValidated > 0 {
+                        totalBlocks += status.blocksValidated
+                        SharedNodeStore.publishValidation(
+                            height: status.currentHeight,
+                            blockHash: status.tipBlockHash,
+                            peerCount: run.peerCount
+                        )
+                    }
+                }
+                // Gave the node to a push or refresh: go again once it's done.
+                if run.preempted { continue }
+                // Stop when caught up, or when a round made no progress
+                // (foreground took over, peers unreachable, cancelled).
+                guard let status = run.status, !status.caughtUp, status.blocksValidated > 0 else { break }
+            }
+            round.value = nil
+
+            // One history record for the whole task, summing its rounds.
+            // Written even if expiration already completed the task.
+            if lastRun?.lockedSinceReboot == true {
+                StoragePaths.log.notice("processing skipped: device locked since reboot")
+            } else if let record = Self.processingRecord(
+                last: lastRun, status: lastStatus, totalBlocks: totalBlocks,
+                rounds: rounds, startedAt: startedAt
+            ) {
+                DispatchQueue.main.async {
+                    self.appendRecord(record)
+                }
+            }
+            // Still behind (or unknown) after whatever happened: ask for
+            // another window.
+            let caughtUp = lastStatus?.caughtUp == true
+            if !caughtUp {
+                Self.scheduleProcessingTask()
+            }
+            gate.fire {
+                task.setTaskCompleted(success: totalBlocks > 0 || caughtUp)
+            }
+        }
+    }
+
+    /// The history record for one processing task: the final tip, with
+    /// the blocks validated and rounds run summed in its timings. `last` is
+    /// the last round that wasn't cut short by a push. Nil if nothing ran.
+    private static func processingRecord(
+        last: WakeRun?,
+        status: CatchUpStatus?,
+        totalBlocks: UInt32,
+        rounds: Int,
+        startedAt: Date
+    ) -> BlockNotificationRecord? {
+        guard last != nil || status != nil else { return nil }
+        let timings = WakeTimings(
+            trigger: "processing",
+            completedMs: UInt64(max(0, Date().timeIntervalSince(startedAt)) * 1000),
+            rounds: rounds,
+            blocksValidated: totalBlocks
+        )
+        guard let status = status else {
+            // No round reached the network: keep the last round's reason.
+            var record = last?.record
+            record?.wakeTimings = timings
+            return record
+        }
+        let source: NotificationSource
+        if status.tipDisagreement {
+            source = .tipDisagreement
+        } else if status.caughtUp {
+            source = .fullValidation
+        } else if totalBlocks > 0 {
+            source = .catchUpProgress
+        } else {
+            source = .headerOnly
+        }
+        var record = BlockNotificationRecord(
+            id: UUID(),
+            height: status.currentHeight,
+            blockHash: status.tipBlockHash,
+            timestamp: status.tipTimestamp,
+            timestampHuman: "",
+            validated: status.caughtUp,
+            headerValidated: true,
+            receivedAt: startedAt,
+            source: source,
+            // A later round that failed outright says why it stopped.
+            validationError: last.map { $0.status == nil ? $0.record?.validationError : status.error } ?? status.error
+        )
+        record.wakeTimings = timings
+        return record
+    }
+
+    /// Whether a long catch-up makes sense yet: a validation mode has been
+    /// chosen and, for AssumeUTXO, the snapshot is in. Before that a
+    /// catch-up would validate from genesis on a node meant for a
+    /// snapshot. Opens the shared node, as the wake would.
+    private static func nodeIsSetUp() -> Bool {
+        guard let mode = ValidationModePreference.current else { return false }
+        guard mode == .assumeUtxo else { return true }
+        guard let (node, _) = try? NodeHost.shared.node() else { return false }
+        return (try? node.needsSnapshot()) == false
     }
 
     // MARK: - Locked since reboot

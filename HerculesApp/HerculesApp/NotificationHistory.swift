@@ -7,7 +7,9 @@ enum NotificationSource: String, Codable {
     case pushPayload        // Info from push relay only, not verified
     case catchUpProgress    // Multi-block catch-up (some blocks validated, more remain)
     case tipDisagreement    // Header cross-check detected peer disagreement (possible eclipse)
+    case invalidChain       // A wake rejected a consensus-invalid block from the network (ticket 024)
     case networkPolicyPaused // Validation skipped: metered network without opt-in
+    case noNetwork          // Validation skipped: no network path at all (ticket 051)
     // Ticket 028 wake outcomes
     case foregroundActive   // App on screen and syncing: the wake left it to foreground
     case transportSlow      // Transport not up with enough budget left for a block
@@ -43,6 +45,11 @@ struct WakeTimings: Codable, Equatable {
     var completedMs: UInt64?
     /// A sync loop left running in the background was stopped for this wake.
     var preemptedSync: Bool?
+    /// BG processing task only (ticket 051): catch-up rounds run, and the
+    /// blocks they validated in total. `completedMs` is then since the
+    /// task started.
+    var rounds: Int?
+    var blocksValidated: UInt32?
 }
 
 /// A record of a block notification, persisted to disk.

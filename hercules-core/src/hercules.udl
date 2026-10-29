@@ -2,6 +2,7 @@ namespace hercules {
     [Throws=HerculesError]
     BlockInfo parse_block_header(string hex_header);
     string hercules_version();
+    string script_backend();
 
     [Throws=HerculesError]
     void reset_database(string db_path);
@@ -60,6 +61,7 @@ dictionary CatchUpStatus {
     u32 tip_timestamp;
     string? error;
     boolean tip_disagreement;
+    boolean invalid_chain_detected;
 };
 
 // Ticket 028: background wakes.
@@ -203,6 +205,9 @@ interface HerculesNode {
     TrustInfo get_trust_info();
 
     [Throws=HerculesError]
+    u32 reconsider_invalid_blocks();
+
+    [Throws=HerculesError]
     string start_wallet_api();
 
     void stop_wallet_api();
@@ -237,6 +242,7 @@ interface HerculesError {
 interface BroadcastError {
     Invalid(string msg);
     Consensus(string msg);
+    NotYetFinal(string msg);
     NonStandard(string msg);
     FeeTooLow(string msg);
     AbsurdFee(string msg);

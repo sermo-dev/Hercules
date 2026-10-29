@@ -1,5 +1,16 @@
 # Ticket 024: Bad Data From a Peer Penalizes the Peer — It Doesn't Halt the Node
 
+## Status (2026-10-26)
+
+**Done.** Merged in PR #24 (merge commit 3347a37) after five review rounds; 505 Rust tests pass, 3 ignored.
+
+### Follow-ups
+- **Colluding stale witnesses.** Peers with valid but stale headers can still outvote an honest peer in the cross-check. They can no longer get it banned: disagreement only lowers its ranking (demerits are never persisted and never count toward a ban). Revisit if ranking manipulation proves practical.
+- **Progress messages use the error banner.** "Checking a peer's headers…" and "Checking a competing header chain…" go through `status.error`, like the existing "Reorg: rolled back…" text, so they show in the red banner. A neutral status line would read better.
+- **Still-ignored tests:** `wake_path_follows_one_block_reorg` and `withheld_reorg_blocks_leave_node_on_old_tip` belong to **025**; `bip34_accepts_core_encoding_at_low_heights` belongs to **026**.
+- **026 interaction:** when 026 lands, classify its new error variants under this ticket's scheme (e.g. `MissingContext` is a local fault, not a consensus failure).
+
+
 ## Summary
 
 Today, if a single peer serves a bad block or a bad header batch, the whole sync stops. Every block and header validation failure in the main sync loop and in `catch_up_blocks` is returned as `Err` out of the function. The offending peer is never penalized, the loop exits, and the next attempt may pick the same peer again.

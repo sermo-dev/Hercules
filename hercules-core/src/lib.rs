@@ -11,11 +11,13 @@ mod assumeutxo;
 mod block_store;
 mod block_validation;
 mod chain_params;
+mod contextual_checks;
 mod mempool;
 mod own_tx_store;
 mod p2p;
 mod peer_pool;
 mod relay_policy;
+mod script_verify;
 mod peer_store;
 mod store;
 mod sync;
@@ -75,6 +77,12 @@ pub fn parse_block_header(hex_header: String) -> Result<BlockInfo, HerculesError
 
 pub fn hercules_version() -> String {
     "Hercules v0.1.0".to_string()
+}
+
+/// The script verification library this build uses (ticket 047), e.g.
+/// "libbitcoinkernel v32.0" or the legacy libbitcoinconsensus v26.
+pub fn script_backend() -> String {
+    script_verify::active_backend_name().to_string()
 }
 
 /// Wipe all on-disk state for a Hercules node so the next launch starts from a
@@ -246,6 +254,7 @@ pub struct CatchUpStatus {
     pub tip_timestamp: u32,
     pub error: Option<String>,
     pub tip_disagreement: bool,
+    pub invalid_chain_detected: bool,
 }
 
 impl From<sync::CatchUpStatus> for CatchUpStatus {
@@ -259,6 +268,7 @@ impl From<sync::CatchUpStatus> for CatchUpStatus {
             tip_timestamp: s.tip_timestamp,
             error: s.error,
             tip_disagreement: s.tip_disagreement,
+            invalid_chain_detected: s.invalid_chain_detected,
         }
     }
 }
@@ -1199,6 +1209,18 @@ impl HerculesNode {
         self.syncer.get_node_status()
     }
 
+    /// Forget every block recorded as consensus-invalid and lift the peer
+    /// bans recorded because of them (ticket 024), e.g. from a Settings
+    /// action after an update or a suspected false rejection. Returns the
+    /// number of bans lifted.
+    pub fn reconsider_invalid_blocks(&self) -> Result<u32, HerculesError> {
+        self.syncer
+            .reconsider_invalid_blocks()
+            .map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })
+    }
+
     pub fn get_trust_info(&self) -> Result<TrustInfo, HerculesError> {
         self.syncer
             .get_trust_info()
@@ -1515,6 +1537,8 @@ pub enum BroadcastError {
     Invalid { msg: String },
     #[error("Consensus-invalid: {msg}")]
     Consensus { msg: String },
+    #[error("Not valid yet: {msg}")]
+    NotYetFinal { msg: String },
     #[error("Non-standard: {msg}")]
     NonStandard { msg: String },
     #[error("Fee too low: {msg}")]
@@ -1538,6 +1562,7 @@ impl From<own_tx_store::SubmitError> for BroadcastError {
         match e {
             S::Decode(_) => BroadcastError::Invalid { msg },
             S::Consensus(_) => BroadcastError::Consensus { msg },
+            S::NotYetFinal { .. } => BroadcastError::NotYetFinal { msg },
             S::NonStandard(_) => BroadcastError::NonStandard { msg },
             S::FeeTooLow { .. } => BroadcastError::FeeTooLow { msg },
             S::AbsurdFee { .. } => BroadcastError::AbsurdFee { msg },

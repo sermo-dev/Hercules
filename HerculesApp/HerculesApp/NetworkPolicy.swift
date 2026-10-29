@@ -34,13 +34,42 @@ final class NetworkPolicy: ObservableObject {
     /// to re-publish from this object.
     static let useCellularDataKey = "useCellularData"
 
+    /// How long a caller waits for the monitor's first path before deciding
+    /// (cold launch from a silent push). `NWPathMonitor` usually delivers
+    /// within a few milliseconds of `start`.
+    static let firstPathTimeout: TimeInterval = 1.5
+
+    // Mirrors of `currentPath` for SwiftUI, updated on main. Decisions read
+    // `currentPath` instead: these lag the monitor by a main-queue hop, and on
+    // a cold launch the first hop runs after the push handler has decided.
     @Published private(set) var pathStatus: NWPath.Status = .requiresConnection
     @Published private(set) var isExpensive: Bool = false
     @Published private(set) var isConstrained: Bool = false
 
+    private struct PathState {
+        var status: NWPath.Status
+        var isExpensive: Bool
+        var isConstrained: Bool
+    }
+
+    /// The latest path, written on the monitor queue. Nil until the first
+    /// update arrives.
+    private let stateLock = NSLock()
+    private var _state: PathState?
+    private var currentPath: PathState? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _state
+    }
+
+    /// Entered at init, left once on the first path update.
+    private let firstPath = DispatchGroup()
+
     /// True if the active path is cellular, Personal Hotspot, or Low Data
     /// Mode — i.e. anywhere we'd burn the user's metered allowance.
-    var isMetered: Bool { isExpensive || isConstrained }
+    var isMetered: Bool {
+        guard let s = currentPath else { return false }
+        return s.isExpensive || s.isConstrained
+    }
 
     /// User preference: are we allowed to use the network even when it's
     /// metered? Read-through to UserDefaults so a Settings toggle takes
@@ -55,9 +84,13 @@ final class NetworkPolicy: ObservableObject {
     /// 1. There is some kind of network path available, AND
     /// 2. Either the path is unmetered, OR the user has opted in to
     ///    spending cellular data on the node.
+    ///
+    /// Before the monitor's first update this is false ("offline"); wake
+    /// and sync entry points call `waitForFirstPath` / `afterFirstPath`
+    /// first.
     var shouldValidate: Bool {
-        guard pathStatus == .satisfied else { return false }
-        if isMetered && !cellularAllowed { return false }
+        guard let s = currentPath, s.status == .satisfied else { return false }
+        if (s.isExpensive || s.isConstrained) && !cellularAllowed { return false }
         return true
     }
 
@@ -76,8 +109,8 @@ final class NetworkPolicy: ObservableObject {
     }
 
     var indicator: Indicator {
-        guard pathStatus == .satisfied else { return .offline }
-        if !isMetered { return .unmetered }
+        guard let s = currentPath, s.status == .satisfied else { return .offline }
+        if !(s.isExpensive || s.isConstrained) { return .unmetered }
         return cellularAllowed ? .meteredAllowed : .meteredBlocked
     }
 
@@ -86,17 +119,60 @@ final class NetworkPolicy: ObservableObject {
 
     private init() {
         monitor = NWPathMonitor()
+        firstPath.enter()
         monitor.pathUpdateHandler = { [weak self] path in
-            // `pathUpdateHandler` fires on `queue`, but the @Published
-            // properties drive SwiftUI views — bounce to main.
+            guard let self = self else { return }
+            // Decisions first, on this queue, so a wake that is waiting
+            // for the first path sees it now rather than after a hop to
+            // main.
+            self.stateLock.lock()
+            let isFirst = self._state == nil
+            self._state = PathState(
+                status: path.status,
+                isExpensive: path.isExpensive,
+                isConstrained: path.isConstrained
+            )
+            self.stateLock.unlock()
+            if isFirst {
+                self.firstPath.leave()
+            }
+            // The @Published mirrors drive SwiftUI views — bounce to main.
             DispatchQueue.main.async {
-                guard let self = self else { return }
                 self.pathStatus = path.status
                 self.isExpensive = path.isExpensive
                 self.isConstrained = path.isConstrained
             }
         }
         monitor.start(queue: queue)
+    }
+
+    /// Block until the monitor has reported its first path, or `timeout`
+    /// passes. Returns at once when the path is already known. True if it
+    /// is known. Background threads only; the main thread uses
+    /// `afterFirstPath`.
+    @discardableResult
+    func waitForFirstPath(timeout: TimeInterval = NetworkPolicy.firstPathTimeout) -> Bool {
+        firstPath.wait(timeout: .now() + timeout) == .success
+    }
+
+    /// Run `body` on the main queue once the first path is known or
+    /// `timeout` passes, whichever comes first. Runs it inline when the
+    /// path is already known and the caller is on main (a warm process).
+    func afterFirstPath(
+        timeout: TimeInterval = NetworkPolicy.firstPathTimeout,
+        _ body: @escaping () -> Void
+    ) {
+        if Thread.isMainThread && currentPath != nil {
+            body()
+            return
+        }
+        let once = OnceGate()
+        firstPath.notify(queue: .main) {
+            once.fire(body)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+            once.fire(body)
+        }
     }
 
     deinit {

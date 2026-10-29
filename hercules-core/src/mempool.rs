@@ -8,6 +8,11 @@ use bitcoin::{Transaction, Txid};
 use log::{debug, info};
 
 use crate::chain_params::ChainParams;
+use crate::contextual_checks::{
+    calculate_sequence_locks, evaluate_sequence_locks, is_final_tx, median_time_past, HeaderTimes,
+    MedianTimes,
+};
+use crate::script_verify;
 use crate::utxo::{UtxoEntry, UtxoSet};
 
 /// Default maximum mempool size: 50 MB of *serialized* transaction bytes.
@@ -116,6 +121,11 @@ pub struct Mempool {
     max_size: usize,
     /// Chain whose script-flag schedule applies to accepted transactions.
     params: &'static ChainParams,
+    /// Median-time-past of the tip that admission last judged against:
+    /// (height, header hash, MTP). Every relayed tx needs it, and it only
+    /// changes with the tip; keyed by hash so a reorg can't serve a stale
+    /// value.
+    tip_mtp_cache: Option<(u32, [u8; 32], i64)>,
 }
 
 impl Mempool {
@@ -134,6 +144,7 @@ impl Mempool {
             total_size: 0,
             max_size: DEFAULT_MAX_SIZE,
             params,
+            tip_mtp_cache: None,
         }
     }
 
@@ -147,6 +158,7 @@ impl Mempool {
             total_size: 0,
             max_size,
             params: ChainParams::mainnet(),
+            tip_mtp_cache: None,
         }
     }
 
@@ -160,7 +172,7 @@ impl Mempool {
     /// 2. Input validation — UTXO set first, then mempool fallback for
     ///    chain spending. Inputs that hit `to_evict` are treated as missing
     ///    so a replacement can't depend on the txs it's replacing.
-    /// 3. Script validation via libbitcoinconsensus, value math, fee rate
+    /// 3. Script validation (`script_verify`), value math, fee rate
     ///    floor, absurd-fee guardrail.
     /// 4. BIP 125 RBF rules 2/3/5 (only if conflicts is non-empty).
     /// 5. Ancestor closure + 25-ancestor / 101 kvB limit checks.
@@ -178,7 +190,11 @@ impl Mempool {
     ///    tx, so the new tx is guaranteed to survive.
     ///
     /// `current_height` is the chain tip height as understood by the
-    /// caller. There is a small staleness window (one block at most)
+    /// caller, and `times` gives the header timestamps of that chain (the
+    /// header store): finality and BIP 68 are judged for a block at
+    /// `current_height + 1` whose parent's median-time-past is the tip's,
+    /// as Core's `CheckFinalTxAtTip` / `CheckSequenceLocksAtTip` do.
+    /// There is a small staleness window (one block at most)
     /// between when the caller reads the height and when this function
     /// runs under the mempool lock; the consequence is at worst a
     /// spurious `NonFinal` or `ImmatureCoinbase` rejection of one tx,
@@ -191,8 +207,9 @@ impl Mempool {
         tx: Transaction,
         utxo_set: &UtxoSet,
         current_height: u32,
+        times: &dyn HeaderTimes,
     ) -> Result<Txid, MempoolError> {
-        self.accept_tx_internal(tx, utxo_set, current_height, AcceptMode::Relay)
+        self.accept_tx_internal(tx, utxo_set, current_height, times, AcceptMode::Relay)
     }
 
     /// Accept one of the **user's own** transactions (ticket 033).
@@ -215,8 +232,9 @@ impl Mempool {
         tx: Transaction,
         utxo_set: &UtxoSet,
         current_height: u32,
+        times: &dyn HeaderTimes,
     ) -> Result<Txid, MempoolError> {
-        self.accept_tx_internal(tx, utxo_set, current_height, AcceptMode::Own)
+        self.accept_tx_internal(tx, utxo_set, current_height, times, AcceptMode::Own)
     }
 
     /// Why our local relay policy (018) would refuse `tx` from a peer, if
@@ -252,11 +270,14 @@ impl Mempool {
         out
     }
 
-    /// Test-only accept entry point that skips libbitcoinconsensus script
+    /// Test-only accept entry point that skips consensus script
     /// validation and the standard-script-type check. Lets unit tests
     /// exercise the graph state, fee math, RBF, and CPFP paths using
     /// trivial anyone-can-spend script_pubkeys instead of crafting valid
     /// signatures. Production callers must always go through `accept_tx`.
+    ///
+    /// Header times are synthetic (`tests::synthetic_times`); tests of the
+    /// time-based rules use [`Mempool::accept_tx_test_with_times`].
     #[cfg(test)]
     pub(crate) fn accept_tx_test(
         &mut self,
@@ -264,7 +285,42 @@ impl Mempool {
         utxo_set: &UtxoSet,
         current_height: u32,
     ) -> Result<Txid, MempoolError> {
-        self.accept_tx_internal(tx, utxo_set, current_height, AcceptMode::SkipConsensus)
+        let times = tests::synthetic_times;
+        self.accept_tx_internal(tx, utxo_set, current_height, &times, AcceptMode::SkipConsensus)
+    }
+
+    /// `accept_tx_test` with caller-supplied header timestamps.
+    #[cfg(test)]
+    pub(crate) fn accept_tx_test_with_times(
+        &mut self,
+        tx: Transaction,
+        utxo_set: &UtxoSet,
+        current_height: u32,
+        times: &dyn HeaderTimes,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_tx_internal(tx, utxo_set, current_height, times, AcceptMode::SkipConsensus)
+    }
+
+    /// Median-time-past at `height` (the tip admission judges against),
+    /// cached per tip header hash. Sources that can't identify the header
+    /// (`header_id_at` = None) are read every time.
+    fn tip_mtp(&mut self, height: u32, times: &dyn HeaderTimes) -> Result<i64, MempoolError> {
+        let id = times.header_id_at(height);
+        if let (Some(id), Some((h, cached_id, mtp))) = (id, self.tip_mtp_cache) {
+            if h == height && cached_id == id {
+                return Ok(mtp);
+            }
+        }
+        let mtp = median_time_past(times, height).map_err(MempoolError::ChainContext)?;
+        // Headers can be replaced while we read them (a reorg on the sync
+        // thread). Cache only if the tip is the same header after the read,
+        // so a value computed across the switch is never keyed to either.
+        let after = times.header_id_at(height);
+        self.tip_mtp_cache = match (id, after) {
+            (Some(id), Some(after)) if id == after => Some((height, id, mtp)),
+            _ => None,
+        };
+        Ok(mtp)
     }
 
     /// Shared accept implementation. See [`AcceptMode`] for what each
@@ -274,6 +330,7 @@ impl Mempool {
         tx: Transaction,
         utxo_set: &UtxoSet,
         current_height: u32,
+        times: &dyn HeaderTimes,
         mode: AcceptMode,
     ) -> Result<Txid, MempoolError> {
         let skip_consensus = matches!(mode, AcceptMode::SkipConsensus);
@@ -293,40 +350,19 @@ impl Mempool {
             return Err(MempoolError::AlreadyInMempool);
         }
 
-        // Finality (nLockTime). A tx is final if nLockTime == 0, all inputs
-        // are nSequence==0xFFFFFFFF, or the locktime has been reached.
-        // Saturating arithmetic on the height + 1 comparison prevents a
-        // wraparound at u32::MAX (irrelevant for current Bitcoin heights
-        // but cheap defensiveness).
-        let all_final = tx.input.iter().all(|i| i.sequence.0 == 0xFFFFFFFF);
-        if !all_final {
-            let lock_time = tx.lock_time.to_consensus_u32();
-            if lock_time != 0 {
-                if lock_time < 500_000_000 {
-                    if lock_time > current_height.saturating_add(1) {
-                        return Err(MempoolError::NonFinal {
-                            lock_time,
-                            current_height,
-                        });
-                    }
-                } else {
-                    // Saturating cast: u64 → u32 wraps in 2106 if we just
-                    // `as`-cast. Treating "secs since epoch" as u32 with
-                    // saturation gives us correct rejection past 2106
-                    // instead of accepting a tx with a 2107 locktime.
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let now: u32 = now_secs.try_into().unwrap_or(u32::MAX);
-                    if lock_time > now {
-                        return Err(MempoolError::NonFinal {
-                            lock_time,
-                            current_height,
-                        });
-                    }
-                }
-            }
+        // Finality (nLockTime), as Core's `CheckFinalTxAtTip`: could `tx`
+        // be mined in the next block? Height locks are judged against
+        // `current_height + 1`, time locks against the tip's median-time-
+        // past (BIP 113), never the wall clock. Same `IsFinalTx` port as
+        // block validation (contextual_checks).
+        let tip_mtp = self.tip_mtp(current_height, times)?;
+        let mut mtp = MedianTimes::new(times);
+        let next_height = current_height.saturating_add(1);
+        if !is_final_tx(&tx, next_height, tip_mtp) {
+            return Err(MempoolError::NonFinal {
+                lock_time: tx.lock_time.to_consensus_u32(),
+                current_height,
+            });
         }
 
         let weight = tx.weight().to_wu();
@@ -410,14 +446,17 @@ impl Mempool {
         // the txs it's about to remove.
         //
         // Resolution and script verification are split into two phases so
-        // that the libbitcoinconsensus 26.0 API can see *all* spent outputs
-        // up-front (BIP 341 sighash commits to every spent output, not just
-        // the one being verified).
+        // that script verification can see *all* spent outputs up-front
+        // (BIP 341 sighash commits to every spent output, not just the one
+        // being verified).
         let serialized_tx = serialize(&tx);
         let flags = self.params.script_flags(current_height);
         let mut input_sum: u64 = 0;
         let mut parents: HashSet<Txid> = HashSet::new();
         let mut spent: Vec<(u64, Vec<u8>)> = Vec::with_capacity(tx.input.len());
+        // Height of each spent coin for BIP 68; a mempool parent counts as
+        // confirming in the next block (Core's `CalculatePrevHeights`).
+        let mut prev_heights: Vec<u32> = Vec::with_capacity(tx.input.len());
 
         for (input_idx, input) in tx.input.iter().enumerate() {
             let prev_txid = &input.previous_output.txid;
@@ -456,7 +495,7 @@ impl Mempool {
                     UtxoEntry {
                         amount: parent_output.value.to_sat(),
                         script_pubkey: parent_output.script_pubkey.as_bytes().to_vec(),
-                        height: 0,
+                        height: next_height,
                         is_coinbase: false,
                     }
                 }
@@ -474,36 +513,27 @@ impl Mempool {
             input_sum = input_sum
                 .checked_add(utxo.amount)
                 .ok_or(MempoolError::MathOverflow)?;
+            prev_heights.push(utxo.height);
             spent.push((utxo.amount, utxo.script_pubkey));
         }
 
-        if !skip_consensus {
-            // Build the FFI Utxo array. Raw pointers reference the heap
-            // allocations owned by `spent`, which lives until the end of
-            // accept_tx_internal — well past these verify calls.
-            let utxos: Vec<bitcoinconsensus::Utxo> = spent
-                .iter()
-                .map(|(amt, spk)| bitcoinconsensus::Utxo {
-                    script_pubkey: spk.as_ptr(),
-                    script_pubkey_len: spk.len() as u32,
-                    value: *amt as i64,
-                })
-                .collect();
+        // BIP 68 relative lock-times for the next block, as Core's
+        // `CalculateLockPointsAtTip` + `CheckSequenceLocksAtTip`. Policy
+        // always enforces them (STANDARD_LOCKTIME_VERIFY_FLAGS); on mainnet
+        // CSV has been active since 419,328 anyway.
+        let lock = calculate_sequence_locks(&tx, true, &prev_heights, &mut mtp)
+            .map_err(MempoolError::ChainContext)?;
+        if !evaluate_sequence_locks(next_height, tip_mtp, lock) {
+            return Err(MempoolError::NonBip68Final {
+                min_height: lock.min_height,
+                min_time: lock.min_time,
+                current_height,
+            });
+        }
 
-            for (input_idx, (amount, script_pubkey)) in spent.iter().enumerate() {
-                bitcoinconsensus::verify_with_flags(
-                    script_pubkey,
-                    *amount,
-                    &serialized_tx,
-                    Some(&utxos),
-                    input_idx,
-                    flags,
-                )
-                .map_err(|e| MempoolError::ScriptFailure {
-                    input_index: input_idx,
-                    error: format!("{:?}", e),
-                })?;
-            }
+        if !skip_consensus {
+            script_verify::verify_transaction(&tx, &spent, flags)
+                .map_err(MempoolError::from_script_verify)?;
         }
 
         // ── Phase 3: value math + fee bounds ────────────────────────────
@@ -1466,7 +1496,16 @@ pub enum MempoolError {
     /// Transaction rejected by Knots-aligned relay policy (spam filters).
     PolicyRejection(crate::relay_policy::PolicyRejection),
     NonFinal { lock_time: u32, current_height: u32 },
+    /// A BIP 68 relative lock isn't satisfied in the next block (Core's
+    /// `non-BIP68-final`). Lock points are the last invalid height/MTP.
+    NonBip68Final { min_height: i64, min_time: i64, current_height: u32 },
     UtxoLookup(String),
+    /// Header timestamps for median-time-past were unavailable (local).
+    ChainContext(String),
+    /// The script verifier itself failed (bad flags, mismatched spent
+    /// outputs, a tx it could not parse back, a kernel/FFI fault): our
+    /// fault, not proof the transaction is invalid. See `from_script_verify`.
+    ScriptVerifierError { input_index: usize, error: String },
     // CPFP / ancestor tracking (ticket 010)
     TooManyAncestors { count: usize, limit: usize },
     AncestorSetTooLarge { vbytes: u64, limit: u64 },
@@ -1480,6 +1519,31 @@ pub enum MempoolError {
         evicted_fee_total: u64,
         relay_surcharge: u64,
     },
+}
+
+impl MempoolError {
+    /// Classify a script-verifier failure, as `block_validation::script_error`
+    /// does for blocks (ticket 024): only a script that evaluated to false
+    /// is `ScriptFailure`. Exhaustive so a new `ScriptVerifyError` must be
+    /// classified here.
+    fn from_script_verify(f: script_verify::ScriptVerifyFailure) -> MempoolError {
+        use script_verify::ScriptVerifyError as E;
+        let script_verify::ScriptVerifyFailure { input_index, error } = f;
+        match error {
+            E::ScriptFailed => MempoolError::ScriptFailure {
+                input_index,
+                error: error.to_string(),
+            },
+            E::InvalidFlags(_)
+            | E::SpentOutputsMismatch { .. }
+            | E::NoInputs
+            | E::TxDeserialize
+            | E::Library(_) => MempoolError::ScriptVerifierError {
+                input_index,
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for MempoolError {
@@ -1552,7 +1616,18 @@ impl std::fmt::Display for MempoolError {
                     lock_time, current_height
                 )
             }
+            MempoolError::NonBip68Final { min_height, min_time, current_height } => {
+                write!(
+                    f,
+                    "transaction not BIP 68 final (needs height > {} and median time > {}, -1 = no lock; current_height={})",
+                    min_height, min_time, current_height
+                )
+            }
             MempoolError::UtxoLookup(e) => write!(f, "UTXO lookup error: {}", e),
+            MempoolError::ChainContext(e) => write!(f, "header context unavailable: {}", e),
+            MempoolError::ScriptVerifierError { input_index, error } => {
+                write!(f, "script verifier error on input {}: {}", input_index, error)
+            }
             MempoolError::TooManyAncestors { count, limit } => {
                 write!(f, "ancestor count {} exceeds limit {}", count, limit)
             }
@@ -1723,7 +1798,7 @@ mod tests {
     // These helpers build a fresh UTXO set and trivial transactions that
     // exercise the full graph/RBF logic without crafting real signatures.
     // The mempool is invoked via `accept_tx_test`, which skips the
-    // libbitcoinconsensus check and the standard-script-type check; every
+    // script verification and the standard-script-type check; every
     // other validation gate runs as in production.
 
     use crate::utxo::UtxoEntry;
@@ -2564,5 +2639,196 @@ mod tests {
 
         // A is still in the mempool — the rejection happened pre-mutation.
         assert!(pool.contains(&a_txid));
+    }
+
+    // ── Ticket 026: finality and BIP 68 at the tip ──────────────────────
+
+    /// Synthetic header timestamps for `accept_tx_test`: 600 s apart from
+    /// 1,600,000,000, so MTP(h) = 1,600,000,000 + 600·(h − 5) for h ≥ 10.
+    pub(super) fn synthetic_times(height: u32) -> Result<u32, String> {
+        Ok(1_600_000_000 + 600 * height)
+    }
+
+    fn tip_mtp() -> u32 {
+        crate::contextual_checks::median_time_past(&synthetic_times, TEST_HEIGHT).unwrap() as u32
+    }
+
+    fn locked_tx(lock_time: u32, sequence: u32) -> (UtxoSet, TempDir, Transaction) {
+        let (utxo, dir) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 100_000);
+        let mut tx = make_tx(&[(seed_txid(1), 0)], &[90_000]);
+        tx.lock_time = LockTime::from_consensus(lock_time);
+        tx.input[0].sequence = Sequence(sequence);
+        (utxo, dir, tx)
+    }
+
+    /// Header source that counts reads and names its tip, for the tip-MTP
+    /// cache.
+    struct CountingTimes {
+        reads: std::cell::Cell<u32>,
+        tip_id: std::cell::Cell<[u8; 32]>,
+    }
+
+    impl HeaderTimes for CountingTimes {
+        fn timestamp_at(&self, height: u32) -> Result<u32, String> {
+            self.reads.set(self.reads.get() + 1);
+            synthetic_times(height)
+        }
+        fn header_id_at(&self, _height: u32) -> Option<[u8; 32]> {
+            Some(self.tip_id.get())
+        }
+    }
+
+    /// The tip's MTP is read once per tip, not once per relayed tx, and a
+    /// different header at the same height (a reorg) is never served the
+    /// old value.
+    #[test]
+    fn tip_mtp_is_cached_per_tip_hash() {
+        let times = CountingTimes {
+            reads: 0.into(),
+            tip_id: [1; 32].into(),
+        };
+        let mut pool = Mempool::new();
+        let (utxo, _d, tx) = locked_tx(tip_mtp() - 1, 0xffff_fffe);
+        pool.accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &times).unwrap();
+        let first = times.reads.get();
+        assert!(first > 0);
+
+        let (utxo, _d, mut tx) = locked_tx(tip_mtp() - 1, 0xffff_fffe);
+        tx.output[0].value = Amount::from_sat(80_000);
+        pool.accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &times).unwrap();
+        assert_eq!(times.reads.get(), first, "same tip: MTP not re-read");
+
+        // A cached MTP 1,000 s later, for a different header at this
+        // height (the branch we reorged away from). Served, it would make
+        // this locktime final; recomputed for the new tip, it is not.
+        times.tip_id.set([2; 32]);
+        let mut pool = Mempool::new();
+        pool.tip_mtp_cache = Some((TEST_HEIGHT, [1; 32], tip_mtp() as i64 + 1_000));
+        let (utxo, _d, tx) = locked_tx(tip_mtp() + 500, 0xffff_fffe);
+        assert!(matches!(
+            pool.accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &times),
+            Err(MempoolError::NonFinal { .. })
+        ));
+    }
+
+    #[test]
+    fn height_locktime_judged_for_next_block() {
+        // CheckFinalTxAtTip: nLockTime < tip + 1. Core's anti-fee-sniping
+        // value (the tip height) is accepted; tip + 1 is not.
+        let (utxo, _d, tx) = locked_tx(TEST_HEIGHT, 0xffff_fffe);
+        assert!(Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT).is_ok());
+        let (utxo, _d, tx) = locked_tx(TEST_HEIGHT + 1, 0xffff_fffe);
+        assert!(matches!(
+            Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT),
+            Err(MempoolError::NonFinal { lock_time, .. }) if lock_time == TEST_HEIGHT + 1
+        ));
+        // Final sequences opt out.
+        let (utxo, _d, tx) = locked_tx(TEST_HEIGHT + 100, 0xffff_ffff);
+        assert!(Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT).is_ok());
+    }
+
+    #[test]
+    fn time_locktime_uses_tip_mtp_not_wall_clock() {
+        // BIP 113: nLockTime < MTP(tip). The synthetic chain is in 2020,
+        // so a wall-clock check would accept both of these.
+        let (utxo, _d, tx) = locked_tx(tip_mtp() - 1, 0xffff_fffe);
+        assert!(Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT).is_ok());
+        let (utxo, _d, tx) = locked_tx(tip_mtp(), 0xffff_fffe);
+        assert!(matches!(
+            Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT),
+            Err(MempoolError::NonFinal { .. })
+        ));
+    }
+
+    #[test]
+    fn bip68_height_lock_on_confirmed_input() {
+        // Seeded coins are at height 1: a relative lock of N is met in the
+        // next block (TEST_HEIGHT + 1) iff 1 + N − 1 < TEST_HEIGHT + 1.
+        let (utxo, _d, tx) = locked_tx(0, TEST_HEIGHT);
+        assert!(Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT).is_ok());
+        let (utxo, _d, tx) = locked_tx(0, TEST_HEIGHT + 1);
+        assert!(matches!(
+            Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT),
+            Err(MempoolError::NonBip68Final { .. })
+        ));
+        // Disable flag: not a lock.
+        let (utxo, _d, tx) = locked_tx(0, (1 << 31) | 0xffff);
+        assert!(Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT).is_ok());
+        // Version 1: BIP 68 doesn't apply.
+        let (utxo, _d, mut tx) = locked_tx(0, 0xffff);
+        tx.version = Version::ONE;
+        assert!(Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT).is_ok());
+    }
+
+    #[test]
+    fn bip68_time_lock_on_confirmed_input() {
+        // Coin at height 1: lock measured from MTP(0) = 1,600,000,000.
+        // Met iff MTP(0) + 512·N − 1 < MTP(tip), i.e. 512·N ≤ span.
+        let span = tip_mtp() - 1_600_000_000;
+        let ok_units = span / 512;
+        let (utxo, _d, tx) = locked_tx(0, (1 << 22) | ok_units);
+        assert!(Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT).is_ok());
+        let (utxo, _d, tx) = locked_tx(0, (1 << 22) | (ok_units + 1));
+        assert!(matches!(
+            Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT),
+            Err(MempoolError::NonBip68Final { .. })
+        ));
+    }
+
+    #[test]
+    fn bip68_mempool_parent_counts_as_next_block() {
+        // A child of an unconfirmed parent can only carry a zero lock
+        // (Core assumes the parent confirms at tip + 1).
+        let (utxo, _dir) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 100_000);
+        let mut pool = Mempool::new();
+        let parent = make_tx(&[(seed_txid(1), 0)], &[90_000]);
+        let parent_txid = pool.accept_tx_test(parent, &utxo, TEST_HEIGHT).unwrap();
+
+        let mut child = make_tx(&[(parent_txid, 0)], &[80_000]);
+        child.input[0].sequence = Sequence(1);
+        assert!(matches!(
+            pool.accept_tx_test(child.clone(), &utxo, TEST_HEIGHT),
+            Err(MempoolError::NonBip68Final { .. })
+        ));
+        child.input[0].sequence = Sequence(0);
+        assert!(pool.accept_tx_test(child, &utxo, TEST_HEIGHT).is_ok());
+    }
+
+    #[test]
+    fn missing_header_times_reject_without_panicking() {
+        let (utxo, _d, tx) = locked_tx(0, 0xffff_ffff);
+        let none = |h: u32| -> Result<u32, String> { Err(format!("no header at {}", h)) };
+        assert!(matches!(
+            Mempool::new().accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &none),
+            Err(MempoolError::ChainContext(_))
+        ));
+    }
+
+    /// Ticket 047 review: only a script evaluating to false rejects the tx
+    /// as a script failure; every verifier fault is local.
+    #[test]
+    fn only_script_failed_is_a_mempool_script_failure() {
+        use crate::script_verify::{ScriptVerifyError as E, ScriptVerifyFailure};
+        let fail = |error| ScriptVerifyFailure { input_index: 1, error };
+        assert!(matches!(
+            MempoolError::from_script_verify(fail(E::ScriptFailed)),
+            MempoolError::ScriptFailure { input_index: 1, .. }
+        ));
+        for other in [
+            E::InvalidFlags(0xffff_ffff),
+            E::SpentOutputsMismatch { inputs: 2, spent: 1 },
+            E::NoInputs,
+            E::TxDeserialize,
+            E::Library("btck_script_pubkey_verify status 2".into()),
+        ] {
+            let e = MempoolError::from_script_verify(fail(other));
+            assert!(
+                matches!(e, MempoolError::ScriptVerifierError { input_index: 1, .. }),
+                "{:?}",
+                e
+            );
+        }
     }
 }

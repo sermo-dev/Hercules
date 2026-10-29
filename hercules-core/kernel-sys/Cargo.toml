@@ -1,0 +1,14 @@
+# Raw FFI to Bitcoin Core's libbitcoinkernel, script-verification subset only
+# (ticket 047 Step 1). build.rs fetches a pinned Bitcoin Core release and
+# builds libbitcoinkernel.a with cmake for the host, iOS device and iOS
+# simulator. Safe wrappers live in hercules-core/src/script_verify/kernel.rs.
+[package]
+name = "hercules-kernel-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+links = "bitcoinkernel"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1.2"

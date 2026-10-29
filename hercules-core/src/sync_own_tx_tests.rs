@@ -1,7 +1,7 @@
 //! Ticket 033: own-transaction submission, tracking, rebroadcast and relay.
 //!
 //! Transactions here spend `OP_TRUE` outputs seeded straight into the UTXO
-//! set, so they pass real libbitcoinconsensus script verification without
+//! set, so they pass real (`script_verify`) script verification without
 //! signatures, and pay to P2WPKH so they are network-standard.
 
 use super::*;
@@ -22,6 +22,18 @@ fn fresh(dir: &TempDir) -> HeaderSync {
     let db = dir.path().join("headers.sqlite3");
     let mut hs = HeaderSync::new(db.to_str().unwrap(), None).unwrap();
     hs.regular_peers_over_tor = true;
+    // Headers up to the validated height, so mempool finality / BIP 68
+    // (ticket 026) can read the tip's median-time-past. Contents only
+    // need distinct hashes and increasing timestamps.
+    let genesis = hs.store.tip().unwrap().unwrap().2;
+    let headers: Vec<bitcoin::block::Header> = (1..=VALIDATED)
+        .map(|h| bitcoin::block::Header {
+            nonce: h,
+            time: genesis.time + 600 * h,
+            ..genesis
+        })
+        .collect();
+    hs.store.store_headers(&headers, 1).unwrap();
     hs.store.set_validated_height(VALIDATED).unwrap();
     hs
 }
@@ -155,6 +167,35 @@ fn consensus_rejects_are_classified() {
     assert!(queued_own(&hs).is_empty());
 }
 
+/// Ticket 026 review: a timelocked own tx is "not valid yet", not
+/// consensus-invalid. It isn't tracked or sent, and once the lock is
+/// reached the same bytes are accepted.
+#[test]
+fn timelocked_own_tx_is_not_yet_final_then_accepted() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+
+    let mut tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    tx.input[0].sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+    tx.lock_time = bitcoin::absolute::LockTime::from_consensus(VALIDATED + 1);
+    match hs.submit_own_tx(&raw(&tx)) {
+        Err(e @ SubmitError::NotYetFinal { .. }) => {
+            assert_eq!(e.kind(), "not_yet_final");
+            assert!(!e.to_string().contains("consensus"), "{}", e);
+        }
+        other => panic!("expected NotYetFinal, got {:?}", other),
+    }
+    assert!(hs.list_own_txs().unwrap().is_empty(), "timelocked tx not tracked");
+    assert!(queued_own(&hs).is_empty());
+
+    // One more validated block: nLockTime VALIDATED+1 < next height.
+    let genesis = hs.store.tip().unwrap().unwrap().2;
+    let next = bitcoin::block::Header { nonce: VALIDATED + 1, time: genesis.time + 600 * (VALIDATED + 1), ..genesis };
+    hs.store.store_headers(&[next], VALIDATED + 1).unwrap();
+    hs.store.set_validated_height(VALIDATED + 1).unwrap();
+    hs.submit_own_tx(&raw(&tx)).expect("final now");
+}
+
 #[test]
 fn not_synced_without_utxo_set() {
     let dir = TempDir::new().unwrap();
@@ -237,7 +278,7 @@ fn local_relay_policy_does_not_block_own_tx() {
     // From a peer, our 018 policy rejects it...
     let mut other = Mempool::new();
     assert!(matches!(
-        other.accept_tx(tx.clone(), &hs.utxo, VALIDATED),
+        other.accept_tx(tx.clone(), &hs.utxo, VALIDATED, &hs.store),
         Err(crate::mempool::MempoolError::NonStandardScript { index: 1 })
     ));
     hs.handle_tx("1.2.3.4:8333", tx.clone()).unwrap();

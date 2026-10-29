@@ -5,6 +5,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>$(BGTASK_CATCHUP_ID)</string>
+		<string>$(BGTASK_PROCESSING_ID)</string>
 	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
@@ -28,6 +29,8 @@
 	<string>$(APP_GROUP_ID)</string>
 	<key>HRCCatchUpTaskID</key>
 	<string>$(BGTASK_CATCHUP_ID)</string>
+	<key>HRCProcessingTaskID</key>
+	<string>$(BGTASK_PROCESSING_ID)</string>
 	<key>HRCSnapshotSessionID</key>
 	<string>$(SNAPSHOT_SESSION_ID)</string>
 	<key>NSSupportsLiveActivities</key>
@@ -36,6 +39,7 @@
 	<array>
 		<string>remote-notification</string>
 		<string>fetch</string>
+		<string>processing</string>
 	</array>
 </dict>
 </plist>

@@ -21,3 +21,7 @@ screenshot.png
 *.hutx
 *.hutx.gz
 *_utxo.dat
+
+# Ticket 047: Bitcoin Core source fetched by hercules-core/kernel-sys/build.rs
+hercules-core/kernel-sys/bitcoin-core-*/
+hercules-core/kernel-sys/.bitcoin-core-fetch-*/
