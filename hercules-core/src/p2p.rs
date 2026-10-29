@@ -2197,7 +2197,7 @@ pub(crate) mod tests {
 
     // ── Property tests ───────────────────────────────────────────────
 
-    fn arb_inventory() -> impl Strategy<Value = Inventory> {
+    pub(crate) fn arb_inventory() -> impl Strategy<Value = Inventory> {
         (0u8..5, any::<[u8; 32]>()).prop_map(|(k, h)| match k {
             0 => Inventory::Block(BlockHash::from_byte_array(h)),
             1 => Inventory::WitnessBlock(BlockHash::from_byte_array(h)),
@@ -2207,7 +2207,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn arb_header() -> impl Strategy<Value = BlockHeader> {
+    pub(crate) fn arb_header() -> impl Strategy<Value = BlockHeader> {
         (any::<i32>(), any::<[u8; 32]>(), any::<[u8; 32]>(), any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
             |(v, prev, root, time, bits, nonce)| BlockHeader {
                 version: bitcoin::block::Version::from_consensus(v),
@@ -2221,7 +2221,7 @@ pub(crate) mod tests {
     }
 
     /// Messages Hercules sends or parses, with arbitrary contents.
-    fn arb_message() -> impl Strategy<Value = NetworkMessage> {
+    pub(crate) fn arb_message() -> impl Strategy<Value = NetworkMessage> {
         prop_oneof![
             any::<u64>().prop_map(NetworkMessage::Ping),
             any::<u64>().prop_map(NetworkMessage::Pong),

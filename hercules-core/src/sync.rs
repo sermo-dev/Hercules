@@ -5996,3 +5996,8 @@ mod tests {
 #[cfg(test)]
 #[path = "testkit/sync_integration.rs"]
 mod integration_tests;
+
+// Inbound message handling against hostile input (tests/network-app).
+#[cfg(test)]
+#[path = "sync_inbound_tests.rs"]
+mod inbound_tests;
