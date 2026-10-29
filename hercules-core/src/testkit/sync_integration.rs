@@ -54,7 +54,7 @@ impl Node {
 
     /// Simulate an app restart: close every store and reopen the same
     /// directory, pointed at `peers`.
-    fn restart(self, peers: &[&MockPeer]) -> Node {
+    pub(super) fn restart(self, peers: &[&MockPeer]) -> Node {
         let Node { hs, dir, _slot } = self;
         drop(hs);
         let hs = Node::open(&dir, peers);
@@ -71,11 +71,11 @@ impl Node {
     }
 
     /// Point later sync sessions at a different set of mock peers.
-    fn use_peers(&mut self, peers: &[&MockPeer]) {
+    pub(super) fn use_peers(&mut self, peers: &[&MockPeer]) {
         self.hs.peer_source = static_peers(peers);
     }
 
-    fn tip(&self) -> (u32, BlockHash) {
+    pub(super) fn tip(&self) -> (u32, BlockHash) {
         let (h, hash, _) = self.hs.store.tip().unwrap().unwrap();
         (h, hash)
     }
@@ -84,7 +84,7 @@ impl Node {
         self.hs.store.get_hash_at_height(height).unwrap()
     }
 
-    fn validated(&self) -> u32 {
+    pub(super) fn validated(&self) -> u32 {
         self.hs.store.validated_height().unwrap()
     }
 
@@ -92,20 +92,20 @@ impl Node {
         self.hs.utxo.get(&op.txid, op.vout).unwrap().is_some()
     }
 
-    fn peer_store(&self) -> PeerStore {
+    pub(super) fn peer_store(&self) -> PeerStore {
         PeerStore::open(self.dir.path().join("peers.sqlite3").to_str().unwrap()).unwrap()
     }
 
-    fn is_banned(&self, addr: &str) -> bool {
+    pub(super) fn is_banned(&self, addr: &str) -> bool {
         self.peer_store().load_active_bans().unwrap().contains_key(addr)
     }
 
-    fn score(&self, addr: &str) -> Option<i32> {
+    pub(super) fn score(&self, addr: &str) -> Option<i32> {
         self.peer_store().load_score(addr).unwrap()
     }
 
     /// The node's UTXO set is exactly the one `chain` implies.
-    fn assert_utxos_match(&self, chain: &FixtureChain) {
+    pub(super) fn assert_utxos_match(&self, chain: &FixtureChain) {
         let expected = chain.expected_utxos();
         assert_eq!(self.hs.utxo.count().unwrap(), expected.len() as u64, "UTXO count");
         for (op, out) in &expected {
@@ -122,7 +122,7 @@ impl Node {
 
     /// Run `sync()` on a background thread while `body` drives the test,
     /// then stop it. Returns `body`'s result and `sync()`'s return value.
-    fn run_sync<R>(&self, body: impl FnOnce(&HeaderSync) -> R) -> (R, Result<(), SyncError>) {
+    pub(super) fn run_sync<R>(&self, body: impl FnOnce(&HeaderSync) -> R) -> (R, Result<(), SyncError>) {
         std::thread::scope(|s| {
             let handle = s.spawn(|| self.hs.sync(|_| {}));
             let r = body(&self.hs);

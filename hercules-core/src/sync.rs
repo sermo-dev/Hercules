@@ -6001,3 +6001,8 @@ mod integration_tests;
 #[cfg(test)]
 #[path = "sync_inbound_tests.rs"]
 mod inbound_tests;
+
+// Adversarial peers against the real sync paths (tests/network-app).
+#[cfg(test)]
+#[path = "testkit/adversarial_sync.rs"]
+mod adversarial_tests;
