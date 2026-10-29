@@ -1774,8 +1774,12 @@ fn release_env(canonical: &Path, env: Env) {
     }
 }
 
+/// `n` rounded up to a multiple of `granule`, saturating at `u64::MAX`.
+/// A corrupt snapshot header can announce ~2^64 entries; the plain
+/// product overflowed there (a panic in debug builds, a map size wrapped
+/// to 0 in release) instead of failing the capacity check.
 fn round_up(n: u64, granule: u64) -> u64 {
-    n.div_ceil(granule) * granule
+    n.div_ceil(granule).saturating_mul(granule)
 }
 
 /// Map sizes to try, largest first, for an env whose `data.mdb` is
