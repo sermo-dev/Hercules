@@ -402,3 +402,9 @@ The harness only covers the regtest chainstate and script verification. Mainnet 
 - Mempool: `MempoolError::from_script_verify` applies the same split. Only `ScriptFailed` is `MempoolError::ScriptFailure`; the other errors are `MempoolError::ScriptVerifierError`, which own-tx submit reports as `SubmitError::Internal`, not `Consensus`.
 - The About screen names the active backend through the new FFI call `script_backend()`.
 - **Startup cost:** the kernel's static context adds about 100 ms to every process launch, push wakes included. Count it against the wake budget (ticket 028).
+
+## Status (2026-10-28)
+
+**Step 1 shipped** in PR #25 (`3c65619`): script verification runs on libbitcoinkernel v32.0 by default, behind `script_verify`. The legacy libbitcoinconsensus v26 backend is kept and selectable (`script-consensus-legacy`), and `script-differential` runs both and compares. The rules tag includes the active backend, so switching backends reconsiders failed blocks.
+
+**Step 2 (full kernel validation) stays blocked** on upstream, as recorded under Decisions: no UTXO lookup by outpoint, AssumeUTXO loading, pruning or explicit flush in the kernel API yet. Revisit when Core PRs #36630 and #35187 land. The spike branch `spike/047-kernel` is kept for that.

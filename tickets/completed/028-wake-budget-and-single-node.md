@@ -138,3 +138,10 @@ Use `BGProcessingTask` for large backlogs, as 015 Phase 2 intended (with `requir
 ## Roadmap position
 
 Tier 1 (platform reliability). Do it immediately after the Tier 0 safety tickets (022–024, 027). Wakes are how Hercules "validates every block", so wake reliability is a correctness property of the product, not polish.
+
+## Follow-ups after merge (PR #23, 2026-10-25)
+
+- **Needs device measurement:** wake phase timings (`WakeBudget` phases) on a real iPhone, cold and warm.
+- **Known, not fixed:** in strict mode (below minimum chain work), a witness that fails for a non-deadline reason makes the cross-check `Reject`, so a wake on a fresh node can raise a false "possible eclipse" alert. Rare; only before the node reaches minimum chain work.
+- **Known, not fixed:** while history is unreadable, a watchdog placeholder and the late result can share a record id in memory (`NotificationManager.replaceRecord` falls back to append).
+- **Known, not fixed:** `reset_database` holds `OPEN_NODES` during the multi-GB delete, blocking other path claims for that time (acceptable under NodeHost's `resetting` flag).

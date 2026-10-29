@@ -147,3 +147,9 @@ What is missing is the processing task itself. The README's architecture box lis
 ## Roadmap position
 
 Tier 1 (platform reliability), right after 028. #1 and #3 directly undermine "validates every block" and first-run setup, and #5 blocks App Store submission.
+
+## Status (2026-10-28)
+
+Merged in PR #28 (`3fbae39`). Findings 1–7 fixed; #8 was not a bug. Review fixes added processing-round preemption by push/refresh wakes (NodeHostScenarios s14), a 206 accept for resumed downloads, and offline push wording.
+
+**Still needs a device:** the hardware checks under Verification (cold-launch push, force-quit mid-download, reset → Start, idle timer during import, `_simulateLaunchForTaskWithIdentifier` for the processing task).
