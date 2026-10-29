@@ -16,10 +16,12 @@ use crate::assumeutxo::{SnapshotAnchor, MAINNET_ANCHOR, MIN_CHAIN_WORK};
 // ── Script verification flags ────────────────────────────────────────
 //
 // Bit positions follow Bitcoin Core's `SCRIPT_VERIFY_*` enum
-// (src/script/interpreter.h), which is also the ABI of
-// libbitcoinconsensus. They are defined here rather than imported from the
-// script library so the activation table below stays independent of which
-// library verifies scripts (ticket 047 swaps it).
+// (src/script/interpreter.h), which is also the ABI of both script
+// backends: libbitcoinkernel's `btck_ScriptVerificationFlags_*` and
+// libbitcoinconsensus's `bitcoinconsensus_SCRIPT_FLAGS_VERIFY_*`. They are
+// defined here rather than imported so the activation table below stays
+// independent of which library verifies scripts (`script_verify`, ticket
+// 047); the tests below check them against each library's own constants.
 
 pub const SCRIPT_VERIFY_NONE: u32 = 0;
 pub const SCRIPT_VERIFY_P2SH: u32 = 1 << 0;
@@ -37,10 +39,27 @@ pub struct ScriptFlagActivation {
     pub flags: u32,
 }
 
-/// Mainnet script-flag schedule. Reproduces exactly what
-/// `bitcoinconsensus::height_to_flags` returned when it was the source of
-/// truth (proved bit-for-bit at every boundary by
+/// Mainnet script-flag schedule: each soft fork's buried activation height
+/// (Core v32 `src/kernel/chainparams.cpp`: BIP66Height, BIP65Height,
+/// CSVHeight, SegwitHeight; Taproot from the BIP 341 deployment). It
+/// reproduces what `bitcoinconsensus::height_to_flags` returned, except
+/// Taproot: that function used `height > 709_632`, one block late (see
 /// `mainnet_script_flags_match_height_to_flags`).
+///
+/// Core v32 itself (`GetBlockScriptFlags`) does it differently: P2SH,
+/// WITNESS and TAPROOT are on for *every* block from genesis, except two
+/// historical blocks that violated them (`script_flag_exceptions`: BIP16
+/// exception block 170060 gets no flags, Taproot exception block 692261 gets
+/// P2SH|WITNESS). The two schemes give different flags only below 709_632,
+/// where Core is stricter than the rules were at the time. Hercules
+/// validates only blocks above the AssumeUTXO anchor (943_500), where both
+/// give exactly the full set (0x20e15) and are equivalent.
+///
+/// Ticket 003 (cooperative historical validation) re-validates old blocks
+/// and should switch to Core's scheme (flags always on plus the two
+/// exception block hashes) so results match Core bit-for-bit below 709_632.
+/// The mainnet chain is valid under both, but they could disagree on
+/// blocks Core rejects that were valid under the rules of their era.
 const MAINNET_SCRIPT_FLAGS: &[ScriptFlagActivation] = &[
     // BIP 16
     ScriptFlagActivation { height: 173_805, flags: SCRIPT_VERIFY_P2SH },
@@ -55,8 +74,10 @@ const MAINNET_SCRIPT_FLAGS: &[ScriptFlagActivation] = &[
         height: 481_824,
         flags: SCRIPT_VERIFY_NULLDUMMY | SCRIPT_VERIFY_WITNESS,
     },
-    // BIP 341/342 (Taproot). `height_to_flags` used `height > 709_632`.
-    ScriptFlagActivation { height: 709_633, flags: SCRIPT_VERIFY_TAPROOT },
+    // BIP 341/342 (Taproot): enforced from block 709_632 inclusive (Core:
+    // MinBIP9WarningHeight 711_648 = activation + 2016; 0.21.1 release
+    // notes "as of block 709632"). `height_to_flags` used `> 709_632`.
+    ScriptFlagActivation { height: 709_632, flags: SCRIPT_VERIFY_TAPROOT },
 ];
 
 /// Regtest: Core's regtest has every buried deployment active from height
@@ -173,6 +194,7 @@ mod tests {
 
     /// Every height at which a mainnet flag changes, plus the neighbours
     /// and the extremes.
+    #[cfg(feature = "script-consensus-legacy")]
     fn mainnet_probe_heights() -> Vec<u32> {
         let mut heights = vec![0, 1, u32::MAX - 1, u32::MAX];
         for a in MAINNET_SCRIPT_FLAGS {
@@ -186,25 +208,29 @@ mod tests {
         heights
     }
 
+    #[cfg(feature = "script-consensus-legacy")]
     #[test]
     fn mainnet_script_flags_match_height_to_flags() {
         let p = ChainParams::mainnet();
+        // The one intended difference: `height_to_flags` turned Taproot on
+        // a block late (`> 709_632`); Core enforces it at 709_632.
+        let old = |h: u32| {
+            let f = bitcoinconsensus::height_to_flags(h);
+            if h == 709_632 { f | SCRIPT_VERIFY_TAPROOT } else { f }
+        };
+        assert_eq!(bitcoinconsensus::height_to_flags(709_632) & SCRIPT_VERIFY_TAPROOT, 0);
         for h in mainnet_probe_heights() {
-            assert_eq!(
-                p.script_flags(h),
-                bitcoinconsensus::height_to_flags(h),
-                "flag mismatch at height {}",
-                h
-            );
+            assert_eq!(p.script_flags(h), old(h), "flag mismatch at height {}", h);
         }
         // Dense sweep around each boundary for good measure.
         for a in MAINNET_SCRIPT_FLAGS {
             for h in a.height.saturating_sub(50)..a.height + 50 {
-                assert_eq!(p.script_flags(h), bitcoinconsensus::height_to_flags(h), "h={}", h);
+                assert_eq!(p.script_flags(h), old(h), "h={}", h);
             }
         }
     }
 
+    #[cfg(feature = "script-consensus-legacy")]
     #[test]
     fn script_flag_bits_match_libbitcoinconsensus_abi() {
         assert_eq!(SCRIPT_VERIFY_P2SH, bitcoinconsensus::VERIFY_P2SH);
@@ -222,8 +248,38 @@ mod tests {
         assert_eq!(SCRIPT_VERIFY_TAPROOT, bitcoinconsensus::VERIFY_TAPROOT);
     }
 
+    /// Against the pinned release's `bitcoinkernel.h` macros themselves
+    /// (exported by kernel-sys/src/flags.c), not a transcription.
+    #[cfg(feature = "script-kernel")]
+    #[test]
+    fn script_flag_bits_match_libbitcoinkernel_abi() {
+        use hercules_kernel_sys as k;
+        // SAFETY: plain `const uint32_t` data symbols.
+        unsafe {
+            assert_eq!(SCRIPT_VERIFY_NONE, k::hercules_btck_flag_none);
+            assert_eq!(SCRIPT_VERIFY_P2SH, k::hercules_btck_flag_p2sh);
+            assert_eq!(SCRIPT_VERIFY_DERSIG, k::hercules_btck_flag_dersig);
+            assert_eq!(SCRIPT_VERIFY_NULLDUMMY, k::hercules_btck_flag_nulldummy);
+            assert_eq!(
+                SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY,
+                k::hercules_btck_flag_checklocktimeverify
+            );
+            assert_eq!(
+                SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+                k::hercules_btck_flag_checksequenceverify
+            );
+            assert_eq!(SCRIPT_VERIFY_WITNESS, k::hercules_btck_flag_witness);
+            assert_eq!(SCRIPT_VERIFY_TAPROOT, k::hercules_btck_flag_taproot);
+            // Kernel's ALL is exactly our seven flags: no flag we don't map.
+            assert_eq!(
+                crate::script_verify::SCRIPT_VERIFY_ALL_CONSENSUS,
+                k::hercules_btck_flag_all
+            );
+        }
+    }
+
     /// Library-independent statement of the mainnet schedule, so the table
-    /// stays pinned after ticket 047 removes `height_to_flags`.
+    /// stays pinned in kernel-only builds (no `height_to_flags`).
     #[test]
     fn mainnet_script_flags_explicit_values() {
         let p = ChainParams::mainnet();
@@ -233,8 +289,11 @@ mod tests {
         assert_eq!(p.script_flags(388_381), 0x205);
         assert_eq!(p.script_flags(419_328), 0x605);
         assert_eq!(p.script_flags(481_824), 0xe15);
-        assert_eq!(p.script_flags(709_632), 0xe15);
-        assert_eq!(p.script_flags(709_633), 0x20e15);
+        assert_eq!(p.script_flags(709_631), 0xe15);
+        assert_eq!(p.script_flags(709_632), 0x20e15);
+        // Everything Hercules validates (above the AssumeUTXO anchor) gets
+        // the full set, the same flags Core v32 uses there.
+        assert_eq!(p.script_flags(crate::assumeutxo::ASSUMEUTXO_HEIGHT + 1), 0x20e15);
     }
 
     #[test]

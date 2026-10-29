@@ -86,7 +86,7 @@ struct AboutView: View {
                     )
                     bulletPoint(
                         "Full block validation with script checks",
-                        detail: "Downloads complete blocks and verifies every transaction, including running Bitcoin Script for each input using libbitcoinconsensus."
+                        detail: "Downloads complete blocks and verifies every transaction, including running Bitcoin Script for each input using \(scriptBackend()) from Bitcoin Core."
                     )
                     bulletPoint(
                         "UTXO set tracking",

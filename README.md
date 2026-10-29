@@ -90,7 +90,7 @@ All network connections are routed through **Tor** (via Arti, the Tor Project's 
 │  ┌──────────────────▼─────────────────────────────┐ │
 │  │  Rust Core                                     │ │
 │  │  ┌──────────────┐  ┌────────────────────────┐  │ │
-│  │  │ rust-bitcoin  │  │ libbitcoinconsensus    │  │ │
+│  │  │ rust-bitcoin  │  │ libbitcoinkernel       │  │ │
 │  │  │ Block parsing │  │ Script validation (C)  │  │ │
 │  │  │ Serialization │  │ Consensus rules        │  │ │
 │  │  └──────────────┘  └────────────────────────┘  │ │
@@ -121,7 +121,7 @@ All network connections are routed through **Tor** (via Arti, the Tor Project's 
 | UI | Swift / SwiftUI | iOS app, lifecycle management |
 | Bridge | UniFFI | Swift ↔ Rust interop |
 | Block parsing | rust-bitcoin | Deserialization, script types, addresses |
-| Consensus | libbitcoinconsensus (C FFI) | Script validation — battle-tested, from Bitcoin Core |
+| Consensus | libbitcoinkernel (C FFI, Bitcoin Core v32.0) | Script validation — Bitcoin Core's own interpreter, pinned release; libbitcoinconsensus v26 kept as a selectable fallback |
 | Networking | Custom Rust | Bitcoin P2P protocol (version, verack, inv, getdata, block, tx) |
 | Tor | Arti (Rust) | Onion routing for all connections |
 | Storage | SQLite or LMDB | UTXO set, headers, pruned blocks |
@@ -137,9 +137,9 @@ The core is written in Rust for several reasons:
 - UniFFI provides clean Swift bindings with minimal overhead
 - A single Rust codebase could later target Android, desktop, and WASM
 
-### Why libbitcoinconsensus
+### Why Bitcoin Core's script engine (libbitcoinkernel)
 
-Consensus validation is the one place where "don't reinvent it" is an absolute rule. A single bug in consensus code means your node forks off the network — it accepts blocks the rest of the network rejects, or vice versa. `libbitcoinconsensus` is extracted directly from Bitcoin Core and has 15 years of battle-testing. We use it via C FFI for script validation and implement the remaining consensus checks (PoW, merkle root, block reward, UTXO updates) in Rust with extensive testing against Bitcoin Core's test vectors.
+Consensus validation is the one place where "don't reinvent it" is an absolute rule. A single bug in consensus code means your node forks off the network — it accepts blocks the rest of the network rejects, or vice versa. Script verification therefore runs on Bitcoin Core's own interpreter through `libbitcoinkernel`, Core's C API over its validation engine, built from a pinned Core release (v32.0) for device and simulator. It replaced `libbitcoinconsensus`, which Core deprecated in v27 and removed in v28: a frozen copy would never learn future soft forks. The old library is kept as a build-time fallback (`script-consensus-legacy`), and a differential test mode runs every check through both (ticket 047). The remaining consensus checks (PoW, merkle root, block reward, UTXO updates) are implemented in Rust with extensive testing against Bitcoin Core's test vectors.
 
 ## Implementation Phases
 
@@ -176,7 +176,7 @@ This is the core of the project and the largest phase, broken into four sub-phas
 - Validate block structure: merkle root, coinbase, block weight/size, witness commitments
 - Transaction format validation
 
-**Phase 2b — Script Validation via libbitcoinconsensus (2-3 weeks)**
+**Phase 2b — Script Validation via libbitcoinconsensus (2-3 weeks)** (since ticket 047: libbitcoinkernel)
 - Integrate `bitcoinconsensus` crate (bundles the C library from Bitcoin Core)
 - Validate transaction scripts for all input types (P2SH, SegWit, Taproot)
 - Handle BIP activation heights (BIP 16, 34, 65, 66, 68/112/113, 141/143, 341/342)
@@ -325,7 +325,7 @@ Hercules progressively reduces trust assumptions as each phase ships. At every s
 
 ### Phase 2: Sovereign Validation (app open)
 
-While the app is foregrounded, Hercules validates every new block: transaction scripts (via libbitcoinconsensus), UTXO spends, merkle roots, proof of work, coinbase rewards. Verifies your own transactions against your own UTXO set — zero reliance on third parties. Prunes old block data, keeping storage at ~10-12GB.
+While the app is foregrounded, Hercules validates every new block: transaction scripts (via Bitcoin Core's libbitcoinkernel), UTXO spends, merkle roots, proof of work, coinbase rewards. Verifies your own transactions against your own UTXO set — zero reliance on third parties. Prunes old block data, keeping storage at ~10-12GB.
 
 **Trust assumption:** The AssumeUTXO snapshot hash, hardcoded in open-source code and cross-verifiable against Bitcoin Core v26+ source. This is the same trust model every Bitcoin Core user operates under by default.
 

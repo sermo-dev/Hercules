@@ -1,7 +1,7 @@
 //! Ticket 033: own-transaction submission, tracking, rebroadcast and relay.
 //!
 //! Transactions here spend `OP_TRUE` outputs seeded straight into the UTXO
-//! set, so they pass real libbitcoinconsensus script verification without
+//! set, so they pass real (`script_verify`) script verification without
 //! signatures, and pay to P2WPKH so they are network-standard.
 
 use super::*;
