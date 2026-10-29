@@ -713,3 +713,123 @@ fn path_claim_is_per_database_not_per_spelling() {
         Err(HerculesError::NodeOpen { .. })
     ));
 }
+
+// ── Extreme inputs and vanished peers (tests/network-app) ────────────
+//
+// `wake_catch_up` is non-throwing over FFI (hercules.udl): a panic on the
+// wake path is a `try!` crash in a background wake, so every input must
+// come back as an outcome.
+
+#[test]
+fn wake_catch_up_turns_any_parameters_into_an_outcome() {
+    let c = chain(5);
+    let (a, b) = honest_pair(&c);
+    let n = node_with(&[&a, &b], None);
+    for (budget_ms, max_blocks, min_block_ms) in [
+        (0, 50, 0),
+        (0, 0, u32::MAX),
+        (1, 1, 1),
+        (5_000, 0, 0),
+        (5_000, 50, u32::MAX),
+        (u32::MAX, 0, 0),
+        (u32::MAX, 2, 1_000),
+        (u32::MAX, u32::MAX, 0),
+    ] {
+        let start = Instant::now();
+        let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(budget_ms)), max_blocks, min_block_ms);
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(15), "({}, {}, {}) took {:?}", budget_ms, max_blocks, min_block_ms, took);
+        match r.outcome {
+            WakeOutcome::Completed => {
+                let s = r.status.as_ref().expect("completed without status");
+                assert!(s.blocks_validated <= max_blocks, "({}, {}): {:?}", budget_ms, max_blocks, s);
+            }
+            WakeOutcome::TimedOut | WakeOutcome::TransportSlow => {
+                assert!(
+                    budget_ms < 10 || min_block_ms > budget_ms,
+                    "({}, {}, {}): {:?}",
+                    budget_ms,
+                    max_blocks,
+                    min_block_ms,
+                    r
+                );
+            }
+            other => panic!("({}, {}, {}): unexpected {:?}: {:?}", budget_ms, max_blocks, min_block_ms, other, r.error),
+        }
+        // No phase is stamped later than the wake says it ran.
+        for t in [
+            r.timings.transport_ready_ms,
+            r.timings.peers_ready_ms,
+            r.timings.headers_checked_ms,
+            r.timings.validated_ms,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(t <= r.elapsed_ms, "phase at {} ms after a {} ms wake", t, r.elapsed_ms);
+        }
+    }
+    // The unbounded ones ran to completion.
+    assert_eq!(n.validated(), 5);
+}
+
+#[test]
+fn wake_with_every_peer_gone_fails_cleanly_and_quickly() {
+    let c = chain(5);
+    let (a, b) = honest_pair(&c);
+    let n = node_with(&[&a, &b], None);
+    drop(a);
+    drop(b);
+    let start = Instant::now();
+    let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(20_000)), 50, 1_000);
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+    assert_eq!(r.outcome, WakeOutcome::Failed, "{:?}", r);
+    assert!(r.error.is_some());
+    assert!(r.timings.peers_ready_ms.is_none());
+    // The node is still usable for the next wake.
+    assert_eq!(n.validated(), 0);
+    assert!(n.node.get_status().is_ok());
+}
+
+#[test]
+fn concurrent_wakes_and_getters_never_deadlock() {
+    let c = chain(8);
+    let (a, b) = honest_pair(&c);
+    let n = Arc::new(node_with(&[&a, &b], None));
+    let wakes: Vec<_> = (0..6u32)
+        .map(|i| {
+            let n = Arc::clone(&n);
+            thread::spawn(move || (i, n.node.wake_catch_up(Arc::new(WakeBudget::new(1_000 + 500 * i)), 2, 0)))
+        })
+        .collect();
+    // Getters stay responsive while wakes hold the session.
+    let pollers: Vec<_> = (0..2)
+        .map(|_| {
+            let n = Arc::clone(&n);
+            thread::spawn(move || {
+                for _ in 0..50 {
+                    n.node.get_status().unwrap();
+                    let _ = n.node.get_mempool_status();
+                    let _ = n.node.get_node_status();
+                    let _ = n.node.is_validation_paused();
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        })
+        .collect();
+    let start = Instant::now();
+    for w in wakes {
+        let (i, r) = w.join().expect("wake panicked");
+        assert!(
+            matches!(r.outcome, WakeOutcome::Completed | WakeOutcome::Busy | WakeOutcome::TimedOut),
+            "wake {}: {:?}",
+            i,
+            r
+        );
+    }
+    for p in pollers {
+        p.join().expect("getter panicked");
+    }
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+    assert!(n.validated() <= 8);
+}
