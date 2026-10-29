@@ -12,6 +12,7 @@ use crate::contextual_checks::{
     calculate_sequence_locks, evaluate_sequence_locks, is_final_tx, median_time_past, HeaderTimes,
     MedianTimes,
 };
+use crate::script_verify;
 use crate::utxo::{UtxoEntry, UtxoSet};
 
 /// Default maximum mempool size: 50 MB of *serialized* transaction bytes.
@@ -171,7 +172,7 @@ impl Mempool {
     /// 2. Input validation — UTXO set first, then mempool fallback for
     ///    chain spending. Inputs that hit `to_evict` are treated as missing
     ///    so a replacement can't depend on the txs it's replacing.
-    /// 3. Script validation via libbitcoinconsensus, value math, fee rate
+    /// 3. Script validation (`script_verify`), value math, fee rate
     ///    floor, absurd-fee guardrail.
     /// 4. BIP 125 RBF rules 2/3/5 (only if conflicts is non-empty).
     /// 5. Ancestor closure + 25-ancestor / 101 kvB limit checks.
@@ -269,7 +270,7 @@ impl Mempool {
         out
     }
 
-    /// Test-only accept entry point that skips libbitcoinconsensus script
+    /// Test-only accept entry point that skips consensus script
     /// validation and the standard-script-type check. Lets unit tests
     /// exercise the graph state, fee math, RBF, and CPFP paths using
     /// trivial anyone-can-spend script_pubkeys instead of crafting valid
@@ -311,7 +312,14 @@ impl Mempool {
             }
         }
         let mtp = median_time_past(times, height).map_err(MempoolError::ChainContext)?;
-        self.tip_mtp_cache = id.map(|id| (height, id, mtp));
+        // Headers can be replaced while we read them (a reorg on the sync
+        // thread). Cache only if the tip is the same header after the read,
+        // so a value computed across the switch is never keyed to either.
+        let after = times.header_id_at(height);
+        self.tip_mtp_cache = match (id, after) {
+            (Some(id), Some(after)) if id == after => Some((height, id, mtp)),
+            _ => None,
+        };
         Ok(mtp)
     }
 
@@ -438,9 +446,9 @@ impl Mempool {
         // the txs it's about to remove.
         //
         // Resolution and script verification are split into two phases so
-        // that the libbitcoinconsensus 26.0 API can see *all* spent outputs
-        // up-front (BIP 341 sighash commits to every spent output, not just
-        // the one being verified).
+        // that script verification can see *all* spent outputs up-front
+        // (BIP 341 sighash commits to every spent output, not just the one
+        // being verified).
         let serialized_tx = serialize(&tx);
         let flags = self.params.script_flags(current_height);
         let mut input_sum: u64 = 0;
@@ -524,32 +532,8 @@ impl Mempool {
         }
 
         if !skip_consensus {
-            // Build the FFI Utxo array. Raw pointers reference the heap
-            // allocations owned by `spent`, which lives until the end of
-            // accept_tx_internal — well past these verify calls.
-            let utxos: Vec<bitcoinconsensus::Utxo> = spent
-                .iter()
-                .map(|(amt, spk)| bitcoinconsensus::Utxo {
-                    script_pubkey: spk.as_ptr(),
-                    script_pubkey_len: spk.len() as u32,
-                    value: *amt as i64,
-                })
-                .collect();
-
-            for (input_idx, (amount, script_pubkey)) in spent.iter().enumerate() {
-                bitcoinconsensus::verify_with_flags(
-                    script_pubkey,
-                    *amount,
-                    &serialized_tx,
-                    Some(&utxos),
-                    input_idx,
-                    flags,
-                )
-                .map_err(|e| MempoolError::ScriptFailure {
-                    input_index: input_idx,
-                    error: format!("{:?}", e),
-                })?;
-            }
+            script_verify::verify_transaction(&tx, &spent, flags)
+                .map_err(MempoolError::from_script_verify)?;
         }
 
         // ── Phase 3: value math + fee bounds ────────────────────────────
@@ -1518,6 +1502,10 @@ pub enum MempoolError {
     UtxoLookup(String),
     /// Header timestamps for median-time-past were unavailable (local).
     ChainContext(String),
+    /// The script verifier itself failed (bad flags, mismatched spent
+    /// outputs, a tx it could not parse back, a kernel/FFI fault): our
+    /// fault, not proof the transaction is invalid. See `from_script_verify`.
+    ScriptVerifierError { input_index: usize, error: String },
     // CPFP / ancestor tracking (ticket 010)
     TooManyAncestors { count: usize, limit: usize },
     AncestorSetTooLarge { vbytes: u64, limit: u64 },
@@ -1531,6 +1519,31 @@ pub enum MempoolError {
         evicted_fee_total: u64,
         relay_surcharge: u64,
     },
+}
+
+impl MempoolError {
+    /// Classify a script-verifier failure, as `block_validation::script_error`
+    /// does for blocks (ticket 024): only a script that evaluated to false
+    /// is `ScriptFailure`. Exhaustive so a new `ScriptVerifyError` must be
+    /// classified here.
+    fn from_script_verify(f: script_verify::ScriptVerifyFailure) -> MempoolError {
+        use script_verify::ScriptVerifyError as E;
+        let script_verify::ScriptVerifyFailure { input_index, error } = f;
+        match error {
+            E::ScriptFailed => MempoolError::ScriptFailure {
+                input_index,
+                error: error.to_string(),
+            },
+            E::InvalidFlags(_)
+            | E::SpentOutputsMismatch { .. }
+            | E::NoInputs
+            | E::TxDeserialize
+            | E::Library(_) => MempoolError::ScriptVerifierError {
+                input_index,
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for MempoolError {
@@ -1606,12 +1619,15 @@ impl std::fmt::Display for MempoolError {
             MempoolError::NonBip68Final { min_height, min_time, current_height } => {
                 write!(
                     f,
-                    "transaction not BIP 68 final (min height {}, min time {}, current_height={})",
+                    "transaction not BIP 68 final (needs height > {} and median time > {}, -1 = no lock; current_height={})",
                     min_height, min_time, current_height
                 )
             }
             MempoolError::UtxoLookup(e) => write!(f, "UTXO lookup error: {}", e),
             MempoolError::ChainContext(e) => write!(f, "header context unavailable: {}", e),
+            MempoolError::ScriptVerifierError { input_index, error } => {
+                write!(f, "script verifier error on input {}: {}", input_index, error)
+            }
             MempoolError::TooManyAncestors { count, limit } => {
                 write!(f, "ancestor count {} exceeds limit {}", count, limit)
             }
@@ -1782,7 +1798,7 @@ mod tests {
     // These helpers build a fresh UTXO set and trivial transactions that
     // exercise the full graph/RBF logic without crafting real signatures.
     // The mempool is invoked via `accept_tx_test`, which skips the
-    // libbitcoinconsensus check and the standard-script-type check; every
+    // script verification and the standard-script-type check; every
     // other validation gate runs as in production.
 
     use crate::utxo::UtxoEntry;
@@ -2788,5 +2804,31 @@ mod tests {
             Mempool::new().accept_tx_test_with_times(tx, &utxo, TEST_HEIGHT, &none),
             Err(MempoolError::ChainContext(_))
         ));
+    }
+
+    /// Ticket 047 review: only a script evaluating to false rejects the tx
+    /// as a script failure; every verifier fault is local.
+    #[test]
+    fn only_script_failed_is_a_mempool_script_failure() {
+        use crate::script_verify::{ScriptVerifyError as E, ScriptVerifyFailure};
+        let fail = |error| ScriptVerifyFailure { input_index: 1, error };
+        assert!(matches!(
+            MempoolError::from_script_verify(fail(E::ScriptFailed)),
+            MempoolError::ScriptFailure { input_index: 1, .. }
+        ));
+        for other in [
+            E::InvalidFlags(0xffff_ffff),
+            E::SpentOutputsMismatch { inputs: 2, spent: 1 },
+            E::NoInputs,
+            E::TxDeserialize,
+            E::Library("btck_script_pubkey_verify status 2".into()),
+        ] {
+            let e = MempoolError::from_script_verify(fail(other));
+            assert!(
+                matches!(e, MempoolError::ScriptVerifierError { input_index: 1, .. }),
+                "{:?}",
+                e
+            );
+        }
     }
 }

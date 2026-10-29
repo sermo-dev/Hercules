@@ -144,15 +144,22 @@ impl SubmitError {
                 tip_height,
             },
             M::NonBip68Final { min_height, min_time, .. } => SubmitError::NotYetFinal {
-                reason: if min_time >= 0 {
+                // The lock points cover all inputs; either or both can be
+                // set (-1 = none), so name every condition that applies.
+                reason: {
+                    let mut needs = Vec::new();
+                    if min_height >= 0 {
+                        needs.push(format!("a block after height {}", min_height));
+                    }
+                    if min_time >= 0 {
+                        needs.push(format!(
+                            "the median time of recent blocks to pass {}",
+                            min_time
+                        ));
+                    }
                     format!(
-                        "an input's relative timelock (BIP 68) needs the median time of recent blocks to pass {}",
-                        min_time
-                    )
-                } else {
-                    format!(
-                        "an input's relative timelock (BIP 68) needs a block after height {}",
-                        min_height
+                        "an input's relative timelock (BIP 68) needs {}",
+                        needs.join(" and ")
                     )
                 },
                 validated_height,
@@ -194,6 +201,8 @@ impl SubmitError {
                 "already in mempool (should be handled by caller)".into(),
             ),
             M::UtxoLookup(s) | M::ChainContext(s) => SubmitError::Internal(s),
+            // Our verifier failed, not the transaction (ticket 047).
+            M::ScriptVerifierError { .. } => SubmitError::Internal(msg),
         }
     }
 
@@ -1181,6 +1190,10 @@ mod tests {
             SubmitError::Consensus(_)
         ));
         assert!(matches!(
+            c(MempoolError::ScriptVerifierError { input_index: 0, error: "x".into() }),
+            SubmitError::Internal(_)
+        ));
+        assert!(matches!(
             c(MempoolError::DustOutput { index: 0, amount: 1 }),
             SubmitError::NonStandard(_)
         ));
@@ -1237,6 +1250,13 @@ mod tests {
         assert!(bip68.to_string().contains("after height 20"), "{}", bip68);
         let bip68_time = c(MempoolError::NonBip68Final { min_height: -1, min_time: 1_700_000_000, current_height: 10 });
         assert!(bip68_time.to_string().contains("pass 1700000000"), "{}", bip68_time);
+        assert!(!bip68_time.to_string().contains("a block after height"), "{}", bip68_time);
+        let both = c(MempoolError::NonBip68Final { min_height: 20, min_time: 1_700_000_000, current_height: 10 });
+        assert!(
+            both.to_string().contains("after height 20 and the median time of recent blocks to pass 1700000000"),
+            "{}",
+            both
+        );
         assert!(matches!(
             crate::BroadcastError::from(bip68),
             crate::BroadcastError::NotYetFinal { .. }

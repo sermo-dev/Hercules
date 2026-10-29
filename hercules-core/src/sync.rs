@@ -132,12 +132,24 @@ const FORK_FOLLOW_BUDGET: Duration = Duration::from_secs(10 * 60);
 /// (ticket 024). Combined with the crate version in `rules_tag`, so any
 /// app update reconsiders them too. No test pins the number (tests go
 /// through `rules_tag()`), so a bump is this one line.
-/// History: 2 = ticket 026 (contextual rules; BIP 34 accepts heights 1..=16).
-const VALIDATION_RULES_VERSION: u32 = 2;
+///
+/// History:
+/// - 2: script verification moved from libbitcoinconsensus v26 to
+///   libbitcoinkernel (ticket 047), and the verifier's errors are classified
+///   through `ScriptVerifyError` instead of `bitcoinconsensus::Error`.
+/// - 3: ticket 026 (contextual consensus rules; BIP 34 accepts heights 1..=16).
+const VALIDATION_RULES_VERSION: u32 = 3;
 
-/// Rules tag stored with each `failed_blocks` row.
+/// Rules tag stored with each `failed_blocks` row. Includes the script
+/// backend, so switching between libbitcoinkernel and the legacy library
+/// (ticket 047) reconsiders blocks the other one failed.
 fn rules_tag() -> String {
-    format!("{}+{}", VALIDATION_RULES_VERSION, env!("CARGO_PKG_VERSION"))
+    format!(
+        "{}+{}+{}",
+        VALIDATION_RULES_VERSION,
+        env!("CARGO_PKG_VERSION"),
+        crate::script_verify::active_backend_name()
+    )
 }
 
 /// Cap on how many addresses we'll process from a single addr / addrv2

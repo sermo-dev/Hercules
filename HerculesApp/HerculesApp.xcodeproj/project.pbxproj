@@ -18,6 +18,7 @@
 		7278C10C3CC2424F1099807B /* NodeHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */; };
 		8FCF4BC9300EA0B5AE98A0B7 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */; };
 		916E16D86ED9743267AE8804 /* SharedNodeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AC4E7AF001C5D6258259379 /* SharedNodeState.swift */; };
+		9CE626A19F68023E91505EC3 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 963EEE892D1B27F1508C5040 /* PrivacyInfo.xcprivacy */; };
 		9E9C169F7571AD37D2B73530 /* HerculesWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC2415BD33A7DBAD601ACFF /* HerculesWidget.swift */; };
 		A128B0A9D11BC0123589A67B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F6A2BE5D8836DC97A10384A /* AppDelegate.swift */; };
 		AA3A717247168C156786CE85 /* WakeCoordination.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80ECE0624FEAEF806943E691 /* WakeCoordination.swift */; };
@@ -77,6 +78,7 @@
 		878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeActivityAttributes.swift; sourceTree = "<group>"; };
 		8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerculesApp.swift; sourceTree = "<group>"; };
 		91B6627F64A7DEA672DD126A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		963EEE892D1B27F1508C5040 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		A1D43EA3963B18DAD924BE53 /* HerculesWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesWidget.entitlements; sourceTree = "<group>"; };
 		A39D7E95A1FE6D2B01A6BF53 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeHost.swift; sourceTree = "<group>"; };
@@ -151,6 +153,7 @@
 				A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */,
 				F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */,
 				369D4212C2AB889A298C77F9 /* NotificationManager.swift */,
+				963EEE892D1B27F1508C5040 /* PrivacyInfo.xcprivacy */,
 				91B6627F64A7DEA672DD126A /* SettingsView.swift */,
 				4AC4E7AF001C5D6258259379 /* SharedNodeState.swift */,
 				73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */,
@@ -262,6 +265,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				CB293751781200CE7EC2D89D /* Assets.xcassets in Resources */,
+				9CE626A19F68023E91505EC3 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -331,7 +335,7 @@
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -419,7 +423,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_ID)";
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -514,7 +518,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_ID)";
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -536,7 +540,7 @@
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};

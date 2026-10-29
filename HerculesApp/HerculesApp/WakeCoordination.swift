@@ -13,6 +13,20 @@ enum WakeConfig {
     /// up: not enough for one block.
     static let minBlockMs: UInt32 = 8_000
     static let maxBlocks: UInt32 = 7
+
+    // BG processing task (ticket 051): on power, minutes long, so it works
+    // through a backlog in rounds. Each round is one wake on the shared
+    // node, which re-checks the network policy and yields to foreground
+    // sync between rounds; the expiration handler cancels the current one.
+    static let processingRoundMs: UInt32 = 120_000
+    static let processingMaxBlocks: UInt32 = 1_000
+    /// Rounds that ran to their end (caught up, stalled, or out of budget).
+    static let processingMaxRounds = 30
+    /// Rounds that gave way to a push or refresh (cancelled mid-round, or
+    /// never started). Counted apart so block wakes don't eat the round
+    /// cap; still capped so the loop is bounded. ~1 per 10-minute block,
+    /// so this is far more than any processing window sees.
+    static let processingMaxYields = 200
 }
 
 /// Runs a body at most once. Wakes have several ways to finish (Rust
@@ -57,12 +71,29 @@ final class NodeSessionState {
         /// The app is on screen and syncing: foreground is already
         /// validating, so the wake records that and completes at once.
         case foregroundActive
+        /// A processing round asked while a push or refresh is in flight
+        /// (ticket 051). Not registered; wait for it to finish and ask
+        /// again. Decided under the same lock as a push's admission, so a
+        /// push can't slip in between the check and the round starting.
+        case yield
+    }
+
+    /// What kind of wake is asking. A push or BG refresh has ~30 s and
+    /// must not wait out a BG processing round's minutes, so it cancels
+    /// any running round on admission (ticket 051).
+    enum WakeKind: Equatable {
+        /// Silent push, BG refresh, test notification.
+        case short
+        /// One round of the BG processing task.
+        case processing
     }
 
     private let lock = NSLock()
     private var foregroundSessions = 0
     private var foregroundPreempted = false
     private var wakes: [ObjectIdentifier: WakeCancellable] = [:]
+    /// The subset of `wakes` that are processing rounds.
+    private var processingWakes = Set<ObjectIdentifier>()
     /// Why we (not iOS) cancelled a wake, so its record says "foreground"
     /// or "reset" rather than "ran out of time".
     private var cancelReasons: [ObjectIdentifier: WakeCancelReason] = [:]
@@ -77,19 +108,55 @@ final class NodeSessionState {
         return wakes.count
     }
 
-    func admitWake(_ token: WakeCancellable, appInForeground: Bool) -> Admission {
+    /// In-flight pushes and refreshes. The processing task waits for this
+    /// to reach 0 before each round, so it doesn't contend with them.
+    var inFlightShortWakes: Int {
         lock.lock(); defer { lock.unlock() }
+        return wakes.count - processingWakes.count
+    }
+
+    func admitWake(
+        _ token: WakeCancellable,
+        appInForeground: Bool,
+        kind: WakeKind = .short
+    ) -> Admission {
+        lock.lock()
         if foregroundSessions > 0 && appInForeground {
+            lock.unlock()
             return .foregroundActive
         }
-        wakes[ObjectIdentifier(token)] = token
+        let id = ObjectIdentifier(token)
+        if kind == .processing && wakes.count > processingWakes.count {
+            lock.unlock()
+            return .yield
+        }
+        wakes[id] = token
+        // A push or refresh preempts a processing round: Rust's session
+        // lock goes to whoever holds it, and a round holds it for minutes
+        // while the push's ~30 s run out. The round keeps what it validated
+        // (each block is committed as it goes), and the task starts its
+        // next round once this wake is done. Cancelled outside the lock.
+        var preempted: [WakeCancellable] = []
+        if kind == .processing {
+            processingWakes.insert(id)
+        } else {
+            for pid in processingWakes where cancelReasons[pid] == nil {
+                cancelReasons[pid] = .preemptedByWake
+                if let round = wakes[pid] { preempted.append(round) }
+            }
+        }
+        let admission: Admission
         if foregroundSessions > 0 {
             // Marked now, not when Rust reports back: the sync loop returns
             // (and asks `endForeground`) before the wake's call does.
             foregroundPreempted = true
-            return .run(preemptsForeground: true)
+            admission = .run(preemptsForeground: true)
+        } else {
+            admission = .run(preemptsForeground: false)
         }
-        return .run(preemptsForeground: false)
+        lock.unlock()
+        preempted.forEach { $0.cancel() }
+        return admission
     }
 
     /// The wake returned. `stoppedForegroundSync` is Rust's report. If it
@@ -101,6 +168,7 @@ final class NodeSessionState {
         lock.lock(); defer { lock.unlock() }
         let id = ObjectIdentifier(token)
         wakes.removeValue(forKey: id)
+        processingWakes.remove(id)
         if !stoppedForegroundSync && wakes.isEmpty {
             foregroundPreempted = false
         }
@@ -148,6 +216,8 @@ enum WakeCancelReason: Equatable {
     case none
     case foregroundStarted
     case reset
+    /// A push or refresh arrived during a BG processing round (ticket 051).
+    case preemptedByWake
 }
 
 /// What to do when a foreground sync session ends (ticket 028).

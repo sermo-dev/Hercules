@@ -2,6 +2,7 @@ namespace hercules {
     [Throws=HerculesError]
     BlockInfo parse_block_header(string hex_header);
     string hercules_version();
+    string script_backend();
 
     [Throws=HerculesError]
     void reset_database(string db_path);

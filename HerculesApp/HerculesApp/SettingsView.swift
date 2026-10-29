@@ -743,6 +743,8 @@ struct SettingsView: View {
         }
         var parts: [String] = []
         if let trigger = t.trigger { parts.append(trigger) }
+        if let rounds = t.rounds { parts.append("\(rounds) round\(rounds == 1 ? "" : "s")") }
+        if let blocks = t.blocksValidated { parts.append("\(blocks) blocks") }
         if let node = secs(t.nodeReadyMs) {
             parts.append("node \(node)" + (t.nodeReused == true ? " (warm)" : ""))
         }
@@ -770,6 +772,7 @@ struct SettingsView: View {
         case .headerOnly: return "checkmark.circle.fill"
         case .pushPayload: return "bell.fill"
         case .networkPolicyPaused: return "pause.circle.fill"
+        case .noNetwork: return "wifi.slash"
         case .foregroundActive: return "iphone"
         case .transportSlow: return "tortoise.fill"
         case .wakeBusy: return "hourglass"
@@ -788,6 +791,7 @@ struct SettingsView: View {
         case .headerOnly: return Theme.warning
         case .pushPayload: return Theme.textSecondary
         case .networkPolicyPaused: return Theme.warning
+        case .noNetwork: return Theme.warning
         case .foregroundActive: return Theme.textSecondary
         case .transportSlow: return Theme.warning
         case .wakeBusy: return Theme.textSecondary
@@ -806,6 +810,7 @@ struct SettingsView: View {
         case .headerOnly: return "Header"
         case .pushPayload: return "Unverified"
         case .networkPolicyPaused: return "Paused"
+        case .noNetwork: return "Offline"
         case .foregroundActive: return "Foreground"
         case .transportSlow: return "Transport Slow"
         case .wakeBusy: return "Busy"

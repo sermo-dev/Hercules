@@ -17,6 +17,7 @@ mod own_tx_store;
 mod p2p;
 mod peer_pool;
 mod relay_policy;
+mod script_verify;
 mod peer_store;
 mod store;
 mod sync;
@@ -76,6 +77,12 @@ pub fn parse_block_header(hex_header: String) -> Result<BlockInfo, HerculesError
 
 pub fn hercules_version() -> String {
     "Hercules v0.1.0".to_string()
+}
+
+/// The script verification library this build uses (ticket 047), e.g.
+/// "libbitcoinkernel v32.0" or the legacy libbitcoinconsensus v26.
+pub fn script_backend() -> String {
+    script_verify::active_backend_name().to_string()
 }
 
 /// Wipe all on-disk state for a Hercules node so the next launch starts from a
