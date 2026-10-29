@@ -228,6 +228,44 @@ fn headers_on(mut prev: BlockHash, from: u32, to: u32, salt: u32) -> Vec<Header>
 }
 
 /// Store headers 1..=`tip` on top of genesis.
+/// End to end, from the user and from a peer: a tx spending one coin twice
+/// is consensus-invalid (Core `bad-txns-inputs-duplicate`). Before the
+/// mempool checked this, it was accepted with the coin counted twice and
+/// relayed to peers that discourage the sender for it.
+#[test]
+fn duplicate_input_tx_is_refused_from_user_and_peers() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let coin = seed(&hs, 1, OP_TRUE, 1, false);
+    // Pays more than the coin holds: only "valid" if counted twice.
+    let mut tx = spend(coin, 150_000);
+    tx.input.push(tx.input[0].clone());
+    match hs.submit_own_tx(&raw(&tx)) {
+        Err(SubmitError::Consensus(msg)) => assert!(msg.contains("already spends"), "{}", msg),
+        other => panic!("expected a consensus reject, got {:?}", other),
+    }
+    hs.handle_tx("1.2.3.4:8333", tx.clone()).unwrap();
+    assert!(!hs.mempool.lock().unwrap().contains(&tx.compute_txid()));
+    assert!(hs.list_own_txs().unwrap().is_empty());
+    assert!(hs.relay_queue.lock().unwrap().is_empty());
+}
+
+/// Own coinbase spends are judged for the next block, as block validation
+/// will judge them: with the UTXO set at 200, a coinbase from 101 can be
+/// mined in block 201 and is accepted; one from 102 can't yet.
+#[test]
+fn own_coinbase_spend_is_judged_for_the_next_block() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let immature = spend(seed(&hs, 2, OP_TRUE, VALIDATED - 98, true), 90_000);
+    match hs.submit_own_tx(&raw(&immature)) {
+        Err(SubmitError::Consensus(msg)) => assert!(msg.contains("immature coinbase"), "{}", msg),
+        other => panic!("expected immature, got {:?}", other),
+    }
+    let mature = spend(seed(&hs, 1, OP_TRUE, VALIDATED - 99, true), 90_000);
+    hs.submit_own_tx(&raw(&mature)).expect("spendable in block VALIDATED + 1");
+}
+
 fn store_headers_to(hs: &HeaderSync, tip: u32) {
     let headers = headers_on(genesis_header().block_hash(), 1, tip, 0);
     hs.store.store_headers(&headers, 1).unwrap();
