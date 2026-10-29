@@ -167,6 +167,8 @@ impl SubmitError {
             },
             M::CoinbaseTx
             | M::MalformedTx
+            | M::DuplicateInput { .. }
+            | M::ValueOutOfRange { .. }
             | M::MissingInput { .. }
             | M::ImmatureCoinbase { .. }
             | M::ScriptFailure { .. }

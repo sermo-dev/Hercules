@@ -46,6 +46,9 @@ const MAX_TX_WEIGHT: u64 = 400_000;
 /// Coinbase maturity: 100 blocks before coinbase outputs are spendable.
 const COINBASE_MATURITY: u32 = 100;
 
+/// Bitcoin's MAX_MONEY in satoshis (CheckTransaction's MoneyRange bound).
+const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
 /// Maximum transaction expiry time (14 days).
 const MAX_TX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
 
@@ -346,6 +349,32 @@ impl Mempool {
             return Err(MempoolError::MalformedTx);
         }
 
+        // The rest of Core's CheckTransaction: no outpoint spent twice
+        // (`bad-txns-inputs-duplicate`) and every output, and their total,
+        // within MAX_MONEY (`bad-txns-vout-toolarge`,
+        // `bad-txns-txouttotal-toolarge`). The script check below verifies
+        // inputs one at a time, so without this a tx spending one coin
+        // twice would have that coin's value counted twice and be relayed
+        // to peers that treat it as consensus-invalid.
+        let mut outpoints = HashSet::with_capacity(tx.input.len());
+        for (input_index, input) in tx.input.iter().enumerate() {
+            if !outpoints.insert(input.previous_output) {
+                return Err(MempoolError::DuplicateInput { input_index });
+            }
+        }
+        let mut output_total: u64 = 0;
+        for output in &tx.output {
+            let amount = output.value.to_sat();
+            if amount > MAX_MONEY {
+                return Err(MempoolError::ValueOutOfRange { what: "output", amount });
+            }
+            // Both terms are at most MAX_MONEY here: no overflow.
+            output_total += amount;
+            if output_total > MAX_MONEY {
+                return Err(MempoolError::ValueOutOfRange { what: "output total", amount: output_total });
+            }
+        }
+
         if self.txs.contains_key(&txid) {
             return Err(MempoolError::AlreadyInMempool);
         }
@@ -515,6 +544,10 @@ impl Mempool {
                 .ok_or(MempoolError::MathOverflow)?;
             prev_heights.push(utxo.height);
             spent.push((utxo.amount, utxo.script_pubkey));
+        }
+        // CheckTxInputs `bad-txns-inputvalues-outofrange`.
+        if input_sum > MAX_MONEY {
+            return Err(MempoolError::ValueOutOfRange { what: "input total", amount: input_sum });
         }
 
         // BIP 68 relative lock-times for the next block, as Core's
@@ -1471,6 +1504,13 @@ fn is_standard_bare_multisig(spk: &bitcoin::Script) -> bool {
 pub enum MempoolError {
     CoinbaseTx,
     MalformedTx,
+    /// Two inputs spend the same outpoint (CheckTransaction,
+    /// `bad-txns-inputs-duplicate`). Consensus-invalid.
+    DuplicateInput { input_index: usize },
+    /// An output, the output total or the input total exceeds MAX_MONEY
+    /// (`bad-txns-vout-toolarge`, `bad-txns-txouttotal-toolarge`,
+    /// `bad-txns-inputvalues-outofrange`). Consensus-invalid.
+    ValueOutOfRange { what: &'static str, amount: u64 },
     AlreadyInMempool,
     MissingInput { txid: Txid, vout: u32 },
     ImmatureCoinbase { input_index: usize, coinbase_height: u32 },
@@ -1551,6 +1591,12 @@ impl std::fmt::Display for MempoolError {
         match self {
             MempoolError::CoinbaseTx => write!(f, "coinbase transactions are not allowed in mempool"),
             MempoolError::MalformedTx => write!(f, "transaction has empty inputs or outputs"),
+            MempoolError::DuplicateInput { input_index } => {
+                write!(f, "input {} spends an outpoint an earlier input already spends", input_index)
+            }
+            MempoolError::ValueOutOfRange { what, amount } => {
+                write!(f, "{} of {} sats exceeds MAX_MONEY", what, amount)
+            }
             MempoolError::AlreadyInMempool => write!(f, "transaction already in mempool"),
             MempoolError::MissingInput { txid, vout } => {
                 write!(f, "input {}:{} not found in UTXO set", txid, vout)
