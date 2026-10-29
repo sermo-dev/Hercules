@@ -444,6 +444,10 @@ class NodeViewModel: ObservableObject {
         nodeLock.unlock()
         activeSession = nil
         syncGeneration += 1
+        // A Start deferred behind the retired session belongs to the old
+        // node: a successful reset starts sync itself, a failed one leaves
+        // it stopped.
+        startWhenSessionEnds = false
     }
 
     /// The foreground session, on its background thread. Returns early
@@ -535,6 +539,11 @@ class NodeViewModel: ObservableObject {
             // Don't start an 8.8 GB download for a session that's over.
             if token.isOver { return }
 
+            // The downloader refuses to start while the network policy
+            // reads "offline", which it does until the monitor's first
+            // path (ticket 051). Normally long since known by now.
+            NetworkPolicy.shared.waitForFirstPath()
+
             // Block until the file is on disk. Surfaces progress to
             // the UI via the SnapshotDownloader subscriptions set up
             // in init().
@@ -558,6 +567,13 @@ class NodeViewModel: ObservableObject {
                 }
                 return !token.retired && spaceWatch.shouldContinue()
             }
+
+            // The import runs for minutes: keep the screen from
+            // auto-locking (which backgrounds the app), and hold a
+            // background task so a brief app switch doesn't freeze it
+            // mid-write (ticket 051). Released on every exit below.
+            let importAssertion = LongTaskAssertion(name: "Snapshot import")
+            defer { importAssertion.end() }
 
             // Delete the cached .gz after a successful import (it's
             // redundant) or when the file itself was rejected
@@ -646,7 +662,16 @@ class NodeViewModel: ObservableObject {
         }
         if startWhenSessionEnds {
             startWhenSessionEnds = false
-            startSync()
+            // `startSync` set `isSyncRunning` when it deferred this start,
+            // and only the active session's cleanup above clears it. A
+            // session a reset retired never is, so without this the
+            // deferred start would hit `startSync`'s guard and nothing
+            // would run until relaunch (ticket 051). Skip it if a restart
+            // above already launched a session.
+            if !sessionInFlight {
+                isSyncRunning = false
+                startSync()
+            }
         }
     }
 
@@ -863,6 +888,59 @@ final class SnapshotSpaceWatch {
             return false
         }
         return true
+    }
+}
+
+/// Keeps a long foreground job (the snapshot import) going (ticket 051):
+/// disables the idle timer, so the screen doesn't auto-lock and background
+/// the app, and holds a UIKit background task, so a brief trip to the
+/// background doesn't suspend it at once. Created and ended from any
+/// thread; all state lives on the main thread, and `begin` is queued
+/// before `end`. `endBackgroundTask` runs exactly once, from `end` or from
+/// the expiration handler, whichever comes first.
+///
+/// The background task covers the first trip to the background only:
+/// once it expires it isn't re-armed when the app comes back, so a later
+/// trip suspends the import right away (it resumes on return). The idle
+/// timer stays disabled until `end`.
+final class LongTaskAssertion {
+    // Main thread only.
+    private var taskID: UIBackgroundTaskIdentifier = .invalid
+    private var savedIdleTimerDisabled = false
+    private var ended = false
+
+    init(name: String) {
+        DispatchQueue.main.async { self.begin(name) }
+    }
+
+    /// Restore the idle timer and end the background task. Idempotent.
+    func end() {
+        DispatchQueue.main.async {
+            guard !self.ended else { return }
+            self.ended = true
+            self.endBackgroundTask()
+            UIApplication.shared.isIdleTimerDisabled = self.savedIdleTimerDisabled
+        }
+    }
+
+    private func begin(_ name: String) {
+        guard !ended else { return }
+        let app = UIApplication.shared
+        savedIdleTimerDisabled = app.isIdleTimerDisabled
+        app.isIdleTimerDisabled = true
+        taskID = app.beginBackgroundTask(withName: name) { [self] in
+            // Out of background time. iOS kills an app that doesn't end
+            // its task here; the import thread is just suspended with the
+            // process and carries on when the app is next active (LMDB is
+            // crash-safe if it never is).
+            endBackgroundTask()
+        }
+    }
+
+    private func endBackgroundTask() {
+        guard taskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(taskID)
+        taskID = .invalid
     }
 }
 

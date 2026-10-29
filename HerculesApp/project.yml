@@ -5,7 +5,7 @@ name: HerculesApp
 # project.pbxproj together with the generated Info.plist / .entitlements
 # files. Never hand-edit project.pbxproj.
 #
-# Every identifier (bundle IDs, App Group, BGTask ID, background URLSession
+# Every identifier (bundle IDs, App Group, BGTask IDs, background URLSession
 # ID, display name, versions) lives in Config/Shared.xcconfig. Nothing below
 # should hardcode one — reference the build setting instead.
 
@@ -36,6 +36,8 @@ targets:
         OTHER_LDFLAGS: ["-lc++"]
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # iPhone only (ticket 051): the product is a node on your phone.
+        TARGETED_DEVICE_FAMILY: "1"
     info:
       path: HerculesApp/Info.plist
       properties:
@@ -45,12 +47,15 @@ targets:
         UIBackgroundModes:
           - remote-notification
           - fetch
+          - processing
         BGTaskSchedulerPermittedIdentifiers:
           - $(BGTASK_CATCHUP_ID)
+          - $(BGTASK_PROCESSING_ID)
         NSSupportsLiveActivities: true
         # Runtime identifiers read by AppIdentifiers.swift.
         HRCAppGroupID: $(APP_GROUP_ID)
         HRCCatchUpTaskID: $(BGTASK_CATCHUP_ID)
+        HRCProcessingTaskID: $(BGTASK_PROCESSING_ID)
         HRCSnapshotSessionID: $(SNAPSHOT_SESSION_ID)
     entitlements:
       path: HerculesApp/HerculesApp.entitlements
@@ -86,7 +91,7 @@ targets:
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGN_IDENTITY: "iPhone Developer"
         SKIP_INSTALL: YES
-        TARGETED_DEVICE_FAMILY: "1,2"
+        TARGETED_DEVICE_FAMILY: "1"
     info:
       path: HerculesWidget/Info.plist
       properties:

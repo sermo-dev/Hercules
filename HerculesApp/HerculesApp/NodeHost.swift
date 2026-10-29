@@ -119,6 +119,9 @@ final class NodeHost {
     enum WakeResult {
         /// The app is on screen and syncing; nothing was run.
         case foregroundActive
+        /// A processing round found a push or refresh in flight; nothing
+        /// was run (ticket 051).
+        case yielded
         /// `cancelReason`: why the app (not iOS) cancelled the wake, if it did.
         case ran(
             WakeReport, nodeReadyMs: UInt64, nodeReused: Bool, peerCount: UInt32,
@@ -128,12 +131,20 @@ final class NodeHost {
 
     /// Run one wake's catch-up on the shared node. Blocks; call it off the
     /// main thread. `appInForeground` must be read on the main thread when the
-    /// wake arrives.
-    func runWake(budget: WakeBudget, appInForeground: Bool) throws -> WakeResult {
-        switch sessions.admitWake(budget, appInForeground: appInForeground) {
+    /// wake arrives. A BG processing round passes `.processing` and a
+    /// larger `maxBlocks`; a push or refresh admitted meanwhile cancels it.
+    func runWake(
+        budget: WakeBudget,
+        appInForeground: Bool,
+        maxBlocks: UInt32 = WakeConfig.maxBlocks,
+        kind: NodeSessionState.WakeKind = .short
+    ) throws -> WakeResult {
+        switch sessions.admitWake(budget, appInForeground: appInForeground, kind: kind) {
         case .foregroundActive:
             StoragePaths.log.notice("wake: foreground sync active, not running")
             return .foregroundActive
+        case .yield:
+            return .yielded
         case .run(let preemptsForeground):
             var stoppedSync = false
             var finished = false
@@ -147,7 +158,7 @@ final class NodeHost {
             let nodeReadyMs = budget.elapsedMs()
             let report = node.wakeCatchUp(
                 budget: budget,
-                maxBlocks: WakeConfig.maxBlocks,
+                maxBlocks: maxBlocks,
                 minBlockMs: WakeConfig.minBlockMs
             )
             stoppedSync = report.preemptedSync
