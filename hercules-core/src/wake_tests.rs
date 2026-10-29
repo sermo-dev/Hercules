@@ -11,16 +11,20 @@ use tempfile::TempDir;
 use super::*;
 use crate::chain_params::ChainParams;
 use crate::peer_pool::PeerSource;
-use crate::testkit::{Behavior, FixtureChain, MockPeer};
+use crate::testkit::{lmdb_slot, Behavior, FixtureChain, LmdbSlot, MockPeer};
 
+/// Fields drop in order: the node (and its stores) first, then the
+/// directory, then the LMDB slot (`testkit::lmdb_gate`).
 struct Node {
-    _dir: TempDir,
     node: HerculesNode,
+    _dir: TempDir,
+    _slot: LmdbSlot,
 }
 
 /// A clearnet regtest node pointed at `peers`. With `tor`, the node is in
 /// Tor mode and uses that gate as its transport.
 fn node_with(peers: &[&MockPeer], tor: Option<Arc<TorGate>>) -> Node {
+    let slot = lmdb_slot();
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("headers.sqlite3").to_str().unwrap().to_string();
     let mut syncer = sync::HeaderSync::with_config(sync::SyncConfig {
@@ -48,7 +52,7 @@ fn node_with(peers: &[&MockPeer], tor: Option<Arc<TorGate>>) -> Node {
         data_dir: dir.path().to_str().unwrap().to_string(),
         claim: Arc::new(PathClaim::take(&db_path).unwrap()),
     };
-    Node { _dir: dir, node }
+    Node { node, _dir: dir, _slot: slot }
 }
 
 impl Node {
