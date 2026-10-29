@@ -82,6 +82,8 @@ The real fix is ticket 029's private broadcast (short-lived isolated Tor connect
 - Audit every `misbehaving(...)` call site against 024's three classes, and record the class in the log line.
 - Lift bans caused by `FutureTimestamp` on upgrade (one-time cleanup).
 
+- **MTP for early heights:** `validation.rs:96` skips the median-time-past check for heights 1..=10. Core's `GetMedianTimePast` uses however many ancestors exist. This is low impact on mainnet (the anchor is far above), but it's a consensus divergence that regtest and the harness hit. Port it exactly. A reproducer test is in PR #29, ignored.
+
 ### 4. Recently-rejected filter and in-flight map
 
 - Rolling filter of rejected txids (and wtxids), reset each block, as Core's `m_recent_rejects`.
