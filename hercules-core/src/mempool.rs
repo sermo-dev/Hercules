@@ -698,7 +698,7 @@ impl Mempool {
         // correctness bug (lost data on a failed accept) and a free DoS
         // amplifier (one low-fee submission → up to MAX_DESCENDANTS
         // evicted innocents).
-        self.check_capacity_admission(size, fee, vsize, &ancestors)?;
+        self.check_capacity_admission(txid, size, fee, vsize, &ancestors, &to_evict)?;
 
         // ── Phase 7: mutate ─────────────────────────────────────────────
         //
@@ -785,156 +785,123 @@ impl Mempool {
     /// here so that no innocent mempool entries are destroyed by a doomed
     /// accept.
     ///
-    /// Algorithm:
+    /// It replays that loop exactly, on a lightweight copy of the graph as
+    /// it will be after Phase 7 (the conflict set `to_evict` gone, the new
+    /// tx inserted below `our_ancestors`): repeatedly pick the victim root
+    /// with `pick_eviction_victim`, the same deterministic rule
+    /// `evict_lowest_package` uses, and drop it with its descendants,
+    /// until the pool fits. Package sums are recomputed after every drop,
+    /// so a descendant shared by two roots is counted (and freed) once,
+    /// and a root that loses such a descendant is re-ranked, just as in
+    /// the real loop. If the victim's package contains the new tx, reject.
     ///
-    /// 1. Fast-path: if `total_size + new_size <= max_size`, no eviction
-    ///    is needed and the new tx is trivially safe.
-    /// 2. Identify the *root ancestors* of the new tx (entries with empty
-    ///    `ancestors` that the new tx descends from). These are the roots
-    ///    whose packages will fold the new tx in after insertion.
-    /// 3. Build a snapshot of every current root's package
-    ///    `(pkg_fee, pkg_vsize, pkg_size)`. For affected roots (containing
-    ///    the new tx after insertion), add the new tx's contribution.
-    /// 4. If the new tx has no ancestors at all, it forms its own root
-    ///    package containing only itself.
-    /// 5. Sort packages by ascending fee rate (sat/vB) and walk in order,
-    ///    simulating evictions until the projected total size is back
-    ///    under cap. If we hit a package that contains the new tx,
-    ///    reject — that's the runtime saying "the new tx is the next
-    ///    thing I'd evict". The conservative direction is correct:
-    ///    rejecting is always safe, accepting must be provably safe.
-    ///
-    /// Multi-root caveat: a tx whose parents live in two different roots
-    /// will, after insertion, *merge* those roots into one package
-    /// (because both can now reach the new tx as a common descendant).
-    /// This simulation treats them as separate packages and marks the
-    /// new tx as belonging to all of them. The result is conservative —
-    /// it can produce a spurious rejection in rare merge-shaped graphs
-    /// but cannot produce an incorrect acceptance.
+    /// Earlier versions sorted a one-off snapshot of root packages
+    /// instead: that counted a shared descendant once per root (over-
+    /// estimating the space freed) and broke fee-rate ties differently
+    /// from the real loop, so a tx could be accepted and then immediately
+    /// evicted by the loop it was certified against.
     fn check_capacity_admission(
         &self,
+        new_txid: Txid,
         new_size: usize,
         new_fee: u64,
         new_vsize: u64,
         our_ancestors: &HashSet<Txid>,
+        to_evict: &HashSet<Txid>,
     ) -> Result<(), MempoolError> {
+        let evicted_size: usize = to_evict.iter().filter_map(|t| self.txs.get(t)).map(|e| e.size).sum();
+        let mut total = self.total_size.saturating_sub(evicted_size).saturating_add(new_size);
         // Fast path: insertion fits without eviction.
-        if self.total_size.saturating_add(new_size) <= self.max_size {
+        if total <= self.max_size {
             return Ok(());
         }
 
-        // Roots that the new tx descends from. `our_ancestors` is the
-        // *transitive* closure (Phase 5), so the roots are the elements
-        // with empty `ancestors`.
-        let mut affected_roots: HashSet<Txid> = HashSet::new();
-        for ancestor_txid in our_ancestors {
-            if let Some(ancestor) = self.txs.get(ancestor_txid) {
-                if ancestor.ancestors.is_empty() {
-                    affected_roots.insert(*ancestor_txid);
-                }
+        struct Node {
+            fee: u64,
+            vsize: u64,
+            size: usize,
+            root: bool,
+            descendants: Vec<Txid>,
+        }
+        // Roots never change: removing a root also removes every tx that
+        // has it as an ancestor. Descendant lists may name removed txs;
+        // sums skip them, as `evict_lowest_package` skips missing entries.
+        let mut nodes: HashMap<Txid, Node> = self
+            .txs
+            .iter()
+            .filter(|(t, _)| !to_evict.contains(*t))
+            .map(|(t, e)| {
+                (
+                    *t,
+                    Node {
+                        fee: e.fee,
+                        vsize: e.vsize,
+                        size: e.size,
+                        root: e.ancestors.is_empty(),
+                        descendants: e.descendants.iter().copied().collect(),
+                    },
+                )
+            })
+            .collect();
+        for a in our_ancestors {
+            if let Some(n) = nodes.get_mut(a) {
+                n.descendants.push(new_txid);
             }
         }
+        nodes.insert(
+            new_txid,
+            Node {
+                fee: new_fee,
+                vsize: new_vsize,
+                size: new_size,
+                root: our_ancestors.is_empty(),
+                descendants: Vec::new(),
+            },
+        );
 
-        struct PkgSnapshot {
-            pkg_fee: u64,
-            pkg_vsize: u64,
-            pkg_size: usize,
-            contains_new: bool,
-        }
-
-        let mut packages: Vec<PkgSnapshot> = Vec::with_capacity(self.txs.len() / 4 + 1);
-        let mut new_tx_in_some_package = false;
-
-        for (txid, entry) in &self.txs {
-            if !entry.ancestors.is_empty() {
-                continue;
-            }
-            let mut pkg_fee = entry.fee;
-            let mut pkg_vsize = entry.vsize;
-            let mut pkg_size = entry.size;
-            for d in &entry.descendants {
-                if let Some(de) = self.txs.get(d) {
-                    pkg_fee = pkg_fee.saturating_add(de.fee);
-                    pkg_vsize = pkg_vsize.saturating_add(de.vsize);
-                    pkg_size = pkg_size.saturating_add(de.size);
-                }
-            }
-
-            let contains_new = affected_roots.contains(txid);
-            if contains_new {
-                pkg_fee = pkg_fee.saturating_add(new_fee);
-                pkg_vsize = pkg_vsize.saturating_add(new_vsize);
-                pkg_size = pkg_size.saturating_add(new_size);
-                new_tx_in_some_package = true;
-            }
-
-            packages.push(PkgSnapshot {
-                pkg_fee,
-                pkg_vsize,
-                pkg_size,
-                contains_new,
-            });
-        }
-
-        // No ancestors → the new tx becomes its own root package. (Or
-        // we somehow failed to attach it to any existing root, which
-        // shouldn't happen but is harmless to treat the same way.)
-        if !new_tx_in_some_package {
-            packages.push(PkgSnapshot {
-                pkg_fee: new_fee,
-                pkg_vsize: new_vsize,
-                pkg_size: new_size,
-                contains_new: true,
-            });
-        }
-
-        // Sort by ascending package rate (sat/vB). NaN is impossible
-        // because pkg_vsize is always > 0 for any non-empty tx.
-        packages.sort_by(|a, b| {
-            let ra = a.pkg_fee as f64 / a.pkg_vsize.max(1) as f64;
-            let rb = b.pkg_fee as f64 / b.pkg_vsize.max(1) as f64;
-            ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Walk packages worst-first, simulating evictions until we'd be
-        // under the cap. If we reach a package containing the new tx
-        // before that, reject.
-        let mut projected_total = self.total_size.saturating_add(new_size);
+        let package = |nodes: &HashMap<Txid, Node>, root: &Txid| -> (u64, u64) {
+            let n = &nodes[root];
+            n.descendants
+                .iter()
+                .filter_map(|d| nodes.get(d))
+                .fold((n.fee, n.vsize), |(f, v), d| (f.saturating_add(d.fee), v.saturating_add(d.vsize)))
+        };
         let new_fee_rate = new_fee as f64 / new_vsize.max(1) as f64;
-        for pkg in &packages {
-            if projected_total <= self.max_size {
-                return Ok(());
-            }
-            if pkg.contains_new {
-                // The eviction loop would target the new tx. Report the
-                // smallest *surviving* package rate so the caller knows
-                // what the new tx would have to beat to be admitted.
-                let min_surviving = packages
+        while total > self.max_size {
+            let roots: Vec<(Txid, u64, u64)> = nodes
+                .iter()
+                .filter(|(_, n)| n.root)
+                .map(|(t, _)| {
+                    let (fee, vsize) = package(&nodes, t);
+                    (*t, fee, vsize)
+                })
+                .collect();
+            let Some(victim) = pick_eviction_victim(roots.iter().copied()) else {
+                break;
+            };
+            let contains_new =
+                |root: &Txid| *root == new_txid || nodes[root].descendants.contains(&new_txid);
+            if contains_new(&victim) {
+                // The loop would evict the new tx. Report the lowest
+                // package rate it would have had to beat.
+                let min_pkg_fee_rate = roots
                     .iter()
-                    .filter(|p| !p.contains_new)
-                    .map(|p| p.pkg_fee as f64 / p.pkg_vsize.max(1) as f64)
+                    .filter(|(t, _, _)| !contains_new(t))
+                    .map(|(_, f, v)| *f as f64 / (*v).max(1) as f64)
                     .fold(f64::INFINITY, f64::min);
-                let min_pkg_fee_rate = if min_surviving.is_finite() {
-                    min_surviving
-                } else {
-                    0.0
-                };
                 return Err(MempoolError::MempoolFull {
                     new_fee_rate,
-                    min_pkg_fee_rate,
+                    min_pkg_fee_rate: if min_pkg_fee_rate.is_finite() { min_pkg_fee_rate } else { 0.0 },
                 });
             }
-            projected_total = projected_total.saturating_sub(pkg.pkg_size);
-        }
-
-        // Walked every package and still over cap (only possible if the
-        // new tx's package is the very last one, which the loop above
-        // would already have caught — but be defensive).
-        if projected_total > self.max_size {
-            return Err(MempoolError::MempoolFull {
-                new_fee_rate,
-                min_pkg_fee_rate: 0.0,
-            });
+            let members: Vec<Txid> = std::iter::once(victim)
+                .chain(nodes[&victim].descendants.iter().copied())
+                .collect();
+            for m in members {
+                if let Some(n) = nodes.remove(&m) {
+                    total -= n.size;
+                }
+            }
         }
         Ok(())
     }
@@ -1263,43 +1230,27 @@ impl Mempool {
     /// descendants while leaving the parent itself. Always evict at the
     /// root and the package leaves together.
     ///
+    /// The victim is chosen by `pick_eviction_victim`, which
+    /// `check_capacity_admission` replays exactly.
+    ///
     /// Returns true if a package was evicted (used by the capacity loop in
     /// `accept_tx_internal` to detect a stuck state).
     fn evict_lowest_package(&mut self) -> bool {
-        // A "root" is a tx with no ancestors in the mempool. Every
-        // package is rooted at one or more roots; an eviction starting at
-        // any root removes the smallest meaningful package.
-        let mut worst_root: Option<(Txid, f64)> = None;
-        for (txid, entry) in &self.txs {
-            if !entry.ancestors.is_empty() {
-                continue;
-            }
-            // Package = self + all descendants. Use vsize so the
-            // selection criterion matches the per-tx fee_rate (sat/vB)
-            // and CPFP packages with high-fee children outrank unrelated
-            // standalone txs at the same raw fee.
-            let mut pkg_fee = entry.fee;
-            let mut pkg_vsize = entry.vsize;
-            for d in &entry.descendants {
-                if let Some(de) = self.txs.get(d) {
-                    pkg_fee = pkg_fee.saturating_add(de.fee);
-                    pkg_vsize = pkg_vsize.saturating_add(de.vsize);
-                }
-            }
-            if pkg_vsize == 0 {
-                continue;
-            }
-            let pkg_rate = pkg_fee as f64 / pkg_vsize as f64;
-            match worst_root {
-                None => worst_root = Some((*txid, pkg_rate)),
-                Some((_, best_rate)) if pkg_rate < best_rate => {
-                    worst_root = Some((*txid, pkg_rate))
-                }
-                _ => {}
-            }
-        }
+        // A "root" is a tx with no ancestors in the mempool. Package =
+        // self + all descendants. Use vsize so the selection criterion
+        // matches the per-tx fee_rate (sat/vB) and CPFP packages with
+        // high-fee children outrank unrelated standalone txs at the same
+        // raw fee.
+        let roots = self.txs.iter().filter(|(_, e)| e.ancestors.is_empty()).map(|(txid, e)| {
+            let (fee, vsize) = e
+                .descendants
+                .iter()
+                .filter_map(|d| self.txs.get(d))
+                .fold((e.fee, e.vsize), |(f, v), d| (f.saturating_add(d.fee), v.saturating_add(d.vsize)));
+            (*txid, fee, vsize)
+        });
 
-        if let Some((txid, _)) = worst_root {
+        if let Some(txid) = pick_eviction_victim(roots) {
             debug!("Mempool: evicting lowest-package root {}", txid);
             self.evict_with_descendants(&txid);
             true
@@ -1397,6 +1348,29 @@ impl Mempool {
             one_forty_four_blocks: fee_at_block(144),
         }
     }
+}
+
+/// Which root package capacity eviction drops next, from `(root txid,
+/// package fee, package vsize)`: the lowest package fee rate, compared
+/// exactly (`fee_a * vsize_b` vs `fee_b * vsize_a`), ties broken by the
+/// smaller txid. Deterministic (not HashMap order), so the admission
+/// check's replay and the real eviction loop always pick the same root.
+fn pick_eviction_victim(roots: impl Iterator<Item = (Txid, u64, u64)>) -> Option<Txid> {
+    let mut worst: Option<(Txid, u64, u64)> = None;
+    for (txid, fee, vsize) in roots {
+        let is_worse = match worst {
+            None => true,
+            Some((w_txid, w_fee, w_vsize)) => {
+                let this = fee as u128 * w_vsize.max(1) as u128;
+                let that = w_fee as u128 * vsize.max(1) as u128;
+                this < that || (this == that && txid < w_txid)
+            }
+        };
+        if is_worse {
+            worst = Some((txid, fee, vsize));
+        }
+    }
+    worst.map(|(txid, _, _)| txid)
 }
 
 /// Mempool entry information exposed to the wallet RPC.
