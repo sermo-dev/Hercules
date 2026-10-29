@@ -187,3 +187,11 @@ About 3–4 days. BIP68 with time-based locks and the P2SH/witness sigop countin
 ## Roadmap position
 
 Safety tier: **022 → 023 → 024 → 027 → 025/026**. It can run in parallel with 025 once 027's fixtures exist.
+
+## Status (2026-10-28)
+
+Merged in PR #26 (`1c1e0a2`), on top of the libbitcoinkernel switch (#25). `VALIDATION_RULES_VERSION` = 3.
+
+**Follow-ups:**
+- Not done: re-checking mempool finality and BIP 68 after a reorg (Core's `removeForReorg`). Belongs with ticket 025 (reorg hardening).
+- `mainnet_blocks_pass_contextual_rules` is ignored and needs `tools/fetch_mainnet_context.py` data. Re-run it when the contextual rules change.
