@@ -1265,4 +1265,206 @@ mod tests {
         ));
         assert!(matches!(c(MempoolError::ChainContext("x".into())), SubmitError::Internal(_)));
     }
+
+    // ── Data-path pass: every transition, its boundaries, restarts ───
+
+    #[test]
+    fn checktransaction_rejections_are_consensus_errors() {
+        let c = |e| SubmitError::from_mempool(e, false, 10, 10, vec![]);
+        assert_eq!(c(MempoolError::DuplicateInput { input_index: 1 }).kind(), "consensus");
+        assert_eq!(c(MempoolError::ValueOutOfRange { what: "output", amount: 1 }).kind(), "consensus");
+        // Even while lagging: a duplicate input is never "not synced yet".
+        assert_eq!(
+            SubmitError::from_mempool(MempoolError::DuplicateInput { input_index: 1 }, true, 5, 10, vec![]).kind(),
+            "consensus"
+        );
+    }
+
+    #[test]
+    fn backoff_schedule_doubles_from_a_minute_to_an_hour() {
+        let table = [(0u32, 60u64), (1, 60), (2, 120), (3, 240), (4, 480), (5, 960), (6, 1920), (7, 3600), (17, 3600), (u32::MAX, 3600)];
+        for (attempts, secs) in table {
+            assert_eq!(rebroadcast_backoff_secs(attempts), secs, "after {} attempts", attempts);
+        }
+    }
+
+    #[test]
+    fn propagated_resend_is_jittered_within_12_to_36_hours() {
+        let samples: Vec<u64> = (0..2_000).map(|_| propagated_resend_secs()).collect();
+        assert!(samples.iter().all(|s| (12 * 3600..=36 * 3600).contains(s)));
+        // Jittered, and spread over most of the window.
+        let (min, max) = (samples.iter().min().unwrap(), samples.iter().max().unwrap());
+        assert!(max - min > 20 * 3600, "{}..{}", min, max);
+    }
+
+    #[test]
+    fn due_is_inclusive_of_the_scheduled_second() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[0], 1_000).unwrap();
+        assert_eq!(s.due(1_000).unwrap().len(), 1, "due right away");
+        s.record_sent(&txid(1), 1_000).unwrap();
+        assert!(s.due(1_059).unwrap().is_empty());
+        assert_eq!(s.due(1_060).unwrap().len(), 1);
+        // A new foreground session makes pending txs due regardless.
+        s.record_sent(&txid(1), 1_060).unwrap();
+        s.make_all_due(1_061).unwrap();
+        assert_eq!(s.due(1_061).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expiry_and_retention_boundaries() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let t0 = 1_000_000;
+        s.track(txid(1), &[0], t0).unwrap();
+        s.expire(t0 + PENDING_EXPIRY_SECS - 1).unwrap();
+        assert_eq!(status(&s, &txid(1)), OwnTxStatus::Pending);
+        let at = t0 + PENDING_EXPIRY_SECS;
+        s.expire(at).unwrap();
+        assert_eq!(status(&s, &txid(1)), OwnTxStatus::Expired);
+        assert!(!s.is_active(&txid(1)));
+        // Terminal rows are kept for exactly the retention window.
+        s.expire(at + TERMINAL_RETENTION_SECS - 1).unwrap();
+        assert!(s.get(&txid(1)).unwrap().is_some());
+        s.expire(at + TERMINAL_RETENTION_SECS).unwrap();
+        assert!(s.get(&txid(1)).unwrap().is_none());
+    }
+
+    /// `track` revives an expired row (fresh expiry clock) but never
+    /// resurrects a confirmed, replaced or conflicted one.
+    #[test]
+    fn track_revives_only_expired_rows() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        for (i, st) in [
+            OwnTxStatus::Expired,
+            OwnTxStatus::Confirmed { height: 5 },
+            OwnTxStatus::Replaced { by: txid(99) },
+            OwnTxStatus::Conflicted { by: txid(98) },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let t = txid(i as u8 + 1);
+            s.track(t, &[0], 10).unwrap();
+            s.set_status(&t, &st, 20).unwrap();
+            assert!(!s.track(t, &[0], 30).unwrap(), "{:?}: not a new row", st);
+            let rec = s.get(&t).unwrap().unwrap();
+            if st == OwnTxStatus::Expired {
+                assert_eq!(rec.status, OwnTxStatus::Pending);
+                assert_eq!(rec.first_sent_at, 30, "expiry clock restarts");
+                assert!(s.is_pending(&t));
+            } else {
+                assert_eq!(rec.status, st);
+                assert!(!s.is_active(&t));
+            }
+        }
+    }
+
+    /// A reorg demotes confirmations and conflicts strictly above the fork
+    /// height; the fork block itself stays.
+    #[test]
+    fn demotion_is_strictly_above_the_fork_height() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let a = tx_spending(OutPoint { txid: txid(60), vout: 0 }, 1);
+        let b = tx_spending(OutPoint { txid: txid(61), vout: 0 }, 2);
+        let (ta, tb) = (track_tx(&s, &a), track_tx(&s, &b));
+        s.on_block(&block_of(vec![a]), 100, 1).unwrap();
+        s.on_block(&block_of(vec![b]), 101, 1).unwrap();
+        assert_eq!(s.demote_confirmed_above(101, 2).unwrap(), 0);
+        assert_eq!(s.demote_confirmed_above(100, 2).unwrap(), 1);
+        assert_eq!(status(&s, &ta), OwnTxStatus::Confirmed { height: 100 });
+        assert_eq!(status(&s, &tb), OwnTxStatus::Pending);
+        assert_eq!(s.due(2).unwrap().len(), 1, "demoted tx is due for rebroadcast");
+    }
+
+    #[test]
+    fn on_block_is_idempotent() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let prev = OutPoint { txid: txid(70), vout: 0 };
+        let mine = tx_spending(prev, 1);
+        let other = tx_spending(OutPoint { txid: txid(71), vout: 0 }, 2);
+        let (tm, to) = (track_tx(&s, &mine), track_tx(&s, &other));
+        let rival = tx_spending(OutPoint { txid: txid(71), vout: 0 }, 9);
+        let block = block_of(vec![mine, rival]);
+        assert_eq!(s.on_block(&block, 50, 1).unwrap(), 2);
+        assert_eq!(s.on_block(&block, 50, 2).unwrap(), 0);
+        assert_eq!(status(&s, &tm), OwnTxStatus::Confirmed { height: 50 });
+        assert!(matches!(status(&s, &to), OwnTxStatus::Conflicted { .. }));
+    }
+
+    #[test]
+    fn seen_peers_are_capped_and_inactive_txs_ignored() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[0], 0).unwrap();
+        for p in 0..MAX_SEEN_PEERS_PER_TX + 50 {
+            s.record_seen(&txid(1), &format!("10.0.{}.{}:8333", p / 256, p % 256), 1).unwrap();
+        }
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().seen_from_peers as usize, MAX_SEEN_PEERS_PER_TX);
+        assert_eq!(status(&s, &txid(1)), OwnTxStatus::Propagated);
+
+        s.set_status(&txid(1), &OwnTxStatus::Confirmed { height: 3 }, 2).unwrap();
+        s.record_seen(&txid(1), "1.2.3.4:8333", 3).unwrap();
+        s.record_seen(&txid(2), "1.2.3.4:8333", 3).unwrap(); // never tracked
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().seen_from_peers as usize, MAX_SEEN_PEERS_PER_TX);
+        assert!(s.get(&txid(2)).unwrap().is_none());
+    }
+
+    /// Every status, including a block-caused vs an RBF-caused conflict,
+    /// survives a restart with its in-memory caches rebuilt, and the
+    /// rebuilt watch set still settles a `replaced` / `expired` tx that
+    /// confirms after the restart.
+    #[test]
+    fn every_status_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("own.sqlite3");
+        let p = path.to_str().unwrap();
+        let txs: Vec<Transaction> = (0..7u8).map(|i| tx_spending(OutPoint { txid: txid(80 + i), vout: 0 }, i)).collect();
+        let ids: Vec<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
+        let expected = {
+            let s = OwnTxStore::open(p).unwrap();
+            for t in &txs {
+                track_tx(&s, t);
+            }
+            s.record_seen(&ids[1], "1.1.1.1:8333", 5).unwrap();
+            s.on_block(&block_of(vec![txs[2].clone()]), 300, 5).unwrap();
+            s.mark_replaced(&ids[3], ids[0], 5).unwrap();
+            let rival = tx_spending(OutPoint { txid: txid(84), vout: 0 }, 50);
+            s.on_block(&block_of(vec![rival]), 301, 5).unwrap();
+            s.set_status(&ids[5], &OwnTxStatus::Expired, 5).unwrap();
+            s.set_status(&ids[6], &OwnTxStatus::Conflicted { by: txid(1) }, 5).unwrap();
+            ids.iter().map(|t| status(&s, t)).collect::<Vec<_>>()
+        };
+        let s = OwnTxStore::open(p).unwrap();
+        assert_eq!(ids.iter().map(|t| status(&s, t)).collect::<Vec<_>>(), expected);
+        assert!(s.is_pending(&ids[0]));
+        assert!(s.is_active(&ids[1]) && !s.is_pending(&ids[1]));
+        for t in &ids[2..] {
+            assert!(!s.is_active(t));
+        }
+        // Block-caused conflict (301) is undone by a reorg below it; the
+        // other two conflict rows aren't.
+        assert_eq!(s.demote_confirmed_above(300, 6).unwrap(), 1);
+        assert_eq!(status(&s, &ids[4]), OwnTxStatus::Pending);
+        assert_eq!(status(&s, &ids[2]), OwnTxStatus::Confirmed { height: 300 });
+        // Replaced and expired txs that confirm after the restart settle.
+        assert_eq!(s.on_block(&block_of(vec![txs[3].clone(), txs[5].clone()]), 302, 7).unwrap(), 2);
+        assert_eq!(status(&s, &ids[3]), OwnTxStatus::Confirmed { height: 302 });
+        assert_eq!(status(&s, &ids[5]), OwnTxStatus::Confirmed { height: 302 });
+    }
+
+    /// Our child of someone else's transaction: when a rival spend of the
+    /// parent's input confirms, the parent can never confirm, so neither
+    /// can ours. It should be settled as conflicted, not rebroadcast for
+    /// 14 days spending an output that will never exist.
+    #[test]
+    #[ignore = "BUG: an own tx whose (non-own) mempool parent is conflicted out by a block stays pending until the 14-day expiry; on_block only sees own txs' direct inputs"]
+    fn own_child_of_a_conflicted_foreign_parent_is_settled() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let theirs = tx_spending(OutPoint { txid: txid(90), vout: 0 }, 1);
+        let mine = tx_spending(out(&theirs), 2);
+        let tm = track_tx(&s, &mine);
+        // The parent's input is spent by a different tx that confirms.
+        let rival = tx_spending(OutPoint { txid: txid(90), vout: 0 }, 3);
+        s.on_block(&block_of(vec![rival]), 400, 1).unwrap();
+        assert!(matches!(status(&s, &tm), OwnTxStatus::Conflicted { .. }), "{:?}", status(&s, &tm));
+    }
 }
