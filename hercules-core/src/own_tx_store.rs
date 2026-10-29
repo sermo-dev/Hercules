@@ -68,9 +68,15 @@ pub enum SubmitError {
     /// Bytes don't deserialize as a transaction.
     Decode(String),
     /// Consensus-invalid: bad script/signature, missing or spent input,
-    /// immature coinbase, not final, outputs exceed inputs. No node will
-    /// ever accept it.
+    /// immature coinbase, outputs exceed inputs. No node will ever accept
+    /// it.
     Consensus(String),
+    /// Timelocked: valid only once its nLockTime or a BIP 68 relative lock
+    /// is reached, which it isn't for the next block on top of the tip we
+    /// validate against (`validated_height`, which may lag the header tip
+    /// while the node catches up). Nothing was sent; the same bytes can be
+    /// submitted again later. Not a verdict that the tx is invalid.
+    NotYetFinal { reason: String, validated_height: u32, tip_height: u32 },
     /// Consensus-valid but fails network standardness (dust, non-standard
     /// output type, too heavy, too many unconfirmed ancestors), so peers
     /// would not relay it.
@@ -111,14 +117,61 @@ impl SubmitError {
                 validated_height,
                 tip_height,
             },
+            // A wallet sets nLockTime to the tip it sees (anti-fee-sniping).
+            // If that is the header tip and our UTXO set lags, the tx is
+            // final as soon as we catch up (ticket 026 judges finality at
+            // validated_height + 1, as Core's CheckFinalTxAtTip).
+            M::NonFinal { lock_time, .. }
+                if lagging
+                    && lock_time < crate::contextual_checks::LOCKTIME_THRESHOLD
+                    && lock_time <= tip_height =>
+            {
+                SubmitError::NotSynced {
+                    validated_height,
+                    tip_height,
+                }
+            }
+            M::NonFinal { lock_time, .. } => SubmitError::NotYetFinal {
+                reason: if lock_time < crate::contextual_checks::LOCKTIME_THRESHOLD {
+                    format!("its nLockTime is block height {}", lock_time)
+                } else {
+                    format!(
+                        "its nLockTime is time {} (compared with the median time of recent blocks)",
+                        lock_time
+                    )
+                },
+                validated_height,
+                tip_height,
+            },
+            M::NonBip68Final { min_height, min_time, .. } => SubmitError::NotYetFinal {
+                // The lock points cover all inputs; either or both can be
+                // set (-1 = none), so name every condition that applies.
+                reason: {
+                    let mut needs = Vec::new();
+                    if min_height >= 0 {
+                        needs.push(format!("a block after height {}", min_height));
+                    }
+                    if min_time >= 0 {
+                        needs.push(format!(
+                            "the median time of recent blocks to pass {}",
+                            min_time
+                        ));
+                    }
+                    format!(
+                        "an input's relative timelock (BIP 68) needs {}",
+                        needs.join(" and ")
+                    )
+                },
+                validated_height,
+                tip_height,
+            },
             M::CoinbaseTx
             | M::MalformedTx
             | M::MissingInput { .. }
             | M::ImmatureCoinbase { .. }
             | M::ScriptFailure { .. }
             | M::Inflation
-            | M::MathOverflow
-            | M::NonFinal { .. } => SubmitError::Consensus(msg),
+            | M::MathOverflow => SubmitError::Consensus(msg),
             M::OversizedTx { .. }
             | M::DustOutput { .. }
             | M::NonStandardScript { .. }
@@ -147,7 +200,7 @@ impl SubmitError {
             M::AlreadyInMempool => SubmitError::Internal(
                 "already in mempool (should be handled by caller)".into(),
             ),
-            M::UtxoLookup(s) => SubmitError::Internal(s),
+            M::UtxoLookup(s) | M::ChainContext(s) => SubmitError::Internal(s),
             // Our verifier failed, not the transaction (ticket 047).
             M::ScriptVerifierError { .. } => SubmitError::Internal(msg),
         }
@@ -158,6 +211,7 @@ impl SubmitError {
         match self {
             SubmitError::Decode(_) => "decode",
             SubmitError::Consensus(_) => "consensus",
+            SubmitError::NotYetFinal { .. } => "not_yet_final",
             SubmitError::NonStandard(_) => "non_standard",
             SubmitError::FeeTooLow { .. } => "fee_too_low",
             SubmitError::AbsurdFee { .. } => "absurd_fee",
@@ -174,6 +228,26 @@ impl std::fmt::Display for SubmitError {
         match self {
             SubmitError::Decode(s) => write!(f, "invalid transaction encoding: {}", s),
             SubmitError::Consensus(s) => write!(f, "consensus-invalid: {}", s),
+            SubmitError::NotYetFinal {
+                reason,
+                validated_height,
+                tip_height,
+            } => {
+                write!(
+                    f,
+                    "timelocked, not valid yet: {}, not reached for the next block \
+                     (after height {}); nothing was sent, submit it again once the lock passes",
+                    reason, validated_height
+                )?;
+                if validated_height < tip_height {
+                    write!(
+                        f,
+                        " (this node is still catching up to height {}, so it may already be valid)",
+                        tip_height
+                    )?;
+                }
+                Ok(())
+            }
             SubmitError::NonStandard(s) => {
                 write!(f, "non-standard (peers will not relay it): {}", s)
             }
@@ -1149,5 +1223,44 @@ mod tests {
             SubmitError::from_mempool(missing(), true, 5, 10, vec![]),
             SubmitError::NotSynced { validated_height: 5, tip_height: 10 }
         );
+
+        // Same for a height locktime the header tip already satisfies
+        // (ticket 026). Beyond the header tip it is timelocked: not valid
+        // *yet*, never a consensus verdict.
+        let non_final = |lock_time| MempoolError::NonFinal { lock_time, current_height: 5 };
+        assert_eq!(
+            SubmitError::from_mempool(non_final(10), true, 5, 10, vec![]),
+            SubmitError::NotSynced { validated_height: 5, tip_height: 10 }
+        );
+        let lagging = SubmitError::from_mempool(non_final(11), true, 5, 10, vec![]);
+        assert!(matches!(lagging, SubmitError::NotYetFinal { validated_height: 5, tip_height: 10, .. }));
+        assert_eq!(lagging.kind(), "not_yet_final");
+        let text = lagging.to_string();
+        assert!(text.contains("height 11") && text.contains("catching up"), "{}", text);
+        assert!(!text.contains("consensus"), "{}", text);
+
+        let synced = c(non_final(11));
+        assert!(matches!(synced, SubmitError::NotYetFinal { .. }), "{:?}", synced);
+        assert!(!synced.to_string().contains("catching up"), "{}", synced);
+        let time_locked = c(MempoolError::NonFinal { lock_time: 1_700_000_000, current_height: 10 });
+        assert!(time_locked.to_string().contains("time 1700000000"), "{}", time_locked);
+
+        let bip68 = c(MempoolError::NonBip68Final { min_height: 20, min_time: -1, current_height: 10 });
+        assert!(matches!(bip68, SubmitError::NotYetFinal { .. }), "{:?}", bip68);
+        assert!(bip68.to_string().contains("after height 20"), "{}", bip68);
+        let bip68_time = c(MempoolError::NonBip68Final { min_height: -1, min_time: 1_700_000_000, current_height: 10 });
+        assert!(bip68_time.to_string().contains("pass 1700000000"), "{}", bip68_time);
+        assert!(!bip68_time.to_string().contains("a block after height"), "{}", bip68_time);
+        let both = c(MempoolError::NonBip68Final { min_height: 20, min_time: 1_700_000_000, current_height: 10 });
+        assert!(
+            both.to_string().contains("after height 20 and the median time of recent blocks to pass 1700000000"),
+            "{}",
+            both
+        );
+        assert!(matches!(
+            crate::BroadcastError::from(bip68),
+            crate::BroadcastError::NotYetFinal { .. }
+        ));
+        assert!(matches!(c(MempoolError::ChainContext("x".into())), SubmitError::Internal(_)));
     }
 }

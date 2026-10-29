@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, OutPoint, TxOut};
+use bitcoin::{Amount, OutPoint, Sequence, TxOut};
 use tempfile::TempDir;
 
 use super::*;
@@ -775,6 +775,63 @@ fn catch_up_blocks_respects_time_budget_with_slow_peer() {
     assert_eq!(node.validated(), 10 + status.blocks_validated);
     // Budget plus at most one in-flight request, with slack for CI.
     assert!(elapsed < Duration::from_secs(5), "overran budget: {:?}", elapsed);
+}
+
+// ── Contextual rules (ticket 026) ────────────────────────────────────
+//
+// The rule-by-rule boundaries are in testkit::consensus_rules. These run
+// the time-based rules through the real sync path, where median-time-past
+// comes from the header store rather than the fixture.
+
+/// Coin confirmed at 102, spent with a 3-unit (1,536 s) BIP 68 time lock
+/// in block `spend_at`. The lock is first satisfied at 105 (see
+/// consensus_rules::csv_time_lock_boundary). Then 5 more blocks.
+fn csv_time_lock_chain(spend_at: u32) -> (FixtureChain, OutPoint) {
+    let mut c = FixtureChain::new();
+    c.mine(101);
+    let cb = c.coinbase_outpoint(1);
+    let v = c.block(1).txdata[0].output[0].value - Amount::from_sat(1_000);
+    let fund = c.spend(&[cb], vec![TxOut { value: v, script_pubkey: c.p2wpkh_script() }]);
+    c.mine_block(vec![fund.clone()]);
+    let coin = OutPoint::new(fund.compute_txid(), 0);
+    c.mine(spend_at - 1 - c.tip_height());
+    let tx = c.spend_with(
+        &[coin],
+        vec![TxOut { value: v - Amount::from_sat(1_000), script_pubkey: c.p2tr_script() }],
+        |tx| tx.input[0].sequence = Sequence(crate::contextual_checks::SEQUENCE_LOCKTIME_TYPE_FLAG | 3),
+    );
+    c.mine_block(vec![tx]);
+    c.mine(5);
+    (c, coin)
+}
+
+#[test]
+fn csv_time_lock_at_boundary_syncs() {
+    let (chain, coin) = csv_time_lock_chain(105);
+    let peer = MockPeer::spawn(&chain, vec![]);
+    let node = Node::new(&[&peer]);
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&chain));
+    assert!(ok, "did not sync: {:?}, validated {}", res, node.validated());
+    assert!(!node.has_utxo(&coin));
+    node.assert_utxos_match(&chain);
+}
+
+#[test]
+fn csv_time_lock_spent_early_is_never_connected() {
+    let (chain, coin) = csv_time_lock_chain(104);
+    let peer = MockPeer::spawn(&chain, vec![]);
+    let node = Node::new(&[&peer]);
+    let (reached, res) = node.sync_until(SYNC_TIMEOUT, |hs| {
+        hs.store.validated_height().unwrap_or(0) >= 103
+    });
+    assert!(reached, "never validated up to the parent: {:?}", res);
+    // Give sync a window to (wrongly) connect the early spend.
+    let (connected, _) = node.sync_until(Duration::from_secs(3), |hs| {
+        hs.store.validated_height().unwrap_or(0) >= 104
+    });
+    assert!(!connected, "block 104 with an unmet BIP 68 time lock was connected");
+    assert_eq!(node.validated(), 103);
+    assert!(node.has_utxo(&coin));
 }
 
 // ── Reorgs ───────────────────────────────────────────────────────────

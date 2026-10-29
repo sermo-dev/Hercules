@@ -197,15 +197,30 @@ impl HeaderStore {
         Ok(timestamps)
     }
 
+    /// Timestamps of the headers at heights `first..=last`, ascending, in
+    /// one query (median-time-past reads 11 per block). Missing heights
+    /// are simply absent; callers check the count.
+    pub fn get_timestamps_between(&self, first: u32, last: u32) -> Result<Vec<u32>, StoreError> {
+        let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT timestamp FROM headers WHERE height BETWEEN ?1 AND ?2 ORDER BY height",
+            )
+            .map_err(|e| StoreError(format!("prepare timestamps: {}", e)))?;
+        let rows = stmt
+            .query_map(params![first, last], |row| row.get(0))
+            .map_err(|e| StoreError(format!("query timestamps {}..={}: {}", first, last, e)))?
+            .collect::<Result<Vec<u32>, _>>()
+            .map_err(|e| StoreError(format!("read timestamp: {}", e)));
+        rows
+    }
+
     /// Get the timestamp of a header at a specific height.
     pub fn get_timestamp_at(&self, height: u32) -> Result<Option<u32>, StoreError> {
         let conn = self.conn.lock().map_err(|e| StoreError(format!("lock: {}", e)))?;
-        conn.query_row(
-            "SELECT timestamp FROM headers WHERE height = ?1",
-            params![height],
-            |row| row.get(0),
-        )
-        .optional()
+        conn.prepare_cached("SELECT timestamp FROM headers WHERE height = ?1")
+            .and_then(|mut stmt| stmt.query_row(params![height], |row| row.get(0)))
+            .optional()
         .map_err(|e| StoreError(format!("get timestamp at {}: {}", height, e)))
     }
 
@@ -216,14 +231,13 @@ impl HeaderStore {
             .lock()
             .map_err(|e| StoreError(format!("lock: {}", e)))?;
         let result = conn
-            .query_row(
-                "SELECT hash FROM headers WHERE height = ?1",
-                params![height],
-                |row| {
+            .prepare_cached("SELECT hash FROM headers WHERE height = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row(params![height], |row| {
                     let hash_bytes: Vec<u8> = row.get(0)?;
                     Ok(hash_bytes)
-                },
-            )
+                })
+            })
             .optional()
             .map_err(|e| StoreError(format!("get hash at {}: {}", height, e)))?;
 
@@ -689,6 +703,27 @@ mod tests {
         assert_eq!(timestamps[0], genesis.time); // genesis first (ascending)
         assert_eq!(timestamps[1], block1.time); // block 1 second
         assert!(timestamps[0] < timestamps[1]);
+    }
+
+    /// Ticket 026: median-time-past reads its window in one range query;
+    /// a gap must surface as an error, not a shorter window.
+    #[test]
+    fn timestamps_between_reads_a_range() {
+        use crate::contextual_checks::{median_time_past, HeaderTimes};
+        let store = HeaderStore::open(":memory:").unwrap();
+        let genesis = genesis_header();
+        let block1 = block1_header();
+        store.store_headers(&[genesis], 0).unwrap();
+        store.store_headers(&[block1], 1).unwrap();
+
+        assert_eq!(store.get_timestamps_between(0, 1).unwrap(), vec![genesis.time, block1.time]);
+        assert_eq!(store.timestamps_between(0, 1).unwrap(), vec![genesis.time, block1.time]);
+        assert!(store.timestamps_between(0, 2).is_err(), "missing height 2");
+        assert_eq!(median_time_past(&store, 1).unwrap(), block1.time as i64);
+        assert!(median_time_past(&store, 2).is_err());
+        use bitcoin::hashes::Hash as _;
+        assert_eq!(store.header_id_at(1), Some(block1.block_hash().to_byte_array()));
+        assert_eq!(store.header_id_at(2), None);
     }
 
     #[test]

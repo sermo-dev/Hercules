@@ -14,7 +14,7 @@ use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, MdbError, PutFl
 use sha2::{Digest, Sha256};
 use blvm_muhash::{MuHash3072, serialize_coin_for_muhash};
 
-use log::{info, warn};
+use log::{error, info, warn};
 
 use crate::assumeutxo::SnapshotAnchor;
 
@@ -773,9 +773,37 @@ impl UtxoSet {
                 };
                 let utxo_k = utxo_key(&txid_bytes, vout);
                 let utxo_v = encode_utxo_value(&entry);
-                self.utxos
-                    .put(&mut wtxn, &utxo_k, &utxo_v)
-                    .map_err(lmdb("put utxo"))?;
+                // BIP 30 guard (ticket 026). An unspent output with this
+                // txid:vout already existing would be a BIP 30 violation,
+                // which BIP 34 rules out below BIP34_IMPLIES_BIP30_LIMIT
+                // (Core skips the explicit check there too, and treats an
+                // overwrite as a logic error in AddCoins). NO_OVERWRITE
+                // costs nothing on the normal path; if it ever trips we
+                // log, assert in debug builds, and keep the old overwrite
+                // behavior so release builds don't wedge the chain.
+                match self.utxos.put_with_flags(
+                    &mut wtxn,
+                    PutFlags::NO_OVERWRITE,
+                    &utxo_k,
+                    &utxo_v,
+                ) {
+                    Ok(()) => {}
+                    Err(heed::Error::Mdb(MdbError::KeyExist)) => {
+                        error!(
+                            "apply_block {}: output {}:{} overwrites an unspent output (BIP 30)",
+                            height, txid, vout
+                        );
+                        debug_assert!(
+                            false,
+                            "BIP 30: block {} overwrites unspent {}:{}",
+                            height, txid, vout
+                        );
+                        self.utxos
+                            .put(&mut wtxn, &utxo_k, &utxo_v)
+                            .map_err(lmdb("put utxo"))?;
+                    }
+                    Err(e) => return Err(lmdb("put utxo")(e)),
+                }
 
                 let hi_k = height_index_key(height, &txid_bytes, vout);
                 self.height_index
@@ -2236,6 +2264,18 @@ mod tests {
         let d = UtxoSet::open(path).unwrap();
         assert_eq!(d.count().unwrap(), expected);
         assert!(d.map_size() as u64 >= data_len);
+    }
+
+    /// BIP 30 guard (ticket 026): re-creating an unspent output trips the
+    /// debug assertion instead of silently overwriting it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "BIP 30")]
+    fn apply_block_overwriting_unspent_output_asserts() {
+        let (utxo, _dir) = fresh();
+        utxo.apply_block(&genesis_block(), 0).unwrap();
+        // Same coinbase again: same txid, output 0 still unspent.
+        let _ = utxo.apply_block(&genesis_block(), 1);
     }
 
     #[test]

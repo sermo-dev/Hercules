@@ -130,12 +130,15 @@ const FORK_FOLLOW_BUDGET: Duration = Duration::from_secs(10 * 60);
 /// validation could flip a verdict, so `failed_blocks` rows recorded under
 /// the old rules are dropped at startup and those blocks reconsidered
 /// (ticket 024). Combined with the crate version in `rules_tag`, so any
-/// app update reconsiders them too.
+/// app update reconsiders them too. No test pins the number (tests go
+/// through `rules_tag()`), so a bump is this one line.
 ///
-/// 2: script verification moved from libbitcoinconsensus v26 to
-/// libbitcoinkernel (ticket 047), and the verifier's errors are classified
-/// through `ScriptVerifyError` instead of `bitcoinconsensus::Error`.
-const VALIDATION_RULES_VERSION: u32 = 2;
+/// History:
+/// - 2: script verification moved from libbitcoinconsensus v26 to
+///   libbitcoinkernel (ticket 047), and the verifier's errors are classified
+///   through `ScriptVerifyError` instead of `bitcoinconsensus::Error`.
+/// - 3: ticket 026 (contextual consensus rules; BIP 34 accepts heights 1..=16).
+const VALIDATION_RULES_VERSION: u32 = 3;
 
 /// Rules tag stored with each `failed_blocks` row. Includes the script
 /// backend, so switching between libbitcoinkernel and the legacy library
@@ -1360,7 +1363,7 @@ impl HeaderSync {
             let mut pool = self.mempool.lock().unwrap();
             let conflicts = pool.conflicting_txids(&tx);
             (
-                pool.accept_own_tx(tx.clone(), &self.utxo, validated_height),
+                pool.accept_own_tx(tx.clone(), &self.utxo, validated_height, &self.store),
                 conflicts,
             )
         };
@@ -1500,7 +1503,7 @@ impl HeaderSync {
                 return true;
             }
             let conflicts = pool.conflicting_txids(&tx);
-            match pool.accept_own_tx(tx, &self.utxo, validated_height) {
+            match pool.accept_own_tx(tx, &self.utxo, validated_height, &self.store) {
                 Ok(_) => conflicts,
                 Err(e) => {
                     // Inputs not validated yet, or a conflict that a block
@@ -1770,7 +1773,7 @@ impl HeaderSync {
         let result = (|| -> Result<(), BlockValidationError> {
             check_block_mutation(block, height, self.params)?;
             validate_block(block, height, self.params)?;
-            validate_block_scripts(block, height, &self.utxo, self.params)
+            validate_block_scripts(block, height, &self.utxo, self.params, &self.store)
         })();
         match result.map_err(BlockFailure::from) {
             Err(BlockFailure::Consensus(reason)) => match self.utxo_out_of_step(height - 1) {
@@ -4105,7 +4108,7 @@ impl HeaderSync {
 
         let result = {
             let mut mempool = self.mempool.lock().unwrap();
-            mempool.accept_tx(tx, &self.utxo, validated_height)
+            mempool.accept_tx(tx, &self.utxo, validated_height, &self.store)
         }; // mempool lock released before acquiring relay_queue lock
 
         match result {

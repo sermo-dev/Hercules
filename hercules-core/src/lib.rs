@@ -11,6 +11,7 @@ mod assumeutxo;
 mod block_store;
 mod block_validation;
 mod chain_params;
+mod contextual_checks;
 mod mempool;
 mod own_tx_store;
 mod p2p;
@@ -1536,6 +1537,8 @@ pub enum BroadcastError {
     Invalid { msg: String },
     #[error("Consensus-invalid: {msg}")]
     Consensus { msg: String },
+    #[error("Not valid yet: {msg}")]
+    NotYetFinal { msg: String },
     #[error("Non-standard: {msg}")]
     NonStandard { msg: String },
     #[error("Fee too low: {msg}")]
@@ -1559,6 +1562,7 @@ impl From<own_tx_store::SubmitError> for BroadcastError {
         match e {
             S::Decode(_) => BroadcastError::Invalid { msg },
             S::Consensus(_) => BroadcastError::Consensus { msg },
+            S::NotYetFinal { .. } => BroadcastError::NotYetFinal { msg },
             S::NonStandard(_) => BroadcastError::NonStandard { msg },
             S::FeeTooLow { .. } => BroadcastError::FeeTooLow { msg },
             S::AbsurdFee { .. } => BroadcastError::AbsurdFee { msg },

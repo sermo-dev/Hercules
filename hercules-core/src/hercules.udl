@@ -242,6 +242,7 @@ interface HerculesError {
 interface BroadcastError {
     Invalid(string msg);
     Consensus(string msg);
+    NotYetFinal(string msg);
     NonStandard(string msg);
     FeeTooLow(string msg);
     AbsurdFee(string msg);

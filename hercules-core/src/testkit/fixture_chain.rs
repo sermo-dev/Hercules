@@ -28,6 +28,7 @@ use bitcoin::{
 
 use crate::block_validation::block_subsidy;
 use crate::chain_params::ChainParams;
+use crate::contextual_checks::HeaderTimes;
 
 /// Seconds between fixture block timestamps.
 const BLOCK_SPACING: u32 = 600;
@@ -89,6 +90,11 @@ impl FixtureChain {
 
     pub fn blocks(&self) -> &[Block] {
         &self.blocks
+    }
+
+    /// The output at `op` (any output ever created on this chain).
+    pub fn output(&self, op: &OutPoint) -> &TxOut {
+        self.outputs.get(op).expect("output: unknown outpoint")
     }
 
     /// Outpoint of the coinbase output at `height` (always vout 0).
@@ -241,6 +247,17 @@ impl FixtureChain {
     /// Build and sign a transaction spending `prevs` (outputs on this chain
     /// paying the test key, P2WPKH or P2TR) into `outputs`.
     pub fn spend(&self, prevs: &[OutPoint], outputs: Vec<TxOut>) -> Transaction {
+        self.spend_with(prevs, outputs, |_| {})
+    }
+
+    /// `spend`, letting `edit` set fields the signatures commit to
+    /// (version, nLockTime, nSequence) before signing.
+    pub fn spend_with(
+        &self,
+        prevs: &[OutPoint],
+        outputs: Vec<TxOut>,
+        edit: impl FnOnce(&mut Transaction),
+    ) -> Transaction {
         let prev_outs: Vec<TxOut> = prevs
             .iter()
             .map(|p| self.outputs.get(p).cloned().expect("spend: unknown outpoint"))
@@ -259,6 +276,7 @@ impl FixtureChain {
                 .collect(),
             output: outputs,
         };
+        edit(&mut tx);
 
         let secp = Secp256k1::new();
         let keypair = self.keypair();
@@ -334,11 +352,11 @@ impl FixtureChain {
     /// Same header (so same hash), *all* witnesses removed, the coinbase's
     /// reserved value included: a block with no witness data at all that
     /// still carries a witness commitment. rust-bitcoin's
-    /// `check_witness_commitment` (and so `validate_block`) accepts that
-    /// shape; Core's `CheckWitnessMalleation`, which Hercules' sync paths
-    /// now run first as `check_block_mutation`, flags it as mutated. Without
-    /// that check it would only fail in script validation and be mistaken
-    /// for a consensus-invalid block (ticket 024).
+    /// `check_witness_commitment` accepts that shape; Core's
+    /// `CheckWitnessMalleation`, which Hercules runs as
+    /// `check_block_mutation` (and inside `validate_block`), flags it as
+    /// mutated. Without that check it would only fail in script validation
+    /// and be mistaken for a consensus-invalid block (ticket 024).
     pub fn strip_all_witness(block: &Block) -> Block {
         let mut b = block.clone();
         for tx in b.txdata.iter_mut() {
@@ -452,6 +470,17 @@ impl FixtureChain {
     }
 }
 
+/// Header timestamps for the block-level time rules (ticket 026), so
+/// fixture tests can validate without a header store.
+impl HeaderTimes for FixtureChain {
+    fn timestamp_at(&self, height: u32) -> Result<u32, String> {
+        self.blocks
+            .get(height as usize)
+            .map(|b| b.header.time)
+            .ok_or_else(|| format!("no fixture block at height {}", height))
+    }
+}
+
 fn index_outputs(outputs: &mut HashMap<OutPoint, TxOut>, block: &Block) {
     for tx in &block.txdata {
         let txid = tx.compute_txid();
@@ -489,7 +518,7 @@ mod tests {
         for h in 1..=chain.tip_height() {
             let block = chain.block(h);
             validate_block(block, h, p)?;
-            validate_block_scripts(block, h, &utxo, p)?;
+            validate_block_scripts(block, h, &utxo, p, chain)?;
             utxo.apply_block(block, h).unwrap();
         }
         Ok((dir, utxo))
@@ -712,21 +741,24 @@ mod tests {
     }
 
     /// Bitcoin Core's regtest enforces BIP 34 from height 1, encoding
-    /// heights 1..=16 as `OP_1..OP_16`. Hercules' BIP 34 check
-    /// (rust-bitcoin `bip34_block_height`) only accepts a minimal data push,
-    /// and a data push of 1..=16 is never minimal, so it rejects every such
-    /// block. `ChainParams::regtest()` therefore starts BIP 34 at 17.
-    /// Unreachable on mainnet (BIP 34 activates at 227,931), but it would
-    /// bite a bitcoind-differential suite.
+    /// heights 1..=16 as `OP_1..OP_16`. Hercules' old BIP 34 check
+    /// (rust-bitcoin `bip34_block_height`) only accepted a minimal data
+    /// push and rejected these; ticket 026 ports Core's byte-prefix check,
+    /// and regtest now activates BIP 34 at 1 like Core.
     #[test]
-    #[ignore = "ticket 026: BIP 34 check rejects Core's OP_N height encoding (heights 1..=16)"]
     fn bip34_accepts_core_encoding_at_low_heights() {
         let mut c = FixtureChain::new();
-        c.mine(1);
-        let core_regtest = Box::leak(Box::new(ChainParams {
-            bip34_height: 1,
-            ..*ChainParams::regtest()
-        }));
-        validate_block(c.block(1), 1, core_regtest).expect("Core-encoded height 1 coinbase");
+        c.mine(20);
+        let p = FixtureChain::params();
+        assert_eq!(p.bip34_height, 1);
+        for h in 1..=20 {
+            validate_block(c.block(h), h, p)
+                .unwrap_or_else(|e| panic!("Core-encoded height {} coinbase: {}", h, e));
+        }
+        // The encoding is checked, not just tolerated: block 5 at height 6.
+        assert!(matches!(
+            validate_block(c.block(5), 6, p),
+            Err(BlockValidationError::BadCoinbaseHeight { height: 6, .. })
+        ));
     }
 }
