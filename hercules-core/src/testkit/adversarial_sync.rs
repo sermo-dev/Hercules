@@ -600,3 +600,40 @@ fn bans_and_scores_survive_reopening_the_peer_store() {
     assert!(!bans.contains_key("198.51.100.2:8333"), "expired ban loaded");
     assert_eq!(s.load_score("198.51.100.3:8333").unwrap(), Some(37));
 }
+
+// ── Nightly soak ────────────────────────────────────────────────────
+
+/// A long initial sync (3,000 blocks, two retargets of headers) through
+/// a crowd of hostile peers the node is supposed to survive: garbage,
+/// hang-ups, a slow peer, wrong magic, a mutated block, a withheld block,
+/// and a tip liar. Ends with the exact UTXO set and no honest peer
+/// banned or penalized below a fresh score.
+#[test]
+#[ignore = "heavy: ~1-2 min of block validation; nightly CI runs `cargo test --lib -- --ignored heavy_`"]
+fn heavy_long_sync_through_a_hostile_crowd() {
+    let c = chain(3_000);
+    let honest: Vec<MockPeer> = (0..3).map(|_| MockPeer::spawn(&c, vec![])).collect();
+    let hostile = vec![
+        MockPeer::spawn(&c, vec![Behavior::SendGarbage]),
+        MockPeer::spawn(&c, vec![Behavior::Disconnect]),
+        MockPeer::spawn(&c, vec![Behavior::DelayResponses(Duration::from_millis(5))]),
+        MockPeer::spawn(&c, vec![Behavior::WrongMagic]),
+        MockPeer::spawn(&c, vec![Behavior::ServeMutated(1_500)]),
+        MockPeer::spawn(&c, vec![Behavior::WithholdBlock(2_200)]),
+        MockPeer::spawn(&c, vec![Behavior::InflatedHeight(3_500), Behavior::WithholdHeaders]),
+    ];
+    let mut all: Vec<&MockPeer> = hostile.iter().collect();
+    all.extend(honest.iter());
+    let node = Node::new(&all);
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, |hs| hs.store.validated_height().unwrap_or(0) == c.tip_height());
+    assert!(ok, "did not sync through the crowd: {:?}, tip {:?}, validated {}", res, node.tip(), node.validated());
+    assert_eq!(node.tip(), (c.tip_height(), c.tip_hash()));
+    node.assert_utxos_match(&c);
+    for p in &honest {
+        assert!(!node.is_banned(&p.addr()), "honest {} banned", p.addr());
+        assert!(node.score(&p.addr()).map_or(true, |s| s >= FRESH_SCORE), "honest {} penalized", p.addr());
+    }
+    // It only misbehaves when asked; if it was, it must be gone for good.
+    let asked = hostile[3].log().iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_) | NetworkMessage::Ping(_)));
+    assert!(!asked || node.is_banned(&hostile[3].addr()), "wrong-magic peer answered and was not banned");
+}
