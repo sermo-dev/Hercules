@@ -3125,3 +3125,8 @@ mod tests {
         assert!(!utxo.has_utxos_at_height(0).unwrap());
     }
 }
+
+/// Snapshot-format, apply/rollback and corruption edge cases.
+#[cfg(test)]
+#[path = "utxo_tests.rs"]
+mod edge_tests;
