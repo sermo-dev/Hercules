@@ -531,8 +531,11 @@ impl Mempool {
             };
 
             // Coinbase maturity (only confirmed coinbases can be flagged
-            // here; mempool parents synthesize is_coinbase=false above).
-            if utxo.is_coinbase && current_height.saturating_sub(utxo.height) < COINBASE_MATURITY {
+            // here; mempool parents synthesize is_coinbase=false above),
+            // judged for the next block like finality and BIP 68: Core's
+            // CheckTxInputs gets spend height = tip + 1, and block
+            // validation allows the spend at coin height + 100.
+            if utxo.is_coinbase && next_height.saturating_sub(utxo.height) < COINBASE_MATURITY {
                 return Err(MempoolError::ImmatureCoinbase {
                     input_index: input_idx,
                     coinbase_height: utxo.height,
