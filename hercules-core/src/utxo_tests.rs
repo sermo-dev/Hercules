@@ -328,6 +328,27 @@ fn independent_encoder_matches_write_snapshot_and_round_trips() {
         .unwrap();
 }
 
+/// The converter (`src/bin/convert_snapshot.rs`) and the loader must hash
+/// identically, or every snapshot it produces is rejected (or worse, a
+/// hash mismatch is papered over). The three coins of
+/// `tests/convert_snapshot_test.rs::build_core_dump`, inserted through the
+/// library, hash to the value that test pins for the converter's header.
+#[test]
+fn compute_hash_matches_the_converter_golden_value() {
+    const GOLDEN_HASH: &str = "15087b9e28011c20d17569a2303049e1916d080070972d9439707d3cafda8d88";
+    let (utxo, _d, _) = fresh();
+    let script = |pre: &[u8], body: &[u8], post: &[u8]| [pre, body, post].concat();
+    let coins = [
+        ([0x01; 32], 0, 50_000, 100, true, script(&[0x76, 0xa9, 0x14], &[0xaa; 20], &[0x88, 0xac])),
+        ([0x01; 32], 2, 1_000, 100, true, script(&[0xa9, 0x14], &[0xcc; 20], &[0x87])),
+        ([0x02; 32], 1, 10_000, 200, false, script(&[0x00, 0x20], &[0xbb; 32], &[])),
+    ];
+    for (txid, vout, amount, height, is_coinbase, script_pubkey) in coins {
+        utxo.test_insert_utxo(txid, vout, UtxoEntry { amount, script_pubkey, height, is_coinbase }).unwrap();
+    }
+    assert_eq!(hex::encode(utxo.compute_hash().unwrap()), GOLDEN_HASH);
+}
+
 #[test]
 fn snapshot_with_zero_entries_loads_and_records_the_anchor() {
     let (utxo, _d, _) = fresh();
