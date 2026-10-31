@@ -86,12 +86,20 @@ pub fn script_backend() -> String {
 }
 
 /// Wipe all on-disk state for a Hercules node so the next launch starts from a
-/// clean genesis. Deletes the headers DB plus the derived block-store and
-/// peers SQLite files (and their -wal/-shm sidecars), and recursively removes
-/// the LMDB UTXO directory and the app's `migration-conflicts/` directory of
-/// parked pre-migration copies. The caller MUST drop any live `HerculesNode` for
-/// this `db_path` before calling this — open file handles will silently keep
-/// the inodes alive on POSIX, leaving stale state behind.
+/// clean genesis. Recursively removes the LMDB UTXO directory, then deletes
+/// the headers DB plus the derived block-store, own-tx and peers SQLite files
+/// (and their -wal/-shm sidecars), and the app's `migration-conflicts/`
+/// directory of parked pre-migration copies. The caller MUST drop any live
+/// `HerculesNode` for this `db_path` before calling this — open file handles
+/// will silently keep the inodes alive on POSIX, leaving stale state behind.
+///
+/// Interruption-safe (ticket 050): the UTXO env's `.loading` marker is
+/// written before anything is unlinked and removed only once everything
+/// is, and the env goes first. A reset killed (or failing) partway leaves
+/// the marker, so the next open wipes whatever is left of the env. A UTXO
+/// set can therefore never outlive its headers: that state used to make the
+/// next launch roll the set back past its pruned undo data, corrupting it
+/// and condemning the honest chain.
 pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
     // Ticket 028: never unlink files under a live node. Its LMDB env would
     // keep the deleted inodes, and heed would hand that stale env to the
@@ -101,6 +109,7 @@ pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
     // Mirror the path-derivation logic in `HeaderSync::new`. Keep in sync.
     let utxo_dir = sync::derive_sibling_path(&db_path, "utxo-lmdb");
     let blocks_path = sync::derive_sibling_path(&db_path, "blocks.sqlite3");
+    let own_txs_path = sync::derive_sibling_path(&db_path, "own_txs.sqlite3");
     let peers_path = sync::derive_sibling_path(&db_path, "peers.sqlite3");
     // Orphans from builds before the sibling-path refactor / LMDB switch
     // (`hercules-blocks`, `hercules-peers`, `hercules-utxo`). Previously this
@@ -109,11 +118,31 @@ pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
     let legacy_blocks = sync::derive_sibling_path(&db_path, "hercules-blocks.sqlite3");
     let legacy_peers = sync::derive_sibling_path(&db_path, "hercules-peers.sqlite3");
     let legacy_utxo = sync::derive_sibling_path(&db_path, "hercules-utxo.sqlite3");
+    let storage_error = |msg: String| HerculesError::StorageError { msg };
 
-    // SQLite files (headers / blocks / peers) — three sidecars each.
+    // Marker first: from here on, an interrupted reset is finished by the
+    // next `UtxoSet::open`.
+    let marker = utxo::loading_marker_path(std::path::Path::new(&utxo_dir));
+    match std::fs::write(&marker, b"reset in progress\n") {
+        Ok(()) => {}
+        // No directory: nothing was ever stored here.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(storage_error(format!("failed to write {}: {}", marker.display(), e))),
+    }
+
+    // LMDB env: a directory of mmapped files. Recursive removal, before the
+    // headers it was validated against.
+    match std::fs::remove_dir_all(&utxo_dir) {
+        Ok(_) => log::info!("reset_database: removed {}", utxo_dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(storage_error(format!("failed to remove {}: {}", utxo_dir, e))),
+    }
+
+    // SQLite files (headers / blocks / own txs / peers) — three sidecars each.
     for base in [
         &db_path,
         &blocks_path,
+        &own_txs_path,
         &peers_path,
         &legacy_blocks,
         &legacy_peers,
@@ -133,23 +162,17 @@ pub fn reset_database(db_path: String) -> Result<(), HerculesError> {
         }
     }
 
-    // LMDB env: a directory of mmapped files. Recursive removal. Also the
-    // app's `migration-conflicts/` (ticket 030): copies parked by the
+    // The app's `migration-conflicts/` (ticket 030): copies parked by the
     // Documents -> Chain/ migration are dead weight once the node is reset.
     let conflicts_dir = sync::derive_sibling_path(&db_path, "migration-conflicts");
-    for dir in [&utxo_dir, &conflicts_dir] {
-        match std::fs::remove_dir_all(dir) {
-            Ok(_) => log::info!("reset_database: removed {}", dir),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(HerculesError::StorageError {
-                    msg: format!("failed to remove {}: {}", dir, e),
-                });
-            }
-        }
+    match std::fs::remove_dir_all(&conflicts_dir) {
+        Ok(_) => log::info!("reset_database: removed {}", conflicts_dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(storage_error(format!("failed to remove {}: {}", conflicts_dir, e))),
     }
 
-    Ok(())
+    std::fs::remove_file(&marker)
+        .map_err(|e| storage_error(format!("failed to remove {}: {}", marker.display(), e)))
 }
 
 // ── Phase 1 types (header sync) ────────────────────────────────────
@@ -1705,6 +1728,34 @@ mod tests {
         assert!(status.error.is_none());
     }
 
+    /// Ticket 050: a reset killed after writing its marker (here, before
+    /// any unlink) is finished by the next open: the UTXO env is wiped, so
+    /// the node needs a snapshot again rather than keeping a set whose
+    /// headers may be gone.
+    #[test]
+    fn interrupted_reset_is_finished_by_the_next_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("hercules-headers.sqlite3").to_string_lossy().into_owned();
+        {
+            let _node = HerculesNode::new(db.clone(), None).unwrap();
+        }
+        let env = sync::derive_sibling_path(&db, "utxo-lmdb");
+        {
+            let utxo = utxo::UtxoSet::open(&env).unwrap();
+            let coin = utxo::UtxoEntry { amount: 1, script_pubkey: vec![0x51], height: 1, is_coinbase: false };
+            utxo.test_insert_utxo([1; 32], 0, coin).unwrap();
+        }
+        {
+            let node = HerculesNode::new(db.clone(), None).unwrap();
+            assert!(!node.needs_snapshot().unwrap(), "test set not in place");
+        }
+        std::fs::write(format!("{}.loading", env), b"reset in progress\n").unwrap();
+
+        let node = HerculesNode::new(db, None).unwrap();
+        assert!(node.needs_snapshot().unwrap(), "interrupted reset left the UTXO set");
+        assert!(!std::path::Path::new(&format!("{}.loading", env)).exists());
+    }
+
     #[test]
     fn reset_database_removes_live_sibling_stores() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1728,11 +1779,13 @@ mod tests {
         for name in [
             "hercules-headers.sqlite3",
             "blocks.sqlite3",
+            "own_txs.sqlite3",
             "peers.sqlite3",
             "peers.sqlite3-wal",
             "hercules-blocks.sqlite3",
             "hercules-utxo.sqlite3",
             "utxo-lmdb",
+            "utxo-lmdb.loading",
             "migration-conflicts",
         ] {
             assert!(!dir.path().join(name).exists(), "{} survived reset", name);
