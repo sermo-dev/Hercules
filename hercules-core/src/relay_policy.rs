@@ -446,4 +446,137 @@ mod tests {
         tx.input[0].witness.push(vec![0x02; 33]); // compressed pubkey
         assert!(check_relay_policy(&tx).is_ok());
     }
+
+    // ── Data-path pass: both sides of each filter ────────────────────
+
+    fn with_witness(items: Vec<Vec<u8>>) -> Transaction {
+        let mut tx = base_tx();
+        tx.input[0].witness = Witness::from_slice(&items);
+        tx
+    }
+
+    fn with_output(spk: Vec<u8>) -> Transaction {
+        let mut tx = base_tx();
+        tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
+        tx
+    }
+
+    #[test]
+    fn cat21_is_exactly_locktime_21() {
+        for (lock, rejected) in [(20u32, false), (21, true), (22, false), (21 + 500_000_000, false)] {
+            let mut tx = base_tx();
+            tx.lock_time = LockTime::from_consensus(lock);
+            assert_eq!(matches!(check_relay_policy(&tx), Err(PolicyRejection::Cat21)), rejected, "{}", lock);
+        }
+    }
+
+    #[test]
+    fn runes_marker_is_op_13_right_after_op_return() {
+        assert!(matches!(check_relay_policy(&with_output(vec![0x6a, 0x5d])), Err(PolicyRejection::Runes { .. })));
+        for ok in [
+            vec![0x6a],                   // bare OP_RETURN
+            vec![0x6a, 0x5c, 0x01],       // OP_12
+            vec![0x6a, 0x5e, 0x01],       // OP_14
+            vec![0x6a, 0x01, 0x5d],       // OP_13 only as pushed data
+            vec![0x51, 0x5d],             // not an OP_RETURN
+        ] {
+            assert!(check_relay_policy(&with_output(ok.clone())).is_ok(), "{:02x?}", ok);
+        }
+    }
+
+    #[test]
+    fn op_drop_threshold_is_75_bytes() {
+        let script = |n: usize| {
+            let mut s = vec![0x4c, n as u8]; // OP_PUSHDATA1 n
+            s.extend(std::iter::repeat(0x11).take(n));
+            s.push(0x75); // OP_DROP
+            s.push(0x51);
+            s
+        };
+        assert!(check_relay_policy(&with_witness(vec![vec![0x01], script(75)])).is_ok());
+        assert!(matches!(
+            check_relay_policy(&with_witness(vec![vec![0x01], script(76)])),
+            Err(PolicyRejection::OpDropData { input_index: 0 })
+        ));
+        // A key-path-like single element is never script-parsed.
+        assert!(check_relay_policy(&with_witness(vec![script(76)])).is_ok());
+    }
+
+    #[test]
+    fn stamps_marker_is_case_insensitive_and_only_in_the_witness_script() {
+        let ws = |marker: &[u8]| {
+            let mut s = vec![0x51, 0x20];
+            s.extend_from_slice(marker);
+            s
+        };
+        for marker in [&b"stamp:"[..], b"STAMP:", b"StAmP:"] {
+            assert!(
+                matches!(check_relay_policy(&with_witness(vec![vec![0x01], ws(marker)])), Err(PolicyRejection::OlgaStamps { .. })),
+                "{:?}",
+                marker
+            );
+        }
+        // No colon, only in a non-final element, or a lone element: allowed.
+        assert!(check_relay_policy(&with_witness(vec![vec![0x01], ws(b"stamp")])).is_ok());
+        assert!(check_relay_policy(&with_witness(vec![ws(b"stamp:"), vec![0x51]])).is_ok());
+        assert!(check_relay_policy(&with_witness(vec![ws(b"stamp:")])).is_ok());
+    }
+
+    #[test]
+    fn envelope_needs_op_false_immediately_before_op_if() {
+        let envelope = |middle: &[u8]| {
+            let mut s = vec![0x00];
+            s.extend_from_slice(middle);
+            s.extend_from_slice(&[0x63, 0x03, b'o', b'r', b'd', 0x68]);
+            s
+        };
+        match check_relay_policy(&with_witness(vec![vec![0x01], envelope(&[])])) {
+            Err(PolicyRejection::InscriptionEnvelope { tag, .. }) => assert_eq!(tag, "ord"),
+            other => panic!("{:?}", other),
+        }
+        // Something between OP_FALSE and OP_IF breaks the pattern.
+        assert!(check_relay_policy(&with_witness(vec![vec![0x01], envelope(&[0x61])])).is_ok()); // OP_NOP
+        // OP_NOTIF is not an envelope.
+        assert!(check_relay_policy(&with_witness(vec![vec![0x01], vec![0x00, 0x64, 0x51, 0x68]])).is_ok());
+        // An envelope with no push after OP_IF still rejects, tag unknown.
+        match check_relay_policy(&with_witness(vec![vec![0x01], vec![0x00, 0x63, 0x68, 0x51]])) {
+            Err(PolicyRejection::InscriptionEnvelope { tag, .. }) => assert_eq!(tag, "<unknown>"),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    /// The envelope and OP_DROP scans parse *every* witness element as a
+    /// script, including signatures and public keys. A P2WPKH spend whose
+    /// compressed pubkey happens to read `02 xx yy 00 63` (push 2, OP_FALSE,
+    /// OP_IF) is a normal payment, but is refused as an inscription. A
+    /// simulation over random keys and DER signatures puts it at about 1 in
+    /// 17,000 pubkeys and 1 in 15,000 signatures, so ~1 in 8,000 P2WPKH
+    /// inputs; and a pubkey is fixed per address, so every spend from an
+    /// unlucky address is refused relay.
+    #[test]
+    #[ignore = "BUG (policy): inscription/OP_DROP scans parse signatures and pubkeys as scripts; ~1 in 8,000 ordinary P2WPKH inputs is refused relay (every spend of an unlucky address)"]
+    fn p2wpkh_pubkey_that_parses_as_an_envelope_is_allowed() {
+        let mut pubkey = vec![0x02, 0xaa, 0xbb, 0x00, 0x63];
+        pubkey.resize(33, 0x42);
+        // A signature-shaped first element that parses to nothing special.
+        let tx = with_witness(vec![vec![0x30; 72], pubkey]);
+        assert!(check_relay_policy(&tx).is_ok(), "{:?}", check_relay_policy(&tx));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// The filters never panic, whatever the witness and outputs hold.
+        #[test]
+        fn filters_are_total(
+            items in proptest::collection::vec(proptest::collection::vec(proptest::prelude::any::<u8>(), 0..120), 0..5),
+            spk in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..60),
+            lock in proptest::prelude::any::<u32>(),
+        ) {
+            let mut tx = with_witness(items);
+            tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) });
+            tx.lock_time = LockTime::from_consensus(lock);
+            let _ = check_relay_policy(&tx);
+        }
+    }
 }

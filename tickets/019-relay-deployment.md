@@ -47,6 +47,15 @@ A code review found problems that must be fixed as part of this deployment, not 
 
 **Shared infrastructure.** The snapshot publishing pipeline (032) can run on the same always-on `bitcoind` host as `blocknotify`.
 
+## Review findings to fix before deploying (2026-10-25 and 2026-10-28 reviews)
+
+1. **APNs environment mismatch prunes devices.** The stack has one `APNS_HOST` (`template.yaml:27-31`, default sandbox; `notify/index.js:44`). Xcode debug builds get *sandbox* device tokens, while TestFlight and App Store builds get *production* tokens. A token sent to the wrong host returns `BadDeviceToken`, which is in `PRUNE_REASONS` (`notify/index.js:55, 344`), so every device of the other kind is deleted on the first push.
+   - **Fix:** the app sends its `aps-environment` with `/register`, the record stores it, and notify routes each token to its own host. Never prune on `BadDeviceToken` without the environment matching.
+2. **One client can lock everyone out.** Throttling is stage-wide: 5 requests/s, burst 10 (`template.yaml:32-36, 99-107`). A single client above 5 requests/s starves every legitimate `/register`. The app only `print`s on a 429 (`NotificationManager.swift:206-207`) and retries at the next launch, so a new user can believe pushes are on while not registered.
+   - **Fix:** a WAF per-IP rate rule (or per-device-token limits in the Lambda), the stage limit raised as a backstop, and the app surfacing 429 with backoff.
+3. **Runtime.** `nodejs20.x` (`template.yaml:115, 148`) reaches end of support soon. Move to the current Lambda Node LTS before deploying.
+4. **What the relay learns.** It sees each device token alongside the IP that registered it, and the time of every wake. Document this in the privacy policy (044), and keep the relay free of any wallet data. It sends only "a block exists", never block contents (the node always fetches blocks from peers).
+
 ## Background
 
 Three layers of work are already in place:
