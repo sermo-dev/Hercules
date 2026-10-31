@@ -30,6 +30,7 @@ fn fresh(dir: &TempDir) -> HeaderSync {
     let db = dir.path().join("headers.sqlite3");
     let mut hs = HeaderSync::new(db.to_str().unwrap(), None).unwrap();
     hs.regular_peers_over_tor = true;
+    hs.own_tx_trickle_mean_secs = 0.0;
     // Headers up to the validated height, so mempool finality / BIP 68
     // (ticket 026) can read the tip's median-time-past. Contents only
     // need distinct hashes and increasing timestamps.
@@ -429,7 +430,7 @@ fn broadcast_sends_inv_then_tx_to_peer() {
 
     let mut pool = PeerPool::new_for_test();
     let (peer, mut server) = loopback_peer_pair();
-    assert!(pool.add_inbound_peer(peer));
+    pool.add_outbound_peer_for_test(peer);
 
     // The 014 wallet RPC path.
     let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
@@ -451,12 +452,139 @@ fn broadcast_sends_inv_then_tx_to_peer() {
         other => panic!("expected tx, got {}", msg_name(&other)),
     }
 
-    // Another peer announcing it back counts as propagation.
+    // Ticket 052: the peer we sent it to echoing it back proves nothing
+    // (a censoring peer would, to fake delivery); nor does an inbound one.
     write_message(&mut server, NetworkMessage::Inv(vec![Inventory::Transaction(txid)]));
+    hs.service_peer_messages(&mut pool);
+    assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending, "echo counted");
+    let (inbound, mut in_server) = loopback_peer_pair();
+    assert!(pool.add_inbound_peer(inbound));
+    write_message(&mut in_server, NetworkMessage::Inv(vec![Inventory::Transaction(txid)]));
+    hs.service_peer_messages(&mut pool);
+    assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending, "inbound counted");
+
+    // Another outbound peer, one we never sent it to, announcing it back
+    // counts as propagation.
+    let (other, mut other_server) = loopback_peer_pair();
+    pool.add_outbound_peer_for_test(other);
+    write_message(&mut other_server, NetworkMessage::Inv(vec![Inventory::Transaction(txid)]));
     hs.service_peer_messages(&mut pool);
     let rec = hs.own_tx_status(&txid).unwrap().unwrap();
     assert_eq!(rec.status, OwnTxStatus::Propagated);
     assert_eq!(rec.seen_from_peers, 1);
+}
+
+/// Ticket 052's verification: a tx announced by three peers is downloaded
+/// once, whether it is then accepted or rejected; a rejected one isn't
+/// fetched again until the next block, and a request that runs out (or is
+/// answered `notfound`) goes to the next announcer.
+#[test]
+fn announced_txs_are_downloaded_once() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let mut pool = PeerPool::new_for_test();
+    let mut servers = Vec::new();
+    for _ in 0..3 {
+        let (p, s) = loopback_peer_pair();
+        pool.add_outbound_peer_for_test(p);
+        servers.push(s);
+    }
+    let getdatas = |servers: &mut Vec<std::net::TcpStream>| -> Vec<usize> {
+        (0..servers.len())
+            .filter(|&i| matches!(try_read(&mut servers[i]), Some(NetworkMessage::GetData(_))))
+            .collect()
+    };
+
+    // Accepted: everyone announces at once, one is asked.
+    let good = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    let inv = |tx: &Transaction| NetworkMessage::Inv(vec![Inventory::Transaction(tx.compute_txid())]);
+    for s in servers.iter_mut() {
+        write_message(s, inv(&good));
+    }
+    hs.service_peer_messages(&mut pool);
+    let asked = getdatas(&mut servers);
+    assert_eq!(asked.len(), 1, "asked {:?}", asked);
+    write_message(&mut servers[asked[0]], NetworkMessage::Tx(good.clone()));
+    hs.service_peer_messages(&mut pool);
+    assert!(hs.mempool.lock().unwrap().contains(&good.compute_txid()));
+
+    // Rejected (a dust output, decided by what the txid commits to): asked
+    // once, then never again from the others.
+    let dust = spend(seed(&hs, 2, OP_TRUE, 1, false), 100);
+    write_message(&mut servers[0], inv(&dust));
+    hs.service_peer_messages(&mut pool);
+    assert_eq!(getdatas(&mut servers), vec![0]);
+    write_message(&mut servers[0], NetworkMessage::Tx(dust.clone()));
+    hs.service_peer_messages(&mut pool);
+    assert!(!hs.mempool.lock().unwrap().contains(&dust.compute_txid()));
+    for s in servers[1..].iter_mut() {
+        write_message(s, inv(&dust));
+    }
+    hs.service_peer_messages(&mut pool);
+    assert!(getdatas(&mut servers).is_empty(), "rejected tx fetched again");
+
+    // A block later the verdict is forgotten (Core resets on a new tip).
+    hs.store.set_validated_height(VALIDATED + 1).ok();
+    write_message(&mut servers[1], inv(&dust));
+    hs.service_peer_messages(&mut pool);
+    assert_eq!(getdatas(&mut servers), vec![1]);
+    hs.store.set_validated_height(VALIDATED).ok();
+
+    // `notfound` hands the request to the next announcer at once.
+    let third = spend(seed(&hs, 3, OP_TRUE, 1, false), 90_000);
+    write_message(&mut servers[0], inv(&third));
+    hs.service_peer_messages(&mut pool);
+    assert_eq!(getdatas(&mut servers), vec![0]);
+    write_message(&mut servers[2], inv(&third));
+    hs.service_peer_messages(&mut pool);
+    assert!(getdatas(&mut servers).is_empty(), "asked a second announcer while in flight");
+    write_message(&mut servers[0], NetworkMessage::NotFound(vec![Inventory::WitnessTransaction(third.compute_txid())]));
+    hs.service_peer_messages(&mut pool);
+    hs.retry_tx_requests(&pool);
+    assert_eq!(getdatas(&mut servers), vec![2]);
+}
+
+/// Ticket 052's Tor-mode stopgap: an own tx is announced only to outbound
+/// peers never told our onion, after a Poisson delay, and served only to
+/// those; an inbound peer (it dialed our onion) and a self-advertised one
+/// get neither, even after announcing it to us.
+#[test]
+fn own_tx_never_reaches_onion_aware_peers() {
+    let dir = TempDir::new().unwrap();
+    let mut hs = fresh(&dir);
+    let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    let mut pool = PeerPool::new_for_test();
+    let (clean, mut clean_s) = loopback_peer_pair();
+    let (advertised, mut adv_s) = loopback_peer_pair();
+    let (inbound, mut in_s) = loopback_peer_pair();
+    pool.add_outbound_peer_for_test(clean);
+    pool.add_self_advertised_peer_for_test(advertised);
+    assert!(pool.add_inbound_peer(inbound));
+
+    // The trickle: with Core's 2 s mean nothing is due at once.
+    hs.own_tx_trickle_mean_secs = 3600.0;
+    let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
+    hs.drain_relay_queue(&pool);
+    assert!(try_read(&mut clean_s).is_none(), "announced before its delay");
+    hs.relay_queue.lock().unwrap().iter_mut().for_each(|e| e.relay_at = Instant::now());
+    hs.drain_relay_queue(&pool);
+    assert!(matches!(read_one_message(&mut clean_s), NetworkMessage::Inv(_)));
+    assert!(try_read(&mut adv_s).is_none(), "own tx announced to a self-advertised peer");
+    assert!(try_read(&mut in_s).is_none(), "own tx announced to an inbound peer");
+
+    // They announce it to us (they got it elsewhere) and ask for it: not
+    // served, so they can't learn that we have it.
+    for s in [&mut adv_s, &mut in_s] {
+        write_message(s, NetworkMessage::Inv(vec![Inventory::Transaction(txid)]));
+    }
+    hs.service_peer_messages(&mut pool);
+    for s in [&mut adv_s, &mut in_s] {
+        write_message(s, NetworkMessage::GetData(vec![Inventory::WitnessTransaction(txid)]));
+    }
+    hs.service_peer_messages(&mut pool);
+    for s in [&mut adv_s, &mut in_s] {
+        assert!(matches!(read_one_message(s), NetworkMessage::NotFound(_)));
+    }
 }
 
 #[test]
@@ -508,8 +636,8 @@ fn announced_and_announcing_peers_are_not_reannounced_to() {
     let (p1, mut s1) = loopback_peer_pair();
     let (p2, mut s2) = loopback_peer_pair();
     let (a1, a2) = (p1.addr().to_string(), p2.addr().to_string());
-    assert!(pool.add_inbound_peer(p1));
-    assert!(pool.add_inbound_peer(p2));
+    pool.add_outbound_peer_for_test(p1);
+    pool.add_outbound_peer_for_test(p2);
 
     let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
     hs.drain_relay_queue(&pool);
@@ -526,7 +654,7 @@ fn announced_and_announcing_peers_are_not_reannounced_to() {
 
     // A rebroadcast goes only to peers that don't have it: a new peer.
     let (p3, mut s3) = loopback_peer_pair();
-    assert!(pool.add_inbound_peer(p3));
+    pool.add_outbound_peer_for_test(p3);
     hs.rebroadcast_due_own_txs(unix_now_u32() as u64 + crate::own_tx_store::REBROADCAST_MAX_SECS);
     assert_eq!(queued_own(&hs), vec![txid]);
     hs.drain_relay_queue(&pool);
@@ -551,7 +679,7 @@ fn pending_own_tx_is_hidden_from_unsolicited_getdata() {
     let mut pool = PeerPool::new_for_test();
     let (peer, mut server) = loopback_peer_pair();
     let addr = peer.addr().to_string();
-    assert!(pool.add_inbound_peer(peer));
+    pool.add_outbound_peer_for_test(peer);
 
     let own = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
     let txid = hs.submit_own_tx(&raw(&own)).unwrap().txid;
@@ -867,9 +995,10 @@ fn own_parent_is_served_to_a_peer_sent_its_child_and_delivery_is_recorded() {
     let mut pool = PeerPool::new_for_test();
     let (peer, mut server) = loopback_peer_pair();
     let addr = peer.addr().to_string();
-    assert!(pool.add_inbound_peer(peer));
+    // Outbound: own txs never go to inbound peers (ticket 052).
+    pool.add_outbound_peer_for_test(peer);
     let (stranger, mut stranger_server) = loopback_peer_pair();
-    assert!(pool.add_inbound_peer(stranger));
+    pool.add_outbound_peer_for_test(stranger);
 
     let parent = spend_to_op_true(seed(&hs, 1, OP_TRUE, 1, false), 95_000);
     let p = hs.submit_own_tx(&raw(&parent)).unwrap().txid;

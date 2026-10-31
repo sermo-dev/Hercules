@@ -66,15 +66,54 @@ final class NodeHost {
             return (node, true)
         }
         try StoragePaths.prepareForNodeOpen()
-        let node = try HerculesNode.open(
+        // The user's validation mode goes to the node at open (ticket 054),
+        // which records it the first time and from then on is the one
+        // that counts.
+        let node = try HerculesNode.openInMode(
             dbPath: StoragePaths.headersDBPath,
-            torDataDir: StoragePaths.torDataDir
+            torDataDir: StoragePaths.torDataDir,
+            mode: ValidationModePreference.current.map(Self.nodeMode)
         )
         opens += 1
         StoragePaths.log.notice("NodeHost: opened node (\(self.opens) in this process)")
         node.setNetworkMetered(metered: NetworkPolicy.shared.isMetered)
+        Self.adoptNodeSetup(node)
         current = node
         return (node, false)
+    }
+
+    /// Tell an open node the mode the user just chose (it may have been
+    /// opened by a wake before there was one). No-op if none is open: the
+    /// next open passes it.
+    func recordValidationMode(_ mode: ValidationMode) {
+        lock.lock()
+        let node = current
+        lock.unlock()
+        guard let node = node else { return }
+        _ = try? node.setValidationMode(mode: Self.nodeMode(mode))
+        Self.adoptNodeSetup(node)
+    }
+
+    static func nodeMode(_ mode: ValidationMode) -> NodeValidationMode {
+        switch mode {
+        case .assumeUtxo: return .assumeUtxo
+        case .fromGenesis: return .genesis
+        }
+    }
+
+    /// Take the node's recorded mode and snapshot state as the app's
+    /// (ticket 054): the node is the source of truth, `UserDefaults` its
+    /// mirror. A node with no mode yet leaves the app's choice alone.
+    private static func adoptNodeSetup(_ node: HerculesNode) {
+        guard let recorded = try? node.validationMode() else { return }
+        let mode: ValidationMode = recorded == .assumeUtxo ? .assumeUtxo : .fromGenesis
+        if ValidationModePreference.current != mode {
+            StoragePaths.log.notice("NodeHost: adopting the node's validation mode \(mode.rawValue, privacy: .public)")
+            ValidationModePreference.current = mode
+        }
+        if mode == .assumeUtxo, let needs = try? node.needsSnapshot() {
+            NodeSetupState.shared.snapshotLoaded = !needs
+        }
     }
 
     /// Close the node and delete its chain data (validation-mode switch).
@@ -117,6 +156,7 @@ final class NodeHost {
         while true {
             do {
                 try resetDatabase(dbPath: StoragePaths.headersDBPath)
+                NodeSetupState.shared.resetForNewNode()
                 StoragePaths.log.notice("NodeHost: reset complete")
                 return
             } catch HerculesError.NodeOpen {

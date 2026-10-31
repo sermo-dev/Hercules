@@ -52,9 +52,49 @@ struct PeerSlot {
     /// detect leaked slots where the caller dropped the Peer without
     /// calling return_peer().
     checked_out_at: Option<Instant>,
+    /// The address had connected successfully before this connection, so
+    /// an onion counts as its own netgroup (ticket 052; see `netgroup`).
+    /// Decided at connect time: the connection itself doesn't prove it.
+    proven: bool,
+    /// We told this peer our .onion address on this connection (the
+    /// on-connect self-ad, a `getaddr` reply or the 24 h re-broadcast). Own
+    /// transactions never go to such a peer, nor to any inbound one (which
+    /// dialed the onion): either could tie them to that long-lived identity
+    /// (ticket 052's stopgap until 029's private broadcast). Never set for
+    /// the `OWN_TX_OUTBOUND` connections kept clean for own transactions.
+    self_advertised: bool,
+    /// Where the address came from, for the per-source outbound cap: the
+    /// gossip source group of an address that was neither known-good nor
+    /// from DNS when we dialed it, else `None` (protected).
+    gossip_source: Option<String>,
+    /// Core's per-peer `addr` token bucket (`m_addr_token_bucket`): one
+    /// token per address processed, refilled at `ADDR_RATE_PER_SEC`.
+    addr_tokens: f64,
+    addr_tokens_at: Instant,
 }
 
 impl PeerSlot {
+    /// A slot with every ticket 052 field at its default (unproven, never
+    /// self-advertised to, protected source, Core's initial single addr
+    /// token), for struct-update syntax at the construction sites.
+    fn base(peer: Option<Peer>, addr: String, inbound: bool) -> PeerSlot {
+        PeerSlot {
+            peer,
+            addr,
+            user_agent: String::new(),
+            height: 0,
+            score: SCORE_DEFAULT,
+            inbound,
+            demerit: 0,
+            checked_out_at: None,
+            proven: false,
+            self_advertised: false,
+            gossip_source: None,
+            addr_tokens: 1.0,
+            addr_tokens_at: Instant::now(),
+        }
+    }
+
     /// What peer selection ranks by: reputation minus divergence demerits.
     fn weight(&self) -> i32 {
         (self.score - self.demerit).max(SCORE_MIN)
@@ -70,6 +110,47 @@ const SOFT_PENALTY_FLOOR: i32 = SCORE_DEFAULT / 2;
 /// Minimum interval between DNS re-discovery attempts.
 const DNS_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Core's addr rate limit (net_processing `MAX_ADDR_RATE_PER_SECOND`):
+/// each peer's token bucket refills at this many addresses a second...
+const ADDR_RATE_PER_SEC: f64 = 0.1;
+
+/// ...up to `MAX_ADDR_PROCESSING_TOKEN_BUCKET` (= `MAX_ADDR_TO_SEND`).
+/// Sending `getaddr` (every outbound connect does) adds this many on top,
+/// as Core does, so the reply is taken whole. An inbound peer, which we
+/// never ask, starts with Core's single token: its unsolicited gossip is
+/// a trickle (ticket 052).
+const ADDR_TOKEN_BURST: f64 = 1000.0;
+
+/// One gossip source (an outbound peer's netgroup, or all inbound peers
+/// together: their gossip is the unverified bucket) may hold at most this
+/// fraction of the address book (1 / `ADDR_SOURCE_SHARE`), like Core's
+/// source-keyed new-table buckets (a source group maps to 64 of 1024).
+/// Further addresses from a full source are dropped (ticket 052).
+const ADDR_SOURCE_SHARE: usize = 16;
+
+/// Outbound slots that only protected addresses (DNS seeds, bundled
+/// onion seeds, addresses we have connected to before) may fill, so a
+/// gossip flood can't own every connection (ticket 052).
+const RESERVED_PROTECTED_OUTBOUND: usize = 4;
+
+/// Most outbound slots filled from one gossip source's addresses.
+const MAX_OUTBOUND_PER_SOURCE: usize = 2;
+
+/// Below this many eligible protected candidates, DNS fallback runs even
+/// when gossip keeps the total above `DNS_FALLBACK_THRESHOLD`: a flood
+/// must not starve the seeds (ticket 052).
+const PROTECTED_FALLBACK_THRESHOLD: usize = 2 * RESERVED_PROTECTED_OUTBOUND;
+
+/// Outbound connections kept free of our onion self-ad, the only ones own
+/// transactions are announced on (ticket 052): every other outbound peer
+/// is told our onion on connect, as before, for inbound discovery.
+const OWN_TX_OUTBOUND: usize = 4;
+
+/// An inbound peer must have been silent this long to be evicted for a
+/// newcomer when inbound slots are full (ticket 052). Live peers answer
+/// our pings (`p2p::PING_INTERVAL`) well within it.
+const INBOUND_EVICTION_IDLE: Duration = Duration::from_secs(5 * 60);
+
 /// Maximum number of known addresses to retain in memory. The real Bitcoin
 /// Core addrman keeps tens of thousands; we cap small for an iPhone budget.
 /// When the manager fills up, eviction prefers the address with the most
@@ -83,6 +164,14 @@ const MAX_KNOWN_ADDRS: usize = 10_000;
 /// because `maintain()` runs on the synchronous monitor loop — we can't let
 /// it stall the loop for tens of seconds chasing a long tail of dead peers.
 const REFILL_BUDGET: Duration = Duration::from_secs(2);
+
+/// A wake's connect pass (ticket 054, 028's fanout): connections dialed
+/// at once, the fewest it settles for while time allows (two peers can
+/// confirm a tip between them), and how long it keeps dialing to get
+/// them. The pass also stops at the wake's own connect deadline.
+const WAKE_CONNECT_PARALLEL: usize = 3;
+const WAKE_MIN_PEERS: usize = 2;
+const WAKE_CONNECT_BUDGET: Duration = Duration::from_secs(8);
 
 /// Minimum number of viable candidates before we'll re-query DNS seeds. The
 /// AddrManager is the primary source of peer addresses; DNS is only consulted
@@ -101,10 +190,10 @@ const ADDR_RETRY_BASE: Duration = Duration::from_secs(60);
 /// rather than being shadow-banned forever.
 const ADDR_RETRY_MAX: Duration = Duration::from_secs(3600);
 
-/// How we first learned about an address. Recorded for diagnostics — neither
-/// eviction nor candidate selection reads this — but it makes peer-discovery
-/// bugs much easier to investigate from the SQLite shell. New variants must
-/// also be reflected in `AddrSource::as_str` / `from_str`.
+/// How we first learned about an address. `Dns` and `Manual` entries are
+/// protected (ticket 052): eviction never picks them over gossip, and a
+/// share of outbound slots is reserved for them (see `AddrMeta::protected`).
+/// New variants must also be reflected in `AddrSource::as_str` / `from_str`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddrSource {
     Dns,
@@ -152,19 +241,36 @@ struct AddrMeta {
     last_success: Option<Instant>,
     failure_count: u32,
     source: AddrSource,
+    /// Who told us (ticket 052): the netgroup of the outbound peer that
+    /// gossiped it, `INBOUND_SOURCE` for every inbound peer, or the source
+    /// tag itself ("dns", "manual"). Caps one source's share of the book.
+    source_group: String,
     dirty: bool,
 }
 
+/// The one gossip source group shared by every inbound peer: whoever
+/// connects to us picks itself, and its per-connection id says nothing
+/// about who it is, so all of them together are one "unverified" source.
+const INBOUND_SOURCE: &str = "inbound";
+
 impl AddrMeta {
-    fn new(source: AddrSource) -> AddrMeta {
+    fn new(source: AddrSource, source_group: &str) -> AddrMeta {
         AddrMeta {
             first_seen: Instant::now(),
             last_tried: None,
             last_success: None,
             failure_count: 0,
             source,
+            source_group: source_group.to_string(),
             dirty: true,
         }
+    }
+
+    /// Never evicted ahead of gossip, and eligible for the reserved
+    /// outbound slots: DNS / bundled seeds, manual entries, and anything we
+    /// have connected to before (ticket 052's protected set).
+    fn protected(&self) -> bool {
+        self.last_success.is_some() || matches!(self.source, AddrSource::Dns | AddrSource::Manual)
     }
 
     /// Reconstruct an in-memory entry from a persisted record. Restored
@@ -191,6 +297,13 @@ impl AddrMeta {
             last_success,
             failure_count: record.failure_count,
             source: AddrSource::from_str(&record.source),
+            // Rows from before ticket 052 have no group: their tag stands
+            // in, so they share one bucket per kind rather than none.
+            source_group: if record.source_group.is_empty() {
+                record.source.clone()
+            } else {
+                record.source_group.clone()
+            },
             dirty: false,
         }
     }
@@ -210,6 +323,7 @@ impl AddrMeta {
                 .map(|t| instant_to_unix_offset(t, now, now_unix)),
             failure_count: self.failure_count,
             source: self.source.as_str().to_string(),
+            source_group: self.source_group.clone(),
         }
     }
 
@@ -264,14 +378,16 @@ impl AddrMeta {
 /// reliability when refilling the outbound pool.
 ///
 /// This is intentionally much simpler than Bitcoin Core's `CAddrMan`: no
-/// new/tried tables, no bucket-based eclipse hardening, no peers.dat
-/// persistence. The goal is to fix the immediate symptom (outbound pool
-/// shrinks below MAX_OUTBOUND when DNS-discovered peers fall over) without
-/// committing to the full addrman complexity. Persistence can be added
-/// later if iPhone restart-churn proves it necessary.
+/// new/tried tables. Ticket 052 adds the parts of its eclipse hardening a
+/// flood defeats without them: each gossip source may fill only
+/// 1 / `ADDR_SOURCE_SHARE` of the book (Core's source-keyed buckets), and
+/// protected entries (`AddrMeta::protected`) are never evicted to make
+/// room for gossip.
 struct AddrManager {
     addrs: HashMap<String, AddrMeta>,
     max_size: usize,
+    /// Entries per `source_group`, for the per-source cap.
+    per_source: HashMap<String, usize>,
     /// Addresses evicted (or otherwise removed) since the last flush, queued
     /// for `delete_addrs_bulk` so the on-disk view stays consistent with the
     /// in-memory cap. Cleared by `take_pending_deletes` after flush.
@@ -283,6 +399,7 @@ impl AddrManager {
         AddrManager {
             addrs: HashMap::new(),
             max_size,
+            per_source: HashMap::new(),
             pending_deletes: Vec::new(),
         }
     }
@@ -291,16 +408,48 @@ impl AddrManager {
         self.addrs.len()
     }
 
-    /// Insert a single address with a `source` tag. New addresses get a
+    /// Most entries one gossip source may hold.
+    fn source_cap(&self) -> usize {
+        (self.max_size / ADDR_SOURCE_SHARE).max(1)
+    }
+
+    /// Add `meta` under `addr` (not present), keeping `per_source` in step.
+    fn put(&mut self, addr: String, meta: AddrMeta) {
+        *self.per_source.entry(meta.source_group.clone()).or_default() += 1;
+        self.addrs.insert(addr, meta);
+    }
+
+    /// Remove `addr` and queue its on-disk delete.
+    fn remove(&mut self, addr: &str) {
+        if let Some(meta) = self.addrs.remove(addr) {
+            if let Some(n) = self.per_source.get_mut(&meta.source_group) {
+                *n -= 1;
+                if *n == 0 {
+                    self.per_source.remove(&meta.source_group);
+                }
+            }
+            self.pending_deletes.push(addr.to_string());
+        }
+    }
+
+    /// Insert a single address with a `source` tag, learned from
+    /// `source_group` (see `AddrMeta::source_group`). New addresses get a
     /// fresh AddrMeta; existing addresses are left alone (we don't want
     /// gossip to wipe out a peer's established success/failure history).
+    /// Gossip from a source that already holds its share is dropped.
     /// Returns true if a new entry was actually added.
-    fn insert(&mut self, addr: String, source: AddrSource) -> bool {
+    fn insert(&mut self, addr: String, source: AddrSource, source_group: &str) -> bool {
         if self.addrs.contains_key(&addr) {
             return false;
         }
-        self.evict_if_full();
-        self.addrs.insert(addr, AddrMeta::new(source));
+        let meta = AddrMeta::new(source, source_group);
+        if !meta.protected() && self.per_source.get(source_group).copied().unwrap_or(0) >= self.source_cap() {
+            return false;
+        }
+        if !self.evict_if_full(meta.protected()) {
+            return false;
+        }
+        self.put(addr, meta);
         true
     }
 
@@ -312,9 +461,11 @@ impl AddrManager {
         if self.addrs.contains_key(&record.addr) {
             return false;
         }
-        self.evict_if_full();
-        self.addrs
-            .insert(record.addr.clone(), AddrMeta::from_record(record));
+        let meta = AddrMeta::from_record(record);
+        if !self.evict_if_full(meta.protected()) {
+            return false;
+        }
+        self.put(record.addr.clone(), meta);
         true
     }
 
@@ -323,10 +474,11 @@ impl AddrManager {
         &mut self,
         addrs: I,
         source: AddrSource,
+        source_group: &str,
     ) -> usize {
         let mut added = 0;
         for addr in addrs {
-            if self.insert(addr, source) {
+            if self.insert(addr, source, source_group) {
                 added += 1;
             }
         }
@@ -352,51 +504,55 @@ impl AddrManager {
         out
     }
 
-    /// Evict one entry to make room when at capacity.
+    /// Make room for one entry when at capacity. Returns false if there is
+    /// none to be had for it: a gossip entry never displaces a protected
+    /// one (ticket 052).
     ///
     /// Policy, in priority order:
-    /// 1. Among entries that have never successfully connected, drop the one
-    ///    with the highest `failure_count` (oldest `first_seen` as tiebreaker).
-    ///    This pushes addresses we have evidence are bad off the list before
-    ///    addresses we've never tried.
-    /// 2. If every entry has succeeded at least once, drop the oldest one.
-    ///    Should be exceedingly rare at MAX_KNOWN_ADDRS=10_000.
+    /// 1. Among unprotected entries (gossip we never connected to), drop
+    ///    the one with the highest `failure_count`, oldest `first_seen` as
+    ///    tiebreaker. Evidence of badness goes first; per-source caps keep
+    ///    any one source from owning this pool.
+    /// 2. For a protected newcomer only: among protected entries that never
+    ///    connected (untried seeds), the same order.
+    /// 3. For a protected newcomer only, if every entry has succeeded at
+    ///    least once: the oldest. Exceedingly rare at MAX_KNOWN_ADDRS=10_000.
     ///
-    /// Known-good entries are *never* evicted by step 1 — they're the most
-    /// valuable thing the addrman holds and they survive churn.
-    fn evict_if_full(&mut self) {
+    /// Known-good entries are the most valuable thing the addrman holds:
+    /// only step 3 ever evicts one.
+    fn evict_if_full(&mut self, newcomer_protected: bool) -> bool {
         if self.addrs.len() < self.max_size {
-            return;
+            return true;
         }
 
         // Capture `now` once so the comparator inside max_by_key doesn't
         // re-read the clock for every entry.
         let now = Instant::now();
+        let worst = |filter: &dyn Fn(&AddrMeta) -> bool| -> Option<String> {
+            self.addrs
+                .iter()
+                .filter(|(_, m)| filter(m))
+                .max_by_key(|(_, m)| (m.failure_count, now.duration_since(m.first_seen).as_secs()))
+                .map(|(addr, _)| addr.clone())
+        };
 
-        let victim: Option<String> = self
-            .addrs
-            .iter()
-            .filter(|(_, m)| m.last_success.is_none())
-            .max_by_key(|(_, m)| {
-                (m.failure_count, now.duration_since(m.first_seen).as_secs())
-            })
-            .map(|(addr, _)| addr.clone());
-
-        if let Some(addr) = victim {
-            self.addrs.remove(&addr);
-            self.pending_deletes.push(addr);
-            return;
+        let mut victim = worst(&|m| !m.protected());
+        if victim.is_none() && newcomer_protected {
+            victim = worst(&|m| m.last_success.is_none());
         }
-
-        // Fallback: every entry has at least one success. Drop the oldest.
-        if let Some(addr) = self
-            .addrs
-            .iter()
-            .max_by_key(|(_, m)| now.duration_since(m.first_seen).as_secs())
-            .map(|(addr, _)| addr.clone())
-        {
-            self.addrs.remove(&addr);
-            self.pending_deletes.push(addr);
+        if victim.is_none() && newcomer_protected {
+            victim = self
+                .addrs
+                .iter()
+                .max_by_key(|(_, m)| now.duration_since(m.first_seen).as_secs())
+                .map(|(addr, _)| addr.clone());
+        }
+        match victim {
+            Some(addr) => {
+                self.remove(&addr);
+                true
+            }
+            None => false,
         }
     }
 
@@ -406,10 +562,11 @@ impl AddrManager {
     /// caller that creates a *new* entry here is the bootstrap connect path.
     fn record_success(&mut self, addr: &str) {
         let now = Instant::now();
-        let entry = self
-            .addrs
-            .entry(addr.to_string())
-            .or_insert_with(|| AddrMeta::new(AddrSource::Dns));
+        if !self.addrs.contains_key(addr) {
+            self.evict_if_full(true);
+            self.put(addr.to_string(), AddrMeta::new(AddrSource::Dns, AddrSource::Dns.as_str()));
+        }
+        let entry = self.addrs.get_mut(addr).expect("just inserted");
         entry.last_tried = Some(now);
         entry.last_success = Some(now);
         entry.failure_count = 0;
@@ -420,13 +577,29 @@ impl AddrManager {
     /// (driving the exponential backoff) and stamps last_tried.
     fn record_failure(&mut self, addr: &str) {
         let now = Instant::now();
-        let entry = self
-            .addrs
-            .entry(addr.to_string())
-            .or_insert_with(|| AddrMeta::new(AddrSource::Dns));
+        if !self.addrs.contains_key(addr) {
+            self.evict_if_full(true);
+            self.put(addr.to_string(), AddrMeta::new(AddrSource::Dns, AddrSource::Dns.as_str()));
+        }
+        let entry = self.addrs.get_mut(addr).expect("just inserted");
         entry.last_tried = Some(now);
         entry.failure_count = entry.failure_count.saturating_add(1);
         entry.dirty = true;
+    }
+
+    /// True if `addr` has connected successfully before (an onion then
+    /// counts as its own netgroup).
+    fn is_proven(&self, addr: &str) -> bool {
+        self.addrs.get(addr).is_some_and(|m| m.last_success.is_some())
+    }
+
+    /// The gossip source group an address was learned from, or `None` if
+    /// it is protected (see `PeerSlot::gossip_source`).
+    fn gossip_source(&self, addr: &str) -> Option<String> {
+        self.addrs
+            .get(addr)
+            .filter(|m| !m.protected())
+            .map(|m| m.source_group.clone())
     }
 
     /// Number of addresses currently eligible for a connection attempt
@@ -437,13 +610,21 @@ impl AddrManager {
         self.addrs.values().filter(|m| m.is_eligible(now)).count()
     }
 
+    /// `candidate_count` over protected entries only: a gossip flood can
+    /// keep the total high while every seed is gone or in backoff.
+    fn protected_candidate_count(&self) -> usize {
+        let now = Instant::now();
+        self.addrs.values().filter(|m| m.protected() && m.is_eligible(now)).count()
+    }
+
     /// Pick up to `limit` candidate addresses, ranked best first. Excludes
     /// addresses for which `exclude` returns true (used to skip already-
     /// connected or banned peers, or to enforce subnet diversity).
     ///
     /// Ranking: known-good first, then never-tried, then retry tier. Within
-    /// a tier, oldest first_seen wins so we don't starve older entries when
-    /// new gossip floods in.
+    /// a tier protected entries (seeds) come before gossip (ticket 052),
+    /// then fewer failures, then oldest first_seen, so we don't starve
+    /// older entries when new gossip floods in.
     fn pick_candidates(&self, limit: usize, exclude: &dyn Fn(&str) -> bool) -> Vec<String> {
         let now = Instant::now();
         let mut entries: Vec<(&String, &AddrMeta)> = self
@@ -456,6 +637,7 @@ impl AddrManager {
             let ta = a.tier(now);
             let tb = b.tier(now);
             ta.cmp(&tb)
+                .then(b.protected().cmp(&a.protected()))
                 .then(a.failure_count.cmp(&b.failure_count))
                 .then(a.first_seen.cmp(&b.first_seen))
         });
@@ -472,7 +654,7 @@ impl AddrManager {
 const BAN_DURATION: Duration = Duration::from_secs(24 * 3600);
 
 /// Default starting score for a freshly connected peer (neutral).
-const SCORE_DEFAULT: i32 = 100;
+pub(crate) const SCORE_DEFAULT: i32 = 100;
 
 /// Maximum allowed score (cap on rewards so a long-lived peer can still be
 /// penalised meaningfully if it later starts misbehaving).
@@ -584,25 +766,42 @@ fn subnet_bucket(addr: &str) -> Option<String> {
     None
 }
 
+/// The single netgroup of every onion we haven't connected to before
+/// (ticket 052): anyone can mint onions by the thousand, so unproven ones
+/// count as one operator for outbound diversity and the cross-check.
+const UNPROVEN_ONION_GROUP: &str = "onion";
+
+fn is_onion(addr: &str) -> bool {
+    addr.contains(".onion")
+}
+
 /// `subnet_bucket`, or `None` (no bucket, so no diversity limit) when the
 /// chain doesn't enforce netgroup diversity. Only regtest turns it off:
-/// every mock peer in the test harness lives on 127.0.0.1.
-fn netgroup(addr: &str, enforce_diversity: bool) -> Option<String> {
-    if enforce_diversity {
-        subnet_bucket(addr)
-    } else {
-        None
+/// every mock peer in the test harness lives on 127.0.0.1. An onion is in
+/// `UNPROVEN_ONION_GROUP` unless `proven` (it connected before), and then
+/// in no bucket, as before: Tor gives it no network locality.
+fn netgroup(addr: &str, enforce_diversity: bool, proven: bool) -> Option<String> {
+    if !enforce_diversity {
+        return None;
     }
+    if is_onion(addr) && !proven {
+        return Some(UNPROVEN_ONION_GROUP.to_string());
+    }
+    subnet_bucket(addr)
 }
 
 /// Group used to keep header cross-check peers independent of each other
 /// (and of the peer being checked): the outbound diversity bucket (/16
-/// IPv4, /32 IPv6), and otherwise the host itself, so each onion address
+/// IPv4, /32 IPv6), `UNPROVEN_ONION_GROUP` for onions we hadn't connected
+/// to before, and otherwise the host itself, so each proven onion address
 /// (or unparseable host) is its own group. With diversity off (regtest,
 /// where every mock peer is on 127.0.0.1) each address is its own group.
-fn cross_check_group(addr: &str, enforce_diversity: bool) -> String {
+fn cross_check_group(addr: &str, enforce_diversity: bool, proven: bool) -> String {
     if !enforce_diversity {
         return addr.to_string();
+    }
+    if is_onion(addr) && !proven {
+        return UNPROVEN_ONION_GROUP.to_string();
     }
     subnet_bucket(addr).unwrap_or_else(|| {
         let host = match addr.rsplit_once(':') {
@@ -611,6 +810,42 @@ fn cross_check_group(addr: &str, enforce_diversity: bool) -> String {
         };
         format!("host:{}", host)
     })
+}
+
+/// `cross_check_group` for a wake's agreement count (ticket 054): an
+/// onion's group follows its slot's `proven`. A peer that has left the
+/// pool counts as unproven (one group with every other unproven onion):
+/// its address book entry is proven by the connect itself, and taking
+/// that would count it as an independent opinion.
+fn wake_group(slots: &[PeerSlot], addr: &str, enforce_diversity: bool) -> String {
+    let proven = slots.iter().find(|s| s.addr == addr).is_some_and(|s| s.proven);
+    cross_check_group(addr, enforce_diversity, proven)
+}
+
+/// Why a peer is penalized: the two of ticket 024's three failure
+/// classes that are the peer's fault (ticket 052's audit). The third,
+/// a local fault (our store, our clock, our deadline), has no variant on
+/// purpose: it never costs a peer anything, so it can't be passed to
+/// `misbehaving`. Logged with every penalty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offense {
+    /// Bad delivery or protocol abuse: a wrong or mutated copy of a
+    /// block, a block or headers it never sent, unconnectable or oversized
+    /// batches, height claims it can't back. The data on the network may
+    /// be fine; this peer's handling of it isn't.
+    Delivery,
+    /// Data that breaks a consensus rule (or the compiled-in anchor) by
+    /// itself, whatever our clock or store says.
+    Consensus,
+}
+
+impl std::fmt::Display for Offense {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Offense::Delivery => "bad delivery",
+            Offense::Consensus => "consensus-invalid",
+        })
+    }
 }
 
 /// Where a pool gets addresses when its address book runs low.
@@ -661,7 +896,14 @@ pub struct PeerPool {
     params: &'static ChainParams,
     /// Where bootstrap / fallback addresses come from.
     source: PeerSource,
+    /// Why a configured peer store could not be opened (after one retry),
+    /// if it couldn't: this session then remembers no bans, scores or
+    /// addresses, and says so in its status (ticket 052).
+    store_error: Option<String>,
 }
+
+/// Pause before the one retry of a peer store that failed to open.
+const STORE_OPEN_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 impl PeerPool {
     /// Create a new peer pool. Discovers peers via DNS (or Tor if available)
@@ -695,10 +937,18 @@ impl PeerPool {
         connect_deadline: Option<Instant>,
     ) -> Result<PeerPool, PeerError> {
         // Open the persistence store and hydrate any existing bans + known
-        // addresses. Failures are logged but non-fatal — the pool still works
-        // without persistence (just slower to find peers on first launch).
+        // addresses. A store that won't open is retried once (ticket 052:
+        // the WAL-switch race is fixed, but any other open error used to
+        // drop ban persistence for the whole session without a word); if it
+        // still fails the pool runs without persistence and its status says
+        // so (`persistence_warning`).
+        let mut store_error = None;
         let (store, bans, restored_addrs) = match peers_db_path {
-            Some(path) => match PeerStore::open(path) {
+            Some(path) => match PeerStore::open(path).or_else(|e| {
+                warn!("PeerPool: peer store failed to open ({}), retrying once", e);
+                std::thread::sleep(STORE_OPEN_RETRY_DELAY);
+                PeerStore::open(path)
+            }) {
                 Ok(s) => {
                     let bans = s.load_active_bans().unwrap_or_else(|e| {
                         warn!("PeerPool: failed to load bans from disk: {}", e);
@@ -721,6 +971,7 @@ impl PeerPool {
                 }
                 Err(e) => {
                     warn!("PeerPool: peer store unavailable, running without persistence: {}", e);
+                    store_error = Some(e.to_string());
                     (None, HashMap::new(), Vec::new())
                 }
             },
@@ -736,15 +987,18 @@ impl PeerPool {
         // can't sustain a healthy outbound pool. The first launch always hits
         // this branch (empty disk → 0 < threshold); subsequent launches with
         // a populated peers.sqlite skip DNS entirely and start cold-syncing
-        // against known-good peers.
-        if addrs.candidate_count() < DNS_FALLBACK_THRESHOLD {
+        // against known-good peers. A book full of gossip but short of
+        // protected entries also asks (ticket 052).
+        if addrs.candidate_count() < DNS_FALLBACK_THRESHOLD
+            || addrs.protected_candidate_count() < PROTECTED_FALLBACK_THRESHOLD
+        {
             let seeds = seed_addrs(&source, tor.as_ref());
             if seeds.is_empty() && addrs.len() == 0 {
                 return Err(PeerError::Connection(
                     "no peers discovered via DNS and no addresses on disk".into(),
                 ));
             }
-            let added = addrs.insert_many(seeds, AddrSource::Dns);
+            let added = addrs.insert_many(seeds, AddrSource::Dns, AddrSource::Dns.as_str());
             info!(
                 "PeerPool: bootstrap added {} new addresses from DNS (total known: {})",
                 added,
@@ -770,6 +1024,7 @@ impl PeerPool {
             last_addr_flush: Instant::now(),
             params,
             source,
+            store_error,
         };
 
         pool.maintain_until(connect_deadline);
@@ -862,14 +1117,17 @@ impl PeerPool {
         // DNS is now a fallback, not the primary source. We only re-query
         // when the AddrManager is depleted enough that we'd otherwise stall
         // — the steady-state expectation is that gossip from connected peers
-        // keeps the manager well above DNS_FALLBACK_THRESHOLD.
-        if self.addrs.candidate_count() < DNS_FALLBACK_THRESHOLD
+        // keeps the manager well above DNS_FALLBACK_THRESHOLD — or when
+        // protected entries run short: a gossip flood keeps the total up
+        // while every seed has gone (ticket 052).
+        if (self.addrs.candidate_count() < DNS_FALLBACK_THRESHOLD
+            || self.addrs.protected_candidate_count() < PROTECTED_FALLBACK_THRESHOLD)
             && self.last_dns_query.elapsed() >= DNS_REDISCOVERY_INTERVAL
         {
             self.last_dns_query = Instant::now();
             let fresh = seed_addrs(&self.source, self.tor.as_ref());
             if !fresh.is_empty() {
-                let added = self.addrs.insert_many(fresh, AddrSource::Dns);
+                let added = self.addrs.insert_many(fresh, AddrSource::Dns, AddrSource::Dns.as_str());
                 info!(
                     "PeerPool: DNS fallback added {} new addresses (total known: {})",
                     added,
@@ -883,21 +1141,36 @@ impl PeerPool {
 
         let diversity = self.params.enforce_netgroup_diversity;
 
-        // Snapshot the current outbound buckets and connected addresses so
-        // we can filter candidates without holding the slots lock for the
-        // duration of the connection attempt.
-        let (already_connected, used_buckets): (HashSet<String>, HashSet<String>) = {
+        // Snapshot the current outbound buckets, connected addresses and
+        // per-source counts so we can filter candidates without holding the
+        // slots lock for the duration of the connection attempt.
+        let mut already_connected: HashSet<String> = HashSet::new();
+        let mut used_buckets: HashSet<String> = HashSet::new();
+        let mut per_source: HashMap<String, usize> = HashMap::new();
+        let mut unprotected_slots = 0;
+        let mut clean_slots = 0;
+        {
             let slots = self.slots.lock().unwrap();
-            let connected = slots.iter().map(|s| s.addr.clone()).collect();
-            let buckets = slots
-                .iter()
-                .filter(|s| !s.inbound)
-                .filter_map(|s| netgroup(&s.addr, diversity))
-                .collect();
-            (connected, buckets)
-        };
+            for s in slots.iter() {
+                already_connected.insert(s.addr.clone());
+                if s.inbound {
+                    continue;
+                }
+                if let Some(bucket) = netgroup(&s.addr, diversity, s.proven) {
+                    used_buckets.insert(bucket);
+                }
+                if let Some(src) = &s.gossip_source {
+                    *per_source.entry(src.clone()).or_default() += 1;
+                    unprotected_slots += 1;
+                }
+                if !s.self_advertised {
+                    clean_slots += 1;
+                }
+            }
+        }
 
         let bans = &self.bans;
+        let addrs = &self.addrs;
         let exclude = |addr: &str| -> bool {
             if bans.contains_key(addr) {
                 return true;
@@ -905,7 +1178,7 @@ impl PeerPool {
             if already_connected.contains(addr) {
                 return true;
             }
-            if let Some(bucket) = netgroup(addr, diversity) {
+            if let Some(bucket) = netgroup(addr, diversity, addrs.is_proven(addr)) {
                 if used_buckets.contains(&bucket) {
                     return true;
                 }
@@ -940,15 +1213,27 @@ impl PeerPool {
         let our_onion_pubkey: Option<[u8; 32]> =
             self.tor.as_ref().and_then(|t| t.our_onion_pubkey());
 
-        for addr in candidates {
-            if connected >= needed {
+        // A wake (it has a connect deadline) dials in parallel, and keeps
+        // dialing past `REFILL_BUDGET` until it has `WAKE_MIN_PEERS` (ticket
+        // 054): one sequential attempt per round trip, checked against the
+        // budget only between attempts, left a Tor wake with one peer, and
+        // one peer's word for the tip.
+        let wake = connect_deadline.is_some();
+        let parallel = if wake { WAKE_CONNECT_PARALLEL } else { 1 };
+        let mut pending: std::collections::VecDeque<String> = candidates.into();
+
+        loop {
+            if connected >= needed || pending.is_empty() {
                 break;
             }
             if connect_deadline.is_some_and(|d| Instant::now() >= d) {
                 info!("PeerPool: connect deadline reached after {} new connections", connected);
                 break;
             }
-            if refill_started.elapsed() >= REFILL_BUDGET {
+            let short_of_wake_minimum = wake
+                && current + connected < WAKE_MIN_PEERS
+                && refill_started.elapsed() < WAKE_CONNECT_BUDGET;
+            if refill_started.elapsed() >= REFILL_BUDGET && !short_of_wake_minimum {
                 info!(
                     "PeerPool: refill budget ({}s) exhausted after {} new connections",
                     REFILL_BUDGET.as_secs(),
@@ -957,77 +1242,167 @@ impl PeerPool {
                 break;
             }
 
-            // Re-check the bucket against this pass's claims (the snapshot
-            // above only reflects buckets occupied at the start of refill).
-            if let Some(bucket) = netgroup(&addr, diversity) {
-                if claimed_buckets.contains(&bucket) {
+            // The next batch: candidates from distinct buckets that this
+            // pass hasn't claimed (the snapshot above only reflects buckets
+            // occupied at the start of refill), within ticket 052's gossip
+            // limits counting the batch as if every dial succeeds. One that
+            // shares a bucket or source with another in the batch waits for
+            // a later one. Proven and the gossip source are decided before
+            // connecting: the connect itself would make the address
+            // "proven" and "protected".
+            let want = parallel.min(needed - connected);
+            let mut batch: Vec<(String, bool, Option<String>, Option<String>)> = Vec::with_capacity(want);
+            let mut batch_buckets: HashSet<String> = HashSet::new();
+            let mut batch_sources: HashMap<String, usize> = HashMap::new();
+            let mut batch_unprotected = 0;
+            let mut i = 0;
+            while batch.len() < want && i < pending.len() {
+                let addr = &pending[i];
+                let proven = self.addrs.is_proven(addr);
+                let gossip_source = self.addrs.gossip_source(addr);
+                let bucket = netgroup(addr, diversity, proven);
+                if bucket.as_ref().is_some_and(|b| claimed_buckets.contains(b)) {
+                    pending.remove(i);
                     continue;
                 }
+                // Ticket 052: gossip addresses fill at most
+                // MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND slots, and at
+                // most MAX_OUTBOUND_PER_SOURCE of them from any one source.
+                if let Some(src) = &gossip_source {
+                    let from_src = per_source.get(src).copied().unwrap_or(0);
+                    if unprotected_slots >= MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND
+                        || from_src >= MAX_OUTBOUND_PER_SOURCE
+                    {
+                        pending.remove(i);
+                        continue;
+                    }
+                    if unprotected_slots + batch_unprotected >= MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND
+                        || from_src + batch_sources.get(src).copied().unwrap_or(0) >= MAX_OUTBOUND_PER_SOURCE
+                    {
+                        i += 1;
+                        continue;
+                    }
+                }
+                if bucket.as_ref().is_some_and(|b| batch_buckets.contains(b)) {
+                    i += 1;
+                    continue;
+                }
+                batch_buckets.extend(bucket.clone());
+                if let Some(src) = &gossip_source {
+                    *batch_sources.entry(src.clone()).or_default() += 1;
+                    batch_unprotected += 1;
+                }
+                if let Some(addr) = pending.remove(i) {
+                    batch.push((addr, proven, gossip_source, bucket));
+                }
+            }
+            if batch.is_empty() {
+                break;
             }
 
             let magic = self.params.magic;
-            let result = if let Some(ref tor) = self.tor {
-                Peer::connect_tor(tor, &addr, self.our_height as i32, magic)
+            let our_height = self.our_height as i32;
+            let tor = self.tor.clone();
+            let dial = |addr: &str| match tor {
+                Some(ref tor) => Peer::connect_tor(tor, addr, our_height, magic),
+                None => Peer::connect(addr, our_height, magic),
+            };
+            type Dialed = (String, bool, Option<String>, Option<String>, Result<Peer, PeerError>);
+            let results: Vec<Dialed> = if batch.len() == 1 {
+                batch.into_iter().map(|(addr, proven, src, bucket)| {
+                    let r = dial(&addr);
+                    (addr, proven, src, bucket, r)
+                }).collect()
             } else {
-                Peer::connect(&addr, self.our_height as i32, magic)
+                std::thread::scope(|s| {
+                    let dials: Vec<_> = batch
+                        .into_iter()
+                        .map(|(addr, proven, src, bucket)| {
+                            let dial = &dial;
+                            s.spawn(move || {
+                                let r = dial(&addr);
+                                (addr, proven, src, bucket, r)
+                            })
+                        })
+                        .collect();
+                    dials
+                        .into_iter()
+                        .filter_map(|h| h.join().ok())
+                        .collect()
+                })
             };
 
-            match result {
-                Ok(mut peer) => {
-                    let user_agent = peer.peer_user_agent().unwrap_or_default();
-                    let height = peer.peer_height().unwrap_or(0).max(0) as u32;
-                    info!(
-                        "PeerPool: connected to {} ({}) at height {}",
-                        addr, user_agent, height
-                    );
-                    self.addrs.record_success(&addr);
+            for (addr, proven, gossip_source, bucket, result) in results {
+                match result {
+                    Ok(mut peer) => {
+                        let user_agent = peer.peer_user_agent().unwrap_or_default();
+                        let height = peer.peer_height().unwrap_or(0).max(0) as u32;
+                        info!(
+                            "PeerPool: connected to {} ({}) at height {}",
+                            addr, user_agent, height
+                        );
+                        self.addrs.record_success(&addr);
 
-                    // Self-advertise unsolicited so this peer learns our
-                    // onion address immediately and can start gossiping it
-                    // onward. `send_self_advertisement` no-ops if the peer
-                    // didn't negotiate addrv2, so we don't need to filter
-                    // here. A failure on the self-ad is non-fatal — the
-                    // peer is still usable for header sync, we just won't
-                    // get inbound discovery via this particular path.
-                    if let Some(pubkey) = our_onion_pubkey {
-                        if let Err(e) = peer.send_self_advertisement(pubkey, 8333) {
-                            warn!("PeerPool: self-ad to {} failed: {}", addr, e);
+                        // Self-advertise unsolicited so this peer learns our
+                        // onion address immediately and can start gossiping
+                        // it onward — except on the first `OWN_TX_OUTBOUND`
+                        // connections, kept clean so own transactions have
+                        // peers that can't tie them to the onion (ticket
+                        // 052). `send_self_advertisement` no-ops if the peer
+                        // didn't negotiate addrv2 (it then never learns the
+                        // onion). A failure on the self-ad is non-fatal — the
+                        // peer is still usable for header sync, we just won't
+                        // get inbound discovery via this particular path.
+                        let mut self_advertised = false;
+                        if let Some(pubkey) = our_onion_pubkey.filter(|_| clean_slots >= OWN_TX_OUTBOUND) {
+                            self_advertised = peer.wants_addrv2();
+                            if let Err(e) = peer.send_self_advertisement(pubkey, 8333) {
+                                warn!("PeerPool: self-ad to {} failed: {}", addr, e);
+                            }
                         }
+                        if !self_advertised {
+                            clean_slots += 1;
+                        }
+
+                        // Restore any persisted score so a known-good peer comes
+                        // back at its earned reputation, not as a stranger.
+                        let score = self
+                            .store
+                            .as_ref()
+                            .and_then(|s| s.load_score(&addr).ok().flatten())
+                            .unwrap_or(SCORE_DEFAULT);
+
+                        if let Some(bucket) = bucket {
+                            claimed_buckets.insert(bucket);
+                        }
+                        if let Some(src) = &gossip_source {
+                            *per_source.entry(src.clone()).or_default() += 1;
+                            unprotected_slots += 1;
+                        }
+
+                        let slot = PeerSlot {
+                            user_agent,
+                            height,
+                            score,
+                            proven,
+                            self_advertised,
+                            gossip_source,
+                            // `connect` asked for its address book: take the
+                            // reply whole, as Core does after a `getaddr`.
+                            addr_tokens: 1.0 + ADDR_TOKEN_BURST,
+                            ..PeerSlot::base(Some(peer), addr, false)
+                        };
+
+                        self.slots.lock().unwrap().push(slot);
+                        connected += 1;
                     }
-
-                    // Restore any persisted score so a known-good peer comes
-                    // back at its earned reputation, not as a stranger.
-                    let score = self
-                        .store
-                        .as_ref()
-                        .and_then(|s| s.load_score(&addr).ok().flatten())
-                        .unwrap_or(SCORE_DEFAULT);
-
-                    if let Some(bucket) = netgroup(&addr, diversity) {
-                        claimed_buckets.insert(bucket);
+                    Err(e) => {
+                        warn!("PeerPool: failed to connect to {}: {}", addr, e);
+                        self.addrs.record_failure(&addr);
                     }
-
-                    let slot = PeerSlot {
-                        peer: Some(peer),
-                        addr,
-                        user_agent,
-                        height,
-                        score,
-                        inbound: false,
-                        demerit: 0,
-            checked_out_at: None,
-                    };
-
-                    self.slots.lock().unwrap().push(slot);
-                    connected += 1;
-                }
-                Err(e) => {
-                    warn!("PeerPool: failed to connect to {}: {}", addr, e);
-                    self.addrs.record_failure(&addr);
                 }
             }
         }
-
         if connected > 0 {
             let total = self.slots.lock().unwrap().len();
             info!(
@@ -1045,16 +1420,84 @@ impl PeerPool {
     /// it drains queued gossip from message handlers. Returns the number of
     /// brand-new addresses added (existing entries are left untouched so
     /// gossip can't reset earned reputation).
-    pub fn ingest_gossip_addrs(&mut self, addrs: Vec<String>) -> usize {
-        let added = self.addrs.insert_many(addrs, AddrSource::Gossip);
+    ///
+    /// `from` is the peer that sent them (ticket 052): its source group
+    /// bounds how much of the book its gossip may fill. Every inbound peer
+    /// shares the one `INBOUND_SOURCE` group (the unverified bucket); an
+    /// outbound peer's group is its netgroup (`cross_check_group`, each
+    /// onion its own: we chose to dial it).
+    ///
+    /// They are rate-limited first by `from`'s token bucket
+    /// (`take_addr_tokens`): addresses beyond its tokens are dropped, and a
+    /// peer no longer in the pool gets none in.
+    pub fn ingest_gossip_addrs(&mut self, from: &str, mut addrs: Vec<String>) -> usize {
+        addrs.truncate(self.take_addr_tokens(from, addrs.len()));
+        let (source, group) = if self.is_inbound(from) {
+            (AddrSource::Inbound, INBOUND_SOURCE.to_string())
+        } else {
+            let group = cross_check_group(from, self.params.enforce_netgroup_diversity, true);
+            (AddrSource::Gossip, format!("gossip:{}", group))
+        };
+        let added = self.addrs.insert_many(addrs, source, &group);
         if added > 0 {
             info!(
-                "PeerPool: ingested {} new gossip addresses (total known: {})",
+                "PeerPool: ingested {} new gossip addresses from {} (total known: {})",
                 added,
+                from,
                 self.addrs.len()
             );
         }
         added
+    }
+
+    /// Core's addr rate limit (ProcessAddrs, ticket 052): refill `addr`'s
+    /// token bucket for the time since its last message (at
+    /// `ADDR_RATE_PER_SEC`, not past `ADDR_TOKEN_BURST`) and spend one
+    /// token per address, up to `wanted`. Returns how many of the message's
+    /// addresses may be processed; the rest are dropped. 0 for a peer not
+    /// in the pool.
+    pub fn take_addr_tokens(&self, addr: &str, wanted: usize) -> usize {
+        let now = Instant::now();
+        let mut slots = self.slots.lock().unwrap();
+        let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) else {
+            return 0;
+        };
+        if slot.addr_tokens < ADDR_TOKEN_BURST {
+            let elapsed = now.saturating_duration_since(slot.addr_tokens_at).as_secs_f64();
+            slot.addr_tokens = (slot.addr_tokens + elapsed * ADDR_RATE_PER_SEC).min(ADDR_TOKEN_BURST);
+        }
+        slot.addr_tokens_at = now;
+        let allowed = (slot.addr_tokens.floor().max(0.0) as usize).min(wanted);
+        slot.addr_tokens -= allowed as f64;
+        if allowed < wanted {
+            info!("PeerPool: rate-limited {} of {} addresses from {}", wanted - allowed, wanted, addr);
+        }
+        allowed
+    }
+
+    /// Whether `addr` may be told our onion address: inbound peers (they
+    /// dialed it) and outbound peers already told on connect. The
+    /// `OWN_TX_OUTBOUND` clean connections never are (ticket 052).
+    pub fn may_self_advertise(&self, addr: &str) -> bool {
+        let slots = self.slots.lock().unwrap();
+        slots.iter().any(|s| s.addr == addr && (s.inbound || s.self_advertised))
+    }
+
+    /// Whether own transactions may be announced or served to `addr`: an
+    /// outbound peer we never told our onion (ticket 052's stopgap until
+    /// 029's private broadcast). Inbound peers reached us at the onion, so
+    /// anything they learn first from us is tied to it.
+    pub fn may_carry_own_txs(&self, addr: &str) -> bool {
+        let slots = self.slots.lock().unwrap();
+        slots.iter().any(|s| s.addr == addr && !s.inbound && !s.self_advertised)
+    }
+
+    /// Why this session isn't persisting bans and scores, if it isn't: the
+    /// configured peer store failed to open, twice (ticket 052).
+    pub fn persistence_warning(&self) -> Option<String> {
+        self.store_error.as_ref().map(|e| {
+            format!("Peer store unavailable: bans and peer scores are not remembered this session ({})", e)
+        })
     }
 
     /// Number of addresses currently held in the address manager. Exposed
@@ -1123,6 +1566,7 @@ impl PeerPool {
             last_addr_flush: Instant::now(),
             params,
             source: PeerSource::Discover,
+            store_error: None,
         }
     }
 
@@ -1301,8 +1745,10 @@ impl PeerPool {
     /// counter.
     ///
     /// Callers pass a positive penalty (10, 20, 50, 100, …) — this method
-    /// handles the sign internally so existing call sites need no changes.
-    pub fn misbehaving(&mut self, addr: &str, howmuch: u32) {
+    /// handles the sign internally — and the `Offense` class it is for,
+    /// which is logged (ticket 052). Local faults have no class: they are
+    /// never the peer's fault, so they never reach this method.
+    pub fn misbehaving(&mut self, addr: &str, howmuch: u32, offense: Offense) {
         let mut should_ban = false;
         {
             let mut slots = self.slots.lock().unwrap();
@@ -1313,8 +1759,8 @@ impl PeerPool {
                 let new_score = (slot.score as i64 - howmuch as i64).max(SCORE_MIN as i64);
                 slot.score = new_score as i32;
                 warn!(
-                    "PeerPool: peer {} misbehaving (-{}), score now {}",
-                    addr, howmuch, slot.score
+                    "PeerPool: peer {} misbehaving ({}, -{}), score now {}",
+                    addr, offense, howmuch, slot.score
                 );
                 if slot.score <= BAN_LOW_THRESHOLD {
                     should_ban = true;
@@ -1482,15 +1928,23 @@ impl PeerPool {
     /// the choice is deterministic.
     pub fn cross_check_peer(&self, others: &[String]) -> Option<String> {
         let diversity = self.params.enforce_netgroup_diversity;
-        let taken: HashSet<String> =
-            others.iter().map(|a| cross_check_group(a, diversity)).collect();
         let slots = self.slots.lock().unwrap();
+        // An onion's group depends on whether it had connected before
+        // this connection (the slot's `proven`, ticket 052).
+        let proven = |addr: &str| {
+            slots
+                .iter()
+                .find(|s| s.addr == addr)
+                .map_or_else(|| self.addrs.is_proven(addr), |s| s.proven)
+        };
+        let taken: HashSet<String> =
+            others.iter().map(|a| cross_check_group(a, diversity, proven(a))).collect();
         let mut best: Option<&PeerSlot> = None;
         for s in slots.iter() {
             if s.inbound
                 || s.peer.is_none()
                 || others.iter().any(|o| o == &s.addr)
-                || taken.contains(&cross_check_group(&s.addr, diversity))
+                || taken.contains(&cross_check_group(&s.addr, diversity, s.proven))
             {
                 continue;
             }
@@ -1499,6 +1953,67 @@ impl PeerPool {
             }
         }
         best.map(|s| s.addr.clone())
+    }
+
+    /// The next peer a wake asks for headers (ticket 054): an available
+    /// outbound peer not in `asked`. The first is the highest-weighted
+    /// (reputation, never a claimed height). After that a second opinion
+    /// is wanted, so a peer claiming more than `tip_height` goes first (it
+    /// may have what the others withheld), then one independent
+    /// (`cross_check_group`) of every peer in `agreeing`, then weight;
+    /// the earliest slot on a tie.
+    pub fn wake_header_peer(
+        &self,
+        asked: &[String],
+        agreeing: &[String],
+        tip_height: u32,
+    ) -> Option<String> {
+        let diversity = self.params.enforce_netgroup_diversity;
+        let slots = self.slots.lock().unwrap();
+        let taken: HashSet<String> =
+            agreeing.iter().map(|a| wake_group(&slots, a, diversity)).collect();
+        let second_opinion = !asked.is_empty();
+        let rank = |s: &PeerSlot| {
+            let taller = second_opinion && s.height > tip_height;
+            let independent = !taken.contains(&cross_check_group(&s.addr, diversity, s.proven));
+            (taller, independent, s.weight())
+        };
+        let mut best: Option<&PeerSlot> = None;
+        for s in slots.iter() {
+            if s.inbound || s.peer.is_none() || asked.iter().any(|a| a == &s.addr) {
+                continue;
+            }
+            if best.map_or(true, |b| rank(s) > rank(b)) {
+                best = Some(s);
+            }
+        }
+        best.map(|s| s.addr.clone())
+    }
+
+    /// How many of `addrs` are independent of each other: the number of
+    /// distinct `cross_check_group`s among them (ticket 054: two peers in
+    /// one /16 agreeing is one opinion).
+    pub fn independent_count(&self, addrs: &[String]) -> usize {
+        let diversity = self.params.enforce_netgroup_diversity;
+        let slots = self.slots.lock().unwrap();
+        addrs
+            .iter()
+            .map(|a| wake_group(&slots, a, diversity))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Every available outbound peer not in `excluded`, highest weight
+    /// first (earliest slot on a tie): a wake spreads its block requests
+    /// over them (ticket 054).
+    pub fn available_outbound_excluding(&self, excluded: &[String]) -> Vec<String> {
+        let slots = self.slots.lock().unwrap();
+        let mut found: Vec<&PeerSlot> = slots
+            .iter()
+            .filter(|s| !s.inbound && s.peer.is_some() && !excluded.iter().any(|e| e == &s.addr))
+            .collect();
+        found.sort_by_key(|s| std::cmp::Reverse(s.weight()));
+        found.into_iter().map(|s| s.addr.clone()).collect()
     }
 
     /// Pick an available outbound peer not in `excluded`, highest score
@@ -1565,41 +2080,68 @@ impl PeerPool {
 
         let inbound = slots.iter().filter(|s| s.inbound).count();
         if inbound >= MAX_INBOUND {
-            info!("PeerPool: rejecting inbound peer (at capacity {}/{})", inbound, MAX_INBOUND);
-            return false;
+            // Simple inbound eviction (ticket 052): make room by dropping
+            // the inbound peer silent the longest, if it has been silent
+            // for `INBOUND_EVICTION_IDLE` (a live peer answers our pings
+            // well within that). Otherwise every slot is busy: refuse the
+            // newcomer. Checked-out peers are in use, never evicted.
+            let idlest = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.inbound)
+                .filter_map(|(i, s)| s.peer.as_ref().map(|p| (i, p.idle_for())))
+                .max_by_key(|(_, idle)| *idle);
+            match idlest {
+                Some((i, idle)) if idle >= INBOUND_EVICTION_IDLE => {
+                    info!(
+                        "PeerPool: evicting inbound peer {} (silent {}s) for {}",
+                        slots[i].addr,
+                        idle.as_secs(),
+                        addr
+                    );
+                    slots.remove(i);
+                }
+                _ => {
+                    info!("PeerPool: rejecting inbound peer (at capacity {}/{})", inbound, MAX_INBOUND);
+                    return false;
+                }
+            }
         }
 
         info!("PeerPool: accepted inbound peer {} ({}) at height {}", addr, user_agent, height);
 
         // No persisted score to restore: the address is a per-connection
-        // id (see `Peer::accept`), not an identity.
+        // id (see `Peer::accept`), not an identity. Core's single starting
+        // addr token: we never ask an inbound peer for addresses.
         slots.push(PeerSlot {
-            peer: Some(peer),
-            addr,
             user_agent,
             height,
-            score: SCORE_DEFAULT,
-            inbound: true,
-            demerit: 0,
-            checked_out_at: None,
+            ..PeerSlot::base(Some(peer), addr, true)
         });
         true
     }
 
     /// Add an already-connected peer as an outbound slot, for tests that
-    /// drive the pool with loopback peers.
+    /// drive the pool with loopback peers. It is one of the clean
+    /// connections (never self-advertised to).
     #[cfg(test)]
     pub(crate) fn add_outbound_peer_for_test(&self, peer: Peer) {
         let addr = peer.addr().to_string();
         self.slots.lock().unwrap().push(PeerSlot {
-            peer: Some(peer),
-            addr,
             user_agent: "/test/".to_string(),
-            height: 0,
-            score: SCORE_DEFAULT,
-            inbound: false,
-            demerit: 0,
-            checked_out_at: None,
+            ..PeerSlot::base(Some(peer), addr, false)
+        });
+    }
+
+    /// `add_outbound_peer_for_test`, for a peer we told our onion on
+    /// connect (not one of the `OWN_TX_OUTBOUND` clean connections).
+    #[cfg(test)]
+    pub(crate) fn add_self_advertised_peer_for_test(&self, peer: Peer) {
+        let addr = peer.addr().to_string();
+        self.slots.lock().unwrap().push(PeerSlot {
+            user_agent: "/test/".to_string(),
+            self_advertised: true,
+            ..PeerSlot::base(Some(peer), addr, false)
         });
     }
 
@@ -1767,6 +2309,7 @@ mod tests {
             last_addr_flush: Instant::now(),
             params: ChainParams::mainnet(),
             source: PeerSource::Discover,
+            store_error: None,
         }
     }
 
@@ -1785,6 +2328,7 @@ mod tests {
             last_addr_flush: Instant::now(),
             params: ChainParams::mainnet(),
             source: PeerSource::Discover,
+            store_error: None,
         }
     }
 
@@ -1803,6 +2347,7 @@ mod tests {
             inbound,
             demerit: 0,
             checked_out_at: None,
+            ..PeerSlot::base(None, String::new(), false)
         });
     }
 
@@ -1897,7 +2442,7 @@ mod tests {
         add_slot(&pool, "reliable.peer:8333", 899_999);
         // 70-point penalty leaves sketchy at 30, above BAN_LOW_THRESHOLD so
         // it stays in the pool but its weighted score makes reliable win.
-        pool.misbehaving("sketchy.peer:8333", 70);
+        pool.misbehaving("sketchy.peer:8333", 70, Offense::Delivery);
         assert!(!pool.is_banned("sketchy.peer:8333"));
         pool.reward("reliable.peer:8333", 80);
         assert_eq!(
@@ -1951,10 +2496,10 @@ mod tests {
         add_slot(&pool, "peer:8333", 100);
         assert_eq!(pool.get_score("peer:8333"), Some(SCORE_DEFAULT));
 
-        pool.misbehaving("peer:8333", 10);
+        pool.misbehaving("peer:8333", 10, Offense::Delivery);
         assert_eq!(pool.get_score("peer:8333"), Some(SCORE_DEFAULT - 10));
 
-        pool.misbehaving("peer:8333", 20);
+        pool.misbehaving("peer:8333", 20, Offense::Delivery);
         assert_eq!(pool.get_score("peer:8333"), Some(SCORE_DEFAULT - 30));
     }
 
@@ -1965,12 +2510,12 @@ mod tests {
 
         // Drop to just above ban threshold — not banned
         // 100 - 79 = 21, > BAN_LOW_THRESHOLD (20)
-        pool.misbehaving("peer:8333", 79);
+        pool.misbehaving("peer:8333", 79, Offense::Delivery);
         assert!(!pool.is_banned("peer:8333"));
         assert_eq!(pool.count(), 1);
 
         // One more point — score = 20, == BAN_LOW_THRESHOLD → banned
-        pool.misbehaving("peer:8333", 1);
+        pool.misbehaving("peer:8333", 1, Offense::Delivery);
         assert!(pool.is_banned("peer:8333"));
         assert_eq!(pool.count(), 0);
     }
@@ -1980,7 +2525,7 @@ mod tests {
         let mut pool = test_pool();
         add_slot(&pool, "peer:8333", 100);
 
-        pool.misbehaving("peer:8333", u32::MAX);
+        pool.misbehaving("peer:8333", u32::MAX, Offense::Delivery);
         // Score should be clamped at SCORE_MIN, not panic, and peer should be banned
         assert!(pool.is_banned("peer:8333"));
     }
@@ -2020,7 +2565,7 @@ mod tests {
         assert_eq!(pool.get_score("peer:8333"), Some(150));
 
         // Take a 100-point hit (e.g., serving an oversized header batch)
-        pool.misbehaving("peer:8333", 100); // score = 50
+        pool.misbehaving("peer:8333", 100, Offense::Delivery); // score = 50
         assert!(!pool.is_banned("peer:8333"), "earned reputation absorbs the hit");
         assert_eq!(pool.get_score("peer:8333"), Some(50));
     }
@@ -2044,7 +2589,7 @@ mod tests {
         add_slot(&pool, "peer.a:8333", 100);
         add_slot(&pool, "peer.b:8333", 200);
         pool.reward("peer.a:8333", 25);   // 125
-        pool.misbehaving("peer.b:8333", 10); // 90
+        pool.misbehaving("peer.b:8333", 10, Offense::Delivery); // 90
 
         pool.flush_scores();
 
@@ -2110,6 +2655,7 @@ mod tests {
                 inbound: false,
                 demerit: 0,
                 checked_out_at: Some(Instant::now() - Duration::from_secs(300)),
+                ..PeerSlot::base(None, String::new(), false)
             });
             // Also add a healthy slot with no checkout
             slots.push(PeerSlot {
@@ -2121,6 +2667,7 @@ mod tests {
                 inbound: false,
                 demerit: 0,
             checked_out_at: None,
+            ..PeerSlot::base(None, String::new(), false)
             });
         }
         assert_eq!(pool.count(), 2);
@@ -2148,6 +2695,7 @@ mod tests {
                 inbound: false,
                 demerit: 0,
                 checked_out_at: Some(Instant::now()), // just now
+                ..PeerSlot::base(None, String::new(), false)
             });
         }
 
@@ -2250,6 +2798,7 @@ mod tests {
             inbound,
             demerit: 0,
             checked_out_at: None,
+            ..PeerSlot::base(None, String::new(), false)
         });
         server
     }
@@ -2316,21 +2865,23 @@ mod tests {
     }
 
     #[test]
-    fn cross_check_peer_counts_onions_per_address_and_breaks_ties_by_slot_order() {
+    fn cross_check_peer_counts_proven_onions_per_address_and_breaks_ties_by_slot_order() {
         let pool = test_pool();
         let _a = add_live_slot(&pool, "aaaa.onion:8333", 0, SCORE_DEFAULT, false);
         let _b = add_live_slot(&pool, "bbbb.onion:8333", 0, SCORE_DEFAULT, false);
         let _c = add_live_slot(&pool, "cccc.onion:8333", 0, SCORE_DEFAULT, false);
+        // Each connected before (ticket 052: unproven onions share a group).
+        pool.slots.lock().unwrap().iter_mut().for_each(|s| s.proven = true);
         let others = ["aaaa.onion:8333".to_string()];
         assert_eq!(pool.cross_check_peer(&others).as_deref(), Some("bbbb.onion:8333"));
         // The same onion on another port is the same group.
         assert_eq!(
-            cross_check_group("bbbb.onion:8333", true),
-            cross_check_group("bbbb.onion:18333", true)
+            cross_check_group("bbbb.onion:8333", true, true),
+            cross_check_group("bbbb.onion:18333", true, true)
         );
         assert_ne!(
-            cross_check_group("bbbb.onion:8333", true),
-            cross_check_group("cccc.onion:8333", true)
+            cross_check_group("bbbb.onion:8333", true, true),
+            cross_check_group("cccc.onion:8333", true, true)
         );
     }
 
@@ -2348,7 +2899,7 @@ mod tests {
         // Selection sees the demerit...
         assert_eq!(pool.best_peer_addr().as_deref(), Some("5.6.7.8:8333"));
         // ...but a later routine penalty doesn't turn it into a ban.
-        pool.misbehaving("1.2.3.4:8333", 10);
+        pool.misbehaving("1.2.3.4:8333", 10, Offense::Delivery);
         assert!(!pool.is_banned("1.2.3.4:8333"));
         assert_eq!(pool.get_score("1.2.3.4:8333"), Some(SCORE_DEFAULT - 10));
     }
@@ -2383,11 +2934,11 @@ mod tests {
     fn netgroup_diversity_only_relaxed_when_params_say_so() {
         // Mainnet enforces /16 buckets — loopback mock peers would share one.
         assert!(ChainParams::mainnet().enforce_netgroup_diversity);
-        assert_eq!(netgroup("127.0.0.1:18444", true), Some("v4:127.0".to_string()));
-        assert_eq!(netgroup("127.0.0.1:18445", true), netgroup("127.0.0.1:18444", true));
+        assert_eq!(netgroup("127.0.0.1:18444", true, false), Some("v4:127.0".to_string()));
+        assert_eq!(netgroup("127.0.0.1:18445", true, false), netgroup("127.0.0.1:18444", true, false));
         // Regtest (test-only) disables the bucket entirely.
         assert!(!ChainParams::regtest().enforce_netgroup_diversity);
-        assert_eq!(netgroup("127.0.0.1:18444", false), None);
+        assert_eq!(netgroup("127.0.0.1:18444", false, false), None);
     }
 
     #[test]
@@ -2453,9 +3004,22 @@ mod tests {
 
     // ── AddrManager tests ────────────────────────────────────────────
 
+    /// An outbound peer in `pool` with a full addr token bucket, to gossip
+    /// from (ticket 052: gossip from a peer not in the pool is dropped).
+    fn gossip_source(pool: &PeerPool) -> String {
+        let addr = "198.51.100.7:8333".to_string();
+        let mut slots = pool.slots.lock().unwrap();
+        if !slots.iter().any(|s| s.addr == addr) {
+            slots.push(PeerSlot { addr_tokens: ADDR_TOKEN_BURST, ..PeerSlot::base(None, addr.clone(), false) });
+        }
+        addr
+    }
+
     /// Shorthand for tests: insert with the gossip source tag (most common).
     fn ti(m: &mut AddrManager, addr: &str) -> bool {
-        m.insert(addr.to_string(), AddrSource::Gossip)
+        // Each address its own source: these tests are about eviction
+        // order, not the per-source cap.
+        m.insert(addr.to_string(), AddrSource::Gossip, &format!("gossip:{}", addr))
     }
 
     #[test]
@@ -2476,6 +3040,7 @@ mod tests {
                 "1.2.3.4:8333".to_string(), // duplicate
             ],
             AddrSource::Gossip,
+            "gossip:test",
         );
         assert_eq!(added, 2);
         assert_eq!(m.len(), 2);
@@ -2518,7 +3083,7 @@ mod tests {
     #[test]
     fn addrman_backoff_grows_with_failures() {
         // Backoff doubles per failure, starting from ADDR_RETRY_BASE.
-        let mut meta = AddrMeta::new(AddrSource::Gossip);
+        let mut meta = AddrMeta::new(AddrSource::Gossip, "gossip:test");
         meta.last_tried = Some(Instant::now());
 
         meta.failure_count = 1;
@@ -2535,7 +3100,7 @@ mod tests {
     fn addrman_backoff_caps_at_max() {
         // After enough failures the backoff plateaus at ADDR_RETRY_MAX
         // instead of growing without bound.
-        let mut meta = AddrMeta::new(AddrSource::Gossip);
+        let mut meta = AddrMeta::new(AddrSource::Gossip, "gossip:test");
         meta.last_tried = Some(Instant::now());
         meta.failure_count = 50;
         assert_eq!(meta.current_backoff(), ADDR_RETRY_MAX);
@@ -2543,7 +3108,7 @@ mod tests {
 
     #[test]
     fn addrman_eligible_for_never_tried() {
-        let meta = AddrMeta::new(AddrSource::Gossip);
+        let meta = AddrMeta::new(AddrSource::Gossip, "gossip:test");
         assert!(meta.is_eligible(Instant::now()));
     }
 
@@ -2551,7 +3116,7 @@ mod tests {
     fn addrman_eligible_after_backoff_elapsed() {
         // Synthesise an entry whose last_tried was long ago, so even with
         // failures the backoff has elapsed.
-        let mut meta = AddrMeta::new(AddrSource::Gossip);
+        let mut meta = AddrMeta::new(AddrSource::Gossip, "gossip:test");
         meta.failure_count = 1;
         meta.last_tried = Some(Instant::now() - (ADDR_RETRY_BASE * 2));
         assert!(meta.is_eligible(Instant::now()));
@@ -2674,6 +3239,7 @@ mod tests {
             last_success: None,
             failure_count: 3,
             source: "gossip".to_string(),
+            source_group: String::new(),
         };
         assert!(m.insert_from_record(&record));
         let meta = m.addrs.get("restored:8333").unwrap();
@@ -2722,7 +3288,7 @@ mod tests {
     #[test]
     fn ingest_gossip_addrs_returns_count_added() {
         let mut pool = test_pool();
-        let added = pool.ingest_gossip_addrs(vec![
+        let added = pool.ingest_gossip_addrs(&gossip_source(&pool), vec![
             "1.2.3.4:8333".to_string(),
             "5.6.7.8:8333".to_string(),
         ]);
@@ -2730,7 +3296,7 @@ mod tests {
         assert_eq!(pool.known_addr_count(), 2);
 
         // Re-ingesting the same addresses adds zero new entries.
-        let added2 = pool.ingest_gossip_addrs(vec!["1.2.3.4:8333".to_string()]);
+        let added2 = pool.ingest_gossip_addrs(&gossip_source(&pool), vec!["1.2.3.4:8333".to_string()]);
         assert_eq!(added2, 0);
         assert_eq!(pool.known_addr_count(), 2);
     }
@@ -2740,7 +3306,7 @@ mod tests {
     #[test]
     fn flush_addrs_writes_dirty_entries_to_store() {
         let mut pool = test_pool_with_store();
-        pool.ingest_gossip_addrs(vec![
+        pool.ingest_gossip_addrs(&gossip_source(&pool), vec![
             "1.2.3.4:8333".to_string(),
             "5.6.7.8:8333".to_string(),
         ]);
@@ -2774,16 +3340,18 @@ mod tests {
             last_addr_flush: Instant::now(),
             params: ChainParams::mainnet(),
             source: PeerSource::Discover,
+            store_error: None,
         };
 
-        pool.ingest_gossip_addrs(vec!["a:8333".to_string(), "b:8333".to_string()]);
+        pool.addrs.insert("a:8333".into(), AddrSource::Gossip, "gossip:1");
+        pool.addrs.insert("b:8333".into(), AddrSource::Gossip, "gossip:2");
         pool.flush_addrs(); // baseline: both written
 
         // Insert a third → cap=2 forces eviction. Eviction prefers the
         // entry with most failures, but with all-zero failures it falls
         // through to "highest failure_count among never-success" (0 here)
         // which then breaks ties on first_seen age, evicting the oldest.
-        pool.ingest_gossip_addrs(vec!["c:8333".to_string()]);
+        pool.addrs.insert("c:8333".into(), AddrSource::Gossip, "gossip:3");
         pool.flush_addrs();
 
         let loaded = store.load_all_addrs().unwrap();
@@ -2797,7 +3365,7 @@ mod tests {
         // A second flush with no intervening mutation should issue zero
         // INSERTs (verified indirectly: no panic, store contents unchanged).
         let mut pool = test_pool_with_store();
-        pool.ingest_gossip_addrs(vec!["a:8333".to_string()]);
+        pool.ingest_gossip_addrs(&gossip_source(&pool), vec!["a:8333".to_string()]);
         pool.flush_addrs();
         let before = pool.store.as_ref().unwrap().load_all_addrs().unwrap();
         pool.flush_addrs();
@@ -2819,6 +3387,7 @@ mod tests {
                 last_success: None,
                 failure_count: 0,
                 source: "dns".to_string(),
+                source_group: "dns".to_string(),
             };
             assert!(m.insert_from_record(&record));
         }
@@ -2828,9 +3397,10 @@ mod tests {
     // ── Address poisoning (tests/network-app) ────────────────────────
     //
     // Ticket 011 keeps the address manager deliberately simple (no
-    // new/tried buckets, no per-source limits). What it does promise:
-    // known-good addresses are never evicted, gossip never resets an
-    // entry's history, and known-good ones are dialed first.
+    // new/tried buckets). What it promises: known-good addresses are never
+    // evicted, gossip never resets an entry's history, and known-good ones
+    // are dialed first; ticket 052 adds per-source caps and a protected
+    // set (seeds, known-good) gossip can never evict.
 
     /// Capacity for the flood tests: eviction scans the whole manager per
     /// insert, so a 10k-entry flood test takes seconds; the policy is the
@@ -2840,10 +3410,15 @@ mod tests {
     /// A full manager: `good` known-good, `dns` hour-old untried DNS
     /// entries, then a gossip flood twice its capacity from one peer.
     fn flooded(good: usize, dns: usize) -> AddrManager {
+        flooded_from(good, dns, 1)
+    }
+
+    /// `flooded`, the flood spread over `sources` gossip source groups.
+    fn flooded_from(good: usize, dns: usize, sources: u32) -> AddrManager {
         let mut m = AddrManager::new(FLOOD_CAP);
         let hour_ago = unix_now() - 3600;
         for i in 0..good {
-            m.insert(format!("good{}:8333", i), AddrSource::Dns);
+            m.insert(format!("good{}:8333", i), AddrSource::Dns, "dns");
             m.record_success(&format!("good{}:8333", i));
         }
         for i in 0..dns {
@@ -2854,16 +3429,20 @@ mod tests {
                 last_success: None,
                 failure_count: 0,
                 source: "dns".into(),
+                source_group: "dns".into(),
             });
         }
-        let flood = (0..2 * FLOOD_CAP as u32).map(|i| format!("{}.{}.{}.{}:8333", 100 + (i >> 16), (i >> 8) & 0xff, i & 0xff, 7));
-        m.insert_many(flood, AddrSource::Gossip);
+        for i in 0..2 * FLOOD_CAP as u32 {
+            let addr = format!("{}.{}.{}.{}:8333", 100 + (i >> 16), (i >> 8) & 0xff, i & 0xff, 7);
+            m.insert(addr, AddrSource::Gossip, &format!("gossip:src{}", i % sources));
+        }
         m
     }
 
     #[test]
     fn gossip_flood_never_evicts_known_good_addresses_and_stays_bounded() {
-        let m = flooded(50, 0);
+        // Enough sources to fill the book despite per-source caps.
+        let m = flooded_from(50, 0, 40);
         assert_eq!(m.len(), FLOOD_CAP);
         for i in 0..50 {
             assert!(m.addrs.contains_key(&format!("good{}:8333", i)), "good{} evicted", i);
@@ -2883,29 +3462,255 @@ mod tests {
     #[test]
     fn gossip_never_resets_an_entrys_history() {
         let mut m = AddrManager::new(100);
-        m.insert("flaky:8333".into(), AddrSource::Dns);
+        m.insert("flaky:8333".into(), AddrSource::Dns, "dns");
         for _ in 0..3 {
             m.record_failure("flaky:8333");
         }
-        m.insert("good:8333".into(), AddrSource::Dns);
+        m.insert("good:8333".into(), AddrSource::Dns, "dns");
         m.record_success("good:8333");
         // The same addresses gossiped back by a peer.
-        assert_eq!(m.insert_many(["flaky:8333".to_string(), "good:8333".to_string()], AddrSource::Gossip), 0);
+        assert_eq!(m.insert_many(["flaky:8333".to_string(), "good:8333".to_string()], AddrSource::Gossip, "gossip:test"), 0);
         assert_eq!(m.addrs["flaky:8333"].failure_count, 3);
         assert!(!m.addrs["flaky:8333"].is_eligible(Instant::now()), "gossip lifted a backoff");
         assert!(m.addrs["good:8333"].last_success.is_some());
-        assert_eq!(m.addrs["good:8333"].source, AddrSource::Dns);
+        assert_eq!(m.addrs["good:8333"].source, AddrSource::Dns, "dns");
     }
 
-    /// One gossiping peer can push every untried DNS-learned address out
-    /// of a full manager (oldest untried go first), leaving only its own
-    /// addresses plus the known-good ones as candidates. Core's per-source
-    /// buckets prevent this; ticket 011 deferred them.
+    /// One gossiping peer used to push every untried DNS-learned address
+    /// out of a full manager (oldest untried go first), leaving only its
+    /// own addresses plus the known-good ones as candidates. Ticket 052's
+    /// per-source caps (Core's source buckets) prevent this.
     #[test]
-    #[ignore = "BUG: no per-source limits (011 deferred bucketing): one peer's addr flood evicts every untried DNS address"]
     fn one_gossip_source_cannot_evict_all_dns_addresses() {
         let m = flooded(0, 200);
         let survivors = (0..200).filter(|i| m.addrs.contains_key(&format!("dns{}:8333", i))).count();
         assert!(survivors >= 100, "only {} of 200 DNS addresses survived a single peer's flood", survivors);
+    }
+
+    /// One source holds at most 1/ADDR_SOURCE_SHARE of the book; and
+    /// however many sources flood it, DNS and known-good entries survive
+    /// (they are protected, ticket 052).
+    #[test]
+    fn per_source_cap_and_protected_set_survive_a_many_source_flood() {
+        let m = flooded(0, 0);
+        assert_eq!(m.len(), FLOOD_CAP / ADDR_SOURCE_SHARE, "one source past its share");
+        let m = flooded_from(20, 300, 64);
+        assert_eq!(m.len(), FLOOD_CAP);
+        for i in 0..300 {
+            assert!(m.addrs.contains_key(&format!("dns{}:8333", i)), "dns{} evicted by gossip", i);
+        }
+        for i in 0..20 {
+            assert!(m.addrs.contains_key(&format!("good{}:8333", i)));
+        }
+        // Gossip can't push protected entries out, even into a book that
+        // is all protected: it is dropped instead.
+        let mut full = AddrManager::new(4);
+        for i in 0..4 {
+            full.insert(format!("seed{}:8333", i), AddrSource::Dns, "dns");
+        }
+        assert!(!full.insert("1.2.3.4:8333".into(), AddrSource::Gossip, "gossip:x"));
+        assert_eq!(full.len(), 4);
+    }
+
+    /// Within a tier, seeds are tried before gossip.
+    #[test]
+    fn untried_seeds_are_dialed_before_untried_gossip() {
+        let mut m = AddrManager::new(100);
+        for i in 0..10 {
+            m.insert(format!("10.0.0.{}:8333", i), AddrSource::Gossip, "gossip:x");
+        }
+        m.insert("seed:8333".into(), AddrSource::Dns, "dns");
+        assert_eq!(m.pick_candidates(1, &|_| false), vec!["seed:8333".to_string()]);
+    }
+
+    /// Ticket 052: Core's addr token bucket. An inbound peer starts with
+    /// one token and gains 0.1 a second; an outbound peer we sent `getaddr`
+    /// to may answer with a full 1,000.
+    #[test]
+    fn addr_gossip_is_rate_limited_per_peer() {
+        let pool = test_pool();
+        add_slot_with_inbound(&pool, "inbound#1", 0, true);
+        assert_eq!(pool.take_addr_tokens("inbound#1", 1000), 1);
+        assert_eq!(pool.take_addr_tokens("inbound#1", 1000), 0);
+        {
+            // Ten seconds later: one more.
+            let mut slots = pool.slots.lock().unwrap();
+            let s = slots.iter_mut().find(|s| s.addr == "inbound#1").unwrap();
+            s.addr_tokens_at -= Duration::from_secs(10);
+        }
+        assert_eq!(pool.take_addr_tokens("inbound#1", 1000), 1);
+        pool.slots.lock().unwrap().push(PeerSlot {
+            addr_tokens: 1.0 + ADDR_TOKEN_BURST,
+            ..PeerSlot::base(None, "1.2.3.4:8333".into(), false)
+        });
+        assert_eq!(pool.take_addr_tokens("1.2.3.4:8333", 1000), 1000);
+        assert_eq!(pool.take_addr_tokens("1.2.3.4:8333", 1000), 1);
+        assert_eq!(pool.take_addr_tokens("not-connected:8333", 10), 0);
+    }
+
+    /// Inbound gossip is the unverified bucket: every inbound peer shares
+    /// one source group, so together they hold at most one share.
+    #[test]
+    fn all_inbound_gossip_shares_one_source() {
+        let mut pool = test_pool();
+        for i in 0..3 {
+            let id = format!("inbound#{}", i);
+            pool.slots.lock().unwrap().push(PeerSlot {
+                addr_tokens: ADDR_TOKEN_BURST,
+                ..PeerSlot::base(None, id, true)
+            });
+        }
+        let cap = MAX_KNOWN_ADDRS / ADDR_SOURCE_SHARE;
+        let mut added = 0;
+        for i in 0..3u32 {
+            let batch: Vec<String> =
+                (0..cap as u32).map(|j| format!("45.{}.{}.{}:8333", i, j >> 8, j & 0xff)).collect();
+            added += pool.ingest_gossip_addrs(&format!("inbound#{}", i), batch);
+        }
+        assert_eq!(added, cap);
+        assert!(pool.addrs.addrs.values().all(|m| m.source == AddrSource::Inbound && m.source_group == INBOUND_SOURCE));
+    }
+
+    /// Ticket 052: onions we never connected to are one netgroup, for
+    /// outbound diversity and the cross-check; a proven one is its own.
+    #[test]
+    fn unproven_onions_are_one_netgroup() {
+        assert_eq!(netgroup("aaaa.onion:8333", true, false), netgroup("bbbb.onion:8333", true, false));
+        assert_eq!(netgroup("aaaa.onion:8333", true, true), None);
+        assert_eq!(cross_check_group("aaaa.onion:8333", true, false), cross_check_group("bbbb.onion:8333", true, false));
+        assert_ne!(cross_check_group("aaaa.onion:8333", true, true), cross_check_group("bbbb.onion:8333", true, true));
+        assert_eq!(netgroup("aaaa.onion:8333", false, false), None, "regtest: no diversity");
+
+        let pool = test_pool();
+        let _a = add_live_slot(&pool, "1.2.3.4:8333", 0, SCORE_DEFAULT, false);
+        let _b = add_live_slot(&pool, "bbbb.onion:8333", 0, SCORE_MAX, false);
+        let _c = add_live_slot(&pool, "cccc.onion:8333", 0, SCORE_DEFAULT, false);
+        // Witness: the best-scored onion. Tiebreaker: not the other
+        // unproven onion (same operator, as far as we know).
+        let w = pool.cross_check_peer(&["1.2.3.4:8333".to_string()]).unwrap();
+        assert_eq!(w, "bbbb.onion:8333");
+        assert_eq!(pool.cross_check_peer(&["1.2.3.4:8333".to_string(), w]), None);
+    }
+
+    /// Ticket 052: own transactions go only to outbound peers we never
+    /// told our onion; the onion is only offered to peers that know it.
+    #[test]
+    fn own_tx_and_self_ad_eligibility_by_connection() {
+        let pool = test_pool();
+        add_slot_with_inbound(&pool, "inbound#1", 0, true);
+        add_slot(&pool, "1.1.1.1:8333", 0);
+        pool.slots.lock().unwrap().push(PeerSlot {
+            self_advertised: true,
+            ..PeerSlot::base(None, "2.2.2.2:8333".into(), false)
+        });
+        assert!(!pool.may_carry_own_txs("inbound#1"));
+        assert!(pool.may_carry_own_txs("1.1.1.1:8333"));
+        assert!(!pool.may_carry_own_txs("2.2.2.2:8333"));
+        assert!(!pool.may_carry_own_txs("unknown:8333"));
+        assert!(pool.may_self_advertise("inbound#1"));
+        assert!(!pool.may_self_advertise("1.1.1.1:8333"));
+        assert!(pool.may_self_advertise("2.2.2.2:8333"));
+    }
+
+    /// Ticket 052: with inbound slots full, a newcomer evicts the peer
+    /// silent the longest, if it has been silent long enough; otherwise
+    /// it is refused.
+    #[test]
+    fn full_inbound_evicts_the_idlest_or_refuses() {
+        let pool = test_pool();
+        let mut servers = Vec::new();
+        for i in 0..MAX_INBOUND {
+            let (mut peer, server) = crate::p2p::tests::loopback_peer_pair();
+            peer.set_addr_for_test(&format!("inbound#{}", i), true);
+            if i == 3 {
+                peer.set_idle_for_test(INBOUND_EVICTION_IDLE + Duration::from_secs(1));
+            } else if i == 5 {
+                peer.set_idle_for_test(INBOUND_EVICTION_IDLE + Duration::from_secs(60));
+            }
+            assert!(pool.add_inbound_peer(peer));
+            servers.push(server);
+        }
+        let newcomer = |n: &str| {
+            let (mut peer, server) = crate::p2p::tests::loopback_peer_pair();
+            peer.set_addr_for_test(n, true);
+            (peer, server)
+        };
+        let (p, _s1) = newcomer("inbound#new1");
+        assert!(pool.add_inbound_peer(p));
+        assert_eq!(pool.inbound_count(), MAX_INBOUND);
+        assert!(!pool.is_inbound("inbound#5"), "idlest not evicted");
+        let (p, _s2) = newcomer("inbound#new2");
+        assert!(pool.add_inbound_peer(p));
+        assert!(!pool.is_inbound("inbound#3"));
+        // Everyone left is active: refused.
+        let (p, _s3) = newcomer("inbound#new3");
+        assert!(!pool.add_inbound_peer(p));
+        assert_eq!(pool.inbound_count(), MAX_INBOUND);
+    }
+
+    /// Ticket 052: a peer store that can't be opened leaves the session
+    /// running, and its status says it isn't remembering bans.
+    #[test]
+    fn unopenable_peer_store_is_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // A directory where the file should be: SQLite can't open it.
+        let path = dir.path().join("peers.sqlite3");
+        std::fs::create_dir(&path).unwrap();
+        let mut chain = crate::testkit::FixtureChain::new();
+        chain.mine(1);
+        let peer = crate::testkit::MockPeer::spawn(&chain, vec![]);
+        let pool = PeerPool::new(0, None, path.to_str(), ChainParams::regtest(), PeerSource::Static(vec![peer.addr()]))
+            .expect("runs without persistence");
+        let warning = pool.persistence_warning().expect("warning");
+        assert!(warning.contains("not remembered"), "{}", warning);
+        assert!(test_pool().persistence_warning().is_none());
+    }
+
+    /// Ticket 052, against real (mock) peers: gossip addresses fill at most
+    /// MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND outbound slots, at most
+    /// MAX_OUTBOUND_PER_SOURCE from one source, and seeds come first.
+    #[test]
+    fn outbound_slots_reserved_for_protected_addresses_and_capped_per_source() {
+        let mut chain = crate::testkit::FixtureChain::new();
+        chain.mine(1);
+        let peers: Vec<crate::testkit::MockPeer> =
+            (0..16).map(|_| crate::testkit::MockPeer::spawn(&chain, vec![])).collect();
+        let mut pool = PeerPool::new_for_test_with(ChainParams::regtest());
+        // Two seeds; ten gossip addresses from source A, four from B.
+        for p in &peers[..2] {
+            pool.addrs.insert(p.addr(), AddrSource::Dns, "dns");
+        }
+        for (i, p) in peers[2..].iter().enumerate() {
+            let src = if i < 10 { "gossip:A" } else { "gossip:B" };
+            pool.addrs.insert(p.addr(), AddrSource::Gossip, src);
+        }
+        pool.maintain();
+        let slots = pool.slots.lock().unwrap();
+        let from = |src: &str| slots.iter().filter(|s| s.gossip_source.as_deref() == Some(src)).count();
+        assert_eq!(slots.iter().filter(|s| s.gossip_source.is_none()).count(), 2, "both seeds dialed");
+        assert_eq!(from("gossip:A"), MAX_OUTBOUND_PER_SOURCE);
+        assert_eq!(from("gossip:B"), MAX_OUTBOUND_PER_SOURCE);
+        assert!(slots.len() <= 2 + MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND);
+        // The first OWN_TX_OUTBOUND connections (all, without an onion) are
+        // clean for own transactions.
+        assert!(slots.iter().all(|s| !s.self_advertised));
+    }
+
+    /// The same limits for a wake, which dials `WAKE_CONNECT_PARALLEL` at
+    /// once (ticket 054): a batch counts its own gossip addresses, so it
+    /// can't take three from one source because none had connected yet.
+    #[test]
+    fn wake_parallel_dials_keep_the_gossip_limits() {
+        let mut chain = crate::testkit::FixtureChain::new();
+        chain.mine(1);
+        let peers: Vec<crate::testkit::MockPeer> =
+            (0..12).map(|_| crate::testkit::MockPeer::spawn(&chain, vec![])).collect();
+        let mut pool = PeerPool::new_for_test_with(ChainParams::regtest());
+        for p in &peers {
+            pool.addrs.insert(p.addr(), AddrSource::Gossip, "gossip:A");
+        }
+        pool.maintain_until(Some(Instant::now() + Duration::from_secs(10)));
+        let slots = pool.slots.lock().unwrap();
+        assert_eq!(slots.len(), MAX_OUTBOUND_PER_SOURCE, "{} slots from one source", slots.len());
     }
 }

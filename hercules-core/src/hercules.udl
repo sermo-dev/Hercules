@@ -62,12 +62,21 @@ dictionary CatchUpStatus {
     string? error;
     boolean tip_disagreement;
     boolean invalid_chain_detected;
+    boolean tip_confirmed;
+    boolean awaiting_snapshot;
+};
+
+// Ticket 054: recorded in the node at first open.
+enum NodeValidationMode {
+    "AssumeUtxo",
+    "Genesis",
 };
 
 // Ticket 028: background wakes.
 
 enum WakeOutcome {
     "Completed",
+    "Unconfirmed",
     "TransportSlow",
     "Busy",
     "Cancelled",
@@ -165,6 +174,16 @@ interface HerculesNode {
     // Doesn't wait for Tor: bootstrap runs in the background (ticket 028).
     [Name=open, Throws=HerculesError]
     constructor(string db_path, string? tor_data_dir);
+
+    // `open`, recording the validation mode if none is yet (ticket 054).
+    [Name=open_in_mode, Throws=HerculesError]
+    constructor(string db_path, string? tor_data_dir, NodeValidationMode? mode);
+
+    [Throws=HerculesError]
+    NodeValidationMode set_validation_mode(NodeValidationMode mode);
+
+    [Throws=HerculesError]
+    NodeValidationMode? validation_mode();
 
     [Throws=HerculesError]
     boolean wait_for_transport(u32 timeout_ms);

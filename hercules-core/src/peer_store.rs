@@ -21,8 +21,14 @@ pub struct PeerStore {
 }
 
 /// `peers.sqlite3` layout version (`PRAGMA user_version`, ticket 050).
-/// History: 1 = `peer_scores`, `peer_bans` and `known_addrs`.
-const SCHEMA_VERSION: u32 = 1;
+/// History:
+/// - 1: `peer_scores`, `peer_bans` and `known_addrs`.
+/// - 2 (ticket 052): `known_addrs.source_group`, the gossip source an
+///   address came from (per-source caps). The upgrade also lifts every
+///   ban and restores every below-default score once: until 052 a header
+///   merely ahead of our clock cost its sender 50 points, so a phone with
+///   a slow clock banned honest peers, and bans never recorded why.
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct PeerStoreError(pub String);
@@ -32,9 +38,10 @@ pub struct PeerStoreError(pub String);
 /// `Instant` is monotonic and meaningless across process restarts.
 ///
 /// `source` records *how* we first learned about an address ("dns",
-/// "gossip", "inbound", or "manual") for diagnostics — eviction and
-/// candidate selection don't read it, but it makes peer-discovery bugs
-/// far easier to investigate from the SQLite shell.
+/// "gossip", "inbound", or "manual"); "dns" and "manual" entries are
+/// protected from eviction (ticket 052). `source_group` is *who* told us
+/// (the gossiping peer's netgroup, "inbound" for any inbound peer, or the
+/// `source` tag), for the per-source cap; empty on rows from before 052.
 #[derive(Debug, Clone)]
 pub struct AddrRecord {
     pub addr: String,
@@ -43,6 +50,7 @@ pub struct AddrRecord {
     pub last_success: Option<u64>,
     pub failure_count: u32,
     pub source: String,
+    pub source_group: String,
 }
 
 impl std::fmt::Display for PeerStoreError {
@@ -67,14 +75,35 @@ impl PeerStore {
 
         let version = crate::store::check_schema_version(&conn, "peer store", SCHEMA_VERSION)
             .map_err(PeerStoreError)?;
+        let mut conn = conn;
         if version < SCHEMA_VERSION {
-            // Files from before versioning (0) already have this layout;
-            // the CREATE IF NOT EXISTS below covers new ones.
-            crate::store::set_schema_version(&conn, "peer store", SCHEMA_VERSION)
-                .map_err(PeerStoreError)?;
+            Self::migrate(&mut conn)?;
         }
 
-        conn.execute_batch(
+        info!("Peer store opened at {}", path);
+        Ok(PeerStore {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Bring a file below `SCHEMA_VERSION` (new, from before versioning,
+    /// or version 1) up to it, in one immediate transaction so concurrent
+    /// first opens take turns: each re-reads the version under the lock,
+    /// and only the first does the work.
+    fn migrate(conn: &mut Connection) -> Result<(), PeerStoreError> {
+        let err = |what: &str| {
+            let what = what.to_string();
+            move |e: rusqlite::Error| PeerStoreError(format!("{}: {}", what, e))
+        };
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(err("begin migration"))?;
+        let version = crate::store::check_schema_version(&tx, "peer store", SCHEMA_VERSION)
+            .map_err(PeerStoreError)?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        tx.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS peer_scores (
                 addr TEXT PRIMARY KEY,
@@ -91,18 +120,45 @@ impl PeerStore {
                 last_tried INTEGER,
                 last_success INTEGER,
                 failure_count INTEGER NOT NULL DEFAULT 0,
-                source TEXT NOT NULL
+                source TEXT NOT NULL,
+                source_group TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS known_addrs_last_success
                 ON known_addrs(last_success);
             ",
         )
-        .map_err(|e| PeerStoreError(format!("create tables: {}", e)))?;
-
-        info!("Peer store opened at {}", path);
-        Ok(PeerStore {
-            conn: Mutex::new(conn),
-        })
+        .map_err(err("create tables"))?;
+        // Version 1 (and unversioned) files have `known_addrs` without it.
+        let has_group: bool = tx
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('known_addrs') WHERE name = 'source_group'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(err("read known_addrs columns"))?
+            > 0;
+        if !has_group {
+            tx.execute_batch("ALTER TABLE known_addrs ADD COLUMN source_group TEXT NOT NULL DEFAULT ''")
+                .map_err(err("add source_group"))?;
+        }
+        // One-time amnesty (ticket 052): bans and penalties before this
+        // version may have been for a header ahead of our clock, and none
+        // recorded its cause. A misbehaving peer just earns its ban again.
+        let lifted = tx.execute("DELETE FROM peer_bans", []).map_err(err("lift bans"))?;
+        let restored = tx
+            .execute(
+                "UPDATE peer_scores SET score = ?1 WHERE score < ?1",
+                params![crate::peer_pool::SCORE_DEFAULT],
+            )
+            .map_err(err("restore scores"))?;
+        if lifted > 0 || restored > 0 {
+            info!(
+                "PeerStore: upgrade lifted {} ban(s) and restored {} score(s) (ticket 052)",
+                lifted, restored
+            );
+        }
+        crate::store::set_schema_version(&tx, "peer store", SCHEMA_VERSION).map_err(PeerStoreError)?;
+        tx.commit().map_err(err("commit migration"))
     }
 
     /// Persist (or upsert) a single peer's reputation score.
@@ -246,14 +302,15 @@ impl PeerStore {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO known_addrs
-                        (addr, first_seen, last_tried, last_success, failure_count, source)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        (addr, first_seen, last_tried, last_success, failure_count, source, source_group)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT(addr) DO UPDATE SET
                         first_seen = excluded.first_seen,
                         last_tried = excluded.last_tried,
                         last_success = excluded.last_success,
                         failure_count = excluded.failure_count,
-                        source = excluded.source",
+                        source = excluded.source,
+                        source_group = excluded.source_group",
                 )
                 .map_err(|e| PeerStoreError(format!("prepare: {}", e)))?;
             for r in records {
@@ -264,6 +321,7 @@ impl PeerStore {
                     r.last_success.map(|t| t as i64),
                     r.failure_count as i64,
                     r.source,
+                    r.source_group,
                 ])
                 .map_err(|e| PeerStoreError(format!("save addr: {}", e)))?;
             }
@@ -279,7 +337,7 @@ impl PeerStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT addr, first_seen, last_tried, last_success, failure_count, source
+                "SELECT addr, first_seen, last_tried, last_success, failure_count, source, source_group
                  FROM known_addrs",
             )
             .map_err(|e| PeerStoreError(format!("prepare: {}", e)))?;
@@ -292,6 +350,7 @@ impl PeerStore {
                     last_success: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
                     failure_count: row.get::<_, i64>(4)? as u32,
                     source: row.get::<_, String>(5)?,
+                    source_group: row.get::<_, String>(6)?,
                 })
             })
             .map_err(|e| PeerStoreError(format!("query: {}", e)))?;
@@ -304,7 +363,10 @@ impl PeerStore {
 
     /// Delete a batch of addresses by key. Called from `flush_addrs` to drop
     /// rows the in-memory eviction policy chose to discard, so the on-disk
-    /// view stays bounded at MAX_KNOWN_ADDRS. Empty input is a no-op.
+    /// view stays bounded at MAX_KNOWN_ADDRS. Their `peer_scores` rows go
+    /// with them (ticket 052): scores expire with the address book, so the
+    /// table no longer keeps every address ever scored. Empty input is a
+    /// no-op.
     pub fn delete_addrs_bulk(&self, addrs: &[String]) -> Result<(), PeerStoreError> {
         if addrs.is_empty() {
             return Ok(());
@@ -317,9 +379,15 @@ impl PeerStore {
             let mut stmt = tx
                 .prepare("DELETE FROM known_addrs WHERE addr = ?1")
                 .map_err(|e| PeerStoreError(format!("prepare: {}", e)))?;
+            let mut scores = tx
+                .prepare("DELETE FROM peer_scores WHERE addr = ?1")
+                .map_err(|e| PeerStoreError(format!("prepare: {}", e)))?;
             for addr in addrs {
                 stmt.execute(params![addr])
                     .map_err(|e| PeerStoreError(format!("delete addr: {}", e)))?;
+                scores
+                    .execute(params![addr])
+                    .map_err(|e| PeerStoreError(format!("delete score: {}", e)))?;
             }
         }
         tx.commit()
@@ -496,6 +564,7 @@ mod tests {
             last_success: Some(1_700_000_400),
             failure_count: 2,
             source: "gossip".to_string(),
+            source_group: String::new(),
         }
     }
 
@@ -584,11 +653,85 @@ mod tests {
             last_success: None,
             failure_count: 0,
             source: "gossip".to_string(),
+            source_group: String::new(),
         };
         store.save_addrs_bulk(&[r]).unwrap();
         let loaded = store.load_all_addrs().unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].last_tried.is_none());
         assert!(loaded[0].last_success.is_none());
+    }
+
+    #[test]
+    fn source_group_round_trips() {
+        let store = fresh_store();
+        let mut r = sample_record("1.2.3.4:8333");
+        r.source_group = "gossip:v4:5.6".into();
+        store.save_addrs_bulk(&[r]).unwrap();
+        assert_eq!(store.load_all_addrs().unwrap()[0].source_group, "gossip:v4:5.6");
+    }
+
+    /// Ticket 052: scores expire with the address book's eviction.
+    #[test]
+    fn deleting_an_address_drops_its_score() {
+        let store = fresh_store();
+        store.save_addrs_bulk(&[sample_record("a:8333"), sample_record("b:8333")]).unwrap();
+        store.save_scores_bulk(&[("a:8333".into(), 40), ("b:8333".into(), 150)]).unwrap();
+        store.delete_addrs_bulk(&["a:8333".to_string()]).unwrap();
+        assert_eq!(store.load_score("a:8333").unwrap(), None);
+        assert_eq!(store.load_score("b:8333").unwrap(), Some(150));
+    }
+
+    /// A version 1 file (ticket 050's layout) is upgraded in place: the
+    /// new column is added with existing rows kept, and the one-time
+    /// amnesty lifts every ban and restores every below-default score
+    /// (they may have been for a header ahead of our clock, ticket 052).
+    /// It runs once: a ban made after the upgrade survives a reopen.
+    #[test]
+    fn upgrade_from_version_1_lifts_old_bans_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("peers.sqlite3");
+        let path = path.to_str().unwrap();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE peer_scores (addr TEXT PRIMARY KEY, score INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE peer_bans (addr TEXT PRIMARY KEY, expiry_unix INTEGER NOT NULL);
+                 CREATE TABLE known_addrs (addr TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_tried INTEGER,
+                     last_success INTEGER, failure_count INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL);
+                 INSERT INTO peer_scores VALUES ('slow-clock.peer:8333', 50, 0), ('good.peer:8333', 180, 0);
+                 INSERT INTO known_addrs VALUES ('good.peer:8333', 1700000000, NULL, 1700000500, 0, 'dns');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO peer_bans VALUES ('slow-clock.peer:8333', ?1)", params![(unix_now() + 3600) as i64])
+                .unwrap();
+        }
+        let store = PeerStore::open(path).unwrap();
+        assert!(store.load_active_bans().unwrap().is_empty(), "old ban kept");
+        assert_eq!(store.load_score("slow-clock.peer:8333").unwrap(), Some(crate::peer_pool::SCORE_DEFAULT));
+        assert_eq!(store.load_score("good.peer:8333").unwrap(), Some(180));
+        let addrs = store.load_all_addrs().unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!((addrs[0].source.as_str(), addrs[0].source_group.as_str()), ("dns", ""));
+
+        store.save_ban("new.ban:8333", Instant::now() + Duration::from_secs(3600)).unwrap();
+        store.save_score("low:8333", 30).unwrap();
+        drop(store);
+        let store = PeerStore::open(path).unwrap();
+        assert!(store.load_active_bans().unwrap().contains_key("new.ban:8333"), "amnesty ran twice");
+        assert_eq!(store.load_score("low:8333").unwrap(), Some(30));
+        let version: u32 = store.conn.lock().unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A file from a newer build is refused, not "migrated" (ticket 050).
+    #[test]
+    fn newer_layout_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("peers.sqlite3");
+        let path = path.to_str().unwrap();
+        Connection::open(path).unwrap().pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        assert!(PeerStore::open(path).is_err());
     }
 }

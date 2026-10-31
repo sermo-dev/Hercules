@@ -778,6 +778,8 @@ struct SettingsView: View {
         case .wakeBusy: return "hourglass"
         case .wakeCancelled: return "clock.badge.xmark"
         case .nodeReset: return "arrow.counterclockwise"
+        case .unconfirmed: return "questionmark.circle"
+        case .awaitingSetup: return "gearshape"
         case .unknown: return "questionmark.circle"
         }
     }
@@ -797,6 +799,8 @@ struct SettingsView: View {
         case .wakeBusy: return Theme.textSecondary
         case .wakeCancelled: return Theme.error
         case .nodeReset: return Theme.textSecondary
+        case .unconfirmed: return Theme.textSecondary
+        case .awaitingSetup: return Theme.textSecondary
         case .unknown: return Theme.textSecondary
         }
     }
@@ -816,6 +820,8 @@ struct SettingsView: View {
         case .wakeBusy: return "Busy"
         case .wakeCancelled: return "Timed Out"
         case .nodeReset: return "Reset"
+        case .unconfirmed: return "Unconfirmed"
+        case .awaitingSetup: return "Finish Setup"
         case .unknown: return "Other"
         }
     }

@@ -176,6 +176,33 @@ fn inflated_height_peer_withholding_headers_does_not_make_a_wake_report_caught_u
     );
 }
 
+/// A wake's withholding signal (ticket 054) is selection-only. Every peer
+/// claims our height (blocks were found since the handshake); the
+/// highest-scored one is asked first and has nothing new, the next one
+/// has headers. The first may just not have the newest block yet, so its
+/// saved score is untouched.
+#[test]
+fn a_peer_with_no_new_headers_during_a_wake_keeps_its_score() {
+    let c = chain(20);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &c.prefix(10));
+    let a = MockPeer::spawn(&c, vec![Behavior::InflatedHeight(10)]);
+    let b = MockPeer::spawn(&c, vec![Behavior::InflatedHeight(10)]);
+    let quiet = MockPeer::spawn(&c, vec![Behavior::InflatedHeight(10), Behavior::WithholdHeaders]);
+    node.peer_store().save_score(&quiet.addr(), 150).unwrap();
+    node.use_peers(&[&quiet, &a, &b]);
+
+    node.hs.catch_up_blocks(50, 15).unwrap();
+    assert!(node.tip().0 > 10, "no peer's headers were stored");
+    assert!(
+        quiet.log().iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+        "the quiet peer was never asked"
+    );
+    assert!(!node.is_banned(&quiet.addr()));
+    let score = node.score(&quiet.addr());
+    assert!(score.is_some_and(|s| s >= 150), "withholding cost saved score: {:?}", score);
+}
+
 /// Reviewer finding: the main loop asks the best peer again after a short
 /// batch, so a peer that claims the tallest chain and answers each
 /// `getheaders` with a single header sets the pace: one round trip (and a
@@ -286,10 +313,9 @@ fn trickled_but_complete_replies_are_slow_not_misbehavior() {
 /// faults) applied to the clock: a header more than 2 h past *our* clock
 /// is refused, but a phone whose clock runs slow sees every honest peer's
 /// new tip that way. Core doesn't punish time-too-new headers (they may
-/// become valid); here each batch costs the sender INVALID_HEADERS_PENALTY,
-/// so two such batches ban an honest peer.
+/// become valid); until ticket 052 each batch cost the sender
+/// INVALID_HEADERS_PENALTY, so two such batches banned an honest peer.
 #[test]
-#[ignore = "BUG: a header >2 h ahead of our clock costs its (honest) sender 50 points; a slow phone clock bans every peer"]
 fn header_from_our_future_does_not_cost_the_peer() {
     let mut c = chain(20);
     let ahead = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3 * 3600) as u32;
@@ -306,6 +332,62 @@ fn header_from_our_future_does_not_cost_the_peer() {
         assert!(!node.is_banned(&p.addr()), "{} banned over our clock", p.addr());
         let score = node.score(&p.addr());
         assert!(score.map_or(true, |s| s >= FRESH_SCORE), "{} penalized over our clock: {:?}", p.addr(), score);
+    }
+}
+
+/// Ticket 052: the headers before one from our future are stored (the
+/// valid prefix), the future one is left for a later round, and nobody is
+/// penalized.
+#[test]
+fn headers_before_one_from_our_future_are_kept() {
+    let mut c = chain(20);
+    c.mine(2);
+    let ahead = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3 * 3600) as u32;
+    c.mine_custom(vec![], |b| b.header.time = ahead);
+    c.mine(1);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &c.prefix(20));
+    let a = MockPeer::spawn(&c, vec![]);
+    let b = MockPeer::spawn(&c, vec![]);
+    node.use_peers(&[&a, &b]);
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, |hs| hs.store.validated_height().unwrap_or(0) == 22);
+    assert!(ok, "valid prefix not kept: {:?}, tip {:?}", res, node.tip());
+    let _ = node.sync_for(Duration::from_secs(2));
+    assert_eq!(node.tip().0, 22, "the header from our future (or past it) was stored");
+    for p in [&a, &b] {
+        assert!(!node.is_banned(&p.addr()));
+        assert!(node.score(&p.addr()).map_or(true, |s| s >= FRESH_SCORE), "{} penalized", p.addr());
+    }
+}
+
+/// Review finding (ticket 052 scope addition): a witness and tiebreaker
+/// answering our locator with real but old headers (from genesis) agreed
+/// with each other and outvoted the honest peer every round, until its
+/// weight hit zero, an attacker became the header peer, and the node sat
+/// below the tip believing it was caught up. Two peers out of twelve, no
+/// proof-of-work. Old headers of our own chain are now no opinion, and
+/// answering from below the best shared locator entry costs the replayer.
+#[test]
+fn replayed_old_headers_cannot_outvote_an_honest_peer() {
+    let c = chain(30);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &c.prefix(20));
+    let honest = MockPeer::spawn(&c, vec![]);
+    let r1 = MockPeer::spawn(&c, vec![Behavior::ReplayOldHeaders(5)]);
+    let r2 = MockPeer::spawn(&c, vec![Behavior::ReplayOldHeaders(5)]);
+    node.use_peers(&[&honest, &r1, &r2]);
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, |hs| hs.store.validated_height().unwrap_or(0) == 30);
+    assert!(ok, "held below the tip by replayed headers: {:?}, tip {:?}", res, node.tip());
+    assert!(!node.is_banned(&honest.addr()));
+    assert!(node.score(&honest.addr()).map_or(true, |s| s >= FRESH_SCORE), "honest peer penalized");
+    for r in [&r1, &r2] {
+        assert!(
+            node.is_banned(&r.addr()) || node.score(&r.addr()).map_or(true, |s| s < FRESH_SCORE),
+            "replayer {} unpunished",
+            r.addr()
+        );
     }
 }
 
@@ -474,6 +556,8 @@ fn own_tx_fixture() -> (Node, FixtureChain, bitcoin::Transaction) {
     let mut node = Node::new(&[]);
     presync(&mut node, &c);
     node.hs.regular_peers_over_tor = true;
+    // Announced on the next pass: no trickle delay to wait out (ticket 052).
+    node.hs.own_tx_trickle_mean_secs = 0.0;
     let value = c.block(1).txdata[0].output[0].value;
     let tx = c.spend(
         &[c.coinbase_outpoint(1)],
@@ -539,10 +623,9 @@ fn block_inv_spam_does_not_starve_own_tx_announcements() {
 
 /// Reviewer finding: in Tor mode our inbound peers reached us at our
 /// stable .onion address, so an own tx announced to them first ties it to
-/// that identity. `drain_relay_queue` announces own txs to every peer,
-/// inbound included.
+/// that identity. `drain_relay_queue` announced own txs to every peer,
+/// inbound included, until ticket 052.
 #[test]
-#[ignore = "BUG: own txs are announced to inbound peers, who know our onion address (privacy leak in Tor mode)"]
 fn own_tx_is_never_announced_to_inbound_peers() {
     use crate::p2p::tests::{decode_all, inbound, mem_peer, script_of, their_version};
     let (node, _c, tx) = own_tx_fixture();

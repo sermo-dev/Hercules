@@ -271,5 +271,19 @@ check(NotificationHistory.decode(Data("null".utf8)) == nil, "s22 null is not a h
 check(NotificationHistory.decode(Data()) == nil, "s22 an empty file is not a history")
 check(NotificationHistory.decode(Data("[1, \"x\", null, \(good)]".utf8))?.count == 1, "s22 junk entries dropped, the good one kept")
 
+// 23. ticket 054: the wake gate. (The full table is in HerculesAppTests.)
+func gate(_ mode: ValidationMode?, pending: Bool = false, enabled: Bool? = true,
+          network: WakeGate.Network = .allowed, paused: Bool = false) -> WakeGate.Inputs {
+    WakeGate.Inputs(mode: mode, snapshotPending: pending, network: network, notificationsEnabled: enabled,
+                    freeBytes: nil, pauseBelowBytes: 0, userPaused: paused)
+}
+check(WakeGate.decide(.push, gate(.fromGenesis, enabled: false)) == .skip(.notificationsOff), "s23 notifications off: push skipped")
+check(WakeGate.decide(.push, gate(.fromGenesis, enabled: nil)) == .run(headersOnly: false), "s23 opt-in unreadable (locked since reboot): push not dropped")
+check(WakeGate.decide(.push, gate(nil)) == .skip(.modeNotChosen), "s23 no mode: push skipped")
+check(WakeGate.decide(.push, gate(.assumeUtxo, pending: true)) == .run(headersOnly: true), "s23 snapshot pending: push syncs headers only")
+check(WakeGate.decide(.processing, gate(.assumeUtxo, pending: true)) == .skip(.snapshotPending), "s23 snapshot pending: no processing round")
+check(WakeGate.decide(.foreground, gate(.fromGenesis)) == .run(headersOnly: false), "s23 set up: app open starts sync")
+check(WakeGate.decide(.foreground, gate(.fromGenesis, paused: true)) == .skip(.userPaused), "s23 user Pause is kept")
+
 print(fails == 0 ? "ALL PASS" : "\(fails) FAILED")
 exit(fails == 0 ? 0 : 1)

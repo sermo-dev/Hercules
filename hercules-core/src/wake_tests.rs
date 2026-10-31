@@ -821,7 +821,10 @@ fn concurrent_wakes_and_getters_never_deadlock() {
     for w in wakes {
         let (i, r) = w.join().expect("wake panicked");
         assert!(
-            matches!(r.outcome, WakeOutcome::Completed | WakeOutcome::Busy | WakeOutcome::TimedOut),
+            matches!(
+                r.outcome,
+                WakeOutcome::Completed | WakeOutcome::Unconfirmed | WakeOutcome::Busy | WakeOutcome::TimedOut
+            ),
             "wake {}: {:?}",
             i,
             r
@@ -832,4 +835,46 @@ fn concurrent_wakes_and_getters_never_deadlock() {
     }
     assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
     assert!(n.validated() <= 8);
+}
+
+// ── Ticket 054 ───────────────────────────────────────────────────────
+
+#[test]
+fn one_peer_with_nothing_new_is_unconfirmed_not_completed() {
+    // The only peer says there is nothing past our (old, fixture) tip:
+    // one peer's word, so the wake is `Unconfirmed` and not caught up.
+    let c = chain(6);
+    let only = MockPeer::spawn(&c, vec![]);
+    let n = node_with(&[&only], None);
+    let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(15_000)), 50, 0);
+    assert_eq!(r.outcome, WakeOutcome::Unconfirmed, "{:?}", r);
+    let s = r.status.expect("status");
+    assert_eq!(s.blocks_validated, 6, "validated blocks still count: {:?}", s);
+    assert!(!s.caught_up && !s.tip_confirmed, "{:?}", s);
+
+    // Two agreeing peers: `Completed` and caught up.
+    let (a, b) = honest_pair(&c);
+    let n = node_with(&[&a, &b], None);
+    let r = n.node.wake_catch_up(Arc::new(WakeBudget::new(15_000)), 50, 0);
+    assert_eq!(r.outcome, WakeOutcome::Completed, "{:?}", r);
+    assert!(r.status.expect("status").caught_up);
+}
+
+#[test]
+fn open_in_mode_records_the_mode_once_and_reports_the_nodes() {
+    let _slot = lmdb_slot();
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("headers.sqlite3").to_str().unwrap().to_string();
+    {
+        let node = HerculesNode::open_in_mode(db.clone(), None, None).unwrap();
+        assert_eq!(node.validation_mode().unwrap(), None);
+        assert_eq!(
+            node.set_validation_mode(NodeValidationMode::AssumeUtxo).unwrap(),
+            NodeValidationMode::AssumeUtxo
+        );
+        assert!(node.needs_snapshot().unwrap());
+    }
+    // A later open asking for the other mode gets the recorded one.
+    let node = HerculesNode::open_in_mode(db, None, Some(NodeValidationMode::Genesis)).unwrap();
+    assert_eq!(node.validation_mode().unwrap(), Some(NodeValidationMode::AssumeUtxo));
 }
