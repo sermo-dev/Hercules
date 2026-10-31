@@ -132,3 +132,11 @@ Both were decided (see Decisions).
 ## Roadmap position
 
 **First** in the pre-wallet hardening block: **049 → 050 → 053 → 054 → 052 → 025**, then 035. Wallet sends, rebroadcasts and wake-driven "payment received" all assume the sync loop is alive.
+
+## Status (2026-10-31)
+
+Merged in PR #33 (`5f9a84b`). Write timeouts (20 s; 60 s over Tor) with a 25 kB/s floor, partial-frame read buffer, 20 s handshake deadline, inbound handshakes on a bounded blocking pool (8), queued getdata (one block per step, 288 per peer per hour), locator cap (101), inv caps plus a penalty for announcers that never deliver, BIP35 `mempool` handled as Core does, bounded wallet-RPC reads (4 connections), the 100 MB/day metered upload budget (`setNetworkMetered`), monitor chores on their own clocks, sync peer chosen by demonstrated height, and the header stall timeout.
+
+**Found after merge (fixed in PR #32, `1c17c8f`/`baabf21`):** `outbound_peer_announcing_made_up_blocks_is_banned` hung CI intermittently. Two causes: two connections switching a new SQLite file to WAL at once made one fail "database is locked" immediately, so a `PeerPool` could run a session without persisting bans (now `store::set_wal` retries); and the scoped sync test helpers didn't stop `sync()` when a test body panicked (now `SyncThread` stops it on drop).
+
+**Follow-ups:** persist the metered upload count across launches (it resets at launch today); `PeerPool` still only logs a warning when the peer store can't open and runs without persistence; consider surfacing that (ticket 052).

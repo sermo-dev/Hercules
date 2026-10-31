@@ -136,3 +136,11 @@ connect_block(block, height, ctx) -> Result<Connected, ConnectError>
 ## Roadmap position
 
 Second in the pre-wallet hardening block: **049 → 050 → 053 → 054 → 052 → 025**, then 035. 050 must land before 025 and 035 because both build on `connect_block`.
+
+## Status (2026-10-31)
+
+Merged in PR #32 (`e654c6a`). One connect path (`connect_block` with `ConnectCtx`, returning `Connected` or a `BlockFailure`) for the foreground loop, `validate_latest_block` and `catch_up_blocks`; pruning on every connect (keep 288 + 144 slack, 145-block steps, `PruneWindow` and an optional prune floor); `undo_pruned_below` guard; map-full retry; incremental auto-vacuum with a one-time `VACUUM` only with ≥ 60 s of wake budget and free space above 2× the file; reset ordering (marker first, env first, own txs removed); snapshot activation requires `best_block == (floor, hash)`; repair-first on open (raise `validated_height` when the set is ahead on our chain, else roll back via undo, else wipe); `headers.sqlite3` with `synchronous=FULL` and `fullfsync`; schema versions (LMDB `meta.schema_version` 1, SQLite `user_version` 1).
+
+Review fix before merge: the original wipe-on-open would have destroyed a good UTXO set after a power loss, because SQLite commits weren't `F_FULLFSYNC`; replaced with repair-first plus fullfsync on the header store.
+
+**Still needs a device:** prune and vacuum timing on real flash over a week of background wakes; a pulled-power test during block connect.
