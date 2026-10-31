@@ -64,6 +64,15 @@ final class NetworkPolicy: ObservableObject {
     /// Entered at init, left once on the first path update.
     private let firstPath = DispatchGroup()
 
+    /// Called on the monitor queue with `isMetered` whenever it changes
+    /// (ticket 049: the node caps the blocks it serves on a metered path).
+    /// Guarded by `stateLock`.
+    private var _onMeteredChange: ((Bool) -> Void)?
+    var onMeteredChange: ((Bool) -> Void)? {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _onMeteredChange }
+        set { stateLock.lock(); _onMeteredChange = newValue; stateLock.unlock() }
+    }
+
     /// True if the active path is cellular, Personal Hotspot, or Low Data
     /// Mode — i.e. anywhere we'd burn the user's metered allowance.
     var isMetered: Bool {
@@ -127,15 +136,19 @@ final class NetworkPolicy: ObservableObject {
             // main.
             self.stateLock.lock()
             let isFirst = self._state == nil
+            let wasMetered = self._state.map { $0.isExpensive || $0.isConstrained }
             self._state = PathState(
                 status: path.status,
                 isExpensive: path.isExpensive,
                 isConstrained: path.isConstrained
             )
+            let metered = path.isExpensive || path.isConstrained
+            let onMeteredChange = wasMetered == metered ? nil : self._onMeteredChange
             self.stateLock.unlock()
             if isFirst {
                 self.firstPath.leave()
             }
+            onMeteredChange?(metered)
             // The @Published mirrors drive SwiftUI views — bounce to main.
             DispatchQueue.main.async {
                 self.pathStatus = path.status
