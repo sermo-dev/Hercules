@@ -534,7 +534,7 @@ fn announced_and_announcing_peers_are_not_reannounced_to() {
 }
 
 #[test]
-fn pending_own_tx_is_hidden_from_mempool_and_unsolicited_getdata() {
+fn pending_own_tx_is_hidden_from_unsolicited_getdata() {
     let dir = TempDir::new().unwrap();
     let hs = fresh(&dir);
     let mut pool = PeerPool::new_for_test();
@@ -542,39 +542,47 @@ fn pending_own_tx_is_hidden_from_mempool_and_unsolicited_getdata() {
     let addr = peer.addr().to_string();
     assert!(pool.add_inbound_peer(peer));
 
-    let relayed = spend(seed(&hs, 2, OP_TRUE, 1, false), 90_000);
-    hs.handle_tx("9.9.9.9:8333", relayed.clone()).unwrap();
     let own = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
     let txid = hs.submit_own_tx(&raw(&own)).unwrap().txid;
     // Not drained: this peer has not been told about it.
-
-    write_message(&mut server, NetworkMessage::MemPool);
-    hs.service_peer_messages(&mut pool);
-    match read_one_message(&mut server) {
-        NetworkMessage::Inv(inv) => {
-            assert_eq!(inv, vec![Inventory::Transaction(relayed.compute_txid())])
-        }
-        other => panic!("expected inv, got {}", msg_name(&other)),
-    }
-
-    write_message(&mut server, NetworkMessage::GetData(vec![Inventory::WitnessTransaction(txid)]));
+    let getdata = || NetworkMessage::GetData(vec![Inventory::WitnessTransaction(txid)]);
+    write_message(&mut server, getdata());
     hs.service_peer_messages(&mut pool);
     assert!(matches!(read_one_message(&mut server), NetworkMessage::NotFound(_)));
 
-    // Propagated (someone else announced it): listed in `mempool`, which
-    // counts as announcing it to this peer, so it may now fetch it.
+    // Propagated (someone else announced it), but neither to nor by this
+    // peer: asking is still a probe.
     hs.own_txs.record_seen(&txid, "5.6.7.8:8333", unix_now_u32() as u64).unwrap();
-    assert!(!hs.peer_knows_own_tx(&addr, &txid));
-    write_message(&mut server, NetworkMessage::MemPool);
+    write_message(&mut server, getdata());
     hs.service_peer_messages(&mut pool);
-    match read_one_message(&mut server) {
-        NetworkMessage::Inv(inv) => assert_eq!(inv.len(), 2),
-        other => panic!("expected inv, got {}", msg_name(&other)),
-    }
+    assert!(matches!(read_one_message(&mut server), NetworkMessage::NotFound(_)));
+
+    // Once it has announced the tx to us, it may fetch it.
+    write_message(&mut server, NetworkMessage::Inv(vec![Inventory::Transaction(txid)]));
+    hs.service_peer_messages(&mut pool);
     assert!(hs.peer_knows_own_tx(&addr, &txid));
-    write_message(&mut server, NetworkMessage::GetData(vec![Inventory::WitnessTransaction(txid)]));
+    write_message(&mut server, getdata());
     hs.service_peer_messages(&mut pool);
     assert!(matches!(read_one_message(&mut server), NetworkMessage::Tx(_)));
+}
+
+#[test]
+fn mempool_request_disconnects_like_a_default_core_node() {
+    // Ticket 049: BIP 35 `mempool` is answered as Core answers it without
+    // NODE_BLOOM (which we never advertise): a disconnect, never a list
+    // (which would also put our own txs in front of a probe).
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let relayed = spend(seed(&hs, 2, OP_TRUE, 1, false), 90_000);
+    hs.handle_tx("9.9.9.9:8333", relayed).unwrap();
+    let mut pool = PeerPool::new_for_test();
+    let (peer, mut server) = loopback_peer_pair();
+    assert!(pool.add_inbound_peer(peer));
+
+    write_message(&mut server, NetworkMessage::MemPool);
+    hs.service_peer_messages(&mut pool);
+    assert_eq!(pool.count(), 0, "peer asking for our mempool still connected");
+    assert!(try_read(&mut server).is_none(), "mempool answered");
 }
 
 #[test]

@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use tempfile::TempDir;
 
 use super::*;
-use crate::p2p::tests::{arb_message, decode_all, mem_peer};
+use crate::p2p::tests::{arb_message, decode_all, encode, mem_peer, Chunk};
 use crate::p2p::Peer;
 use crate::testkit::{lmdb_slot, FixtureChain, LmdbSlot};
 
@@ -64,6 +64,8 @@ impl Fixture {
         self.handle_on(&mut peer, msg, &written)
     }
 
+    /// `handle`, on a given peer. Queued `getdata` is served to the end,
+    /// as the monitor loop would over its next passes.
     fn handle_on(
         &self,
         peer: &mut Peer,
@@ -71,7 +73,10 @@ impl Fixture {
         written: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     ) -> (Result<(), String>, Vec<NetworkMessage>) {
         let before = written.lock().unwrap().len();
-        let r = self.hs.handle_peer_message(ADDR, msg, peer, &self.pool);
+        let mut r = self.hs.handle_peer_message(ADDR, msg, peer, &self.pool);
+        while r.is_ok() && self.hs.has_queued_getdata(ADDR) {
+            r = self.hs.serve_getdata_step(ADDR, peer).map(|_| ());
+        }
         let sent = decode_all(&written.lock().unwrap()[before..]);
         (r, sent)
     }
@@ -79,6 +84,11 @@ impl Fixture {
     fn pending_gossip(&self) -> Vec<String> {
         std::mem::take(&mut *self.hs.pending_gossip_addrs.lock().unwrap())
     }
+}
+
+/// A `MemStream` script delivering `msgs` with regtest magic.
+fn script_of_magic(magic: Magic, msgs: Vec<NetworkMessage>) -> Vec<Chunk> {
+    msgs.into_iter().map(|m| Chunk::Data(encode(magic, m))).collect()
 }
 
 fn getheaders(locator: Vec<BlockHash>, stop: BlockHash) -> NetworkMessage {
@@ -141,7 +151,6 @@ fn getheaders_batches_are_capped_at_2000() {
 /// lookups on the sync thread. Core refuses locators over
 /// MAX_LOCATOR_SZ = 101 and disconnects.
 #[test]
-#[ignore = "BUG: getheaders locator size is unbounded (Core caps at 101); one message costs up to ~125k DB lookups"]
 fn getheaders_with_an_oversized_locator_is_refused() {
     let f = fixture(20, 0);
     let locator: Vec<BlockHash> = (0..100_000).map(junk_hash).collect();
@@ -182,7 +191,16 @@ fn getdata_and_inv_over_50000_entries_are_refused_and_at_50000_handled() {
     assert!(r.is_err() && sent.is_empty());
     let (r, sent) = f.handle(NetworkMessage::GetData(items(50_000)));
     r.unwrap();
-    assert!(matches!(&sent[..], [NetworkMessage::NotFound(nf)] if nf.len() == 50_000));
+    // Answered in full, a step (GETDATA_ITEMS_PER_STEP) at a time.
+    let answered: Vec<usize> = sent
+        .iter()
+        .map(|m| match m {
+            NetworkMessage::NotFound(nf) => nf.len(),
+            other => panic!("{}", msg_name(other)),
+        })
+        .collect();
+    assert_eq!(answered.iter().sum::<usize>(), 50_000);
+    assert!(answered.iter().all(|&n| n <= GETDATA_ITEMS_PER_STEP), "{:?}", answered);
 
     let (r, sent) = f.handle(NetworkMessage::Inv(items(50_001)));
     assert!(r.is_err() && sent.is_empty());
@@ -351,6 +369,182 @@ fn getaddr_is_answered_once_per_connection() {
     assert!(matches!(first[..], [NetworkMessage::Addr(_)]), "{:?}", first.iter().map(msg_name).collect::<Vec<_>>());
     let (_, second) = f.handle_on(&mut peer, NetworkMessage::GetAddr, &written);
     assert!(second.is_empty(), "scraper answered twice");
+}
+
+// ── What one request costs us (ticket 049) ───────────────────────────
+
+#[test]
+fn getheaders_locator_at_the_limit_is_served() {
+    let f = fixture(20, 0);
+    let mut locator: Vec<BlockHash> = (0..MAX_LOCATOR_SZ as u32 - 1).map(junk_hash).collect();
+    locator.push(f.chain.hash_at(10));
+    let (r, sent) = f.handle(getheaders(locator, BlockHash::all_zeros()));
+    r.unwrap();
+    assert!(matches!(&sent[..], [NetworkMessage::Headers(h)] if h.len() == 10));
+}
+
+#[test]
+fn getdata_is_served_a_block_per_step_with_nothing_else_read_meanwhile() {
+    let f = fixture(10, 3);
+    let mut pool = PeerPool::new_for_test_with(ChainParams::regtest());
+    let (mut peer, written) = mem_peer(
+        script_of_magic(Magic::REGTEST, vec![NetworkMessage::Ping(5)]),
+        Magic::REGTEST,
+    );
+    peer.set_addr_for_test(ADDR, true);
+    let items: Vec<Inventory> = (8..=10).map(|h| Inventory::WitnessBlock(f.chain.hash_at(h))).collect();
+    // The handler serves the first step at once.
+    f.hs.handle_peer_message(ADDR, NetworkMessage::GetData(items), &mut peer, &f.pool).unwrap();
+    assert_eq!(decode_all(&written.lock().unwrap()).len(), 1);
+    assert!(f.hs.has_queued_getdata(ADDR));
+    assert!(pool.add_inbound_peer(peer));
+
+    // Each monitor pass serves one more block, and the peer's queued ping
+    // waits until the getdata is done (back-pressure).
+    let names = || decode_all(&written.lock().unwrap()).iter().map(msg_name).collect::<Vec<_>>();
+    f.hs.service_peer_messages(&mut pool);
+    assert_eq!(names(), ["block", "block"]);
+    f.hs.service_peer_messages(&mut pool);
+    assert_eq!(names(), ["block", "block", "block"]);
+    assert!(!f.hs.has_queued_getdata(ADDR));
+    f.hs.service_peer_messages(&mut pool);
+    assert_eq!(names(), ["block", "block", "block", "pong"]);
+    let blocks: Vec<BlockHash> = decode_all(&written.lock().unwrap())
+        .iter()
+        .filter_map(|m| match m {
+            NetworkMessage::Block(b) => Some(b.block_hash()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(blocks, (8..=10).map(|h| f.chain.hash_at(h)).collect::<Vec<_>>(), "served in order");
+}
+
+#[test]
+fn blocks_served_to_one_peer_are_capped_per_window() {
+    let f = fixture(3, 1);
+    let extra = 5;
+    let items = vec![Inventory::WitnessBlock(f.chain.hash_at(3)); MAX_BLOCKS_SERVED_PER_PEER as usize + extra];
+    let (r, sent) = f.handle(NetworkMessage::GetData(items));
+    r.unwrap();
+    let blocks = sent.iter().filter(|m| matches!(m, NetworkMessage::Block(_))).count();
+    let refused: usize = sent
+        .iter()
+        .map(|m| match m {
+            NetworkMessage::NotFound(nf) => nf.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!((blocks, refused), (MAX_BLOCKS_SERVED_PER_PEER as usize, extra));
+    // Another peer has its own allowance.
+    let (mut other, written) = mem_peer(vec![], Magic::REGTEST);
+    let one = vec![Inventory::WitnessBlock(f.chain.hash_at(3))];
+    f.hs.handle_peer_message("198.51.100.20:8333", NetworkMessage::GetData(one), &mut other, &f.pool).unwrap();
+    assert!(matches!(&decode_all(&written.lock().unwrap())[..], [NetworkMessage::Block(_)]));
+}
+
+#[test]
+fn metered_upload_cap_stops_block_serving_until_unmetered() {
+    let mut f = fixture(3, 1);
+    let block_size = f.chain.block(3).total_size() as u64;
+    f.hs.upload_budget = crate::upload_budget::UploadBudget::new(2 * block_size);
+    let tip = || NetworkMessage::GetData(vec![Inventory::WitnessBlock(f.chain.hash_at(3)); 3]);
+    let count = |sent: &[NetworkMessage]| {
+        (
+            sent.iter().filter(|m| matches!(m, NetworkMessage::Block(_))).count(),
+            sent.iter().filter(|m| matches!(m, NetworkMessage::NotFound(_))).count(),
+        )
+    };
+    // Unmetered (the default): no cap.
+    assert_eq!(count(&f.handle(tip()).1), (3, 0));
+    f.hs.set_network_metered(true);
+    assert_eq!(count(&f.handle(tip()).1), (2, 1), "past the metered cap");
+    assert_eq!(count(&f.handle(tip()).1), (0, 1), "the cap holds across requests");
+    f.hs.set_network_metered(false);
+    assert_eq!(count(&f.handle(tip()).1), (3, 0), "unmetered again");
+}
+
+#[test]
+fn inv_looks_up_a_bounded_number_of_blocks() {
+    let f = fixture(10, 0);
+    f.hs.new_block_announced.store(false, Ordering::Relaxed);
+    // Known blocks fill the lookup budget; an unknown one after them is
+    // never looked at.
+    let mut inv: Vec<Inventory> =
+        (1..=MAX_BLOCK_INV_LOOKUPS as u32).map(|h| Inventory::Block(f.chain.hash_at(h))).collect();
+    inv.push(Inventory::Block(junk_hash(1)));
+    f.handle(NetworkMessage::Inv(inv)).0.unwrap();
+    assert!(!f.hs.new_block_announced.load(Ordering::Relaxed));
+    assert!(f.hs.take_block_announcement().is_none());
+}
+
+#[test]
+fn inv_of_a_known_block_raises_the_announcers_height() {
+    // Core's UpdateBlockAvailability: an announced block we have is a
+    // block the peer has shown it has.
+    let f = fixture(10, 0);
+    let (mut peer, _) = mem_peer(vec![], Magic::REGTEST);
+    peer.set_addr_for_test(ADDR, false);
+    f.pool.add_outbound_peer_for_test(peer);
+    assert_eq!(f.pool.get_peer_height(ADDR), Some(0));
+    f.handle(NetworkMessage::Inv(vec![Inventory::Block(f.chain.hash_at(7))])).0.unwrap();
+    assert_eq!(f.pool.get_peer_height(ADDR), Some(7));
+    f.handle(NetworkMessage::Inv(vec![Inventory::Block(f.chain.hash_at(3))])).0.unwrap();
+    assert_eq!(f.pool.get_peer_height(ADDR), Some(7), "never lowered");
+}
+
+#[test]
+fn unknown_block_announcements_name_the_first_outbound_announcer_and_throttle_inbound_ones() {
+    let f = fixture(5, 0);
+    f.hs.new_block_announced.store(false, Ordering::Relaxed);
+    f.handle(NetworkMessage::Inv(vec![Inventory::Block(junk_hash(1))])).0.unwrap();
+    f.hs.handle_peer_message("198.51.100.30:8333", NetworkMessage::Inv(vec![Inventory::Block(junk_hash(2))]), &mut mem_peer(vec![], Magic::REGTEST).0, &f.pool).unwrap();
+    assert!(f.hs.new_block_announced.swap(false, Ordering::Relaxed));
+    assert_eq!(f.hs.take_block_announcement(), Some((ADDR.to_string(), junk_hash(1))), "first outbound announcer");
+    assert_eq!(f.hs.take_block_announcement(), None);
+
+    // Inbound announcers are never asked, and wake the loop once per
+    // INBOUND_ANNOUNCEMENT_INTERVAL between them all.
+    let inbound = |id: &str, n: u32| {
+        f.hs.note_block_announcement(id, junk_hash(n), true);
+        f.hs.new_block_announced.swap(false, Ordering::Relaxed)
+    };
+    assert!(inbound("inbound#900001", 3));
+    assert!(!inbound("inbound#900002", 4), "a second inbound wake within the interval");
+    assert_eq!(f.hs.take_block_announcement(), None);
+}
+
+#[test]
+fn transaction_inv_asks_for_at_most_max_getdata_sz() {
+    let f = fixture(1, 0);
+    let inv: Vec<Inventory> = (0..1500u32)
+        .map(|i| {
+            let mut b = [0u8; 32];
+            b[..4].copy_from_slice(&i.to_le_bytes());
+            Inventory::Transaction(bitcoin::Txid::from_byte_array(b))
+        })
+        .collect();
+    let (r, sent) = f.handle(NetworkMessage::Inv(inv));
+    r.unwrap();
+    assert!(matches!(&sent[..], [NetworkMessage::GetData(req)] if req.len() == MAX_GETDATA_SZ));
+    // All 1500 are remembered as known to the peer, asked for or not.
+    assert_eq!(f.hs.relay_state.lock().unwrap()[ADDR].known_txids.len(), 1500);
+}
+
+#[test]
+fn handler_errors_disconnect_the_peer() {
+    // A request over a limit (here an oversized locator) or a failed send
+    // drops the peer from the monitor loop, as Core disconnects.
+    let f = fixture(5, 0);
+    let mut pool = PeerPool::new_for_test_with(ChainParams::regtest());
+    let locator: Vec<BlockHash> = (0..MAX_LOCATOR_SZ as u32 + 1).map(junk_hash).collect();
+    let (mut peer, _) = mem_peer(
+        script_of_magic(Magic::REGTEST, vec![getheaders(locator, BlockHash::all_zeros())]),
+        Magic::REGTEST,
+    );
+    peer.set_addr_for_test(ADDR, true);
+    assert!(pool.add_inbound_peer(peer));
+    f.hs.service_peer_messages(&mut pool);
+    assert_eq!(pool.count(), 0);
 }
 
 // ── Never panics ─────────────────────────────────────────────────────
