@@ -263,4 +263,108 @@ mod tests {
         assert!(base32_decode_lower("MZXW6YTBOI").is_none()); // uppercase
         assert!(base32_decode_lower("0189").is_none()); // 0/1/8/9 not in alphabet
     }
+
+    // ── Vectors and properties (tests/network-app) ───────────────────
+
+    /// Long-lived real v3 services (Tor Project, DuckDuckGo, Facebook):
+    /// their checksums were computed by Tor itself, so they pin our SHA3
+    /// prefix, byte order and version byte to the spec, not to our own
+    /// encoder. (Checked independently with Python's sha3_256 too.)
+    const REAL_ONIONS: &[&str] = &[
+        "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion",
+        "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion",
+        "facebookwkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd.onion",
+    ];
+
+    #[test]
+    fn real_onion_addresses_decode_and_reencode_identically() {
+        for onion in REAL_ONIONS {
+            let pubkey = hostname_to_pubkey(onion).unwrap_or_else(|| panic!("rejected {}", onion));
+            assert_eq!(&pubkey_to_hostname(&pubkey), onion);
+            assert_eq!(hostname_to_pubkey(&format!("{}:8333", onion)), Some(pubkey));
+        }
+    }
+
+    #[test]
+    fn rfc4648_vectors_without_padding() {
+        // RFC 4648 §10, lowercased, '=' padding dropped (Tor never pads).
+        for (input, encoded) in [
+            (&b""[..], ""),
+            (b"f", "my"),
+            (b"fo", "mzxq"),
+            (b"foo", "mzxw6"),
+            (b"foob", "mzxw6yq"),
+            (b"fooba", "mzxw6ytb"),
+            (b"foobar", "mzxw6ytboi"),
+        ] {
+            assert_eq!(base32_encode_lower(input), encoded);
+            let decoded = base32_decode_lower(encoded).unwrap();
+            assert_eq!(&decoded[..input.len()], input, "{}", encoded);
+        }
+    }
+
+    #[test]
+    fn decode_rejects_near_misses() {
+        let good = REAL_ONIONS[1];
+        let stem = good.strip_suffix(".onion").unwrap();
+        for bad in [
+            stem.to_string(),                       // no .onion
+            format!("{}.onion.", stem),             // trailing dot
+            format!("www.{}", good),                // subdomain
+            format!("{}a.onion", stem),             // 57 chars
+            format!("{}.onion", &stem[1..]),        // 55 chars
+            format!("{}.ONION", stem),              // uppercase suffix
+            format!("{}1.onion", &stem[..55]),      // '1' isn't base32
+            String::new(),
+            ".onion".into(),
+            ":8333".into(),
+            format!("{}.onion", "a".repeat(56)),    // all-zero-ish, bad checksum
+        ] {
+            assert!(hostname_to_pubkey(&bad).is_none(), "accepted {:?}", bad);
+        }
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_every_pubkey_round_trips(pubkey in any::<[u8; 32]>()) {
+            let host = pubkey_to_hostname(&pubkey);
+            prop_assert_eq!(host.len(), ENCODED_LEN + ".onion".len());
+            // Version 3 in the last five bits: every v3 address ends in 'd'.
+            prop_assert!(host.ends_with("d.onion"), "{}", host);
+            prop_assert!(host.bytes().all(|b| b.is_ascii_lowercase() || b"234567.".contains(&b)));
+            prop_assert_eq!(hostname_to_pubkey(&host), Some(pubkey));
+        }
+
+        /// The last five characters carry only checksum and version bits
+        /// (bits 256..280), so changing any of them must be caught, always.
+        #[test]
+        fn prop_checksum_and_version_chars_are_always_verified(
+            pubkey in any::<[u8; 32]>(),
+            pos in 51usize..56,
+            replacement in prop::sample::select(ALPHABET.to_vec()),
+        ) {
+            let host = pubkey_to_hostname(&pubkey);
+            let mut bytes = host.clone().into_bytes();
+            // Char 51 also holds the pubkey's last bit; skip it unless the
+            // change is in its low four (checksum) bits.
+            prop_assume!(bytes[pos] != replacement);
+            if pos == 51 {
+                let old = ALPHABET.iter().position(|&c| c == bytes[pos]).unwrap();
+                let new = ALPHABET.iter().position(|&c| c == replacement).unwrap();
+                prop_assume!((old ^ new) & 0x10 == 0);
+            }
+            bytes[pos] = replacement;
+            let mutated = String::from_utf8(bytes).unwrap();
+            prop_assert!(hostname_to_pubkey(&mutated).is_none(), "{} accepted (from {})", mutated, host);
+        }
+
+        #[test]
+        fn prop_decode_never_panics(s in ".{0,80}") {
+            let _ = hostname_to_pubkey(&s);
+            let _ = hostname_to_pubkey(&format!("{}.onion", s));
+            let _ = base32_decode_lower(&s);
+        }
+    }
 }

@@ -4,6 +4,7 @@
 //! `sync` so they can reach `HeaderSync` internals (store, UTXO set, anchor).
 
 pub mod fixture_chain;
+pub mod lmdb_gate;
 pub mod mock_peer;
 
 /// Block-level tests of the ticket-026 contextual rules on fixture chains.
@@ -15,6 +16,7 @@ mod consensus_rules;
 mod consensus_boundaries;
 
 pub use fixture_chain::{FixtureChain, Invalid};
+pub use lmdb_gate::{lmdb_slot, LmdbSlot};
 pub use mock_peer::{Behavior, MockPeer};
 
 /// Address test listeners bind to: `HERCULES_TEST_LOOPBACK` (e.g. `::1`

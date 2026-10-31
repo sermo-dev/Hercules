@@ -380,6 +380,11 @@ pub struct UtxoSet {
     undo: Database<Bytes, Bytes>,
     height_index: Database<Bytes, Unit>,
     meta: Database<Bytes, Bytes>,
+    /// Test builds: a slot in the per-process LMDB lock budget, held for
+    /// this handle's life (see `testkit::lmdb_gate`). Dropped after `Drop`
+    /// has closed the env.
+    #[cfg(test)]
+    _lmdb_slot: crate::testkit::LmdbSlot,
 }
 
 impl UtxoSet {
@@ -484,6 +489,10 @@ impl UtxoSet {
     }
 
     fn open_at(path: &Path) -> Result<UtxoSet, UtxoError> {
+        // Before any LMDB call, so a throttled test waits here instead of
+        // failing `mdb_txn_begin` with EINVAL.
+        #[cfg(test)]
+        let lmdb_slot = crate::testkit::lmdb_slot();
         // SAFETY: heed marks `open` unsafe because LMDB requires the same
         // mmap'd file isn't simultaneously opened with conflicting flags from
         // another process. We're a single-process iOS app and never share the
@@ -624,6 +633,8 @@ impl UtxoSet {
             undo,
             height_index,
             meta,
+            #[cfg(test)]
+            _lmdb_slot: lmdb_slot,
         })
     }
 

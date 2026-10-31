@@ -18,7 +18,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::peer_store::PeerStore;
-use crate::testkit::{Behavior, FixtureChain, Invalid, MockPeer};
+use crate::testkit::{lmdb_slot, Behavior, FixtureChain, Invalid, LmdbSlot, MockPeer};
 
 /// Default SCORE_DEFAULT in peer_pool: a fresh peer's reputation.
 const FRESH_SCORE: i32 = 100;
@@ -26,16 +26,20 @@ const FRESH_SCORE: i32 = 100;
 // ── Harness ──────────────────────────────────────────────────────────
 
 /// A regtest `HeaderSync` in a temp directory, pointed at mock peers.
-struct Node {
-    dir: TempDir,
-    hs: HeaderSync,
+/// Fields drop in order: the stores close before the directory goes and
+/// before the LMDB slot (`testkit::lmdb_gate`) is released.
+pub(super) struct Node {
+    pub(super) hs: HeaderSync,
+    pub(super) dir: TempDir,
+    _slot: LmdbSlot,
 }
 
 impl Node {
-    fn new(peers: &[&MockPeer]) -> Node {
+    pub(super) fn new(peers: &[&MockPeer]) -> Node {
+        let slot = lmdb_slot();
         let dir = TempDir::new().unwrap();
         let hs = Node::open(&dir, peers);
-        Node { dir, hs }
+        Node { hs, dir, _slot: slot }
     }
 
     fn open(dir: &TempDir, peers: &[&MockPeer]) -> HeaderSync {
@@ -50,11 +54,11 @@ impl Node {
 
     /// Simulate an app restart: close every store and reopen the same
     /// directory, pointed at `peers`.
-    fn restart(self, peers: &[&MockPeer]) -> Node {
-        let Node { dir, hs } = self;
+    pub(super) fn restart(self, peers: &[&MockPeer]) -> Node {
+        let Node { hs, dir, _slot } = self;
         drop(hs);
         let hs = Node::open(&dir, peers);
-        Node { dir, hs }
+        Node { hs, dir, _slot }
     }
 
     fn is_failed(&self, hash: &BlockHash) -> bool {
@@ -67,11 +71,11 @@ impl Node {
     }
 
     /// Point later sync sessions at a different set of mock peers.
-    fn use_peers(&mut self, peers: &[&MockPeer]) {
+    pub(super) fn use_peers(&mut self, peers: &[&MockPeer]) {
         self.hs.peer_source = static_peers(peers);
     }
 
-    fn tip(&self) -> (u32, BlockHash) {
+    pub(super) fn tip(&self) -> (u32, BlockHash) {
         let (h, hash, _) = self.hs.store.tip().unwrap().unwrap();
         (h, hash)
     }
@@ -80,7 +84,7 @@ impl Node {
         self.hs.store.get_hash_at_height(height).unwrap()
     }
 
-    fn validated(&self) -> u32 {
+    pub(super) fn validated(&self) -> u32 {
         self.hs.store.validated_height().unwrap()
     }
 
@@ -88,20 +92,20 @@ impl Node {
         self.hs.utxo.get(&op.txid, op.vout).unwrap().is_some()
     }
 
-    fn peer_store(&self) -> PeerStore {
+    pub(super) fn peer_store(&self) -> PeerStore {
         PeerStore::open(self.dir.path().join("peers.sqlite3").to_str().unwrap()).unwrap()
     }
 
-    fn is_banned(&self, addr: &str) -> bool {
+    pub(super) fn is_banned(&self, addr: &str) -> bool {
         self.peer_store().load_active_bans().unwrap().contains_key(addr)
     }
 
-    fn score(&self, addr: &str) -> Option<i32> {
+    pub(super) fn score(&self, addr: &str) -> Option<i32> {
         self.peer_store().load_score(addr).unwrap()
     }
 
     /// The node's UTXO set is exactly the one `chain` implies.
-    fn assert_utxos_match(&self, chain: &FixtureChain) {
+    pub(super) fn assert_utxos_match(&self, chain: &FixtureChain) {
         let expected = chain.expected_utxos();
         assert_eq!(self.hs.utxo.count().unwrap(), expected.len() as u64, "UTXO count");
         for (op, out) in &expected {
@@ -118,7 +122,7 @@ impl Node {
 
     /// Run `sync()` on a background thread while `body` drives the test,
     /// then stop it. Returns `body`'s result and `sync()`'s return value.
-    fn run_sync<R>(&self, body: impl FnOnce(&HeaderSync) -> R) -> (R, Result<(), SyncError>) {
+    pub(super) fn run_sync<R>(&self, body: impl FnOnce(&HeaderSync) -> R) -> (R, Result<(), SyncError>) {
         std::thread::scope(|s| {
             let handle = s.spawn(|| self.hs.sync(|_| {}));
             let r = body(&self.hs);
@@ -132,8 +136,9 @@ impl Node {
         })
     }
 
-    /// Run `sync()` for `duration`, collecting every status error message.
-    fn sync_errors_for(&self, duration: Duration) -> (Vec<String>, Result<(), SyncError>) {
+    /// Run `sync()` for a fixed `window` (or until it returns), collecting
+    /// every status error message.
+    fn sync_errors_for(&self, window: Duration) -> (Vec<String>, Result<(), SyncError>) {
         let errors = Mutex::new(Vec::new());
         let res = std::thread::scope(|s| {
             let handle = s.spawn(|| {
@@ -143,7 +148,10 @@ impl Node {
                     }
                 })
             });
-            std::thread::sleep(duration);
+            let start = Instant::now();
+            while start.elapsed() < window && !handle.is_finished() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             while !handle.is_finished() {
                 self.hs.stop_sync();
                 std::thread::sleep(Duration::from_millis(20));
@@ -153,30 +161,113 @@ impl Node {
         (errors.into_inner().unwrap(), res)
     }
 
-    /// Run `sync()` until `done` holds (true) or `timeout` passes (false).
-    fn sync_until(
+    /// Run `sync()` until `done` holds (true), or the node goes `stall`
+    /// without progress, or `sync()` returns on its own (false). See
+    /// `wait_for`: the bound is on lack of progress, not on wall-clock
+    /// time, so a loaded machine slows these tests down without failing
+    /// them.
+    pub(super) fn sync_until(
         &self,
-        timeout: Duration,
+        stall: Duration,
         done: impl Fn(&HeaderSync) -> bool,
     ) -> (bool, Result<(), SyncError>) {
-        self.run_sync(|hs| wait_until(hs, timeout, &done))
+        std::thread::scope(|s| {
+            let handle = s.spawn(|| self.hs.sync(|_| {}));
+            let ok = wait_for(&self.hs, stall, &done, &|| handle.is_finished());
+            while !handle.is_finished() {
+                self.hs.stop_sync();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (ok, handle.join().expect("sync thread panicked"))
+        })
+    }
+
+    /// Run `sync()` for a fixed `window` in which `event` must not (or,
+    /// for the caller's assertion, may) happen: the negative checks
+    /// ("never validated", "never replaced"). Returns early if `event`
+    /// happens or `sync()` returns.
+    pub(super) fn sync_window(
+        &self,
+        window: Duration,
+        event: impl Fn(&HeaderSync) -> bool,
+    ) -> (bool, Result<(), SyncError>) {
+        std::thread::scope(|s| {
+            let handle = s.spawn(|| self.hs.sync(|_| {}));
+            let start = Instant::now();
+            let mut happened = event(&self.hs);
+            while !happened && start.elapsed() < window && !handle.is_finished() {
+                std::thread::sleep(Duration::from_millis(20));
+                happened = event(&self.hs);
+            }
+            while !handle.is_finished() {
+                self.hs.stop_sync();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            (happened, handle.join().expect("sync thread panicked"))
+        })
+    }
+
+    /// `sync_window` with no event: just let the node run for `window`.
+    pub(super) fn sync_for(&self, window: Duration) -> Result<(), SyncError> {
+        self.sync_window(window, |_| false).1
     }
 }
 
-fn static_peers(peers: &[&MockPeer]) -> PeerSource {
+pub(super) fn static_peers(peers: &[&MockPeer]) -> PeerSource {
     PeerSource::Static(peers.iter().map(|p| p.addr()).collect())
 }
 
-/// Poll `done` until it holds or `timeout` passes.
-fn wait_until(hs: &HeaderSync, timeout: Duration, done: &dyn Fn(&HeaderSync) -> bool) -> bool {
+/// Ceiling on any one wait, progress or not: a livelock that keeps moving
+/// the tip (a reorg flip-flop) still fails, just slowly.
+const HARD_LIMIT: Duration = Duration::from_secs(600);
+
+/// What the node has to show for itself: header tip and validated height.
+/// Any change counts as progress.
+fn progress_mark(hs: &HeaderSync) -> Option<(u32, BlockHash, u32)> {
+    let (h, hash, _) = hs.store.tip().ok().flatten()?;
+    Some((h, hash, hs.store.validated_height().ok()?))
+}
+
+/// Poll `done` until it holds (true). False once the node has gone
+/// `stall` without progress (`progress_mark` unchanged), `finished`
+/// reports the sync loop has returned, or `HARD_LIMIT` passes.
+///
+/// Ticket 027 follow-up: these waits used to be fixed 60 s deadlines, and
+/// the scenarios that validate thousands of blocks (the eclipse tests) are
+/// bound by durable disk commits, not CPU (an `F_FULLFSYNC` per block on
+/// macOS): on a loaded machine they ran past the deadline while still
+/// making steady progress and failed as "stuck". A node that is actually
+/// stuck stops changing its tip and validated height, and fails here
+/// after `stall`.
+fn wait_for(
+    hs: &HeaderSync,
+    stall: Duration,
+    done: &dyn Fn(&HeaderSync) -> bool,
+    finished: &dyn Fn() -> bool,
+) -> bool {
     let start = Instant::now();
-    while start.elapsed() < timeout {
+    let mut mark = progress_mark(hs);
+    let mut last_progress = Instant::now();
+    loop {
         if done(hs) {
             return true;
         }
+        if finished() || last_progress.elapsed() >= stall || start.elapsed() >= HARD_LIMIT {
+            return done(hs);
+        }
         std::thread::sleep(Duration::from_millis(20));
+        let now = progress_mark(hs);
+        if now != mark {
+            mark = now;
+            last_progress = Instant::now();
+        }
     }
-    done(hs)
+}
+
+/// `wait_for` inside a `run_sync` body (the sync loop's own exit is
+/// visible to the caller there, not here).
+fn wait_until(hs: &HeaderSync, stall: Duration, done: &dyn Fn(&HeaderSync) -> bool) -> bool {
+    wait_for(hs, stall, done, &|| false)
 }
 
 /// Header tip is `chain`'s tip and every block up to it is validated.
@@ -193,10 +284,12 @@ fn synced_to(chain: &FixtureChain) -> impl Fn(&HeaderSync) -> bool + '_ {
     }
 }
 
-const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a positive wait (`sync_until`) lets the node go without any
+/// progress before declaring it stuck. Not a deadline for the whole sync.
+pub(super) const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sync `node` to `chain` from fresh mocks, then drop the mocks.
-fn presync(node: &mut Node, chain: &FixtureChain) {
+pub(super) fn presync(node: &mut Node, chain: &FixtureChain) {
     let peer = MockPeer::spawn(chain, vec![]);
     node.use_peers(&[&peer]);
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(chain));
@@ -445,7 +538,7 @@ fn low_work_chain_from_colluding_peers_is_never_validated() {
     // One unit more than the whole chain's work.
     node.hs.min_chain_work = u256_add(chainwork_for_headers(&headers), one);
 
-    let (_, _res) = node.sync_until(Duration::from_secs(4), |_| false);
+    let _ = node.sync_for(Duration::from_secs(4));
     assert_eq!(node.validated(), 0, "validated blocks on a below-min-work chain");
     assert!(a.block_requests().is_empty() && b.block_requests().is_empty());
 }
@@ -489,7 +582,7 @@ fn eclipsed_low_work_headers_are_replaced_by_honest_chain() {
     let b = MockPeer::spawn(&honest_chain, vec![]);
     node.use_peers(&[&a, &b]);
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&honest_chain));
-    assert!(ok, "stuck on the cheap chain: {:?}, tip {:?}", res, node.tip());
+    assert!(ok, "no progress toward the honest chain: {:?}, tip {:?}, validated {}", res, node.tip(), node.validated());
     assert_eq!(node.hash_at(ANCHOR), Some(honest_chain.hash_at(ANCHOR)));
     node.assert_utxos_match(&honest_chain);
 }
@@ -524,7 +617,7 @@ fn recover_from_cheap_chain(honest_chain: &FixtureChain, cheap_chain: &FixtureCh
     let b = MockPeer::spawn(honest_chain, vec![]);
     node.use_peers(&[&a, &b]);
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(honest_chain));
-    assert!(ok, "stuck on the cheap chain: {:?}, tip {:?}", res, node.tip());
+    assert!(ok, "no progress toward the honest chain: {:?}, tip {:?}, validated {}", res, node.tip(), node.validated());
     assert_eq!(node.hash_at(anchor), Some(honest_chain.hash_at(anchor)));
     for p in [&a, &b] {
         assert!(!node.is_banned(&p.addr()), "honest peer banned");
@@ -606,7 +699,7 @@ fn colluding_peers_cannot_replace_low_work_headers_before_a_stall() {
     let c2 = MockPeer::spawn(&cheap_chain, vec![]);
     node.use_peers(&[&c1, &c2]);
 
-    let _ = node.sync_until(Duration::from_secs(5), |_| false);
+    let _ = node.sync_for(Duration::from_secs(5));
     assert_eq!(node.tip(), (300, honest_chain.hash_at(300)), "colluders replaced our headers");
     let rounds = c1
         .log()
@@ -835,7 +928,7 @@ fn csv_time_lock_spent_early_is_never_connected() {
     });
     assert!(reached, "never validated up to the parent: {:?}", res);
     // Give sync a window to (wrongly) connect the early spend.
-    let (connected, _) = node.sync_until(Duration::from_secs(3), |hs| {
+    let (connected, _) = node.sync_window(Duration::from_secs(3), |hs| {
         hs.store.validated_height().unwrap_or(0) >= 104
     });
     assert!(!connected, "block 104 with an unmet BIP 68 time lock was connected");
@@ -930,7 +1023,7 @@ fn failed_block_is_refused_after_restart() {
     drop(honest);
     let hostile2 = MockPeer::spawn(&hostile_chain, vec![]);
     let node = node.restart(&[&hostile2]);
-    let _ = node.sync_until(Duration::from_secs(4), |_| false);
+    let _ = node.sync_for(Duration::from_secs(4));
     assert_eq!(node.tip(), (honest_chain.tip_height(), honest_chain.tip_hash()));
     // It only relays the invalid chain: disconnected and deprioritized, not
     // banned (if our verdict were wrong, banning relayers would ban every
@@ -998,7 +1091,7 @@ fn utxo_out_of_step_with_headers_is_local_not_invalid() {
     let peer = MockPeer::spawn(&chain, vec![]);
     node.use_peers(&[&peer]);
 
-    let (_, res) = node.sync_until(Duration::from_secs(10), |_| false);
+    let res = node.sync_for(Duration::from_secs(10));
     let err = format!("{:?}", res.expect_err("sync must stop on a local fault"));
     assert!(err.contains("doesn't match the header chain"), "{}", err);
     assert!(!node.is_failed(&chain.hash_at(103)), "honest block marked invalid");
@@ -1367,7 +1460,7 @@ fn withheld_reorg_blocks_leave_node_on_old_tip() {
     withholder.set_behaviors(vec![Behavior::WithholdBlock(105), Behavior::WithholdBlock(106)]);
     node.use_peers(&[&withholder]);
 
-    let _ = node.sync_until(Duration::from_secs(8), |_| false);
+    let _ = node.sync_for(Duration::from_secs(8));
     assert_eq!(node.tip(), (a.tip_height(), a.tip_hash()), "abandoned A for an unvalidated branch");
     assert_eq!(node.validated(), a.tip_height());
     node.assert_utxos_match(&a);
