@@ -31,6 +31,8 @@ Smaller findings from the deep review of main at `d627836` that don't belong to 
 - The Wallet API toggle is disabled once sync stops, so the onion RPC can't be turned off (`SettingsView.swift` ~430).
 - `close` racing `start_wallet_api` leaks the server thread and its `PathClaim` (`lib.rs` ~807–817 vs ~1271–1325). This is a second trigger for the race in ticket 055.
 - The widget isn't cleared on reset (`ContentView.swift` ~129, ~177–194).
+- From 054: Switch & Wipe deletes pending own txs; it should warn first, or keep them.
+- From 054: installs the old bug converted to genesis are recorded as genesis; show a one-time notice explaining why (owner decision, 2026-10-31).
 - Unchecked `UInt32` subtraction `targetHeight - currentHeight` (`NotificationManager.swift` ~727, ~873). Defensive only; no known way to reach it.
 
 ## 4. Plausible, not confirmed (investigate)
