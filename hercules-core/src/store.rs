@@ -1268,7 +1268,9 @@ mod tests {
             };
             open(p).unwrap();
             let current = version(None);
-            assert_eq!(current, 1, "{} not stamped", name);
+            // own_txs is at 2 since ticket 053 (`own_tx_delivered`).
+            let expected = if name == "own_txs.sqlite3" { 2 } else { 1 };
+            assert_eq!(current, expected, "{} not stamped", name);
 
             // A file from before versioning opens and is stamped.
             version(Some(0));
