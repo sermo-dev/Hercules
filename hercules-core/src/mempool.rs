@@ -52,9 +52,13 @@ const INCREMENTAL_RELAY_FEE_PER_KVB: f64 = INCREMENTAL_RELAY_FEE_RATE * 1000.0;
 /// halved again for a pool under half full, quartered under a quarter.
 const ROLLING_FEE_HALFLIFE: Duration = Duration::from_secs(12 * 3600);
 
-/// Removal events kept for [`Mempool::drain_removals`]. A consumer drains
-/// after each mempool call, so this only bounds memory when nobody does
-/// (oldest events are dropped and counted). ~70 bytes each.
+/// Removal events kept for [`Mempool::drain_removals`]. `HeaderSync`
+/// drains after every mempool call, so this only bounds memory when
+/// nobody does. Past it the oldest events that don't settle anything
+/// (`RemovalReason::is_final` false) are dropped and counted; final ones
+/// (a replacement, a block conflict) are never dropped, since an own tx
+/// left out of one would stay "pending" for its whole expiry. ~70 bytes
+/// each, and a call can only queue as many as it removed entries.
 const MAX_QUEUED_REMOVALS: usize = 20_000;
 
 /// Maximum standard transaction weight (400,000 WU).
@@ -122,6 +126,36 @@ const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 /// = `MAX_BLOCK_SIGOPS_COST / 5`), so one transaction can't fill a block's
 /// sigop budget.
 const MAX_STANDARD_TX_SIGOPS_COST: u64 = crate::contextual_checks::MAX_BLOCK_SIGOPS_COST / 5;
+
+/// Smallest standard serialization without witness
+/// (`MIN_STANDARD_TX_NONWITNESS_SIZE`, `tx-size-small`): a 64-byte
+/// transaction could pass for an inner node of a block's merkle tree
+/// (CVE-2017-12842), so Core relays nothing below 65 bytes.
+const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
+
+/// Most sigops a P2SH redeem script may have (`MAX_P2SH_SIGOPS`), counted
+/// accurately, so a spend can't pack a block's worth of CHECKMULTISIGs
+/// into one input.
+const MAX_P2SH_SIGOPS: u64 = 15;
+
+/// Most legacy (non-witness) sigops one transaction may execute, counted
+/// as BIP 54 does: in each scriptSig and in the scriptPubKey (or P2SH
+/// redeem script) it spends (`MAX_TX_LEGACY_SIGOPS`, Core 30's
+/// `CheckSigopsBIP54`). Bounds the quadratic legacy sighash cost.
+const MAX_TX_LEGACY_SIGOPS: u64 = 2_500;
+
+/// `IsWitnessStandard` limits: a P2WSH witness script of at most 3600
+/// bytes with at most 100 stack items of at most 80 bytes each, and
+/// tapscript stack items of at most 80 bytes.
+const MAX_STANDARD_P2WSH_SCRIPT_SIZE: usize = 3_600;
+const MAX_STANDARD_P2WSH_STACK_ITEMS: usize = 100;
+const MAX_STANDARD_P2WSH_STACK_ITEM_SIZE: usize = 80;
+const MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE: usize = 80;
+
+/// `EvalScript` limits that a push-only scriptSig can hit
+/// (`MAX_SCRIPT_ELEMENT_SIZE`, `MAX_STACK_SIZE`).
+const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+const MAX_STACK_SIZE: usize = 1_000;
 
 /// A transaction in the mempool with fee metadata and CPFP graph state.
 ///
@@ -230,6 +264,15 @@ pub enum RemovalReason {
     Reorg,
 }
 
+impl RemovalReason {
+    /// Whether the tx can never confirm on this chain once removed for
+    /// this reason (its inputs are spent by a replacement or a block), so
+    /// a wallet must settle it. The others may come back.
+    pub fn is_final(&self) -> bool {
+        matches!(self, RemovalReason::ReplacedBy(_) | RemovalReason::ConflictedByBlock { .. })
+    }
+}
+
 /// One transaction leaving the mempool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MempoolRemoval {
@@ -241,7 +284,6 @@ pub struct MempoolRemoval {
 /// drain, in order, and how many older ones were dropped because the
 /// queue was full (`MAX_QUEUED_REMOVALS`).
 #[derive(Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct MempoolRemovals {
     pub removals: Vec<MempoolRemoval>,
     pub dropped: u64,
@@ -387,6 +429,48 @@ impl Mempool {
         self.accept_tx_internal(tx, utxo_set, current_height, times, AcceptMode::Own)
     }
 
+    /// [`Mempool::accept_own_tx`] for a fresh submission, which must also
+    /// clear what our peers will take: if `tx`'s fee is below
+    /// `network_floor_per_kvb` (sat/kvB, the lowest `feefilter` among our
+    /// peers), no peer would be sent it (Core's `SendMessages` skips a tx
+    /// whose fee is below `filterrate.GetFee(vsize)`), so it is refused
+    /// with [`MempoolError::BelowNetworkMinimum`] before anything changes,
+    /// instead of sitting here "pending" while nobody hears of it (ticket
+    /// 053). 0 means no peer filters.
+    pub fn accept_own_tx_for_network(
+        &mut self,
+        tx: Transaction,
+        utxo_set: &UtxoSet,
+        current_height: u32,
+        times: &dyn HeaderTimes,
+        network_floor_per_kvb: u64,
+    ) -> Result<Txid, MempoolError> {
+        let floor = FeeFloor::Network { per_kvb: network_floor_per_kvb };
+        self.accept_tx_with(tx, utxo_set, current_height, times, AcceptMode::Own, floor)
+    }
+
+    /// Put back an own transaction that a reorg disconnected: it was mined,
+    /// so it already paid its way. As Core's `MaybeUpdateMempoolForReorg`
+    /// (`AcceptToMemoryPool` with `bypass_limits`), no fee-rate floor
+    /// applies (not the minimum relay fee, not the rolling minimum, and not
+    /// the absurd-fee cap, which in Core is the sending RPC's alone); every
+    /// other check does. Capacity still applies: where Core admits it and
+    /// trims the pool once the reorg is done, the admission plan evicts
+    /// cheaper packages now, or refuses it if it is itself the cheapest,
+    /// which is what that trim would have done.
+    ///
+    /// Only own transactions come back this way for now; ticket 025
+    /// re-adds every disconnected transaction through the same floor.
+    pub fn accept_disconnected_own_tx(
+        &mut self,
+        tx: Transaction,
+        utxo_set: &UtxoSet,
+        current_height: u32,
+        times: &dyn HeaderTimes,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_tx_with(tx, utxo_set, current_height, times, AcceptMode::Own, FeeFloor::Bypass)
+    }
+
     /// Why our local relay policy (018) would refuse `tx` from a peer, if
     /// it would. Used to warn the user that an own transaction might
     /// propagate poorly among similarly-filtering nodes; never blocks it.
@@ -473,8 +557,8 @@ impl Mempool {
         Ok(mtp)
     }
 
-    /// Shared accept implementation. See [`AcceptMode`] for what each
-    /// mode checks.
+    /// Shared accept implementation with the standard fee floors. See
+    /// [`AcceptMode`] for what each mode checks.
     fn accept_tx_internal(
         &mut self,
         tx: Transaction,
@@ -482,6 +566,19 @@ impl Mempool {
         current_height: u32,
         times: &dyn HeaderTimes,
         mode: AcceptMode,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_tx_with(tx, utxo_set, current_height, times, mode, FeeFloor::Standard)
+    }
+
+    /// [`Mempool::accept_tx_internal`] with the fee floors `floor` names.
+    fn accept_tx_with(
+        &mut self,
+        tx: Transaction,
+        utxo_set: &UtxoSet,
+        current_height: u32,
+        times: &dyn HeaderTimes,
+        mode: AcceptMode,
+        floor: FeeFloor,
     ) -> Result<Txid, MempoolError> {
         let skip_consensus = matches!(mode, AcceptMode::SkipConsensus);
         let txid = tx.compute_txid();
@@ -604,6 +701,14 @@ impl Mempool {
                 }
             }
             AcceptMode::SkipConsensus => {}
+        }
+
+        // Core's PreChecks `tx-size-small`, right after IsStandardTx. The
+        // test mode skips it with the output-type checks: its fixtures pay
+        // to 1-byte scripts.
+        let base_size = tx.base_size();
+        if mode != AcceptMode::SkipConsensus && base_size < MIN_STANDARD_TX_NONWITNESS_SIZE {
+            return Err(MempoolError::TxSizeSmall { size: base_size });
         }
 
         // ── Phase 1: conflict detection ─────────────────────────────────
@@ -737,6 +842,15 @@ impl Mempool {
         // flags, before any script runs.
         let spent_spks: Vec<&[u8]> = spent.iter().map(|(_, spk)| spk.as_slice()).collect();
 
+        // What the inputs spend, and their witnesses, must be standard too
+        // (Core's `ValidateInputsStandardness` and `IsWitnessStandard`,
+        // network standardness, so own txs as well). The script-type-free
+        // test mode skips them, as it skips output types.
+        if mode != AcceptMode::SkipConsensus {
+            validate_inputs_standardness(&tx, &spent_spks)?;
+            is_witness_standard(&tx, &spent_spks)?;
+        }
+
         // Knots-aligned relay policy (018): reject inscriptions, token
         // protocols, data injection, and parasitic patterns. Needs the
         // spent scriptPubKeys to know which witness element is a script.
@@ -754,11 +868,6 @@ impl Mempool {
             return Err(MempoolError::TooManySigops { cost: sigop_cost, limit: MAX_STANDARD_TX_SIGOPS_COST });
         }
 
-        if !skip_consensus {
-            script_verify::verify_transaction(&tx, &spent, flags)
-                .map_err(MempoolError::from_script_verify)?;
-        }
-
         // ── Phase 3: value math + fee bounds ────────────────────────────
         let output_sum: u64 = tx
             .output
@@ -774,8 +883,8 @@ impl Mempool {
         let fee = input_sum - output_sum;
 
         // Absurd-fee guardrail, own transactions only (see
-        // ABSURD_FEE_THRESHOLD).
-        if mode == AcceptMode::Own && fee > ABSURD_FEE_THRESHOLD {
+        // ABSURD_FEE_THRESHOLD), and not for one a block already mined.
+        if mode == AcceptMode::Own && floor != FeeFloor::Bypass && fee > ABSURD_FEE_THRESHOLD {
             return Err(MempoolError::AbsurdFee {
                 fee,
                 limit: ABSURD_FEE_THRESHOLD,
@@ -783,21 +892,36 @@ impl Mempool {
         }
 
         let fee_rate = fee as f64 / vsize as f64;
-        if fee_rate < MIN_RELAY_FEE_RATE {
-            return Err(MempoolError::InsufficientFee {
-                fee_rate,
-                min_rate: MIN_RELAY_FEE_RATE,
-            });
+        if floor != FeeFloor::Bypass {
+            if fee_rate < MIN_RELAY_FEE_RATE {
+                return Err(MempoolError::InsufficientFee {
+                    fee_rate,
+                    min_rate: MIN_RELAY_FEE_RATE,
+                });
+            }
+            // The rolling minimum (Core's CheckFeeRate, `mempool min fee
+            // not met`): while the pool has recently been full, a tx must
+            // beat what eviction last threw out, plus the incremental
+            // relay fee.
+            let min_fee_per_kvb = self.min_fee_per_kvb(Instant::now());
+            if min_fee_per_kvb > 0 && fee < (min_fee_per_kvb * vsize).div_ceil(1000) {
+                return Err(MempoolError::MempoolMinFeeNotMet {
+                    fee_rate,
+                    min_rate: min_fee_per_kvb as f64 / 1000.0,
+                });
+            }
         }
-        // The rolling minimum (Core's CheckFeeRate, `mempool min fee not
-        // met`): while the pool has recently been full, a tx must beat
-        // what eviction last threw out, plus the incremental relay fee.
-        let min_fee_per_kvb = self.min_fee_per_kvb(Instant::now());
-        if min_fee_per_kvb > 0 && fee < (min_fee_per_kvb * vsize).div_ceil(1000) {
-            return Err(MempoolError::MempoolMinFeeNotMet {
-                fee_rate,
-                min_rate: min_fee_per_kvb as f64 / 1000.0,
-            });
+        // Our peers' floor, compared as each peer compares it before
+        // announcing a tx to us (`fee < filterrate.GetFee(vsize)`, rounded
+        // up). Reported with the rate that clears every floor we know of.
+        if let FeeFloor::Network { per_kvb } = floor {
+            if per_kvb > 0 && fee < (per_kvb * vsize).div_ceil(1000) {
+                let ours = self.min_fee_per_kvb(Instant::now()).max((MIN_RELAY_FEE_RATE * 1000.0) as u64);
+                return Err(MempoolError::BelowNetworkMinimum {
+                    fee_rate,
+                    min_rate: per_kvb.max(ours) as f64 / 1000.0,
+                });
+            }
         }
 
         let size = serialized_tx.len();
@@ -903,6 +1027,34 @@ impl Mempool {
                 });
             }
         };
+
+        // ── Phase 6.6: scripts ──────────────────────────────────────────
+        //
+        // Last, as Core's PreChecks → PolicyScriptChecks →
+        // ConsensusScriptChecks: every cheap check above runs before any
+        // signature is checked, so a tx that fails on fees, RBF or limits
+        // costs no script work (ticket 053).
+        //
+        // Policy first: Core's STANDARD_SCRIPT_VERIFY_FLAGS (low-S, strict
+        // encoding, NULLFAIL, CLEANSTACK, MINIMALIF, minimal pushes,
+        // discouraged upgradable NOPs / witness programs / taproot leaf
+        // versions / OP_SUCCESS / pubkey types, ...), which peers enforce
+        // for relay. Where it fails, the mandatory (all consensus) flags
+        // decide what to tell the user, as Core up to 29 classified it
+        // (`mandatory-script-verify-flag-failed`): still failing is
+        // invalid (`ScriptFailure`); passing is only non-standard (Core 30+
+        // reports both as `mempool-script-verify-flag-failed`, and neither
+        // costs the peer anything here). Then the consensus check proper,
+        // with this build's consensus backend and the tip's flags.
+        if !skip_consensus {
+            if let Err(policy) = script_verify::verify_transaction_policy(&tx, &spent) {
+                script_verify::verify_transaction(&tx, &spent, script_verify::SCRIPT_VERIFY_ALL_CONSENSUS)
+                    .map_err(MempoolError::from_script_verify)?;
+                return Err(MempoolError::from_policy_script_verify(policy));
+            }
+            script_verify::verify_transaction(&tx, &spent, flags)
+                .map_err(MempoolError::from_script_verify)?;
+        }
 
         // ── Phase 7: mutate ─────────────────────────────────────────────
         //
@@ -1140,7 +1292,7 @@ impl Mempool {
     /// beyond the 1 sat/vB relay floor: Core's `GetMinFee`, which is also
     /// what Core advertises in `feefilter`. 0.0 unless the pool has been
     /// full recently.
-    #[cfg_attr(not(test), allow(dead_code))] // for feefilter (053 item 3, after 049)
+    #[cfg_attr(not(test), allow(dead_code))] // for our own feefilter, not sent yet
     pub fn mempool_min_fee_rate(&mut self) -> f64 {
         self.min_fee_per_kvb(Instant::now()) as f64 / 1000.0
     }
@@ -1166,7 +1318,6 @@ impl Mempool {
     /// `accept_own_tx` (replacements, capacity eviction), `remove_confirmed`,
     /// `expire_old`, `remove_tx` — and hand the result to
     /// `OwnTxStore::on_mempool_removals`.
-    #[cfg_attr(not(test), allow(dead_code))] // wired into sync.rs with ticket 049's handlers
     pub fn drain_removals(&mut self) -> MempoolRemovals {
         MempoolRemovals {
             removals: self.removals.drain(..).collect(),
@@ -1176,8 +1327,20 @@ impl Mempool {
 
     fn record_removal(&mut self, txid: Txid, reason: RemovalReason) {
         if self.removals.len() >= MAX_QUEUED_REMOVALS {
-            self.removals.pop_front();
-            self.removals_dropped += 1;
+            // Drop the oldest event that settles nothing; if every queued
+            // event is final, keep them all (see MAX_QUEUED_REMOVALS). The
+            // scan past the front only runs once final events have piled
+            // up undrained.
+            if self.removals.front().is_some_and(|r| !r.reason.is_final()) {
+                self.removals.pop_front();
+                self.removals_dropped += 1;
+            } else if let Some(i) = self.removals.iter().position(|r| !r.reason.is_final()) {
+                self.removals.remove(i);
+                self.removals_dropped += 1;
+            } else if !reason.is_final() {
+                self.removals_dropped += 1;
+                return;
+            }
         }
         self.removals.push_back(MempoolRemoval { txid, reason });
     }
@@ -1481,6 +1644,27 @@ impl Mempool {
         removed
     }
 
+    /// Every mempool transaction that descends from `txid` (empty if it
+    /// isn't in the pool or has none).
+    pub fn descendants(&self, txid: &Txid) -> Vec<Txid> {
+        self.txs.get(txid).map(|e| e.descendants.iter().copied().collect()).unwrap_or_default()
+    }
+
+    /// Test hook: make `txid` look older than `MAX_TX_AGE`.
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&mut self, txid: &Txid) {
+        if let Some(e) = self.txs.get_mut(txid) {
+            e.added_at = Instant::now().checked_sub(MAX_TX_AGE + Duration::from_secs(1)).unwrap();
+        }
+    }
+
+    /// Test hook: set the rolling minimum fee (sat/kvB), as an eviction
+    /// would.
+    #[cfg(test)]
+    pub(crate) fn set_rolling_min_fee_for_test(&mut self, per_kvb: f64) {
+        self.rolling_min_fee = per_kvb;
+    }
+
     /// Check if a transaction is in the mempool.
     pub fn contains(&self, txid: &Txid) -> bool {
         self.txs.contains_key(txid)
@@ -1684,6 +1868,20 @@ enum AcceptMode {
     SkipConsensus,
 }
 
+/// Which fee-rate floors admission applies (Core's `CheckFeeRate` and
+/// where it is skipped).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeeFloor {
+    /// The minimum relay fee and the rolling minimum.
+    Standard,
+    /// Those, and our peers' lowest `feefilter` (sat/kvB): a fresh own
+    /// submission ([`Mempool::accept_own_tx_for_network`]).
+    Network { per_kvb: u64 },
+    /// None, nor the absurd-fee cap: a tx from a disconnected block
+    /// (Core's `bypass_limits`; [`Mempool::accept_disconnected_own_tx`]).
+    Bypass,
+}
+
 /// Output script types this node relays for others (local policy, 018).
 /// Bare P2PK and bare multisig are intentionally excluded: P2PK is
 /// obsolete (no modern wallet generates it), and bare multisig is the
@@ -1751,6 +1949,275 @@ fn is_standard_bare_multisig(spk: &bitcoin::Script) -> bool {
     m <= n && keys.len() == n && keys.iter().all(valid_key)
 }
 
+// ── Input and witness standardness (policy/policy.cpp) ──────────────────
+
+/// What Core's `Solver` makes of a spent scriptPubKey, as far as
+/// `ValidateInputsStandardness` cares.
+#[derive(Debug, PartialEq, Eq)]
+enum SpentType {
+    ScriptHash,
+    /// A witness program of a version we don't know (`WITNESS_UNKNOWN`).
+    WitnessUnknown,
+    NonStandard,
+    /// Any other type `Solver` recognizes: PUBKEY, PUBKEYHASH, MULTISIG,
+    /// NULL_DATA, P2WPKH, P2WSH, P2TR, ANCHOR.
+    Known,
+}
+
+/// Core's `CPubKey::ValidSize`: the length the first byte implies.
+fn pubkey_valid_size(key: &[u8]) -> bool {
+    match key.first() {
+        Some(0x02) | Some(0x03) => key.len() == 33,
+        Some(0x04) | Some(0x06) | Some(0x07) => key.len() == 65,
+        _ => false,
+    }
+}
+
+/// Core's `CheckMinimalPush` for a push opcode (`opcode <= OP_PUSHDATA4`).
+fn is_minimal_push(data: &[u8], opcode: u8) -> bool {
+    match data.len() {
+        0 => opcode == 0x00,
+        // 1..=16 and -1 have their own OP_N opcodes, which aren't pushes.
+        1 if (1..=16).contains(&data[0]) || data[0] == 0x81 => false,
+        n if n <= 75 => opcode as usize == n,
+        n if n <= 255 => opcode == 0x4c,
+        n if n <= 65_535 => opcode == 0x4d,
+        _ => true,
+    }
+}
+
+/// `Solver`'s `GetScriptNumber`: `OP_1..OP_16`, or a minimal push of a
+/// minimally encoded `CScriptNum` of at most 4 bytes, within `min..=max`.
+fn solver_script_number(opcode: u8, data: &[u8], min: i64, max: i64) -> Option<i64> {
+    let n = if (0x51..=0x60).contains(&opcode) {
+        (opcode - 0x50) as i64
+    } else if opcode <= 0x4e {
+        if !is_minimal_push(data, opcode) || data.len() > 4 {
+            return None;
+        }
+        if let Some(&last) = data.last() {
+            if last & 0x7f == 0 && (data.len() <= 1 || data[data.len() - 2] & 0x80 == 0) {
+                return None; // not minimally encoded
+            }
+        }
+        let mut v: i64 = 0;
+        for (i, b) in data.iter().enumerate() {
+            v |= (*b as i64) << (8 * i);
+        }
+        match data.last() {
+            Some(&last) if last & 0x80 != 0 => -(v & !(0x80i64 << (8 * (data.len() - 1)))),
+            _ => v,
+        }
+    } else {
+        return None;
+    };
+    (min..=max).contains(&n).then_some(n)
+}
+
+/// `Solver`'s `MatchMultisig`: `<m> <key>... <n> OP_CHECKMULTISIG`, any
+/// `1 <= m <= n <= 20` (not only what `IsStandard` relays as an output).
+fn solver_is_multisig(spk: &[u8]) -> bool {
+    use crate::contextual_checks::get_op;
+    if spk.last() != Some(&0xae) {
+        return false;
+    }
+    let mut pc = 0;
+    let Some((op, data)) = get_op(spk, &mut pc) else { return false };
+    let Some(m) = solver_script_number(op, data, 1, 20) else { return false };
+    let mut keys = 0i64;
+    let (op, data) = loop {
+        match get_op(spk, &mut pc) {
+            Some((_, data)) if pubkey_valid_size(data) => keys += 1,
+            Some(last) => break last,
+            // Core's GetOp leaves OP_INVALIDOPCODE on failure.
+            None => break (0xff, &[][..]),
+        }
+    };
+    let Some(n) = solver_script_number(op, data, m, 20) else { return false };
+    keys == n && pc + 1 == spk.len()
+}
+
+/// Core's `Solver`, reduced to [`SpentType`], in its order.
+fn solver_type(spk: &[u8]) -> SpentType {
+    use crate::contextual_checks::{is_p2sh, witness_program};
+    if is_p2sh(spk) {
+        return SpentType::ScriptHash;
+    }
+    if let Some((version, program)) = witness_program(spk) {
+        return match (version, program.len()) {
+            (0, 20) | (0, 32) | (1, 32) => SpentType::Known,
+            (1, 2) if program == [0x4e, 0x73] => SpentType::Known, // ANCHOR (P2A)
+            (0, _) => SpentType::NonStandard,
+            _ => SpentType::WitnessUnknown,
+        };
+    }
+    if spk.first() == Some(&0x6a) && is_push_only(bitcoin::Script::from_bytes(&spk[1..])) {
+        return SpentType::Known; // NULL_DATA
+    }
+    let p2pk = match spk.len() {
+        67 => spk[0] == 65,
+        35 => spk[0] == 33,
+        _ => false,
+    } && spk.last() == Some(&0xac)
+        && pubkey_valid_size(&spk[1..spk.len() - 1]);
+    let p2pkh = spk.len() == 25
+        && spk[..3] == [0x76, 0xa9, 0x14]
+        && spk[23..] == [0x88, 0xac];
+    if p2pk || p2pkh || solver_is_multisig(spk) {
+        SpentType::Known
+    } else {
+        SpentType::NonStandard
+    }
+}
+
+/// The stack a push-only scriptSig leaves (`EvalScript` with
+/// `SCRIPT_VERIFY_NONE`, as the policy checks run it to find a redeem
+/// script), or the reason `EvalScript` fails: a push over 520 bytes,
+/// `OP_RESERVED`, more than 1000 items, or a parse error. The caller has
+/// already required push-only (`scriptsig-not-pushonly`).
+fn eval_push_only(script_sig: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
+    use crate::contextual_checks::get_op;
+    // OP_N's values, for OP_1NEGATE (0x4f) to OP_16 (0x60).
+    const SMALL: [u8; 18] = [0x81, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let mut stack = Vec::new();
+    let mut pc = 0;
+    while pc < script_sig.len() {
+        let (op, data) = get_op(script_sig, &mut pc).ok_or("bad opcode")?;
+        if data.len() > MAX_SCRIPT_ELEMENT_SIZE {
+            return Err("push size");
+        }
+        match op {
+            0x00..=0x4e => stack.push(data),
+            0x4f | 0x51..=0x60 => stack.push(std::slice::from_ref(&SMALL[(op - 0x4f) as usize])),
+            _ => return Err("bad opcode"), // OP_RESERVED, or not push-only
+        }
+        if stack.len() > MAX_STACK_SIZE {
+            return Err("stack size");
+        }
+    }
+    Ok(stack)
+}
+
+/// Core's `ValidateInputsStandardness` (`bad-txns-nonstandard-inputs`):
+/// at most `MAX_TX_LEGACY_SIGOPS` legacy sigops (BIP 54), no spend of a
+/// NONSTANDARD or unknown-witness-version output, and P2SH redeem scripts
+/// that parse and have at most `MAX_P2SH_SIGOPS` sigops. `spent[i]` is the
+/// scriptPubKey input `i` spends.
+fn validate_inputs_standardness(tx: &Transaction, spent: &[&[u8]]) -> Result<(), MempoolError> {
+    use crate::contextual_checks::{is_p2sh, p2sh_redeem_sigop_count, script_sigop_count};
+    let nonstandard = |input_index: Option<usize>, reason: String| {
+        Err(MempoolError::NonStandardInputs { input_index, reason })
+    };
+
+    // CheckSigopsBIP54: sigops counted where they execute, i.e. in the
+    // scriptSig and in the spent scriptPubKey (or its redeem script),
+    // accurately (`GetSigOpCount(true)` / `GetSigOpCount(scriptSig)`).
+    let mut legacy: u64 = 0;
+    for (txin, spk) in tx.input.iter().zip(spent) {
+        let script_sig = txin.script_sig.as_bytes();
+        legacy += script_sigop_count(script_sig, true);
+        legacy += if is_p2sh(spk) { p2sh_redeem_sigop_count(script_sig) } else { script_sigop_count(spk, true) };
+        if legacy > MAX_TX_LEGACY_SIGOPS {
+            return nonstandard(None, "non-witness sigops exceed bip54 limit".into());
+        }
+    }
+
+    for (i, (txin, spk)) in tx.input.iter().zip(spent).enumerate() {
+        match solver_type(spk) {
+            SpentType::NonStandard => return nonstandard(Some(i), "script unknown".into()),
+            SpentType::WitnessUnknown => {
+                return nonstandard(Some(i), "witness program is undefined".into())
+            }
+            SpentType::ScriptHash => {
+                let stack = match eval_push_only(txin.script_sig.as_bytes()) {
+                    Ok(stack) => stack,
+                    Err(e) => return nonstandard(Some(i), format!("p2sh scriptsig malformed ({})", e)),
+                };
+                let Some(redeem) = stack.last() else {
+                    return nonstandard(Some(i), "P2SH redeemscript missing".into());
+                };
+                let sigops = script_sigop_count(redeem, true);
+                if sigops > MAX_P2SH_SIGOPS {
+                    return nonstandard(
+                        Some(i),
+                        format!("p2sh redeemscript sigops exceed limit ({} > {})", sigops, MAX_P2SH_SIGOPS),
+                    );
+                }
+            }
+            SpentType::Known => {}
+        }
+    }
+    Ok(())
+}
+
+/// Core's `IsWitnessStandard` (`bad-witness-nonstandard`): a witness only
+/// on a witness program (native or P2SH-wrapped) other than P2A, P2WSH
+/// within the script-size and stack limits, and Taproot with no annex and,
+/// for a tapscript leaf, stack items of at most 80 bytes.
+fn is_witness_standard(tx: &Transaction, spent: &[&[u8]]) -> Result<(), MempoolError> {
+    use crate::contextual_checks::{is_p2sh, witness_program};
+    for (i, (txin, spk)) in tx.input.iter().zip(spent).enumerate() {
+        let fail = |reason| Err(MempoolError::NonStandardWitness { input_index: i, reason });
+        let witness = &txin.witness;
+        if witness.is_empty() {
+            // An empty witness can't be bloated; an invalid spend without
+            // one fails script verification.
+            continue;
+        }
+        if *spk == [0x51, 0x02, 0x4e, 0x73] {
+            return fail("witness stuffing on a pay-to-anchor spend");
+        }
+        let mut script: &[u8] = spk;
+        let mut p2sh = false;
+        if is_p2sh(spk) {
+            let stack = match eval_push_only(txin.script_sig.as_bytes()) {
+                Ok(stack) => stack,
+                Err(_) => return fail("P2SH scriptSig does not evaluate"),
+            };
+            let Some(redeem) = stack.last() else { return fail("P2SH redeem script missing") };
+            script = redeem;
+            p2sh = true;
+        }
+        let Some((version, program)) = witness_program(script) else {
+            return fail("witness on a non-witness-program spend");
+        };
+        let items: Vec<&[u8]> = witness.iter().collect();
+        if version == 0 && program.len() == 32 {
+            let (witness_script, stack) = items.split_last().expect("witness is not empty");
+            if witness_script.len() > MAX_STANDARD_P2WSH_SCRIPT_SIZE {
+                return fail("P2WSH witness script too large");
+            }
+            if stack.len() > MAX_STANDARD_P2WSH_STACK_ITEMS {
+                return fail("P2WSH witness stack has too many items");
+            }
+            if stack.iter().any(|item| item.len() > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE) {
+                return fail("P2WSH witness stack item too large");
+            }
+        }
+        if version == 1 && program.len() == 32 && !p2sh {
+            if items.len() >= 2 && items.last().is_some_and(|a| a.first() == Some(&0x50)) {
+                return fail("taproot annex");
+            }
+            if items.len() >= 2 {
+                // Script path: control block last, then the leaf script.
+                let control_block = items[items.len() - 1];
+                if control_block.is_empty() {
+                    return fail("empty taproot control block");
+                }
+                if control_block[0] & 0xfe == 0xc0
+                    && items[..items.len() - 2]
+                        .iter()
+                        .any(|item| item.len() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE)
+                {
+                    return fail("tapscript stack item too large");
+                }
+            }
+            // One item is a key-path spend: no policy limits.
+        }
+    }
+    Ok(())
+}
+
 /// Core's `CScript::IsPushOnly`: the script parses, and every opcode is a
 /// push or a small-number opcode up to OP_16 (which counts OP_1NEGATE and
 /// OP_RESERVED, as Core does).
@@ -1798,6 +2265,24 @@ pub enum MempoolError {
     /// Fee rate below the rolling minimum a recently full pool demands
     /// (Core's `mempool min fee not met`; see `mempool_min_fee_rate`).
     MempoolMinFeeNotMet { fee_rate: f64, min_rate: f64 },
+    /// An own tx's fee is below every connected peer's `feefilter`, so no
+    /// peer would be sent it (`accept_own_tx_for_network`). `min_rate`
+    /// (sat/vB) clears our own floors and that one.
+    BelowNetworkMinimum { fee_rate: f64, min_rate: f64 },
+    /// Serialized without witness, under `MIN_STANDARD_TX_NONWITNESS_SIZE`
+    /// bytes (`tx-size-small`).
+    TxSizeSmall { size: usize },
+    /// A spent output's type or a P2SH redeem script fails Core's
+    /// `ValidateInputsStandardness` (`bad-txns-nonstandard-inputs`).
+    /// `reason` is Core's detail string; `input_index` is None for the
+    /// whole-tx BIP 54 legacy sigop limit.
+    NonStandardInputs { input_index: Option<usize>, reason: String },
+    /// A witness fails Core's `IsWitnessStandard` (`bad-witness-nonstandard`).
+    NonStandardWitness { input_index: usize, reason: &'static str },
+    /// The scripts pass the consensus flags but not Core's
+    /// STANDARD_SCRIPT_VERIFY_FLAGS (`mempool-script-verify-flag-failed`):
+    /// valid, but no peer relays it. `error` is Core's ScriptError string.
+    NonStandardScriptFlags { input_index: usize, error: String },
     OversizedTx { weight: u64 },
     /// An output worth less than its type's `dust_threshold`.
     DustOutput { index: usize, amount: u64, threshold: u64 },
@@ -1842,6 +2327,37 @@ pub enum MempoolError {
 }
 
 impl MempoolError {
+    /// Invalid on its face, with no chain state involved: a loose coinbase
+    /// or a failure of Core's context-free `CheckTransaction` (no inputs or
+    /// outputs, a duplicate input, a value out of range). No honest node
+    /// relays one, so `handle_tx` disconnects the sender (ticket 053).
+    /// Script and input-value failures are left out on purpose: they depend
+    /// on the coins and flags we judge with, and Core 30+ no longer
+    /// punishes any tx rejection (its mempool reports script failures as
+    /// `TX_NOT_STANDARD`).
+    pub fn is_invalid_on_its_face(&self) -> bool {
+        matches!(
+            self,
+            MempoolError::CoinbaseTx
+                | MempoolError::MalformedTx
+                | MempoolError::DuplicateInput { .. }
+                | MempoolError::ValueOutOfRange { .. }
+        )
+    }
+
+    /// Classify a failure of the policy-flag script pass that the
+    /// consensus flags then passed: non-standard (Core's
+    /// `mempool-script-verify-flag-failed`), or our verifier's own fault.
+    fn from_policy_script_verify(f: script_verify::PolicyScriptFailure) -> MempoolError {
+        match f.error {
+            script_verify::ScriptVerifyError::ScriptFailed => MempoolError::NonStandardScriptFlags {
+                input_index: f.input_index,
+                error: f.script_error,
+            },
+            other => MempoolError::ScriptVerifierError { input_index: f.input_index, error: other.to_string() },
+        }
+    }
+
     /// Classify a script-verifier failure, as `block_validation::script_error`
     /// does for blocks (ticket 024): only a script that evaluated to false
     /// is `ScriptFailure`. Exhaustive so a new `ScriptVerifyError` must be
@@ -1925,6 +2441,32 @@ impl std::fmt::Display for MempoolError {
                     "fee rate {:.2} sat/vB below the mempool's rolling minimum {:.2} sat/vB",
                     fee_rate, min_rate
                 )
+            }
+            MempoolError::BelowNetworkMinimum { fee_rate, min_rate } => {
+                write!(
+                    f,
+                    "fee rate {:.2} sat/vB is below what every connected peer accepts ({:.2} sat/vB)",
+                    fee_rate, min_rate
+                )
+            }
+            MempoolError::TxSizeSmall { size } => {
+                write!(
+                    f,
+                    "transaction is {} bytes without witness, under the standard minimum {}",
+                    size, MIN_STANDARD_TX_NONWITNESS_SIZE
+                )
+            }
+            MempoolError::NonStandardInputs { input_index: Some(i), reason } => {
+                write!(f, "input {} is non-standard: {}", i, reason)
+            }
+            MempoolError::NonStandardInputs { input_index: None, reason } => {
+                write!(f, "non-standard inputs: {}", reason)
+            }
+            MempoolError::NonStandardWitness { input_index, reason } => {
+                write!(f, "input {} has a non-standard witness: {}", input_index, reason)
+            }
+            MempoolError::NonStandardScriptFlags { input_index, error } => {
+                write!(f, "input {} script is non-standard: {}", input_index, error)
             }
             MempoolError::OversizedTx { weight } => {
                 write!(f, "transaction weight {} exceeds limit {}", weight, MAX_TX_WEIGHT)
@@ -3201,16 +3743,22 @@ mod tests {
         pool.accept_tx_internal(tx, utxo, height, &synthetic_times, mode)
     }
 
-    /// An `OP_TRUE` coin: spendable with an empty scriptSig, so the real
-    /// script check (`Relay` / `Own` modes) passes without signatures.
+    /// A P2WSH(`OP_TRUE`) coin: spendable with the witness script alone
+    /// (`spend_ops`), so the real script check (`Relay` / `Own` modes,
+    /// policy flags included) passes without signatures. A bare `OP_TRUE`
+    /// coin would be a non-standard input (`ValidateInputsStandardness`).
     fn seed_op_true(utxo: &UtxoSet, id: u8, amount: u64, height: u32, coinbase: bool) -> OutPoint {
         utxo.test_insert_utxo(
             [id; 32],
             0,
-            UtxoEntry { amount, script_pubkey: vec![0x51], height, is_coinbase: coinbase },
+            UtxoEntry { amount, script_pubkey: p2wsh_op_true().into_bytes(), height, is_coinbase: coinbase },
         )
         .unwrap();
         OutPoint { txid: seed_txid(id), vout: 0 }
+    }
+
+    fn p2wsh_op_true() -> ScriptBuf {
+        ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(vec![0x51]).wscript_hash())
     }
 
     fn p2wpkh_out(value: u64) -> TxOut {
@@ -3220,6 +3768,8 @@ mod tests {
         }
     }
 
+    /// Spends `inputs` as `seed_op_true` coins: the witness is the
+    /// `OP_TRUE` witness script.
     fn spend_ops(inputs: &[OutPoint], outputs: Vec<TxOut>) -> Transaction {
         Transaction {
             version: Version::TWO,
@@ -3230,7 +3780,7 @@ mod tests {
                     previous_output: *op,
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::MAX,
-                    witness: Witness::new(),
+                    witness: Witness::from_slice(&[[0x51]]),
                 })
                 .collect(),
             output: outputs,
@@ -3392,13 +3942,16 @@ mod tests {
         ));
         accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Own).unwrap();
 
-        // Pre-segwit height, so the witness isn't executed: the filter is
-        // all that could refuse it.
+        // As a P2WPKH spend the same bytes are a signature-shaped stack
+        // item, which the filter doesn't scan. (Without a real key the
+        // script check refuses it afterwards: the policy flags apply the
+        // witness rules at any height, ticket 053.)
         let (utxo, _d) = fresh_utxo();
         let coin = seed(&utxo, ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([3; 20])));
         let mut tx = spend_ops(&[coin], vec![p2wpkh_out(900_000)]);
         tx.input[0].witness = Witness::from_slice(&[ws.as_bytes(), &[0x51]]);
-        accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Relay).unwrap();
+        let err = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Relay).unwrap_err();
+        assert!(matches!(err, MempoolError::ScriptFailure { .. }), "{:?}", err);
     }
 
     /// IsStandardTx's version rule: 1 and 2 are standard, 0, 3 (TRUC,
@@ -4350,5 +4903,397 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    // ── Ticket 053 part 2: input / witness standardness, size, policy
+    //    script flags, fee floors ────────────────────────────────────────
+
+    fn seed_spk(utxo: &UtxoSet, id: u8, vout: u32, amount: u64, spk: &ScriptBuf) -> OutPoint {
+        utxo.test_insert_utxo(
+            [id; 32],
+            vout,
+            UtxoEntry { amount, script_pubkey: spk.to_bytes(), height: 1, is_coinbase: false },
+        )
+        .unwrap();
+        OutPoint { txid: seed_txid(id), vout }
+    }
+
+    fn with_input(mut tx: Transaction, i: usize, script_sig: Vec<u8>, witness: &[Vec<u8>]) -> Transaction {
+        tx.input[i].script_sig = ScriptBuf::from_bytes(script_sig);
+        tx.input[i].witness = Witness::from_slice(witness);
+        tx
+    }
+
+    /// A single push of `data` (direct, PUSHDATA1 or PUSHDATA2, minimal).
+    fn push(data: &[u8]) -> Vec<u8> {
+        let mut out = match data.len() {
+            n @ 0..=75 => vec![n as u8],
+            n @ 76..=255 => vec![0x4c, n as u8],
+            n => vec![0x4d, n as u8, (n >> 8) as u8],
+        };
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A valid, policy-clean witness script of exactly `len` (>= 1) bytes:
+    /// pushes of non-small bytes dropped again, then OP_1.
+    fn filler_script(len: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut r = len - 1;
+        while r > 0 {
+            // A piece is <push n> OP_DROP: n + 2 bytes, n in 1..=75.
+            let piece = if r >= 80 { 77 } else if r > 77 { r - 3 } else { r };
+            assert!(piece >= 3, "{} left", r);
+            out.extend(push(&vec![0xaa; piece - 2]));
+            out.push(0x75);
+            r -= piece;
+        }
+        out.push(0x51);
+        assert_eq!(out.len(), len);
+        out
+    }
+
+    fn standard_modes() -> [AcceptMode; 2] {
+        [AcceptMode::Relay, AcceptMode::Own]
+    }
+
+    /// Core's `tx-size-small`: 64 bytes without witness is refused, 65 is
+    /// not (CVE-2017-12842), whatever the witness adds.
+    #[test]
+    fn tx_size_small_boundary_is_65_non_witness_bytes() {
+        for (data_len, ok) in [(2usize, false), (3, true)] {
+            for mode in standard_modes() {
+                let (utxo, _d) = fresh_utxo();
+                let coin = seed_op_true(&utxo, 1, 10_000, 1, false);
+                let mut spk = vec![0x6a];
+                spk.extend(push(&vec![0xaa; data_len]));
+                let tx = spend_ops(
+                    &[coin],
+                    vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) }],
+                );
+                assert_eq!(tx.base_size(), 62 + data_len);
+                let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode);
+                if ok {
+                    r.unwrap();
+                } else {
+                    assert!(matches!(r, Err(MempoolError::TxSizeSmall { size: 64 })), "{:?}", r);
+                }
+            }
+        }
+    }
+
+    /// `ValidateInputsStandardness`: a NONSTANDARD or unknown-witness
+    /// spent output is refused, as relay and as an own send; the test-only
+    /// mode skips it. The ticket 053 reviewer's reproducer: an own tx
+    /// spending OP_2 <32 bytes> with an empty witness was accepted.
+    #[test]
+    fn spends_of_nonstandard_outputs_are_refused() {
+        let mut v2 = vec![0x52, 0x20];
+        v2.extend([7u8; 32]);
+        let mut v0_25 = vec![0x00, 25];
+        v0_25.extend([7u8; 25]);
+        for (spk, reason) in [
+            (vec![0x51], "script unknown"),
+            (v0_25, "script unknown"),
+            (v2, "witness program is undefined"),
+        ] {
+            let spk = ScriptBuf::from_bytes(spk);
+            for mode in standard_modes() {
+                let (utxo, _d) = fresh_utxo();
+                let coin = seed_spk(&utxo, 1, 0, 100_000, &spk);
+                let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, vec![], &[]);
+                match accept_in(&mut Mempool::new(), tx.clone(), &utxo, TEST_HEIGHT, mode) {
+                    Err(MempoolError::NonStandardInputs { input_index: Some(0), reason: r }) => {
+                        assert!(r.contains(reason), "{} vs {}", r, reason)
+                    }
+                    other => panic!("{:?} {}: {:?}", mode, spk, other),
+                }
+                let (utxo, _d) = fresh_utxo();
+                let coin = seed_spk(&utxo, 1, 0, 100_000, &spk);
+                let _ = coin;
+                accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::SkipConsensus).unwrap();
+            }
+        }
+    }
+
+    /// A P2SH redeem script `OP_0 OP_IF <n x OP_CHECKSIG> OP_ENDIF OP_1`
+    /// (the CHECKSIGs never run, but count).
+    fn p2sh_sigops_redeem(n: usize) -> Vec<u8> {
+        let mut r = vec![0x00, 0x63];
+        r.extend(std::iter::repeat_n(0xac, n));
+        r.extend([0x68, 0x51]);
+        r
+    }
+
+    /// `MAX_P2SH_SIGOPS`: 15 redeem-script sigops pass, 16 don't.
+    #[test]
+    fn p2sh_redeem_sigops_boundary_is_15() {
+        for (n, ok) in [(15, true), (16, false)] {
+            for mode in standard_modes() {
+                let redeem = ScriptBuf::from_bytes(p2sh_sigops_redeem(n));
+                let (utxo, _d) = fresh_utxo();
+                let coin = seed_spk(&utxo, 1, 0, 100_000, &ScriptBuf::new_p2sh(&redeem.script_hash()));
+                let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, push(redeem.as_bytes()), &[]);
+                let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode);
+                if ok {
+                    r.unwrap();
+                } else {
+                    assert!(
+                        matches!(&r, Err(MempoolError::NonStandardInputs { reason, .. }) if reason.contains("16 > 15")),
+                        "{:?}",
+                        r
+                    );
+                }
+            }
+        }
+    }
+
+    /// BIP 54 (`MAX_TX_LEGACY_SIGOPS`): 2500 legacy sigops across the
+    /// inputs pass, 2510 don't.
+    #[test]
+    fn bip54_legacy_sigop_limit_is_2500() {
+        for (inputs, ok) in [(250u32, true), (251, false)] {
+            let redeem = ScriptBuf::from_bytes(p2sh_sigops_redeem(10));
+            let spk = ScriptBuf::new_p2sh(&redeem.script_hash());
+            let (utxo, _d) = fresh_utxo();
+            let coins: Vec<OutPoint> = (0..inputs).map(|v| seed_spk(&utxo, 1, v, 10_000, &spk)).collect();
+            let mut tx = spend_ops(&coins, vec![p2wpkh_out(10_000 * inputs as u64 - 200_000)]);
+            for i in 0..tx.input.len() {
+                tx = with_input(tx, i, push(redeem.as_bytes()), &[]);
+            }
+            let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Own);
+            if ok {
+                r.unwrap();
+            } else {
+                assert!(
+                    matches!(&r, Err(MempoolError::NonStandardInputs { input_index: None, reason }) if reason.contains("bip54")),
+                    "{:?}",
+                    r
+                );
+            }
+        }
+    }
+
+    /// A P2SH scriptSig that `EvalScript` can't run (a 521-byte push) is a
+    /// malformed P2SH spend.
+    #[test]
+    fn p2sh_scriptsig_with_an_oversized_push_is_nonstandard() {
+        let redeem = ScriptBuf::from_bytes(p2sh_sigops_redeem(0));
+        let (utxo, _d) = fresh_utxo();
+        let coin = seed_spk(&utxo, 1, 0, 100_000, &ScriptBuf::new_p2sh(&redeem.script_hash()));
+        let mut sig = push(&[0xaa; 521]);
+        sig.extend(push(redeem.as_bytes()));
+        let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, sig, &[]);
+        let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Own);
+        assert!(
+            matches!(&r, Err(MempoolError::NonStandardInputs { reason, .. }) if reason.contains("push size")),
+            "{:?}",
+            r
+        );
+    }
+
+    /// `IsWitnessStandard`'s P2WSH limits, at their boundaries: witness
+    /// script 3600 / 3601 bytes, 100 / 101 stack items, 80 / 81-byte items.
+    /// As own txs: our 018 relay filter caps witness items lower.
+    #[test]
+    fn p2wsh_witness_limits_match_core() {
+        let run = |ws: Vec<u8>, items: Vec<Vec<u8>>| {
+            let script = ScriptBuf::from_bytes(ws.clone());
+            let (utxo, _d) = fresh_utxo();
+            let coin = seed_spk(&utxo, 1, 0, 100_000, &ScriptBuf::new_p2wsh(&script.wscript_hash()));
+            let mut witness = items;
+            witness.push(ws);
+            let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, vec![], &witness);
+            accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Own)
+        };
+        let nonstandard = |r: Result<Txid, MempoolError>, what: &str| {
+            assert!(
+                matches!(&r, Err(MempoolError::NonStandardWitness { reason, .. }) if reason.contains(what)),
+                "{:?}",
+                r
+            )
+        };
+        run(filler_script(3600), vec![]).unwrap();
+        nonstandard(run(filler_script(3601), vec![]), "too large");
+        // n items, the bottom one true, dropped down to it.
+        let stack = |n: usize| {
+            let mut items = vec![vec![]; n];
+            items[0] = vec![0x01];
+            (vec![0x75; n - 1], items)
+        };
+        let (ws, items) = stack(100);
+        run(ws, items).unwrap();
+        let (ws, items) = stack(101);
+        nonstandard(run(ws, items), "too many items");
+        run(vec![0x75, 0x51], vec![vec![0xaa; 80]]).unwrap();
+        nonstandard(run(vec![0x75, 0x51], vec![vec![0xaa; 81]]), "item too large");
+    }
+
+    /// `IsWitnessStandard`: a witness on a P2PKH or P2A spend, a Taproot
+    /// annex and an 81-byte tapscript stack item are refused before any
+    /// script runs.
+    #[test]
+    fn witness_on_the_wrong_spend_type_and_taproot_rules() {
+        let cases: Vec<(ScriptBuf, Vec<Vec<u8>>, &str)> = vec![
+            (ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([1; 20])), vec![vec![1]], "non-witness-program"),
+            (ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]), vec![vec![1]], "pay-to-anchor"),
+            (ScriptBuf::from_bytes([&[0x51, 0x20][..], &[9; 32]].concat()), vec![vec![0; 64], vec![0x50, 1]], "annex"),
+            (
+                ScriptBuf::from_bytes([&[0x51, 0x20][..], &[9; 32]].concat()),
+                vec![vec![0xaa; 81], vec![0x51], [&[0xc0][..], &[2; 32]].concat()],
+                "tapscript stack item",
+            ),
+        ];
+        for (spk, witness, what) in cases {
+            for mode in standard_modes() {
+                let (utxo, _d) = fresh_utxo();
+                let coin = seed_spk(&utxo, 1, 0, 100_000, &spk);
+                let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, vec![], &witness);
+                let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode);
+                assert!(
+                    matches!(&r, Err(MempoolError::NonStandardWitness { reason, .. }) if reason.contains(what)),
+                    "{}: {:?}",
+                    what,
+                    r
+                );
+            }
+        }
+    }
+
+    /// A native pay-to-anchor spend with an empty witness is standard (Core
+    /// 28+), though the policy pass's v26 interpreter predates P2A.
+    #[test]
+    fn pay_to_anchor_spend_is_standard() {
+        let (utxo, _d) = fresh_utxo();
+        let coin = seed_spk(&utxo, 1, 0, 100_000, &ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]));
+        let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, vec![], &[]);
+        accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Relay).unwrap();
+    }
+
+    /// The policy script pass (Core's STANDARD_SCRIPT_VERIFY_FLAGS) refuses
+    /// what only policy forbids, as non-standard, in both modes:
+    /// - a P2SH-wrapped witness v2 program (DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM;
+    ///   the reviewer's case, wrapped so input standardness lets it through);
+    /// - an OP_NOP4 (DISCOURAGE_UPGRADABLE_NOPS);
+    /// - a P2SH redeem script leaving two items (CLEANSTACK);
+    /// - an OP_IF on a non-minimal argument (MINIMALIF).
+    ///
+    /// A script that fails the consensus flags too is `ScriptFailure`.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn policy_script_flags_refuse_what_core_does_not_relay() {
+        let mut v2 = vec![0x52, 0x20];
+        v2.extend([7u8; 32]);
+        let wrapped = ScriptBuf::from_bytes(v2);
+        let p2wsh = |ws: &[u8]| ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(ws.to_vec()).wscript_hash());
+        let cases: Vec<(ScriptBuf, Vec<u8>, Vec<Vec<u8>>, &str)> = vec![
+            (ScriptBuf::new_p2sh(&wrapped.script_hash()), push(wrapped.as_bytes()), vec![], "soft-fork upgrades"),
+            (p2wsh(&[0xb3, 0x51]), vec![], vec![vec![0xb3, 0x51]], "NOPx"),
+            // Legacy P2SH: for witness scripts a clean stack is consensus.
+            (
+                ScriptBuf::new_p2sh(&ScriptBuf::from_bytes(vec![0x51, 0x51]).script_hash()),
+                push(&[0x51, 0x51]),
+                vec![],
+                "exactly one",
+            ),
+            (p2wsh(&[0x63, 0x51, 0x68]), vec![], vec![vec![0x02], vec![0x63, 0x51, 0x68]], "OP_IF"),
+        ];
+        for (spk, script_sig, witness, what) in cases {
+            for mode in standard_modes() {
+                let (utxo, _d) = fresh_utxo();
+                let coin = seed_spk(&utxo, 1, 0, 100_000, &spk);
+                let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, script_sig.clone(), &witness);
+                let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode);
+                assert!(
+                    matches!(&r, Err(MempoolError::NonStandardScriptFlags { error, .. }) if error.contains(what)),
+                    "{}: {:?}",
+                    what,
+                    r
+                );
+            }
+        }
+        // P2WSH(OP_FALSE) spent with OP_TRUE fails consensus too.
+        let (utxo, _d) = fresh_utxo();
+        let coin = seed_spk(&utxo, 1, 0, 100_000, &p2wsh(&[0x00]));
+        let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(90_000)]), 0, vec![], &[vec![0x51]]);
+        let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Own);
+        assert!(matches!(r, Err(MempoolError::ScriptFailure { .. })), "{:?}", r);
+    }
+
+    /// Scripts run last, after fees and limits (Core's PreChecks before
+    /// PolicyScriptChecks): a tx with a failing script and too low a fee
+    /// is refused for the fee.
+    #[test]
+    fn fee_checks_run_before_scripts() {
+        let (utxo, _d) = fresh_utxo();
+        let ws = ScriptBuf::from_bytes(vec![0x00]);
+        let coin = seed_spk(&utxo, 1, 0, 100_000, &ScriptBuf::new_p2wsh(&ws.wscript_hash()));
+        let tx = with_input(spend_ops(&[coin], vec![p2wpkh_out(99_990)]), 0, vec![], &[vec![0x00]]);
+        let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Relay);
+        assert!(matches!(r, Err(MempoolError::InsufficientFee { .. })), "{:?}", r);
+    }
+
+    /// The submit floor: below the peers' feefilter (Core's comparison,
+    /// `fee < ceil(filter * vsize / 1000)`) an own tx is refused and the
+    /// pool is unchanged; at it, accepted. 0 means no floor.
+    #[test]
+    fn network_floor_refuses_an_own_tx_below_every_peer_filter() {
+        let (utxo, _d) = fresh_utxo();
+        let coin = seed_op_true(&utxo, 1, 100_000, 1, false);
+        let tx = spend_ops(&[coin], vec![p2wpkh_out(100_000 - 1_000)]);
+        let vsize = tx.vsize() as u64;
+        // The filter at which 1000 sats is exactly enough.
+        let at = 1_000 * 1000 / vsize;
+        let mut pool = Mempool::new();
+        let r = pool.accept_own_tx_for_network(tx.clone(), &utxo, TEST_HEIGHT, &synthetic_times, at + 10);
+        assert!(matches!(r, Err(MempoolError::BelowNetworkMinimum { .. })), "{:?}", r);
+        assert_eq!(pool.count(), 0);
+        assert!(pool.drain_removals().removals.is_empty());
+        pool.accept_own_tx_for_network(tx, &utxo, TEST_HEIGHT, &synthetic_times, at).unwrap();
+        let (utxo, _d) = fresh_utxo();
+        let coin = seed_op_true(&utxo, 1, 100_000, 1, false);
+        let tx = spend_ops(&[coin], vec![p2wpkh_out(100_000 - 1_000)]);
+        Mempool::new().accept_own_tx_for_network(tx, &utxo, TEST_HEIGHT, &synthetic_times, 0).unwrap();
+    }
+
+    /// A disconnected own tx comes back with no fee floor (Core's
+    /// `bypass_limits`): below the rolling minimum, below 1 sat/vB, and
+    /// over the absurd-fee cap.
+    #[test]
+    fn disconnected_own_tx_bypasses_the_fee_floors() {
+        let (utxo, _d) = fresh_utxo();
+        let cheap_coin = seed_op_true(&utxo, 1, 100_000, 1, false);
+        let cheap = spend_ops(&[cheap_coin], vec![p2wpkh_out(100_000 - 10)]);
+        let mut pool = Mempool::new();
+        pool.rolling_min_fee = 50_000.0; // 50 sat/vB, as after an eviction
+        assert!(matches!(
+            pool.accept_own_tx(cheap.clone(), &utxo, TEST_HEIGHT, &synthetic_times),
+            Err(MempoolError::InsufficientFee { .. })
+        ));
+        pool.accept_disconnected_own_tx(cheap, &utxo, TEST_HEIGHT, &synthetic_times).unwrap();
+        let rich_coin = seed_op_true(&utxo, 2, 100_000_000, 1, false);
+        let absurd = spend_ops(&[rich_coin], vec![p2wpkh_out(1_000)]);
+        pool.accept_disconnected_own_tx(absurd, &utxo, TEST_HEIGHT, &synthetic_times).unwrap();
+    }
+
+    /// Past the cap only non-final events are dropped: replacements and
+    /// block conflicts, which settle own txs, are always kept.
+    #[test]
+    fn removal_queue_never_drops_final_events() {
+        let mut pool = Mempool::new();
+        let id = |i: u64| {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.to_le_bytes());
+            Txid::from_byte_array(b)
+        };
+        let by = id(u64::MAX);
+        for i in 0..MAX_QUEUED_REMOVALS as u64 {
+            pool.record_removal(id(i), RemovalReason::ReplacedBy(by));
+        }
+        pool.record_removal(id(1 << 40), RemovalReason::Evicted);
+        pool.record_removal(id(1 << 41), RemovalReason::ConflictedByBlock { by });
+        let d = pool.drain_removals();
+        assert_eq!((d.removals.len(), d.dropped), (MAX_QUEUED_REMOVALS + 1, 1));
+        assert!(d.removals.iter().all(|r| r.reason.is_final()));
     }
 }

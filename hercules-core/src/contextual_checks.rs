@@ -303,7 +303,7 @@ pub fn evaluate_sequence_locks(block_height: u32, prev_block_mtp: i64, lock: Loc
 /// One step of Core's script parser (`GetScriptOp`, script/script.cpp):
 /// the opcode at `*pc` and, for a push, its data. `None` on a truncated
 /// push or at the end of the script, as Core returns false.
-fn get_op<'s>(script: &'s [u8], pc: &mut usize) -> Option<(u8, &'s [u8])> {
+pub(crate) fn get_op<'s>(script: &'s [u8], pc: &mut usize) -> Option<(u8, &'s [u8])> {
     let opcode = *script.get(*pc)?;
     *pc += 1;
     if opcode > OP_PUSHDATA4 {
@@ -371,7 +371,7 @@ pub fn script_sigop_count(script: &[u8], accurate: bool) -> u64 {
 }
 
 /// `CScript::IsPayToScriptHash`.
-fn is_p2sh(script: &[u8]) -> bool {
+pub(crate) fn is_p2sh(script: &[u8]) -> bool {
     script.len() == 23 && script[0] == OP_HASH160 && script[1] == 0x14 && script[22] == OP_EQUAL
 }
 
@@ -404,7 +404,7 @@ fn last_push(script_sig: &[u8]) -> Option<&[u8]> {
 }
 
 /// `CScript::IsWitnessProgram`: version and program, if `script` is one.
-fn witness_program(script: &[u8]) -> Option<(u8, &[u8])> {
+pub(crate) fn witness_program(script: &[u8]) -> Option<(u8, &[u8])> {
     if script.len() < 4 || script.len() > 42 {
         return None;
     }
@@ -424,7 +424,7 @@ fn witness_program(script: &[u8]) -> Option<(u8, &[u8])> {
 /// last item the scriptSig pushes (`CScript::GetSigOpCount(const CScript&
 /// scriptSig)` on a P2SH scriptPubKey). Zero if the scriptSig isn't push
 /// only.
-fn p2sh_redeem_sigop_count(script_sig: &[u8]) -> u64 {
+pub(crate) fn p2sh_redeem_sigop_count(script_sig: &[u8]) -> u64 {
     match last_push(script_sig) {
         Some(redeem) => script_sigop_count(redeem, true),
         None => 0,
