@@ -47,7 +47,8 @@ pub const PROPAGATED_RESEND_JITTER_SECS: u64 = 24 * 3600;
 
 /// Distinct announcing peers remembered per own transaction. Past this the
 /// count stops growing (and nothing more is written), so a peer that
-/// reconnects over and over can't turn `inv`s into SQLite writes.
+/// reconnects over and over can't turn `inv`s into SQLite writes. The same
+/// cap bounds the peers recorded as having fetched it (`record_delivered`).
 const MAX_SEEN_PEERS_PER_TX: usize = 256;
 
 // ── Submission API types ───────────────────────────────────────────────
@@ -84,6 +85,12 @@ pub enum SubmitError {
     /// Fee rate below the relay floor (or below what a full mempool would
     /// keep). `min` is in sat/vB.
     FeeTooLow { fee_rate: f64, min: f64 },
+    /// Fee rate below the `feefilter` of every connected peer (BIP 133):
+    /// valid here, but no peer would be sent it, so it would sit "pending"
+    /// unheard. Nothing was kept or sent. `min` (sat/vB) clears every
+    /// floor we know of; peers' floors move with their mempools, so a
+    /// later retry may pass (ticket 053).
+    FeeBelowNetworkMinimum { fee_rate: f64, min: f64 },
     /// Absolute fee above the safety ceiling — almost certainly a wallet bug.
     AbsurdFee { fee: u64, limit: u64 },
     /// Double-spends mempool transaction(s) and doesn't qualify as a
@@ -175,6 +182,10 @@ impl SubmitError {
             | M::Inflation
             | M::MathOverflow => SubmitError::Consensus(msg),
             M::OversizedTx { .. }
+            | M::TxSizeSmall { .. }
+            | M::NonStandardInputs { .. }
+            | M::NonStandardWitness { .. }
+            | M::NonStandardScriptFlags { .. }
             | M::DustOutput { .. }
             | M::NonStandardScript { .. }
             | M::NonStandardVersion { .. }
@@ -196,6 +207,9 @@ impl SubmitError {
                 fee_rate: new_fee_rate,
                 min: min_pkg_fee_rate,
             },
+            M::BelowNetworkMinimum { fee_rate, min_rate } => {
+                SubmitError::FeeBelowNetworkMinimum { fee_rate, min: min_rate }
+            }
             M::AbsurdFee { fee, limit } => SubmitError::AbsurdFee { fee, limit },
             M::TooManyReplacements { .. }
             | M::ReplacementAddsUnconfirmed { .. }
@@ -221,6 +235,7 @@ impl SubmitError {
             SubmitError::NotYetFinal { .. } => "not_yet_final",
             SubmitError::NonStandard(_) => "non_standard",
             SubmitError::FeeTooLow { .. } => "fee_too_low",
+            SubmitError::FeeBelowNetworkMinimum { .. } => "fee_below_network_minimum",
             SubmitError::AbsurdFee { .. } => "absurd_fee",
             SubmitError::Conflict { .. } => "conflict",
             SubmitError::AlreadyKnown { .. } => "already_known",
@@ -261,6 +276,12 @@ impl std::fmt::Display for SubmitError {
             SubmitError::FeeTooLow { fee_rate, min } => write!(
                 f,
                 "fee rate {:.2} sat/vB too low (minimum {:.2} sat/vB)",
+                fee_rate, min
+            ),
+            SubmitError::FeeBelowNetworkMinimum { fee_rate, min } => write!(
+                f,
+                "fee rate {:.2} sat/vB is below what every connected peer accepts right now \
+                 ({:.2} sat/vB); nothing was sent",
                 fee_rate, min
             ),
             SubmitError::AbsurdFee { fee, limit } => write!(
@@ -374,13 +395,53 @@ pub struct OwnTxRecord {
     pub attempts: u32,
     /// Number of distinct peers that announced this tx to us.
     pub seen_from_peers: u32,
+    /// Number of distinct peers that fetched it from us (`getdata`) after
+    /// we announced it (ticket 053).
+    pub delivered_to_peers: u32,
     pub status: OwnTxStatus,
     pub updated_at: u64,
+}
+
+/// How far an own transaction is known to have got (ticket 053), for the
+/// wallet's "not yet seen by the network" signal. Judged from what peers
+/// did, not from what we sent: an `inv` alone proves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// No peer has fetched it from us or announced it to us. It may never
+    /// have left the phone (no peers, clearnet waiting for 029's private
+    /// broadcast, or nobody asked for it yet).
+    NotSeen,
+    /// At least one peer fetched it from us; none has announced it back.
+    Delivered,
+    /// A peer announced it to us (`seen_from_peers`), so it is out on the
+    /// network. Which announcements count is ticket 052's rule
+    /// (`record_seen`).
+    SeenOnNetwork,
+}
+
+impl Delivery {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Delivery::NotSeen => "not_seen",
+            Delivery::Delivered => "delivered",
+            Delivery::SeenOnNetwork => "seen_on_network",
+        }
+    }
 }
 
 impl OwnTxRecord {
     pub fn tx(&self) -> Option<Transaction> {
         deserialize(&self.raw).ok()
+    }
+
+    pub fn delivery(&self) -> Delivery {
+        if self.seen_from_peers > 0 || self.status == OwnTxStatus::Propagated {
+            Delivery::SeenOnNetwork
+        } else if self.delivered_to_peers > 0 {
+            Delivery::Delivered
+        } else {
+            Delivery::NotSeen
+        }
     }
 }
 
@@ -430,6 +491,12 @@ pub struct OwnTxStore {
     /// by the `own_tx_seen` table so the count stays distinct across
     /// restarts.
     seen_peers: Mutex<HashMap<Txid, HashSet<String>>>,
+    /// The same for `delivered_to_peers` (`own_tx_delivered`).
+    delivered_peers: Mutex<HashMap<Txid, HashSet<String>>>,
+    /// Test fault: while set, the block and mempool hooks fail as a broken
+    /// database would.
+    #[cfg(test)]
+    pub(crate) fail_hooks: std::sync::atomic::AtomicBool,
 }
 
 /// Statuses `on_block` settles: active ones (confirm or conflict), and
@@ -438,27 +505,34 @@ pub struct OwnTxStore {
 const WATCHED_STATUSES: &str = "('pending', 'propagated', 'replaced', 'expired')";
 
 const SELECT_COLS: &str = "txid, raw, first_sent_at, last_sent_at, next_attempt_at, attempts, \
-     seen_from_peers, status, status_height, status_txid, updated_at";
+     seen_from_peers, status, status_height, status_txid, updated_at, delivered_to_peers";
 
 impl OwnTxStore {
     /// Open or create the tracker at `path` (`":memory:"` for tests).
     pub fn open(path: &str) -> Result<OwnTxStore, OwnTxStoreError> {
         /// `own_txs.sqlite3` layout version (ticket 050). History: 1 = the
-        /// `own_txs` and `own_tx_seen` tables below.
-        const SCHEMA_VERSION: u32 = 1;
+        /// `own_txs` and `own_tx_seen` tables below; 2 = `own_tx_delivered`
+        /// and `own_txs.delivered_to_peers` (ticket 053).
+        const SCHEMA_VERSION: u32 = 2;
         let conn = Connection::open(path).map_err(db_err)?;
         conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT).map_err(db_err)?;
         if path != ":memory:" {
             crate::store::set_wal(&conn).map_err(db_err)?;
+            // Durable commits, as the header store (ticket 050): the block
+            // hook settles own txs before `set_validated_height` commits,
+            // so a settlement lost to power loss after that commit would
+            // never be redone (ticket 053). FULL syncs the WAL on every
+            // commit; fullfsync makes that an F_FULLFSYNC on Apple.
+            for (pragma, value) in [
+                ("synchronous", "FULL"),
+                ("fullfsync", "ON"),
+                ("checkpoint_fullfsync", "ON"),
+            ] {
+                conn.pragma_update(None, pragma, value).map_err(db_err)?;
+            }
         }
         let version = crate::store::check_schema_version(&conn, "own tx store", SCHEMA_VERSION)
             .map_err(OwnTxStoreError)?;
-        if version < SCHEMA_VERSION {
-            // Files from before versioning (0) already have this layout;
-            // the CREATE IF NOT EXISTS below covers new ones.
-            crate::store::set_schema_version(&conn, "own tx store", SCHEMA_VERSION)
-                .map_err(OwnTxStoreError)?;
-        }
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS own_txs (
@@ -472,9 +546,15 @@ impl OwnTxStore {
                 status TEXT NOT NULL,
                 status_height INTEGER,
                 status_txid TEXT,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                delivered_to_peers INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS own_tx_seen (
+                txid TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                PRIMARY KEY (txid, peer)
+            );
+            CREATE TABLE IF NOT EXISTS own_tx_delivered (
                 txid TEXT NOT NULL,
                 peer TEXT NOT NULL,
                 PRIMARY KEY (txid, peer)
@@ -482,14 +562,53 @@ impl OwnTxStore {
             ",
         )
         .map_err(db_err)?;
+        if version < 2 {
+            // Files from before versioning (0) and version 1 files have
+            // the version 1 layout, which the CREATE above leaves alone.
+            let has_column = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('own_txs') WHERE name = 'delivered_to_peers'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(db_err)?
+                > 0;
+            if !has_column {
+                conn.execute(
+                    "ALTER TABLE own_txs ADD COLUMN delivered_to_peers INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(db_err)?;
+            }
+        }
+        if version < SCHEMA_VERSION {
+            crate::store::set_schema_version(&conn, "own tx store", SCHEMA_VERSION)
+                .map_err(OwnTxStoreError)?;
+        }
         let store = OwnTxStore {
             conn: Mutex::new(conn),
             active: Mutex::new(HashMap::new()),
             watched: Mutex::new(HashSet::new()),
             seen_peers: Mutex::new(HashMap::new()),
+            delivered_peers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_hooks: std::sync::atomic::AtomicBool::new(false),
         };
         store.refresh_active()?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    fn injected_fault(&self) -> Result<(), OwnTxStoreError> {
+        if self.fail_hooks.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(OwnTxStoreError("injected fault".into()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn injected_fault(&self) -> Result<(), OwnTxStoreError> {
+        Ok(())
     }
 
     fn refresh_active(&self) -> Result<(), OwnTxStoreError> {
@@ -500,6 +619,10 @@ impl OwnTxStore {
             .map(|r| (r.txid, r.status == OwnTxStatus::Propagated))
             .collect();
         self.seen_peers
+            .lock()
+            .unwrap()
+            .retain(|t, _| active.contains_key(t));
+        self.delivered_peers
             .lock()
             .unwrap()
             .retain(|t, _| active.contains_key(t));
@@ -523,6 +646,7 @@ impl OwnTxStore {
             seen_from_peers: row.get(6)?,
             status: OwnTxStatus::from_row(&status, row.get(8)?, row.get(9)?),
             updated_at: row.get::<_, i64>(10)? as u64,
+            delivered_to_peers: row.get(11)?,
         })
     }
 
@@ -700,6 +824,61 @@ impl OwnTxStore {
         Ok(())
     }
 
+    /// We served this transaction to `peer` in answer to its `getdata`: it
+    /// reached that peer (ticket 053's delivery signal; see [`Delivery`]).
+    /// Counted, and written, once per (peer, txid), as `record_seen`.
+    /// Doesn't change the status: only a peer announcing it moves it to
+    /// propagated, and which announcements count is ticket 052's rule
+    /// (one from a peer we delivered it to proves nothing:
+    /// [`OwnTxStore::was_delivered_to`]).
+    pub fn record_delivered(&self, txid: &Txid, peer: &str, now: u64) -> Result<(), OwnTxStoreError> {
+        if !self.is_active(txid) {
+            return Ok(());
+        }
+        {
+            let mut delivered = self.delivered_peers.lock().unwrap();
+            let peers = delivered.entry(*txid).or_default();
+            if peers.contains(peer) || peers.len() >= MAX_SEEN_PEERS_PER_TX {
+                return Ok(());
+            }
+            peers.insert(peer.to_string());
+        }
+        let conn = self.conn.lock().unwrap();
+        let new_peer = conn
+            .execute(
+                "INSERT OR IGNORE INTO own_tx_delivered (txid, peer) VALUES (?1, ?2)",
+                params![txid.to_string(), peer],
+            )
+            .map_err(db_err)?;
+        if new_peer > 0 {
+            conn.execute(
+                "UPDATE own_txs SET delivered_to_peers = delivered_to_peers + 1, updated_at = ?2
+                 WHERE txid = ?1 AND status IN ('pending', 'propagated')",
+                params![txid.to_string(), now as i64],
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Whether we have served own tx `txid` to `peer` (`record_delivered`),
+    /// in this session or an earlier one.
+    #[cfg_attr(not(test), allow(dead_code))] // for ticket 052's propagation rule
+    pub fn was_delivered_to(&self, txid: &Txid, peer: &str) -> bool {
+        if self.delivered_peers.lock().unwrap().get(txid).is_some_and(|p| p.contains(peer)) {
+            return true;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM own_tx_delivered WHERE txid = ?1 AND peer = ?2",
+            params![txid.to_string(), peer],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|r| r.is_some())
+        .unwrap_or(false)
+    }
+
     /// Write `status`, plus `status_height` for statuses whose variant
     /// doesn't carry one (a conflict's block height), in one UPDATE.
     /// Doesn't refresh the in-memory caches; callers do, once per batch.
@@ -731,6 +910,11 @@ impl OwnTxStore {
     /// descendants of `old` lose their inputs with it and are marked
     /// conflicted by `by` (with no height: no block caused it, so a reorg
     /// doesn't undo it).
+    ///
+    /// Test setup only: `HeaderSync` settles replacements from the
+    /// mempool's removal events (`on_mempool_removals`, ticket 053), which
+    /// reach the same states.
+    #[cfg(test)]
     pub fn mark_replaced(&self, old: &Txid, by: Txid, now: u64) -> Result<(), OwnTxStoreError> {
         if self.is_active(old) {
             info!("Own tx {} replaced by {}", old, by);
@@ -786,6 +970,7 @@ impl OwnTxStore {
     /// Idempotent: re-running it for the same block (crash recovery)
     /// changes nothing more.
     pub fn on_block(&self, block: &Block, height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
+        self.injected_fault()?;
         if self.watched.lock().unwrap().is_empty() {
             return Ok(0);
         }
@@ -870,13 +1055,13 @@ impl OwnTxStore {
     ///
     /// Own descendants that weren't in the mempool are cascaded too (see
     /// `cascade_conflict`). Returns the number of rows changed.
-    #[cfg_attr(not(test), allow(dead_code))] // wired into sync.rs with ticket 049's handlers
     pub fn on_mempool_removals(
         &self,
         removals: &[MempoolRemoval],
         height: u32,
         now: u64,
     ) -> Result<usize, OwnTxStoreError> {
+        self.injected_fault()?;
         let mut changed = 0;
         for removal in removals {
             if !self.is_active(&removal.txid) {
@@ -914,6 +1099,43 @@ impl OwnTxStore {
             self.refresh_active()?;
         }
         Ok(changed)
+    }
+
+    /// Settle an active own tx from what the chain shows when its re-add
+    /// finds an input gone (ticket 053): the block hooks missed it (a
+    /// block connected between its accept and `track`, an interrupted
+    /// hook, or an app restart that lost the mempool events). `by ==
+    /// txid` means the tx itself was mined at `height`; otherwise `by`
+    /// spent its input at `height` and it, and its own descendants, are
+    /// conflicted. Both record `height`, so a reorg below it undoes them
+    /// (`demote_confirmed_above`). Returns the rows changed.
+    pub fn settle_from_chain(&self, txid: &Txid, by: Txid, height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
+        if !self.is_active(txid) {
+            return Ok(0);
+        }
+        let changed = if by == *txid {
+            info!("Own tx {} found confirmed at height {}", txid, height);
+            self.write_status(txid, &OwnTxStatus::Confirmed { height }, None, now)?;
+            1
+        } else {
+            warn!("Own tx {} conflicted: input spent by {} at height {}", txid, by, height);
+            self.write_status(txid, &OwnTxStatus::Conflicted { by }, Some(height), now)?;
+            1 + self.cascade_conflict(vec![*txid], by, Some(height), now)?
+        };
+        self.refresh_active()?;
+        Ok(changed)
+    }
+
+    /// Own transactions recorded as confirmed above `fork_height`: the ones
+    /// a reorg to `fork_height` disconnects, lowest block first. Read
+    /// before `demote_confirmed_above` so the reorg path can put them back
+    /// in the mempool the way Core re-adds disconnected block transactions.
+    pub fn confirmed_above(&self, fork_height: u32) -> Result<Vec<OwnTxRecord>, OwnTxStoreError> {
+        let h = fork_height as i64;
+        self.query(
+            "WHERE status = 'confirmed' AND status_height > ?1 ORDER BY status_height, first_sent_at",
+            &[&h],
+        )
     }
 
     /// Reorg hook: confirmations and conflicts recorded above `fork_height`
@@ -965,12 +1187,17 @@ impl OwnTxStore {
                 params![now as i64, TERMINAL_RETENTION_SECS as i64],
             )
             .map_err(db_err)?;
-            conn.execute(
-                "DELETE FROM own_tx_seen WHERE txid NOT IN
-                    (SELECT txid FROM own_txs WHERE status IN ('pending', 'propagated'))",
-                [],
-            )
-            .map_err(db_err)?;
+            for table in ["own_tx_seen", "own_tx_delivered"] {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {} WHERE txid NOT IN
+                            (SELECT txid FROM own_txs WHERE status IN ('pending', 'propagated'))",
+                        table
+                    ),
+                    [],
+                )
+                .map_err(db_err)?;
+            }
         }
         self.refresh_active()
     }
@@ -984,6 +1211,73 @@ mod tests {
 
     fn txid(b: u8) -> Txid {
         Txid::from_byte_array([b; 32])
+    }
+
+    /// Ticket 053: a version 1 file (no delivery column or table) opens as
+    /// version 2 with its rows intact; deliveries are counted once per
+    /// peer, across reopens, and only for active txs.
+    #[test]
+    fn version_1_file_migrates_and_deliveries_count_once_per_peer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("own_txs.sqlite3");
+        let path = path.to_str().unwrap();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE own_txs (
+                    txid TEXT PRIMARY KEY, raw BLOB NOT NULL, first_sent_at INTEGER NOT NULL,
+                    last_sent_at INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL DEFAULT 0, seen_from_peers INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL, status_height INTEGER, status_txid TEXT,
+                    updated_at INTEGER NOT NULL);
+                 CREATE TABLE own_tx_seen (txid TEXT NOT NULL, peer TEXT NOT NULL, PRIMARY KEY (txid, peer));
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO own_txs (txid, raw, first_sent_at, status, updated_at) VALUES (?1, x'01', 5, 'pending', 5)",
+                params![txid(1).to_string()],
+            )
+            .unwrap();
+        }
+        {
+            let s = OwnTxStore::open(path).unwrap();
+            let rec = s.get(&txid(1)).unwrap().unwrap();
+            assert_eq!((rec.delivered_to_peers, rec.delivery()), (0, Delivery::NotSeen));
+            s.record_delivered(&txid(1), "a", 6).unwrap();
+            s.record_delivered(&txid(1), "a", 7).unwrap();
+            s.record_delivered(&txid(1), "b", 8).unwrap();
+            s.record_delivered(&txid(2), "a", 8).unwrap(); // not tracked
+            let rec = s.get(&txid(1)).unwrap().unwrap();
+            assert_eq!((rec.delivered_to_peers, rec.delivery()), (2, Delivery::Delivered));
+            assert_eq!(rec.status, OwnTxStatus::Pending);
+        }
+        let s = OwnTxStore::open(path).unwrap();
+        s.record_delivered(&txid(1), "a", 9).unwrap();
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().delivered_to_peers, 2);
+        assert!(s.was_delivered_to(&txid(1), "b") && !s.was_delivered_to(&txid(1), "c"));
+        s.record_seen(&txid(1), "c", 10).unwrap();
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().delivery(), Delivery::SeenOnNetwork);
+        let conn = Connection::open(path).unwrap();
+        let v: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 2);
+    }
+
+    /// `settle_from_chain`: mined itself → confirmed; spent by another →
+    /// conflicted with its own descendants; both at the height, so a reorg
+    /// below it undoes them.
+    #[test]
+    fn settle_from_chain_confirms_or_conflicts_with_a_height() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        s.track(txid(1), &[1], 1).unwrap();
+        assert_eq!(s.settle_from_chain(&txid(1), txid(1), 300, 2).unwrap(), 1);
+        assert_eq!(s.get(&txid(1)).unwrap().unwrap().status, OwnTxStatus::Confirmed { height: 300 });
+        assert_eq!(s.settle_from_chain(&txid(1), txid(1), 300, 3).unwrap(), 0, "settled rows are skipped");
+        s.track(txid(2), &[1], 1).unwrap();
+        s.settle_from_chain(&txid(2), txid(9), 301, 2).unwrap();
+        assert_eq!(s.get(&txid(2)).unwrap().unwrap().status, OwnTxStatus::Conflicted { by: txid(9) });
+        assert_eq!(s.demote_confirmed_above(299, 4).unwrap(), 2);
+        assert!(s.is_active(&txid(1)) && s.is_active(&txid(2)));
     }
 
     #[test]

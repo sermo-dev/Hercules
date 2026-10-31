@@ -1360,7 +1360,13 @@ mod tests {
             };
             open(p).unwrap();
             let current = version(None);
-            assert!(current >= 1, "{} not stamped", name);
+            // own_txs is at 2 since ticket 053 (`own_tx_delivered`), peers
+            // since 052 (source buckets, ban amnesty).
+            let expected = match name {
+                "own_txs.sqlite3" | "peers.sqlite3" => 2,
+                _ => 1,
+            };
+            assert_eq!(current, expected, "{} not stamped", name);
 
             // A file from before versioning opens and is stamped.
             version(Some(0));

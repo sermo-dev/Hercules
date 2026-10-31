@@ -3,6 +3,11 @@ extern crate cc;
 use std::env;
 
 fn main() {
+    // Hercules (ticket 053): rebuild when the vendored sources change,
+    // including files git doesn't track yet (cargo's default for a path
+    // dependency only looks at the files git lists).
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=depend");
     // Check whether we can use 64-bit compilation
     let use_64bit_compilation = if env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap() == "64" {
         let check = cc::Build::new()
@@ -96,6 +101,8 @@ fn main() {
         .file("depend/bitcoin/src/script/interpreter.cpp")
         .file("depend/bitcoin/src/script/script.cpp")
         .file("depend/bitcoin/src/script/script_error.cpp")
+        // Hercules (ticket 053): verification under the relay policy flags.
+        .file("depend/bitcoin/src/script/hercules_policy.cpp")
         .compile("libbitcoinconsensus.a");
 
     if seal {

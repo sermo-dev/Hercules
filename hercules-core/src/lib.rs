@@ -1627,6 +1627,13 @@ pub struct OwnTxInfo {
     pub next_attempt_at: u64,
     pub attempts: u32,
     pub seen_from_peers: u32,
+    /// Peers that fetched it from us (ticket 053).
+    pub delivered_to_peers: u32,
+    /// `not_seen` (no peer has fetched it or announced it: the wallet's
+    /// "not yet seen by the network"), `delivered` (a peer fetched it) or
+    /// `seen_on_network` (a peer announced it to us). See
+    /// `own_tx_store::Delivery`.
+    pub delivery: String,
     pub updated_at: u64,
 }
 
@@ -1650,6 +1657,8 @@ impl From<own_tx_store::OwnTxRecord> for OwnTxInfo {
             next_attempt_at: r.next_attempt_at,
             attempts: r.attempts,
             seen_from_peers: r.seen_from_peers,
+            delivered_to_peers: r.delivered_to_peers,
+            delivery: r.delivery().name().to_string(),
             updated_at: r.updated_at,
         }
     }
@@ -1669,6 +1678,10 @@ pub enum BroadcastError {
     NonStandard { msg: String },
     #[error("Fee too low: {msg}")]
     FeeTooLow { msg: String },
+    /// Below every connected peer's fee filter: nothing was sent; retry
+    /// with a higher fee (or later). Ticket 053.
+    #[error("Fee below network minimum: {msg}")]
+    FeeBelowNetworkMinimum { msg: String },
     #[error("Absurd fee: {msg}")]
     AbsurdFee { msg: String },
     #[error("Conflict: {msg}")]
@@ -1691,6 +1704,7 @@ impl From<own_tx_store::SubmitError> for BroadcastError {
             S::NotYetFinal { .. } => BroadcastError::NotYetFinal { msg },
             S::NonStandard(_) => BroadcastError::NonStandard { msg },
             S::FeeTooLow { .. } => BroadcastError::FeeTooLow { msg },
+            S::FeeBelowNetworkMinimum { .. } => BroadcastError::FeeBelowNetworkMinimum { msg },
             S::AbsurdFee { .. } => BroadcastError::AbsurdFee { msg },
             S::Conflict { .. } => BroadcastError::Conflict { msg },
             S::AlreadyKnown { txid } => BroadcastError::AlreadyKnown {
