@@ -11,12 +11,43 @@ use log::info;
 /// Number of recent blocks to retain for NODE_NETWORK_LIMITED serving (BIP 159).
 const SERVING_WINDOW: u32 = 288;
 
+/// `blocks.sqlite3` layout version (`PRAGMA user_version`, ticket 050).
+/// History: 1 = one `blocks` row per height (025 moves to hash keys).
+const SCHEMA_VERSION: u32 = 1;
+
 /// Persistent storage for recent full blocks using SQLite.
 ///
 /// Stores the last 288 blocks so this node can serve them to peers
 /// as required by NODE_NETWORK_LIMITED (BIP 159).
 pub struct BlockStore {
     conn: Mutex<Connection>,
+    /// File path (`:memory:` in tests), for the free-space check before
+    /// `migrate_auto_vacuum`.
+    path: String,
+}
+
+/// Whether `available` bytes of free disk leave room to `VACUUM` a database
+/// of `db_bytes`: SQLite writes the whole new copy (through a temporary
+/// database and the WAL) before the old pages are freed, so it needs about
+/// the database's size again. Twice that, so the vacuum never takes the
+/// last of the disk from the node (or the user).
+fn has_room_for_vacuum(available: u64, db_bytes: u64) -> bool {
+    available > db_bytes.saturating_mul(2)
+}
+
+/// Free bytes on the volume holding `path` (`statvfs`: blocks available to
+/// an unprivileged process, so conservative next to iOS's "important
+/// usage" capacity, which counts purgeable space), or `None` if unknown.
+fn available_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated string and `st` a valid
+    // out-pointer for the duration of the call.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
 impl BlockStore {
@@ -27,11 +58,26 @@ impl BlockStore {
         conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT)
             .map_err(|e| BlockStoreError(format!("set busy_timeout: {}", e)))?;
 
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| BlockStoreError(format!("set WAL: {}", e)))?;
+        // First, before any table exists: a new file then hands the pages
+        // of pruned blocks back to the filesystem (`prune_below`) instead
+        // of growing forever (ticket 050). A file created before this keeps
+        // `NONE` until `migrate_auto_vacuum`.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .map_err(|e| BlockStoreError(format!("set auto_vacuum: {}", e)))?;
+
+        crate::store::set_wal(&conn).map_err(|e| BlockStoreError(format!("set WAL: {}", e)))?;
 
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| BlockStoreError(format!("set synchronous: {}", e)))?;
+
+        let version = crate::store::check_schema_version(&conn, "block store", SCHEMA_VERSION)
+            .map_err(BlockStoreError)?;
+        if version < SCHEMA_VERSION {
+            // Files from before versioning (0) already have this layout;
+            // the CREATE IF NOT EXISTS below covers new ones.
+            crate::store::set_schema_version(&conn, "block store", SCHEMA_VERSION)
+                .map_err(BlockStoreError)?;
+        }
 
         conn.execute_batch(
             "
@@ -48,6 +94,7 @@ impl BlockStore {
         info!("Block store opened at {}", path);
         Ok(BlockStore {
             conn: Mutex::new(conn),
+            path: path.to_string(),
         })
     }
 
@@ -103,13 +150,95 @@ impl BlockStore {
         Ok(count > 0)
     }
 
-    /// Delete blocks below the given height to stay within the serving window.
+    /// Delete blocks below the given height to stay within the serving
+    /// window, returning how many went. One statement, so a kill leaves
+    /// either all of them or none. The caller bounds the work per call
+    /// (`HeaderSync::maybe_prune`).
+    ///
+    /// The freed pages are then handed back to the filesystem
+    /// (`incremental_vacuum`, which costs about what the delete freed). On a
+    /// file still at `auto_vacuum = NONE` that is a no-op and they are only
+    /// reused for later blocks; see `migrate_auto_vacuum`.
     pub fn prune_below(&self, height: u32) -> Result<u32, BlockStoreError> {
         let conn = self.conn.lock().unwrap();
         let deleted = conn
             .execute("DELETE FROM blocks WHERE height < ?1", params![height])
             .map_err(|e| BlockStoreError(format!("prune: {}", e)))?;
+        if deleted > 0 {
+            // Frees one page per step (each step yields a row), so it is
+            // stepped to the end.
+            let mut stmt = conn
+                .prepare("PRAGMA incremental_vacuum")
+                .map_err(|e| BlockStoreError(format!("prepare incremental_vacuum: {}", e)))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| BlockStoreError(format!("incremental_vacuum: {}", e)))?;
+            while rows
+                .next()
+                .map_err(|e| BlockStoreError(format!("incremental_vacuum: {}", e)))?
+                .is_some()
+            {}
+        }
         Ok(deleted as u32)
+    }
+
+    /// Whether the file predates incremental auto-vacuum (`auto_vacuum =
+    /// NONE`, SQLite's default before ticket 050), so pruned blocks are
+    /// never given back to the filesystem.
+    pub fn needs_auto_vacuum_migration(&self) -> Result<bool, BlockStoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mode: u32 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .map_err(|e| BlockStoreError(format!("read auto_vacuum: {}", e)))?;
+        // 0 = NONE, 1 = FULL, 2 = INCREMENTAL.
+        Ok(mode == 0)
+    }
+
+    /// Switch an old file to incremental auto-vacuum, giving back the space
+    /// of everything pruned so far. SQLite can only do this by rewriting the
+    /// whole file (`VACUUM`), which costs I/O for every live block and about
+    /// as much free disk again, so `HeaderSync::maybe_prune` calls it only
+    /// in a processing-length wake and only once pruning has brought the
+    /// store down to its window (so the copy is ~the window, not GBs).
+    ///
+    /// Skipped, returning `Ok(false)`, unless the volume has more than
+    /// twice the database's size free (`has_room_for_vacuum`); the next
+    /// chance tries again. Killed midway (a wake's expiry), nothing is
+    /// lost: in WAL mode the rewrite goes to the WAL and only counts once
+    /// its commit frame is written, so a kill before that leaves the old
+    /// file as it was (the uncommitted frames are discarded on the next
+    /// open), and the next chance retries.
+    pub fn migrate_auto_vacuum(&self) -> Result<bool, BlockStoreError> {
+        let conn = self.conn.lock().unwrap();
+        if self.path != ":memory:" {
+            let db_bytes: u64 = conn
+                .query_row(
+                    "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| BlockStoreError(format!("read database size: {}", e)))?;
+            let dir = std::path::Path::new(&self.path)
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            match available_bytes(dir) {
+                Some(free) if has_room_for_vacuum(free, db_bytes) => {}
+                free => {
+                    info!(
+                        "Block store: skipping the auto-vacuum migration ({} MiB to rewrite, {} free)",
+                        db_bytes >> 20,
+                        free.map_or("unknown".to_string(), |f| format!("{} MiB", f >> 20))
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .map_err(|e| BlockStoreError(format!("set auto_vacuum: {}", e)))?;
+        conn.execute_batch("VACUUM;")
+            .map_err(|e| BlockStoreError(format!("vacuum: {}", e)))?;
+        Ok(true)
     }
 
     /// Get the lowest block height currently stored.
@@ -326,6 +455,86 @@ mod tests {
         store.conn.lock().unwrap().execute("UPDATE blocks SET data = X'0000' WHERE height = 1", []).unwrap();
         assert!(store.get_block_by_hash(&tagged(1).block_hash()).is_err());
         assert!(store.has_block(&tagged(1).block_hash()).unwrap(), "row still present");
+    }
+
+    // ── Ticket 050: auto-vacuum and the layout version ───────────────
+
+    fn pragma(store: &BlockStore, name: &str) -> u32 {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(&format!("PRAGMA {}", name), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Rows of `size` bytes at heights `from..to` (fake hashes), enough
+    /// pages for a prune to be visible in `page_count`.
+    fn fill(store: &BlockStore, from: u32, to: u32, size: usize) {
+        let conn = store.conn.lock().unwrap();
+        for h in from..to {
+            conn.execute(
+                "INSERT INTO blocks (height, hash, data) VALUES (?1, ?2, ?3)",
+                params![h, format!("hash{}", h).as_bytes(), vec![h as u8; size]],
+            )
+            .unwrap();
+        }
+    }
+
+    /// A new file gives pruned blocks' pages back to the filesystem.
+    #[test]
+    fn prune_shrinks_a_new_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = BlockStore::open(dir.path().join("blocks.sqlite3").to_str().unwrap()).unwrap();
+        assert!(!store.needs_auto_vacuum_migration().unwrap());
+        fill(&store, 0, 40, 64 * 1024);
+        let before = pragma(&store, "page_count");
+        assert_eq!(store.prune_below(35).unwrap(), 35);
+        let after = pragma(&store, "page_count");
+        assert!(after * 4 < before, "file did not shrink: {} -> {} pages", before, after);
+        assert_eq!(pragma(&store, "freelist_count"), 0);
+    }
+
+    /// A file from before auto-vacuum keeps its freed pages until the
+    /// one-time migration, which keeps every row.
+    #[test]
+    fn old_file_is_migrated_to_incremental_auto_vacuum() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("blocks.sqlite3");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA auto_vacuum = NONE;
+                 CREATE TABLE blocks (height INTEGER PRIMARY KEY, hash BLOB NOT NULL UNIQUE, data BLOB NOT NULL);",
+            )
+            .unwrap();
+        let store = BlockStore::open(path.to_str().unwrap()).unwrap();
+        assert!(store.needs_auto_vacuum_migration().unwrap());
+        fill(&store, 0, 40, 64 * 1024);
+        let before = pragma(&store, "page_count");
+        store.prune_below(35).unwrap();
+        assert_eq!(pragma(&store, "page_count"), before, "NONE file shrank without a vacuum");
+        assert!(pragma(&store, "freelist_count") > 0);
+
+        assert!(store.migrate_auto_vacuum().unwrap(), "skipped with plenty of space");
+        assert!(!store.needs_auto_vacuum_migration().unwrap());
+        assert!(pragma(&store, "page_count") * 4 < before);
+        assert_eq!(store.count().unwrap(), 5);
+        drop(store);
+        let store = BlockStore::open(path.to_str().unwrap()).unwrap();
+        assert!(!store.needs_auto_vacuum_migration().unwrap(), "migration not persisted");
+        assert_eq!(pragma(&store, "user_version"), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn vacuum_needs_more_than_twice_the_database_free() {
+        assert!(has_room_for_vacuum(2_000_001, 1_000_000));
+        assert!(!has_room_for_vacuum(2_000_000, 1_000_000));
+        assert!(!has_room_for_vacuum(0, 1));
+        assert!(!has_room_for_vacuum(u64::MAX, u64::MAX / 2 + 1), "overflow");
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(available_bytes(dir.path()).is_some_and(|b| b > 0));
+        assert_eq!(available_bytes(&dir.path().join("missing")), None);
     }
 
     /// BIP 159 serving window, kept equal to the 288-block reorg/undo

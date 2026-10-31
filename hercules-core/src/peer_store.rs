@@ -20,6 +20,10 @@ pub struct PeerStore {
     conn: Mutex<Connection>,
 }
 
+/// `peers.sqlite3` layout version (`PRAGMA user_version`, ticket 050).
+/// History: 1 = `peer_scores`, `peer_bans` and `known_addrs`.
+const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct PeerStoreError(pub String);
 
@@ -57,10 +61,18 @@ impl PeerStore {
         conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT)
             .map_err(|e| PeerStoreError(format!("set busy_timeout: {}", e)))?;
 
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| PeerStoreError(format!("set WAL: {}", e)))?;
+        crate::store::set_wal(&conn).map_err(|e| PeerStoreError(format!("set WAL: {}", e)))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| PeerStoreError(format!("set synchronous: {}", e)))?;
+
+        let version = crate::store::check_schema_version(&conn, "peer store", SCHEMA_VERSION)
+            .map_err(PeerStoreError)?;
+        if version < SCHEMA_VERSION {
+            // Files from before versioning (0) already have this layout;
+            // the CREATE IF NOT EXISTS below covers new ones.
+            crate::store::set_schema_version(&conn, "peer store", SCHEMA_VERSION)
+                .map_err(PeerStoreError)?;
+        }
 
         conn.execute_batch(
             "
@@ -361,6 +373,33 @@ mod tests {
 
     fn fresh_store() -> PeerStore {
         PeerStore::open(":memory:").unwrap()
+    }
+
+    /// Two connections opening a new file at once both switch it to WAL;
+    /// SQLite refuses one of them "database is locked" at once (deadlock
+    /// avoidance: both hold a shared lock and want it exclusive), busy
+    /// timeout or not. `PeerPool` then ran its whole session without
+    /// saving bans or scores. Every open must now succeed.
+    #[test]
+    fn concurrent_first_opens_all_succeed() {
+        for _ in 0..30 {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("peers.sqlite3");
+            let path = path.to_str().unwrap().to_string();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let opens: Vec<_> = (0..4)
+                .map(|_| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        PeerStore::open(&path).map(drop)
+                    })
+                })
+                .collect();
+            for open in opens {
+                open.join().unwrap().expect("concurrent first open");
+            }
+        }
     }
 
     #[test]

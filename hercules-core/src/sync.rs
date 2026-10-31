@@ -43,14 +43,66 @@ const SELF_AD_REBROADCAST_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60)
 
 /// Maximum reorg depth we'll accept (bounded by undo data retention window).
 ///
-/// This number must stay in lock-step with the prune horizon below: every
-/// 1000 blocks the sync loop calls `prune_undo_below(next_height - 288)`,
-/// which keeps undo records for heights `>= next_height - 288`. A max-depth
-/// reorg targets exactly `current_tip - 288`, so the boundary is *exact*,
-/// not tight-with-bug — if you bump this constant you must also bump the
-/// `next_height - 288` arithmetic in `sync.rs::prune_undo_below` and in
-/// `block_store.prune_below`.
+/// Pruning keeps undo data for every height `>= validated - PRUNE_KEEP`
+/// (`HeaderSync::maybe_prune`), and `PRUNE_KEEP` is this constant. A
+/// max-depth reorg targets exactly `tip - 288` and rolls back the 288
+/// blocks above it, so the boundary is *exact*. The coupling is also
+/// enforced in code (ticket 050): `UtxoSet::rollback_block_to` refuses a
+/// height whose undo was pruned, and `rollback_utxo_to` refuses a target
+/// below the undo horizon before rolling anything back.
 const MAX_REORG_DEPTH: u32 = 288;
+
+/// Heights of undo data and blocks kept below the validated tip (ticket
+/// 050): enough to roll back a `MAX_REORG_DEPTH` reorg from local data,
+/// and the 288 blocks BIP 159 (NODE_NETWORK_LIMITED) peers may ask for.
+const PRUNE_KEEP: u32 = MAX_REORG_DEPTH;
+
+/// How many heights past the keep window either store may grow before
+/// `maybe_prune` cuts it back: one prune of about a day's blocks, about
+/// once a day, instead of a small one per block.
+const PRUNE_SLACK: u32 = 144;
+
+/// Most heights one `maybe_prune` call removes from each store: exactly
+/// a steady-state prune (`PRUNE_SLACK + 1` heights, about a day of blocks
+/// and their undo). An install from before ticket 050 (GBs never pruned)
+/// is worked off a step per connected block, so a wake inheriting it
+/// spends no longer pruning than any other daily prune; a processing task
+/// (up to 1,000 blocks a round) clears years of backlog.
+const PRUNE_STEP: u32 = PRUNE_SLACK + 1;
+
+/// How far below the validated tip a prune lock (`set_prune_floor`) may
+/// hold blocks back: about two weeks of blocks (~3 GB on mainnet). A wallet
+/// further behind than this falls back to a UTXO walk (ticket 035).
+const PRUNE_LOCK_MAX_HOLD: u32 = 2016;
+
+/// `prune_floor` value for "no prune lock".
+const NO_PRUNE_FLOOR: u32 = u32::MAX;
+
+/// A wake with at least this much budget left is a processing task
+/// (BGProcessingTask rounds get 120 s, push and refresh wakes about 25 s):
+/// only there is the block store's one-time `VACUUM` migration attempted
+/// (`BlockStore::migrate_auto_vacuum`).
+const VACUUM_MIN_BUDGET: Duration = Duration::from_secs(60);
+
+const _: () = assert!(PRUNE_LOCK_MAX_HOLD >= PRUNE_KEEP && PRUNE_STEP > PRUNE_SLACK);
+
+/// The prune window `maybe_prune` works to (see `PRUNE_KEEP`,
+/// `PRUNE_SLACK`, `PRUNE_STEP`, `PRUNE_LOCK_MAX_HOLD`). Tests shrink it
+/// so short fixture chains prune (`HeaderSync::prune_window`).
+#[derive(Debug, Clone, Copy)]
+struct PruneWindow {
+    keep: u32,
+    slack: u32,
+    step: u32,
+    lock_max_hold: u32,
+}
+
+const DEFAULT_PRUNE_WINDOW: PruneWindow = PruneWindow {
+    keep: PRUNE_KEEP,
+    slack: PRUNE_SLACK,
+    step: PRUNE_STEP,
+    lock_max_hold: PRUNE_LOCK_MAX_HOLD,
+};
 
 /// Per-peer cap on the `known_txids` dedup set. A malicious peer that floods
 /// us with INV messages full of unique txids can otherwise grow this set
@@ -332,6 +384,53 @@ enum BlockFailure {
     Local(SyncError),
 }
 
+/// What `HeaderSync::connect_block` did with a block it connected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connected {
+    /// Validated in full and applied.
+    Validated,
+    /// The UTXO set already held exactly this block (applied, then a kill
+    /// or a failed write before `set_validated_height`): it was not
+    /// validated again, and only the steps after the UTXO write were
+    /// (re)run.
+    Recovered,
+}
+
+/// Where `connect_block` is called from, for the parts that depend on it.
+#[derive(Clone, Copy)]
+struct ConnectCtx<'a> {
+    /// The wake's budget; `None` in the foreground sync loop.
+    budget: Option<&'a WakeBudget>,
+}
+
+impl<'a> ConnectCtx<'a> {
+    fn foreground() -> ConnectCtx<'static> {
+        ConnectCtx { budget: None }
+    }
+
+    fn wake(budget: &'a WakeBudget) -> ConnectCtx<'a> {
+        ConnectCtx { budget: Some(budget) }
+    }
+
+    /// A processing-length wake with time to spare: the only place the
+    /// block store's one-time `VACUUM` may run (it stalls the store for as
+    /// long as rewriting every stored block takes).
+    fn has_maintenance_time(&self) -> bool {
+        self.budget
+            .is_some_and(|b| !b.should_stop() && b.remaining() >= VACUUM_MIN_BUDGET)
+    }
+}
+
+/// The steps of `connect_block` after its UTXO write. Each is a kill
+/// point: crash recovery must finish a block killed after any of them, on
+/// every path (tests stop there with `HeaderSync::connect_kill`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectStep {
+    Applied,
+    Stored,
+    Hooked,
+}
+
 impl From<BlockValidationError> for BlockFailure {
     fn from(e: BlockValidationError) -> Self {
         if e.is_mutation() {
@@ -374,6 +473,28 @@ enum ScratchReplacement {
     Wait,
     /// Replace our headers with the fork.
     Replace,
+}
+
+/// The UTXO set is gone (empty, or just wiped): reset `validated_height`
+/// to 0, and reconsider every failed-block verdict, lifting the bans they
+/// caused. Those verdicts were reached against the old set, which may have
+/// been wrong (a retracted snapshot condemns valid blocks spending its bad
+/// coins).
+fn forget_utxo_verdicts(store: &HeaderStore, peers_db_path: Option<&str>) -> Result<(), SyncError> {
+    store
+        .set_validated_height(0)
+        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+    let unbanned = store
+        .clear_failed_blocks()
+        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+    if !unbanned.is_empty() {
+        info!(
+            "UTXO set reset: reconsidering failed blocks, lifting {} ban(s)",
+            unbanned.len()
+        );
+    }
+    lift_bans(peers_db_path, &unbanned);
+    Ok(())
 }
 
 /// Note that `addr` served a bad copy of the block at `height`, so the
@@ -858,6 +979,19 @@ pub struct HeaderSync {
     scratch_stall_rounds: AtomicU32,
     /// How many such rounds must pass before the replacement is allowed.
     scratch_stall_threshold: u32,
+    /// The window `maybe_prune` keeps (ticket 050). Always the default in
+    /// production; tests shrink it so fixture chains prune.
+    prune_window: PruneWindow,
+    /// Prune lock (`set_prune_floor`): blocks at or above this height are
+    /// kept. `NO_PRUNE_FLOOR` when no wallet holds one.
+    prune_floor: AtomicU32,
+    /// The block store's one-time `VACUUM` migration was tried in this
+    /// process (it is not retried per block if it fails).
+    vacuum_attempted: AtomicBool,
+    /// Test kill point: `connect_block` stops after this step once, as if
+    /// the process were killed there.
+    #[cfg(test)]
+    connect_kill: Mutex<Option<ConnectStep>>,
     /// The header-sync stall timeout's grace and minimum rate
     /// (`HEADERS_STALL_GRACE`, `MIN_HEADERS_RATE`); tests shrink them.
     headers_stall_limit: (Duration, f64),
@@ -934,6 +1068,63 @@ impl HeaderSync {
             info!("Stored genesis header");
         }
 
+        // Ticket 050: a UTXO set more than one block above
+        // `validated_height` (a pending snapshot is `activate_pending_
+        // snapshot`'s to judge). The UTXO set is the truth when its block is
+        // on our header chain: LMDB commits are durable before the header
+        // store's, so a power loss can drop the last `set_validated_height`
+        // commits and keep the applies. Raise `validated_height` to it, as
+        // the repair below lowers it. A set whose block isn't on our chain
+        // is left for the normal rollback (`utxo_has_block`) while its undo
+        // reaches back to `validated_height`, and wiped only when it
+        // doesn't: rolling it back would then delete outputs and restore
+        // nothing. That is the interrupted reset (before resets wrote the
+        // marker first), which lost the headers but kept the env.
+        if let Some((utxo_height, utxo_hash)) =
+            utxo.best_block().map_err(|e| SyncError::Store(format!("{}", e)))?
+        {
+            let validated = store
+                .validated_height()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            let floor = utxo
+                .assume_valid_floor()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            let pending_snapshot = floor > 0 && validated < floor;
+            if !pending_snapshot && utxo_height > validated.saturating_add(1) {
+                let on_chain = store
+                    .get_hash_at_height(utxo_height)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?
+                    .map(|h| h.to_byte_array())
+                    == Some(utxo_hash);
+                let undo_from = utxo
+                    .undo_pruned_below()
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                if on_chain {
+                    warn!(
+                        "UTXO set is at block {} of our header chain but validated_height is {} \
+                         (lost header-store commits); raising it",
+                        utxo_height, validated
+                    );
+                    store
+                        .set_validated_height(utxo_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                } else if validated.max(floor) + 1 < undo_from {
+                    warn!(
+                        "UTXO set is at block {} (not on our header chain), validated_height is \
+                         {} and undo below {} is pruned, so it can't be rolled back: wiping it",
+                        utxo_height, validated, undo_from
+                    );
+                    utxo.wipe().map_err(|e| SyncError::Store(format!("{}", e)))?;
+                } else {
+                    warn!(
+                        "UTXO set is at block {} (not on our header chain), validated_height is \
+                         {}: the next connect rolls it back",
+                        utxo_height, validated
+                    );
+                }
+            }
+        }
+
         // Handle upgrade from Phase 2a: if UTXO set is empty but blocks
         // were already structurally validated, reset to re-validate with scripts
         let validated = store
@@ -943,27 +1134,11 @@ impl HeaderSync {
             .count()
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
         if validated > 0 && utxo_count == 0 {
-            store
-                .set_validated_height(0)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
             info!(
                 "UTXO set empty but validated_height was {}, resetting to rebuild",
                 validated
             );
-            // Every failed-block verdict was reached against the set that
-            // is now gone, which may have been wrong (a retracted snapshot
-            // condemns valid blocks spending its bad coins). Reconsider them
-            // all, and lift the bans they caused.
-            let unbanned = store
-                .clear_failed_blocks()
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-            if !unbanned.is_empty() {
-                info!(
-                    "UTXO set reset: reconsidering failed blocks, lifting {} ban(s)",
-                    unbanned.len()
-                );
-            }
-            lift_bans(peers_db_path.as_deref(), &unbanned);
+            forget_utxo_verdicts(&store, peers_db_path.as_deref())?;
         }
 
         // Ticket 024: a crash between a UTXO rollback and the matching
@@ -1086,6 +1261,11 @@ impl HeaderSync {
             pending_unbans: Mutex::new(Vec::new()),
             scratch_stall_rounds: AtomicU32::new(0),
             scratch_stall_threshold: SCRATCH_STALL_ROUNDS,
+            prune_window: DEFAULT_PRUNE_WINDOW,
+            prune_floor: AtomicU32::new(NO_PRUNE_FLOOR),
+            vacuum_attempted: AtomicBool::new(false),
+            #[cfg(test)]
+            connect_kill: Mutex::new(None),
             headers_stall_limit: (HEADERS_STALL_GRACE, MIN_HEADERS_RATE),
         })
     }
@@ -1178,8 +1358,25 @@ impl HeaderSync {
     /// assume-valid floor), activate it once the stored header chain has the
     /// snapshot's block at the floor height. Returns `true` when block
     /// validation may proceed (no snapshot, already active, or just
-    /// activated) and `false` while headers haven't reached the snapshot.
+    /// activated) and `false` while headers haven't reached the snapshot,
+    /// or while the UTXO env holds a partial load (`.loading` marker).
+    ///
+    /// Ticket 050: the set must be the snapshot (best block `(floor,
+    /// snapshot hash)`), or descend from it. A set ahead of the floor on our
+    /// header chain (validated from the snapshot, then the header store
+    /// lost its commits) is activated at its own height; one ahead on
+    /// another chain is activated at the floor and rolled back by the next
+    /// connect, if its undo reaches the floor. Otherwise, e.g. an
+    /// interrupted reset that kept a set validated past the floor on a
+    /// chain our headers no longer follow, it is wiped (crash-safely) and
+    /// the snapshot has to be imported again: rolling it back would cross
+    /// pruned undo data.
     fn activate_pending_snapshot(&self) -> Result<bool, SyncError> {
+        // Partial, unverified rows: nothing may validate against them, in
+        // genesis mode either (a failed load writes no floor).
+        if self.utxo.load_in_progress() {
+            return Ok(false);
+        }
         let floor = self
             .utxo
             .assume_valid_floor()
@@ -1212,6 +1409,71 @@ impl HeaderSync {
                 )))
             }
         };
+
+        // The set should be exactly the snapshot. A set loaded before the
+        // best-block marker (ticket 024) has none; pending since then,
+        // nothing can have moved it off the floor.
+        let best = self
+            .utxo
+            .best_block()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if let Some((height, hash)) = best.filter(|b| *b != (floor, expected)) {
+            let header_at = |h: u32| -> Result<Option<[u8; 32]>, SyncError> {
+                Ok(self
+                    .store
+                    .get_hash_at_height(h)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?
+                    .map(|b| b.to_byte_array()))
+            };
+            if height > floor {
+                // Ahead of the floor: validated from the snapshot, with
+                // the activation (or later `set_validated_height`) commits
+                // lost, or kept by an interrupted reset. Which chain it is
+                // on can't be told until our headers reach its height.
+                // Headers 0..count: they reach `height` iff count > height.
+                let count = self.store.count().map_err(|e| SyncError::Store(format!("{}", e)))?;
+                if count <= height {
+                    return Ok(false);
+                }
+                if header_at(height)? == Some(hash) && header_at(floor)? == Some(expected) {
+                    warn!(
+                        "Pending snapshot at {} but the UTXO set is at block {} of our header \
+                         chain (lost header-store commits); activating at {}",
+                        floor, height, height
+                    );
+                    self.store
+                        .set_validated_height(height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                    return Ok(true);
+                }
+            }
+            // Not on our chain. If its undo reaches back to the floor, the
+            // activation below lets the next connect roll it back there;
+            // otherwise (or below the floor, where nothing can be undone)
+            // it can never become the snapshot again.
+            let undo_from = self
+                .utxo
+                .undo_pruned_below()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            if height <= floor || floor + 1 < undo_from {
+                warn!(
+                    "Pending snapshot at {} but the UTXO set is at block {} (height {}), not on \
+                     our header chain and not rollable back to the floor; wiping it",
+                    floor,
+                    BlockHash::from_byte_array(hash),
+                    height
+                );
+                self.utxo
+                    .wipe()
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                forget_utxo_verdicts(&self.store, self.peers_db_path.as_deref())?;
+                return Err(SyncError::Store(format!(
+                    "the UTXO set was not the snapshot at height {} (it was at {}), so it was \
+                     wiped: import the snapshot again",
+                    floor, height
+                )));
+            }
+        }
 
         match self
             .store
@@ -1351,8 +1613,13 @@ impl HeaderSync {
         })
     }
 
-    /// Check if the UTXO set is empty (needs snapshot or full sync from genesis).
+    /// Check if the UTXO set is empty (needs snapshot or full sync from
+    /// genesis). Also true while the env holds a partial load (its
+    /// `.loading` marker is down): those rows are not a set (ticket 050).
     pub fn needs_snapshot(&self) -> Result<bool, SyncError> {
+        if self.utxo.load_in_progress() {
+            return Ok(true);
+        }
         let count = self
             .utxo
             .count()
@@ -1829,6 +2096,19 @@ impl HeaderSync {
         if top <= target {
             return Ok(None);
         }
+        // Refuse before rolling anything back if a block on the way down
+        // has lost its undo data (ticket 050): a local fault, never a
+        // verdict on any block, and the set stays where it was.
+        let undo_from = self
+            .utxo
+            .undo_pruned_below()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        if target + 1 < undo_from {
+            return Err(SyncError::Store(format!(
+                "can't roll the UTXO set back from {} to {}: undo data below {} was pruned",
+                top, target, undo_from
+            )));
+        }
         for h in (target + 1..=top).rev() {
             let parent = if h - 1 <= validated {
                 self.store
@@ -1896,29 +2176,186 @@ impl HeaderSync {
         }
     }
 
-    /// The rest of connecting a block `utxo_has_block` found already
-    /// applied: store it for serving if that write never happened, run the
-    /// block hook (it may not have run, or was undone at open, see
-    /// `HeaderSync::new`; it is idempotent), and advance `validated_height`.
-    fn finish_recovered_block(&self, block: &bitcoin::Block, height: u32) -> Result<(), SyncError> {
-        info!(
-            "Block {} at {} already applied (crash recovery), advancing validated height",
-            block.block_hash(),
-            height
-        );
-        let stored = self
-            .block_store
-            .has_block(&block.block_hash())
-            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+    /// Validate and connect the block at `height` (always
+    /// `validated_height + 1`): the one connect path the sync loop, the
+    /// push-wake `validate_latest_block` and `catch_up_blocks` share
+    /// (ticket 050). In order, each step durable before the next:
+    ///
+    /// 1. Crash recovery (`utxo_has_block`): the UTXO set may already hold
+    ///    this block, in which case validation and the UTXO write are
+    ///    skipped, or a different block at this height, which is rolled
+    ///    back first.
+    /// 2. `check_block` (mutation, structure, scripts) and
+    ///    `UtxoSet::apply_block`, which writes the best-block marker in the
+    ///    same LMDB txn.
+    /// 3. `block_store.store_block` (if a recovered block's write was lost).
+    /// 4. The connect hooks (`on_block_connected`). The coins the block
+    ///    spent (from `apply_block`, or read back from undo for a
+    ///    recovered block) are in hand here for the wallet hook (035).
+    /// 5. `set_validated_height`.
+    /// 6. `maybe_prune`.
+    ///
+    /// A kill after step 2, 3 or 4 leaves the set one block above
+    /// `validated_height` with its marker naming this block, so the next
+    /// connect at this height (on any path) takes branch 1 and re-runs
+    /// 3-5. Hooks must be idempotent: they can run twice, and are undone at
+    /// open for blocks above `validated_height` (`HeaderSync::new`). A
+    /// failed prune is logged, not returned: the block is connected.
+    ///
+    /// Failures come back in the ticket 024 classes for the caller's
+    /// response. Only `check_block` produces `Delivery` or `Consensus`;
+    /// everything after it is `Local`.
+    fn connect_block(
+        &self,
+        block: &bitcoin::Block,
+        height: u32,
+        ctx: ConnectCtx,
+    ) -> Result<Connected, BlockFailure> {
+        let local = |e: &dyn std::fmt::Display| BlockFailure::Local(SyncError::Store(e.to_string()));
+        let hash = block.block_hash();
+        let (connected, spent) = if self.utxo_has_block(height, hash).map_err(BlockFailure::Local)? {
+            info!(
+                "Block {} at {} already applied (crash recovery), finishing its connect",
+                hash, height
+            );
+            let spent = self
+                .utxo
+                .spent_coins_at(height)
+                .map_err(|e| local(&e))?
+                .unwrap_or_default();
+            (Connected::Recovered, spent)
+        } else {
+            self.check_block(block, height)?;
+            let spent = self.utxo.apply_block(block, height).map_err(|e| local(&e))?;
+            (Connected::Validated, spent)
+        };
+        self.kill_point(ConnectStep::Applied)?;
+
+        // Kept for serving (BIP 159) and reorgs. A recovered block's write
+        // may already have happened.
+        let stored = connected == Connected::Recovered
+            && self.block_store.has_block(&hash).map_err(|e| local(&e))?;
         if !stored {
             self.block_store
                 .store_block(block, height)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                .map_err(|e| local(&e))?;
         }
+        self.kill_point(ConnectStep::Stored)?;
+
+        // The wallet hook (035) joins here and gets `spent`.
+        debug!("Connecting block {} at {}: {} coins spent", hash, height, spent.len());
         self.on_block_connected(block, height);
+        self.kill_point(ConnectStep::Hooked)?;
+
         self.store
             .set_validated_height(height)
-            .map_err(|e| SyncError::Store(format!("{}", e)))
+            .map_err(|e| local(&e))?;
+
+        if let Err(e) = self.maybe_prune(height, ctx) {
+            warn!("Pruning after block {}: {}", height, e);
+        }
+        Ok(connected)
+    }
+
+    /// Test kill point (see `ConnectStep`): fails `connect_block` with a
+    /// local fault once, right after `step`, when a test asked for it.
+    #[cfg(test)]
+    fn kill_point(&self, step: ConnectStep) -> Result<(), BlockFailure> {
+        let mut kill = self.connect_kill.lock().unwrap();
+        if *kill == Some(step) {
+            *kill = None;
+            return Err(BlockFailure::Local(SyncError::Store(format!(
+                "test kill after {:?}",
+                step
+            ))));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn kill_point(&self, _step: ConnectStep) -> Result<(), BlockFailure> {
+        Ok(())
+    }
+
+    /// Prune undo data and stored blocks that have fallen out of the keep
+    /// window below `validated` (ticket 050). Runs after every connect on
+    /// every path, so a phone kept current by background wakes prunes too.
+    ///
+    /// Triggered by what is stored, not by height: a store prunes once its
+    /// lowest height is more than `keep + slack` below `validated`, back to
+    /// `validated - keep`, and by at most `step` heights per call, so a wake
+    /// inheriting a backlog spends a bounded time on it. Undo pruning
+    /// records its horizon (`UtxoSet::undo_pruned_below`), which the reorg
+    /// path then can't roll back past. Blocks are also held back by the
+    /// prune lock (`set_prune_floor`).
+    ///
+    /// Only in a call that found the block store already inside its window
+    /// (no block prune due), a processing-length wake
+    /// (`ConnectCtx::has_maintenance_time`) migrates a pre-050 file to
+    /// incremental auto-vacuum, once per process and only with the disk
+    /// space for it (`BlockStore::migrate_auto_vacuum`).
+    fn maybe_prune(&self, validated: u32, ctx: ConnectCtx) -> Result<(), SyncError> {
+        let store_err = |e: &dyn std::fmt::Display| SyncError::Store(e.to_string());
+        let PruneWindow { keep, slack, step, lock_max_hold } = self.prune_window;
+        let horizon = validated.saturating_sub(keep);
+
+        if let Some(lowest) = self.utxo.lowest_undo_height().map_err(|e| store_err(&e))? {
+            if lowest < horizon.saturating_sub(slack) {
+                let to = horizon.min(lowest.saturating_add(step));
+                self.utxo.prune_undo_below(to).map_err(|e| store_err(&e))?;
+                debug!("Pruned undo data below {}", to);
+            }
+        }
+
+        let block_horizon = match self.prune_floor.load(Ordering::Relaxed) {
+            NO_PRUNE_FLOOR => horizon,
+            floor => horizon
+                .min(floor)
+                .max(validated.saturating_sub(lock_max_hold))
+                .min(horizon),
+        };
+        if let Some(lowest) = self.block_store.lowest_height().map_err(|e| store_err(&e))? {
+            if lowest < block_horizon.saturating_sub(slack) {
+                let to = block_horizon.min(lowest.saturating_add(step));
+                let pruned = self.block_store.prune_below(to).map_err(|e| store_err(&e))?;
+                debug!("Pruned {} blocks below {}", pruned, to);
+                return Ok(());
+            }
+        }
+
+        if ctx.has_maintenance_time()
+            && !self.vacuum_attempted.load(Ordering::Relaxed)
+            && self
+                .block_store
+                .needs_auto_vacuum_migration()
+                .map_err(|e| store_err(&e))?
+        {
+            // Once per process, done or not: a skip for disk space (or a
+            // failure) is retried by the next wake's process.
+            self.vacuum_attempted.store(true, Ordering::Relaxed);
+            info!("Block store: one-time migration to incremental auto-vacuum");
+            let started = Instant::now();
+            if self
+                .block_store
+                .migrate_auto_vacuum()
+                .map_err(|e| store_err(&e))?
+            {
+                info!("Block store migrated in {} ms", started.elapsed().as_millis());
+            }
+        }
+        Ok(())
+    }
+
+    /// Prune lock (ticket 050, for 035's wallet scanner): keep stored
+    /// blocks at or above `height` until the lock moves, or `None` clears
+    /// it. Bounded: never more than `PRUNE_LOCK_MAX_HOLD` blocks below the
+    /// validated tip, so a wallet that stops scanning can't fill the disk.
+    /// Undo pruning is unaffected (reorg depth is bounded on its own). In
+    /// memory: a wallet sets it again whenever the node opens.
+    #[allow(dead_code)] // Inert until a wallet registers (035).
+    pub fn set_prune_floor(&self, height: Option<u32>) {
+        self.prune_floor
+            .store(height.unwrap_or(NO_PRUNE_FLOOR), Ordering::Relaxed);
     }
 
     /// Full validation of a downloaded block at `height`, classified for
@@ -2348,9 +2785,11 @@ impl HeaderSync {
         }))
     }
 
-    /// Block-connect hook shared by every path that applies a block:
-    /// drop its transactions (and their conflicts) from the mempool and
-    /// settle any own transactions it confirms or conflicts.
+    /// Block-connect hook, run by `connect_block` for every block on every
+    /// path: drop its transactions (and their conflicts) from the mempool
+    /// and settle any own transactions it confirms or conflicts. Delivered
+    /// at least once: crash recovery runs it again, so everything here must
+    /// be idempotent.
     fn on_block_connected(&self, block: &bitcoin::Block, height: u32) {
         self.mempool.lock().unwrap().remove_confirmed(block);
         if let Err(e) = self.own_txs.on_block(block, height, unix_now_u32() as u64) {
@@ -3159,96 +3598,54 @@ impl HeaderSync {
                         continue;
                     }
 
-                    // Crash recovery: the UTXO set already holds this very
-                    // block (applied, then validated_height not updated).
-                    // A different block there is rolled back first.
-                    if self.utxo_has_block(next_height, block_hash)? {
-                        self.finish_recovered_block(&block, next_height)?;
-                        let best = pool.best_peer_addr().unwrap_or_default();
-                        on_progress(self.make_status(
-                            tip_height,
-                            peer_height,
-                            &pool,
-                            &best,
-                            false,
-                            next_height,
-                            None,
-                        ));
-                        continue;
-                    }
-
-                    // Mutation check, structure, scripts + UTXO spends.
-                    // Ticket 024: a bad copy costs the sender and is fetched
-                    // elsewhere; an invalid block costs the chain.
-                    match self.check_block(&block, next_height) {
-                        Ok(()) => {}
-                        Err(BlockFailure::Delivery(reason)) => {
-                            warn!(
-                                "Mutated block {} from {}: {}; fetching it elsewhere",
-                                next_height, block_peer_addr, reason
-                            );
-                            pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY);
-                            record_bad_delivery(&mut bad_deliveries, next_height, block_peer_addr);
-                            continue;
-                        }
-                        Err(BlockFailure::Consensus(reason)) => {
-                            self.reject_invalid_block(next_height, block_hash, &reason)?;
-                            if let Some(announcer) = header_source(&header_sources, next_height) {
-                                let announcer = announcer.to_string();
-                                self.ban_announcer(&mut pool, &announcer, block_hash);
+                    // Validate and connect: crash recovery, mutation check,
+                    // structure, scripts + UTXO spends, storage, hooks and
+                    // pruning (ticket 050). Ticket 024: a bad copy costs the
+                    // sender and is fetched elsewhere; an invalid block
+                    // costs the chain.
+                    let connected =
+                        match self.connect_block(&block, next_height, ConnectCtx::foreground()) {
+                            Ok(c) => c,
+                            Err(BlockFailure::Delivery(reason)) => {
+                                warn!(
+                                    "Mutated block {} from {}: {}; fetching it elsewhere",
+                                    next_height, block_peer_addr, reason
+                                );
+                                pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY);
+                                record_bad_delivery(&mut bad_deliveries, next_height, block_peer_addr);
+                                continue;
                             }
-                            let best = pool.best_peer_addr().unwrap_or_default();
-                            on_progress(self.make_status(
-                                next_height - 1,
-                                peer_height,
-                                &pool,
-                                &best,
-                                true,
-                                validated,
-                                Some(format!(
-                                    "Rejected an invalid block from the network at height {}: {}",
-                                    next_height, reason
-                                )),
-                            ));
-                            continue;
-                        }
-                        Err(BlockFailure::Local(e)) => return Err(e),
-                    }
-
-                    // Update UTXO set with this block's changes
-                    self.utxo
-                        .apply_block(&block, next_height)
-                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-                    // Store block for NODE_NETWORK_LIMITED serving (last 288 blocks)
-                    self.block_store
-                        .store_block(&block, next_height)
-                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-                    // Remove confirmed transactions from mempool
-                    self.on_block_connected(&block, next_height);
-
-                    self.store
-                        .set_validated_height(next_height)
-                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                            Err(BlockFailure::Consensus(reason)) => {
+                                self.reject_invalid_block(next_height, block_hash, &reason)?;
+                                if let Some(announcer) = header_source(&header_sources, next_height) {
+                                    let announcer = announcer.to_string();
+                                    self.ban_announcer(&mut pool, &announcer, block_hash);
+                                }
+                                let best = pool.best_peer_addr().unwrap_or_default();
+                                on_progress(self.make_status(
+                                    next_height - 1,
+                                    peer_height,
+                                    &pool,
+                                    &best,
+                                    true,
+                                    validated,
+                                    Some(format!(
+                                        "Rejected an invalid block from the network at height {}: {}",
+                                        next_height, reason
+                                    )),
+                                ));
+                                continue;
+                            }
+                            Err(BlockFailure::Local(e)) => return Err(e),
+                        };
 
                     // Relay new tip block to peers (skip during IBD catchup)
-                    if next_height == tip_height {
+                    if connected == Connected::Validated && next_height == tip_height {
                         let inv = vec![Inventory::Block(block_hash)];
                         pool.for_each_peer(|_addr, _, peer| {
                             peer.send_inv(inv.clone())
                                 .map_err(|e| format!("block relay: {}", e))
                         });
-                    }
-
-                    // Prune old data for deeply-buried blocks (keep 288 for reorgs)
-                    if next_height % 1000 == 0 && next_height > 288 {
-                        self.utxo
-                            .prune_undo_below(next_height - 288)
-                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
-                        self.block_store
-                            .prune_below(next_height - 288)
-                            .map_err(|e| SyncError::Store(format!("{}", e)))?;
                     }
 
                     if next_height % 1000 == 0 {
@@ -4782,30 +5179,10 @@ impl HeaderSync {
                 return Ok(notification);
             }
 
-            // Crash recovery, as in `sync()` and `catch_up_blocks`: the UTXO
-            // set may already hold this block, or a different one at this
-            // height that must be rolled back before validating.
-            match self.utxo_has_block(new_tip, block_hash) {
-                Ok(false) => {}
-                Ok(true) => {
-                    if let Err(e) = self.finish_recovered_block(&block, new_tip) {
-                        notification.validation_error = Some(format!("{}", e));
-                        return Ok(notification);
-                    }
-                    notification.validation_error = None;
-                    notification.validated = true;
-                    budget.mark(WakePhase::Validated);
-                    break;
-                }
-                Err(e) => {
-                    notification.validation_error = Some(format!("{}", e));
-                    return Ok(notification);
-                }
-            }
-
-            // Mutation check, structure, scripts (ticket 024 classes).
-            match self.check_block(&block, new_tip) {
-                Ok(()) => {}
+            // Validate and connect, the same path as `sync()` and
+            // `catch_up_blocks` (ticket 050), crash recovery included.
+            match self.connect_block(&block, new_tip, ConnectCtx::wake(budget)) {
+                Ok(_) => {}
                 Err(BlockFailure::Delivery(reason)) => {
                     warn!("validate_latest_block: mutated block from {}: {}", from, reason);
                     pool.misbehaving(&from, MUTATED_BLOCK_PENALTY);
@@ -4828,33 +5205,6 @@ impl HeaderSync {
                 }
             }
             notification.validation_error = None;
-
-            // Apply to UTXO set
-            if let Err(e) = self.utxo.apply_block(&block, new_tip) {
-                notification.validation_error =
-                    Some(format!("utxo: {}", e));
-                return Ok(notification);
-            }
-
-            // Store block for NODE_NETWORK_LIMITED serving. A failure here
-            // means the chain has advanced past `new_tip` in the UTXO set
-            // but `block_store` doesn't have the bytes — we'd be unable to
-            // serve this height to peers asking for it. Surface the error
-            // so the Swift caller can retry, matching the propagation
-            // pattern used in the main sync loop above.
-            if let Err(e) = self.block_store.store_block(&block, new_tip) {
-                notification.validation_error =
-                    Some(format!("block store: {}", e));
-                return Ok(notification);
-            }
-
-            // Remove confirmed transactions from mempool
-            self.on_block_connected(&block, new_tip);
-
-            self.store
-                .set_validated_height(new_tip)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
             notification.validated = true;
             budget.mark(WakePhase::Validated);
             info!("validate_latest_block: block {} fully validated", new_tip);
@@ -5151,24 +5501,10 @@ impl HeaderSync {
                 continue;
             }
 
-            // Crash recovery: the UTXO set already holds this very block
-            // (a different block there is rolled back first).
-            if self.utxo_has_block(next_height, block_hash)? {
-                if let Err(e) = self.finish_recovered_block(&block, next_height) {
-                    return Ok(CatchUpStatus {
-                        error: Some(format!("block {}: {}", next_height, e)),
-                        ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
-                    });
-                }
-                validated_height = next_height;
-                blocks_validated += 1;
-                bad_peers.clear();
-                continue;
-            }
-
-            // Mutation check, structure, scripts (ticket 024 classes).
-            match self.check_block(&block, next_height) {
-                Ok(()) => {}
+            // Validate and connect, the same path as `sync()` and
+            // `validate_latest_block` (ticket 050), crash recovery included.
+            match self.connect_block(&block, next_height, ConnectCtx::wake(budget)) {
+                Ok(_) => {}
                 Err(BlockFailure::Delivery(reason)) => {
                     warn!(
                         "catch_up_blocks: mutated block {} from {}: {}",
@@ -5201,26 +5537,6 @@ impl HeaderSync {
                 }
                 Err(BlockFailure::Local(e)) => return Err(e),
             }
-
-            // Update UTXO set
-            self.utxo
-                .apply_block(&block, next_height)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-            // Store block for NODE_NETWORK_LIMITED serving
-            if let Err(e) = self.block_store.store_block(&block, next_height) {
-                return Ok(CatchUpStatus {
-                    error: Some(format!("block store at {}: {}", next_height, e)),
-                    ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
-                });
-            }
-
-            // Remove confirmed transactions from mempool
-            self.on_block_connected(&block, next_height);
-
-            self.store
-                .set_validated_height(next_height)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
             validated_height = next_height;
             blocks_validated += 1;
@@ -6416,3 +6732,8 @@ mod inbound_tests;
 #[cfg(test)]
 #[path = "testkit/adversarial_sync.rs"]
 mod adversarial_tests;
+
+// Ticket 050: the shared connect path, pruning, resets and activation.
+#[cfg(test)]
+#[path = "testkit/connect_paths.rs"]
+mod connect_path_tests;

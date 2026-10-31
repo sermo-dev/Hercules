@@ -1203,3 +1203,174 @@ fn has_utxos_at_height_misses_blocks_with_no_stored_outputs() {
     assert!(!utxo.has_utxos_at_height(3).unwrap());
     assert_eq!(utxo.best_block().unwrap().map(|b| b.0), Some(3));
 }
+
+// ── Ticket 050: spent coins, the undo horizon, versions, wipes ───────
+
+fn coin(amount: u64, height: u32) -> UtxoEntry {
+    UtxoEntry { amount, script_pubkey: vec![0x51], height, is_coinbase: false }
+}
+
+/// `apply_block` hands back exactly the coins it recorded as undo, in
+/// input order and without in-block spends, and `spent_coins_at` reads
+/// the same list back until that undo is pruned.
+#[test]
+fn apply_block_returns_the_coins_it_wrote_to_undo() {
+    let (utxo, _d, _) = fresh();
+    utxo.test_insert_utxo([1; 32], 0, coin(1_000, 1)).unwrap();
+    utxo.test_insert_utxo([2; 32], 3, coin(2_000, 2)).unwrap();
+    let c1 = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+    let c2 = OutPoint::new(Txid::from_byte_array([2; 32]), 3);
+    let first = spend_tx(&[c1], vec![out(900, vec![0x52])]);
+    let chained = OutPoint::new(first.compute_txid(), 0);
+    let second = spend_tx(&[chained, c2], vec![out(2_800, vec![0x53])]);
+    let block = block_of(5, vec![coinbase(5, vec![out(50, vec![0x51])]), first, second]);
+
+    let spent = utxo.apply_block(&block, 5).unwrap();
+    let expected = vec![
+        SpentCoin { outpoint: c1, coin: coin(1_000, 1) },
+        SpentCoin { outpoint: c2, coin: coin(2_000, 2) },
+    ];
+    assert_eq!(spent, expected, "in-block spend included or order changed");
+    assert_eq!(utxo.spent_coins_at(5).unwrap(), Some(expected));
+    assert_eq!(utxo.spent_coins_at(6).unwrap(), Some(vec![]), "a height with no undo");
+
+    utxo.prune_undo_below(6).unwrap();
+    assert_eq!(utxo.spent_coins_at(5).unwrap(), None, "pruned undo reported as present");
+}
+
+/// `n` blocks from height 2, each spending the previous one's output, on
+/// a set seeded with one coin at height 1. Returns each height's hash.
+fn apply_spending_blocks(utxo: &UtxoSet, n: u32) -> BTreeMap<u32, [u8; 32]> {
+    utxo.test_insert_utxo([1; 32], 0, coin(1_000_000, 1)).unwrap();
+    let mut prev = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+    let mut hashes = BTreeMap::new();
+    for h in 2..2 + n {
+        let tx = spend_tx(&[prev], vec![out(1_000_000 - h as u64, vec![0x52, h as u8])]);
+        prev = OutPoint::new(tx.compute_txid(), 0);
+        let block = block_of(h, vec![coinbase(h, vec![out(50, vec![0x51])]), tx]);
+        hashes.insert(h, block.block_hash().to_byte_array());
+        utxo.apply_block(&block, h).unwrap();
+    }
+    hashes
+}
+
+/// The prune/reorg coupling in code: a height whose undo was pruned
+/// can't be rolled back (it used to delete the block's outputs, restore
+/// nothing and report success), and the refusal changes nothing.
+#[test]
+fn rollback_below_the_pruned_undo_horizon_is_refused() {
+    let (utxo, _d, _) = fresh();
+    let hashes = apply_spending_blocks(&utxo, 9); // heights 2..=10
+    utxo.prune_undo_below(6).unwrap();
+    for h in (6..=10).rev() {
+        utxo.rollback_block_to(h, hashes.get(&(h - 1)).copied().unwrap_or([0; 32])).unwrap();
+    }
+    let before = dump(&utxo);
+    let err = utxo.rollback_block_to(5, hashes[&4]).unwrap_err();
+    assert!(err.0.contains("was pruned"), "{}", err);
+    assert_eq!(dump(&utxo), before, "a refused rollback wrote something");
+    assert_eq!(utxo.best_block().unwrap(), Some((5, hashes[&5])));
+}
+
+#[test]
+fn prune_records_its_horizon_and_never_lowers_it() {
+    let (utxo, _d, path) = fresh();
+    assert_eq!(utxo.undo_pruned_below().unwrap(), 0);
+    apply_spending_blocks(&utxo, 9);
+    assert_eq!(utxo.lowest_undo_height().unwrap(), Some(2));
+    utxo.prune_undo_below(8).unwrap();
+    assert_eq!(utxo.undo_pruned_below().unwrap(), 8);
+    assert_eq!(utxo.lowest_undo_height().unwrap(), Some(8));
+    utxo.prune_undo_below(4).unwrap();
+    assert_eq!(utxo.undo_pruned_below().unwrap(), 8, "horizon moved down");
+    drop(utxo);
+    let utxo = UtxoSet::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(utxo.undo_pruned_below().unwrap(), 8, "horizon not persisted");
+}
+
+/// Apply N blocks spending snapshot coins on a snapshot-loaded set, roll
+/// all N back: the set's MuHash is the snapshot's again.
+#[test]
+fn snapshot_set_round_trips_to_its_muhash() {
+    let (utxo, _d, _) = fresh();
+    let hutx = Hutx::new((1..=6u8).map(|i| HutxEntry::new(i, i as u32, 10_000 * i as u64)).collect());
+    load(&utxo, &hutx.bytes(), Some(&hutx.anchor())).unwrap();
+    let snapshot_muhash = utxo.muhash().unwrap().unwrap();
+    assert_eq!(utxo.test_muhash(), snapshot_muhash, "test MuHash differs from load's");
+
+    let floor = hutx.height;
+    let mut hashes = BTreeMap::from([(floor, hutx.block_hash)]);
+    for (i, h) in (floor + 1..=floor + 5).enumerate() {
+        let i = i as u8 + 1;
+        let snap = OutPoint::new(Txid::from_byte_array([i; 32]), i as u32);
+        let block = block_of(
+            h,
+            vec![coinbase(h, vec![out(50, vec![0x51])]), spend_tx(&[snap], vec![out(9_000, vec![0x52, i])])],
+        );
+        hashes.insert(h, block.block_hash().to_byte_array());
+        utxo.apply_block(&block, h).unwrap();
+    }
+    assert_ne!(utxo.test_muhash(), snapshot_muhash);
+    for h in (floor + 1..=floor + 5).rev() {
+        utxo.rollback_block_to(h, hashes[&(h - 1)]).unwrap();
+    }
+    assert_eq!(utxo.test_muhash(), snapshot_muhash);
+    assert_eq!(utxo.compute_hash().unwrap(), hutx.hash());
+    assert_eq!(utxo.best_block().unwrap(), Some((floor, hutx.block_hash)));
+}
+
+/// A new env is stamped with this build's layout version; an env from
+/// before versioning (no key) is the same layout and opens as is; one
+/// from a newer build is refused with an error that says why.
+#[test]
+fn lmdb_schema_version_is_stamped_and_a_newer_one_refused() {
+    let (utxo, _d, path) = fresh();
+    let stamped = |u: &UtxoSet| {
+        let _gate = u.read_gate().unwrap();
+        let rtxn = u.env.read_txn().unwrap();
+        u.meta.get(&rtxn, META_KEY_SCHEMA_VERSION).unwrap().map(|b| b.to_vec())
+    };
+    assert_eq!(stamped(&utxo), Some(LMDB_SCHEMA_VERSION.to_le_bytes().to_vec()));
+
+    {
+        let _gate = utxo.read_gate().unwrap();
+        let mut wtxn = utxo.env.write_txn().unwrap();
+        utxo.meta.delete(&mut wtxn, META_KEY_SCHEMA_VERSION).unwrap();
+        wtxn.commit().unwrap();
+    }
+    utxo.apply_block(&block_of(1, vec![coinbase(1, vec![out(1, vec![0x51])])]), 1).unwrap();
+    drop(utxo);
+    let utxo = UtxoSet::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(utxo.count().unwrap(), 1, "pre-versioning env not kept");
+    assert_eq!(stamped(&utxo), Some(LMDB_SCHEMA_VERSION.to_le_bytes().to_vec()));
+
+    put_raw(&utxo, &utxo.meta, META_KEY_SCHEMA_VERSION, &(LMDB_SCHEMA_VERSION + 1).to_le_bytes());
+    drop(utxo);
+    let err = UtxoSet::open(path.to_str().unwrap()).err().expect("newer layout opened");
+    assert!(err.0.contains("newer than this build supports") && err.0.contains("downgraded"), "{}", err);
+}
+
+/// `wipe` empties the set (meta included, but not the layout version) and
+/// leaves no marker; while the marker is down the set reports as a load
+/// in progress, and a crash before it is removed ends in a wipe at open.
+#[test]
+fn wipe_empties_the_set_crash_safely() {
+    let (utxo, _d, path) = fresh();
+    let hutx = Hutx::new(vec![HutxEntry::new(1, 0, 5_000)]);
+    load(&utxo, &hutx.bytes(), Some(&hutx.anchor())).unwrap();
+    assert!(!utxo.load_in_progress());
+    utxo.wipe().unwrap();
+    assert_eq!(utxo.count().unwrap(), 0);
+    assert_eq!(utxo.assume_valid_floor().unwrap(), 0);
+    assert_eq!(utxo.best_block().unwrap(), None);
+    assert!(!utxo.load_in_progress() && !loading_marker_path(&path).exists());
+
+    // Killed mid-wipe: marker down, rows still there.
+    load(&utxo, &hutx.bytes(), Some(&hutx.anchor())).unwrap();
+    fs::write(loading_marker_path(&path), b"wipe in progress\n").unwrap();
+    assert!(utxo.load_in_progress());
+    drop(utxo);
+    let utxo = UtxoSet::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(utxo.count().unwrap(), 0);
+    assert!(!utxo.load_in_progress());
+}
