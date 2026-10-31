@@ -176,6 +176,33 @@ fn inflated_height_peer_withholding_headers_does_not_make_a_wake_report_caught_u
     );
 }
 
+/// A wake's withholding signal (ticket 054) is selection-only. Every peer
+/// claims our height (blocks were found since the handshake); the
+/// highest-scored one is asked first and has nothing new, the next one
+/// has headers. The first may just not have the newest block yet, so its
+/// saved score is untouched.
+#[test]
+fn a_peer_with_no_new_headers_during_a_wake_keeps_its_score() {
+    let c = chain(20);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &c.prefix(10));
+    let a = MockPeer::spawn(&c, vec![Behavior::InflatedHeight(10)]);
+    let b = MockPeer::spawn(&c, vec![Behavior::InflatedHeight(10)]);
+    let quiet = MockPeer::spawn(&c, vec![Behavior::InflatedHeight(10), Behavior::WithholdHeaders]);
+    node.peer_store().save_score(&quiet.addr(), 150).unwrap();
+    node.use_peers(&[&quiet, &a, &b]);
+
+    node.hs.catch_up_blocks(50, 15).unwrap();
+    assert!(node.tip().0 > 10, "no peer's headers were stored");
+    assert!(
+        quiet.log().iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+        "the quiet peer was never asked"
+    );
+    assert!(!node.is_banned(&quiet.addr()));
+    let score = node.score(&quiet.addr());
+    assert!(score.is_some_and(|s| s >= 150), "withholding cost saved score: {:?}", score);
+}
+
 /// Reviewer finding: the main loop asks the best peer again after a short
 /// batch, so a peer that claims the tallest chain and answers each
 /// `getheaders` with a single header sets the pace: one round trip (and a

@@ -283,9 +283,10 @@ const MAX_HEADERS_PER_MSG: usize = 2000;
 const WAKE_RECENT_TIP_SECS: u32 = 60 * 60;
 
 /// A peer said it had nothing past our tip, then another showed headers
-/// past it (ticket 054, 016's withholding signal). Small: an honest peer
-/// that hasn't received a block found seconds ago looks the same, and a
-/// wake runs right after one is found.
+/// past it (ticket 054, 016's withholding signal). A selection demerit
+/// only (`PeerPool::deprioritize`), never the persisted score: an honest
+/// peer that hasn't received a block found seconds ago looks the same,
+/// and a wake runs right after one is found.
 const WITHHELD_HEADERS_PENALTY: u32 = 5;
 
 /// Header-sync stall timeout (ticket 049), after Core's
@@ -5690,8 +5691,8 @@ impl HeaderSync {
     ///   budget, rather than failing the wake.
     /// - New headers go through the same checks as before (cross-check,
     ///   anchor, validation) and are stored. Peers that said there was
-    ///   nothing new before them lose a little score
-    ///   (`WITHHELD_HEADERS_PENALTY`).
+    ///   nothing new before them are deprioritized for this connection
+    ///   (`WITHHELD_HEADERS_PENALTY`); their score is untouched.
     /// - A second opinion whose chain doesn't hold our tip is no opinion
     ///   if it is behind us (it may not have our newest block yet). If it
     ///   claims our height or more, or its headers reach past our tip, it
@@ -5804,7 +5805,7 @@ impl HeaderSync {
                             addr,
                             headers.len()
                         );
-                        pool.misbehaving(&quiet, WITHHELD_HEADERS_PENALTY);
+                        pool.deprioritize(&quiet, WITHHELD_HEADERS_PENALTY);
                     }
                     let last = tip_height + headers.len() as u32;
                     sources.push((tip_height + 1, last, addr.clone()));
