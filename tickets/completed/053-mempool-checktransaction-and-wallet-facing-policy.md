@@ -165,3 +165,11 @@ Decided: stay at 1 sat/vB (see Decisions).
 ## Roadmap position
 
 Third in the pre-wallet hardening block: **049 → 050 → 053 → 054 → 052 → 025**. The duplicate-input fix is small and can go first. The wallet-facing parts (items 2–5) must land before 040 and the send flow.
+
+## Status (2026-10-31)
+
+Part 1 merged in PR #31 (`661d64a`); part 2 in PR #36 (`4ebb3b4`). Part 2: Core's `STANDARD_SCRIPT_VERIFY_FLAGS` checked through `hercules_policy.cpp` in the patched v26 library (linked in every build; non-Apple kernel builds refused by `compile_error!`); input/witness standardness, tx-size-small, policy scripts last, fee floors and `FeeBelowNetworkMinimum`; the mempool removal stream wired through `settle_mempool_removals`; own-tx delivery records (`own_tx_delivered`, `own_txs.sqlite3` schema 2) and reconciliation from the chain (`resolve_missing_own_input`); a tracker failure never stops a block connect (`unsettled_blocks`, retried on the maintenance tick, status "transaction tracking is behind"). Owner decisions taken as recommended: `CheckTransaction` failures disconnect without scoring; a send below a stale fee floor is still refused; Core 30's 2,500 sigop limit (BIP 54); the ~1–2 MB larger app.
+
+**At merge with 052:** the own-parent exception (serving a parent to a peer that knows an own descendant) sits on top of 052's rule that own txs only go to clean outbound peers.
+
+**Follow-ups:** TRUC / v3 policy (057).
