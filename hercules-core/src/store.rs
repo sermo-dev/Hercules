@@ -18,6 +18,46 @@ pub struct HeaderStore {
 /// there is normally no other connection; this is defense in depth.
 pub(crate) const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// `headers.sqlite3` layout version (`PRAGMA user_version`, ticket 050).
+///
+/// History:
+/// - 1: `headers`, `metadata`, `failed_blocks` (with `rules`) and
+///   `failed_block_bans` keyed on (addr, hash). Files from before
+///   versioning read 0 and are brought to this by the in-place fixups in
+///   `HeaderStore::open`.
+pub(crate) const HEADERS_SCHEMA_VERSION: u32 = 1;
+
+/// The layout version (`PRAGMA user_version`) of the SQLite file behind
+/// `conn`, read before anything touches its tables (ticket 050). A version
+/// above `supported` was written by a newer build (the app was
+/// downgraded): refused with an error saying so, since reading or
+/// "migrating" a layout we don't know could corrupt it. 0 means the file
+/// is new or predates versioning; the caller migrates anything below
+/// `supported` and then calls `set_schema_version`.
+pub(crate) fn check_schema_version(
+    conn: &Connection,
+    store: &str,
+    supported: u32,
+) -> Result<u32, String> {
+    let found: u32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| format!("read {} schema version: {}", store, e))?;
+    if found > supported {
+        return Err(format!(
+            "the {} has layout version {}, newer than this build supports ({}): the app \
+             was downgraded. Update the app, or reset the node to start over",
+            store, found, supported
+        ));
+    }
+    Ok(found)
+}
+
+/// Record `version` as the file's layout version, once its tables match it.
+pub(crate) fn set_schema_version(conn: &Connection, store: &str, version: u32) -> Result<(), String> {
+    conn.pragma_update(None, "user_version", version)
+        .map_err(|e| format!("set {} schema version: {}", store, e))
+}
+
 impl HeaderStore {
     /// Open or create a header store at the given path.
     pub fn open(path: &str) -> Result<HeaderStore, StoreError> {
@@ -29,6 +69,9 @@ impl HeaderStore {
         // also benefits from WAL's crash-recovery semantics.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| StoreError(format!("set WAL: {}", e)))?;
+
+        let version = check_schema_version(&conn, "header store", HEADERS_SCHEMA_VERSION)
+            .map_err(StoreError)?;
 
         conn.execute_batch(
             "
@@ -100,6 +143,9 @@ impl HeaderStore {
             ",
         )
         .map_err(|e| StoreError(format!("create failed-block tables: {}", e)))?;
+        if version < HEADERS_SCHEMA_VERSION {
+            set_schema_version(&conn, "header store", HEADERS_SCHEMA_VERSION).map_err(StoreError)?;
+        }
 
         let store = HeaderStore {
             conn: Mutex::new(conn),
@@ -1145,5 +1191,44 @@ mod tests {
         drop(store);
         let store = HeaderStore::open(path.to_str().unwrap()).unwrap();
         assert!(store.failed_hashes().unwrap().contains(&hash));
+    }
+
+    /// Ticket 050: every SQLite store stamps its layout version (an old
+    /// file, at 0, is today's layout and keeps its rows), and refuses a
+    /// file from a newer build with an error saying the app was downgraded.
+    #[test]
+    fn sqlite_stores_stamp_their_version_and_refuse_a_newer_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        type Opener = fn(&str) -> Result<(), String>;
+        let stores: [(&str, Opener); 4] = [
+            ("headers.sqlite3", |p| HeaderStore::open(p).map(drop).map_err(|e| e.0)),
+            ("blocks.sqlite3", |p| crate::block_store::BlockStore::open(p).map(drop).map_err(|e| e.0)),
+            ("own_txs.sqlite3", |p| crate::own_tx_store::OwnTxStore::open(p).map(drop).map_err(|e| e.0)),
+            ("peers.sqlite3", |p| crate::peer_store::PeerStore::open(p).map(drop).map_err(|e| e.0)),
+        ];
+        for (name, open) in stores {
+            let path = dir.path().join(name);
+            let p = path.to_str().unwrap();
+            let version = |v: Option<u32>| {
+                let conn = Connection::open(&path).unwrap();
+                if let Some(v) = v {
+                    conn.pragma_update(None, "user_version", v).unwrap();
+                }
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0)).unwrap()
+            };
+            open(p).unwrap();
+            let current = version(None);
+            assert_eq!(current, 1, "{} not stamped", name);
+
+            // A file from before versioning opens and is stamped.
+            version(Some(0));
+            open(p).unwrap();
+            assert_eq!(version(None), current, "{}", name);
+
+            version(Some(current + 1));
+            let err = open(p).expect_err(name);
+            assert!(err.contains("newer than this build supports") && err.contains("downgraded"), "{}: {}", name, err);
+            assert_eq!(version(None), current + 1, "{}: refused file was modified", name);
+        }
     }
 }

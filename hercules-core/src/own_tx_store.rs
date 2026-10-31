@@ -438,10 +438,21 @@ const SELECT_COLS: &str = "txid, raw, first_sent_at, last_sent_at, next_attempt_
 impl OwnTxStore {
     /// Open or create the tracker at `path` (`":memory:"` for tests).
     pub fn open(path: &str) -> Result<OwnTxStore, OwnTxStoreError> {
+        /// `own_txs.sqlite3` layout version (ticket 050). History: 1 = the
+        /// `own_txs` and `own_tx_seen` tables below.
+        const SCHEMA_VERSION: u32 = 1;
         let conn = Connection::open(path).map_err(db_err)?;
         conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT).map_err(db_err)?;
         if path != ":memory:" {
             conn.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
+        }
+        let version = crate::store::check_schema_version(&conn, "own tx store", SCHEMA_VERSION)
+            .map_err(OwnTxStoreError)?;
+        if version < SCHEMA_VERSION {
+            // Files from before versioning (0) already have this layout;
+            // the CREATE IF NOT EXISTS below covers new ones.
+            crate::store::set_schema_version(&conn, "own tx store", SCHEMA_VERSION)
+                .map_err(OwnTxStoreError)?;
         }
         conn.execute_batch(
             "

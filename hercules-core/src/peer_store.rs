@@ -20,6 +20,10 @@ pub struct PeerStore {
     conn: Mutex<Connection>,
 }
 
+/// `peers.sqlite3` layout version (`PRAGMA user_version`, ticket 050).
+/// History: 1 = `peer_scores`, `peer_bans` and `known_addrs`.
+const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct PeerStoreError(pub String);
 
@@ -61,6 +65,15 @@ impl PeerStore {
             .map_err(|e| PeerStoreError(format!("set WAL: {}", e)))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| PeerStoreError(format!("set synchronous: {}", e)))?;
+
+        let version = crate::store::check_schema_version(&conn, "peer store", SCHEMA_VERSION)
+            .map_err(PeerStoreError)?;
+        if version < SCHEMA_VERSION {
+            // Files from before versioning (0) already have this layout;
+            // the CREATE IF NOT EXISTS below covers new ones.
+            crate::store::set_schema_version(&conn, "peer store", SCHEMA_VERSION)
+                .map_err(PeerStoreError)?;
+        }
 
         conn.execute_batch(
             "
