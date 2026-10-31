@@ -184,7 +184,8 @@ impl SubmitError {
             | M::TooManyAncestors { .. }
             | M::AncestorSetTooLarge { .. }
             | M::TooManyDescendants { .. } => SubmitError::NonStandard(msg),
-            M::InsufficientFee { fee_rate, min_rate } => SubmitError::FeeTooLow {
+            M::InsufficientFee { fee_rate, min_rate }
+            | M::MempoolMinFeeNotMet { fee_rate, min_rate } => SubmitError::FeeTooLow {
                 fee_rate,
                 min: min_rate,
             },
