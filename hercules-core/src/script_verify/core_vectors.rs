@@ -61,12 +61,53 @@ fn consensus_flag(name: &str) -> Option<u32> {
     })
 }
 
-/// (consensus bits, whether every name was a consensus flag).
-fn parse_flags(s: &str) -> (u32, bool) {
+/// Every script flag name Core's vectors use, policy ones included, with
+/// Core's bit values (`script_verify_flag_name` order), for the policy-flag
+/// pass (ticket 053), which takes them all.
+fn any_flag(name: &str) -> Option<u32> {
+    if let Some(b) = consensus_flag(name) {
+        return Some(b);
+    }
+    Some(match name {
+        "STRICTENC" => 1 << 1,
+        "LOW_S" => 1 << 3,
+        "SIGPUSHONLY" => 1 << 5,
+        "MINIMALDATA" => 1 << 6,
+        "DISCOURAGE_UPGRADABLE_NOPS" => 1 << 7,
+        "CLEANSTACK" => 1 << 8,
+        "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => 1 << 12,
+        "MINIMALIF" => 1 << 13,
+        "NULLFAIL" => 1 << 14,
+        "WITNESS_PUBKEYTYPE" => 1 << 15,
+        "CONST_SCRIPTCODE" => 1 << 16,
+        "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => 1 << 18,
+        "DISCOURAGE_OP_SUCCESS" => 1 << 19,
+        "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => 1 << 20,
+        _ => return None,
+    })
+}
+
+/// Every flag bit (`MAX_SCRIPT_VERIFY_FLAGS`).
+pub const ALL_SCRIPT_FLAGS: u32 = (1 << 21) - 1;
+
+/// Which flag names a loader maps: the consensus seven (both backends'
+/// consensus entry points), or all of them (the policy pass).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FlagSet {
+    Consensus,
+    All,
+}
+
+/// (bits, whether every name was mapped).
+fn parse_flags_in(s: &str, set: FlagSet) -> (u32, bool) {
     let mut bits = 0;
     let mut exact = true;
     for n in s.split(',') {
-        match consensus_flag(n) {
+        let b = match set {
+            FlagSet::Consensus => consensus_flag(n),
+            FlagSet::All => any_flag(n),
+        };
+        match b {
             Some(b) => bits |= b,
             None => exact = false,
         }
@@ -83,6 +124,12 @@ fn load(json: &str) -> Vec<Value> {
 /// Skips vectors using `#SCRIPT#` / `#CONTROLBLOCK#` (they need Core's
 /// taproot builder) and any whose asm we can't parse.
 pub fn script_tests() -> Loaded {
+    script_tests_in(FlagSet::Consensus)
+}
+
+/// [`script_tests`] with `set`'s flags: under `FlagSet::All` every vector
+/// keeps all its flags and Core's verdict.
+pub fn script_tests_in(set: FlagSet) -> Loaded {
     let mut cases = vec![];
     let mut skipped = 0;
     for (idx, t) in load(SCRIPT_TESTS).iter().enumerate() {
@@ -116,7 +163,7 @@ pub fn script_tests() -> Loaded {
         };
         let flag_str = a[pos + 2].as_str().unwrap();
         let expected = a[pos + 3].as_str().unwrap();
-        let (mut flags, exact) = parse_flags(flag_str);
+        let (mut flags, exact) = parse_flags_in(flag_str, set);
         if flag_str.split(',').any(|f| f == "CLEANSTACK") {
             flags |= SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS; // as Core's DoTest
         }
@@ -159,6 +206,20 @@ pub fn script_tests() -> Loaded {
 /// `tx_valid.json` (flags = excluded set) and `tx_invalid.json` (flags =
 /// set under which it fails).
 pub fn tx_tests(valid_file: bool) -> Loaded {
+    tx_tests_in(valid_file, FlagSet::Consensus)
+}
+
+/// [`tx_tests`] with `set`'s flags (see [`script_tests_in`]). Under
+/// `FlagSet::All` a valid vector runs with every flag but the excluded
+/// ones, trimmed as Core's `TrimFlags` (no WITNESS without P2SH, no
+/// CLEANSTACK without WITNESS); an invalid one with its flags filled as
+/// `FillFlags` (CLEANSTACK adds WITNESS, WITNESS adds P2SH).
+pub fn tx_tests_in(valid_file: bool, set: FlagSet) -> Loaded {
+    let all = match set {
+        FlagSet::Consensus => SCRIPT_VERIFY_ALL_CONSENSUS,
+        FlagSet::All => ALL_SCRIPT_FLAGS,
+    };
+    let cleanstack = any_flag("CLEANSTACK").unwrap();
     let mut cases = vec![];
     let mut skipped = 0;
     let json = if valid_file { TX_VALID } else { TX_INVALID };
@@ -201,28 +262,36 @@ pub fn tx_tests(valid_file: bool) -> Loaded {
         let flag_str = a[2].as_str().unwrap();
         let (case_flags, expect_valid) = if valid_file {
             // Valid under ALL minus the excluded flags (soft forks are monotone).
-            let (excl, _) = parse_flags(flag_str);
-            (SCRIPT_VERIFY_ALL_CONSENSUS & !excl, Some(true))
+            let (excl, _) = parse_flags_in(flag_str, set);
+            (all & !excl, Some(true))
         } else if flag_str == "BADTX" {
             // Fails CheckTransaction, not scripts: compare backends only.
-            (SCRIPT_VERIFY_ALL_CONSENSUS, None)
+            (all, None)
         } else {
-            let (bits, exact) = parse_flags(flag_str);
+            let (bits, exact) = parse_flags_in(flag_str, set);
             (bits, exact.then_some(false))
         };
         // WITNESS requires P2SH. Mirror Core's transaction_tests TrimFlags
         // (valid: drop WITNESS if P2SH excluded) and FillFlags (invalid:
         // add P2SH if WITNESS set).
         let flags = if valid_file {
-            if case_flags & SCRIPT_VERIFY_P2SH == 0 {
-                case_flags & !SCRIPT_VERIFY_WITNESS
-            } else {
-                case_flags
+            let mut f = case_flags;
+            if f & SCRIPT_VERIFY_P2SH == 0 {
+                f &= !SCRIPT_VERIFY_WITNESS;
             }
-        } else if case_flags & SCRIPT_VERIFY_WITNESS != 0 {
-            case_flags | SCRIPT_VERIFY_P2SH
+            if f & SCRIPT_VERIFY_WITNESS == 0 {
+                f &= !cleanstack;
+            }
+            f
         } else {
-            case_flags
+            let mut f = case_flags;
+            if f & cleanstack != 0 {
+                f |= SCRIPT_VERIFY_WITNESS;
+            }
+            if f & SCRIPT_VERIFY_WITNESS != 0 {
+                f |= SCRIPT_VERIFY_P2SH;
+            }
+            f
         };
         let kind = if valid_file { "tx_valid" } else { "tx_invalid" };
         cases.push(Case {

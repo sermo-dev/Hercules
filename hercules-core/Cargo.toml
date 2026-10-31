@@ -12,7 +12,9 @@ uniffi = { version = "0.28", features = ["cli"] }
 bitcoin = { version = "0.32", features = ["serde"] }
 # Script verification backends (ticket 047). See src/script_verify/mod.rs.
 hercules-kernel-sys = { path = "kernel-sys", optional = true }
-bitcoinconsensus = { version = "0.106", optional = true }
+# The patched libbitcoinconsensus v26 is always linked: it is the relay
+# policy-flag script pass (ticket 053), and optionally the consensus backend.
+bitcoinconsensus = { version = "0.106" }
 hex = "0.4"
 sha2 = "0.10"
 sha3 = "0.10"
@@ -41,7 +43,7 @@ script-kernel = ["dep:hercules-kernel-sys"]
 # The frozen, patched libbitcoinconsensus v26 (patches/bitcoinconsensus).
 # Use instead of the kernel: `--no-default-features --features
 # script-consensus-legacy`. Enabling both backends alone is a compile error.
-script-consensus-legacy = ["dep:bitcoinconsensus"]
+script-consensus-legacy = []
 # Test-only: every script check runs through both backends and the process
 # aborts if they disagree. Compile error in release (non-test) builds.
 script-differential = ["script-kernel", "script-consensus-legacy"]

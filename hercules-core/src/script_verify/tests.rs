@@ -186,6 +186,53 @@ fn core_vectors_match_core_expected_results() {
     check_expected(&vector_cases());
 }
 
+/// Ticket 053: the policy-flag entry point (`hercules_policy.cpp`) gives
+/// Core's verdict on every Core vector under *all* its flags, policy ones
+/// included (LOW_S, NULLFAIL, CLEANSTACK, MINIMALDATA, the DISCOURAGE_*
+/// family, ...), which the consensus entry points can't take.
+#[test]
+fn policy_flag_pass_matches_core_vectors_under_all_flags() {
+    use core_vectors::FlagSet;
+    let script = core_vectors::script_tests_in(FlagSet::All);
+    let valid = core_vectors::tx_tests_in(true, FlagSet::All);
+    let invalid = core_vectors::tx_tests_in(false, FlagSet::All);
+    let mut checked = 0;
+    let mut policy_flagged = 0;
+    for c in script.cases.iter().chain(&valid.cases).chain(&invalid.cases) {
+        let Some(expect) = c.expect_valid else { continue };
+        let raw = serialize(&c.tx);
+        let utxos: Vec<bitcoinconsensus::Utxo> = c
+            .spent
+            .iter()
+            .map(|(amt, spk)| bitcoinconsensus::Utxo {
+                script_pubkey: spk.as_ptr(),
+                script_pubkey_len: spk.len() as u32,
+                value: *amt as i64,
+            })
+            .collect();
+        let ok = (0..c.tx.input.len()).all(|i| {
+            bitcoinconsensus::verify_with_policy_flags(&c.spent[i].1, c.spent[i].0, &raw, &utxos, i, c.flags)
+                .is_ok()
+        });
+        assert_eq!(ok, expect, "{}", c.name);
+        checked += 1;
+        if c.flags & !SCRIPT_VERIFY_ALL_CONSENSUS != 0 {
+            policy_flagged += 1;
+        }
+    }
+    // Most vectors carry a policy flag; guard against the loader dropping them.
+    assert!(checked > 1_300, "{} vectors checked", checked);
+    assert!(policy_flagged > 700, "{} vectors with policy flags", policy_flagged);
+}
+
+/// The policy pass's flag table is Core's STANDARD_SCRIPT_VERIFY_FLAGS as
+/// the library defines them by name, and a superset of the consensus ones.
+#[test]
+fn standard_flags_match_the_library() {
+    assert_eq!(STANDARD_SCRIPT_VERIFY_FLAGS, bitcoinconsensus::standard_flags());
+    assert_eq!(STANDARD_SCRIPT_VERIFY_FLAGS & SCRIPT_VERIFY_ALL_CONSENSUS, SCRIPT_VERIFY_ALL_CONSENSUS);
+}
+
 /// Every Core vector is loaded except a known few (the 5 script_tests
 /// that need Core's taproot builder, `#SCRIPT#`/`#CONTROLBLOCK#`, and the
 /// tx vectors that are coinbases or don't deserialize), and the number

@@ -23,6 +23,12 @@
 //! Linking both is safe only because the legacy build seals its symbols
 //! (see `patches/bitcoinconsensus/build.rs`).
 //!
+//! Whatever the consensus backend, mempool acceptance also runs a policy
+//! pass under Core's STANDARD_SCRIPT_VERIFY_FLAGS
+//! ([`verify_transaction_policy`], ticket 053) through the patched v26
+//! library's `hercules_policy.cpp`, so that library is linked in every
+//! build (sealed on Apple targets, as in differential mode).
+//!
 //! Both libraries take the same seven consensus flags with the same bit
 //! values; `chain_params::SCRIPT_VERIFY_*` is the source of truth and the
 //! tests below check it against each library's own constants.
@@ -226,6 +232,85 @@ pub fn verify_transaction(
     {
         Backend::ConsensusLegacy.verify_transaction(tx, spent, flags)
     }
+}
+
+/// Bitcoin Core's `STANDARD_SCRIPT_VERIFY_FLAGS` (policy/policy.h): the
+/// seven consensus flags plus the relay policy ones, which peers apply
+/// before relaying a transaction. Bit values are Core's
+/// `script_verify_flag_name` order, as both libraries number them; the
+/// tests check this against the legacy library's own table.
+pub const STANDARD_SCRIPT_VERIFY_FLAGS: u32 = SCRIPT_VERIFY_ALL_CONSENSUS
+    | (1 << 1)  // STRICTENC
+    | (1 << 3)  // LOW_S
+    | (1 << 6)  // MINIMALDATA
+    | (1 << 7)  // DISCOURAGE_UPGRADABLE_NOPS
+    | (1 << 8)  // CLEANSTACK
+    | (1 << 12) // DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+    | (1 << 13) // MINIMALIF
+    | (1 << 14) // NULLFAIL
+    | (1 << 15) // WITNESS_PUBKEYTYPE
+    | (1 << 16) // CONST_SCRIPTCODE
+    | (1 << 18) // DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+    | (1 << 19) // DISCOURAGE_OP_SUCCESS
+    | (1 << 20); // DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+
+/// First input failing the policy-flag pass, with Core's `ScriptError`
+/// string for the user (e.g. "Non-canonical signature: S value is
+/// unnecessarily high").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyScriptFailure {
+    pub input_index: usize,
+    pub error: ScriptVerifyError,
+    pub script_error: String,
+}
+
+/// Verify every input of `tx` under [`STANDARD_SCRIPT_VERIFY_FLAGS`]: Core's
+/// `PolicyScriptChecks` (ticket 053). Mempool acceptance only; a failure
+/// says nothing about consensus validity (rerun [`verify_transaction`] with
+/// the consensus flags to classify it).
+///
+/// Always the patched libbitcoinconsensus v26 (`hercules_policy.cpp`),
+/// whatever the consensus backend: the kernel's C API takes the consensus
+/// flags only. v26's interpreter has the same policy flags and semantics
+/// as the kernel's Core release; the consensus pass that follows runs on
+/// the consensus backend.
+pub fn verify_transaction_policy(tx: &Transaction, spent: &[SpentOutput]) -> Result<(), PolicyScriptFailure> {
+    let fail = |input_index, error| PolicyScriptFailure { input_index, error, script_error: String::new() };
+    if tx.input.is_empty() {
+        return Err(fail(0, ScriptVerifyError::NoInputs));
+    }
+    if spent.len() != tx.input.len() {
+        return Err(fail(0, ScriptVerifyError::SpentOutputsMismatch { inputs: tx.input.len(), spent: spent.len() }));
+    }
+    let raw = serialize(tx);
+    let utxos: Vec<bitcoinconsensus::Utxo> = spent
+        .iter()
+        .map(|(amt, spk)| bitcoinconsensus::Utxo {
+            script_pubkey: spk.as_ptr(),
+            script_pubkey_len: spk.len() as u32,
+            value: *amt as i64,
+        })
+        .collect();
+    for (input_index, (amount, spk)) in spent.iter().enumerate() {
+        if let Err((e, script_error)) = bitcoinconsensus::verify_with_policy_flags(
+            spk,
+            *amount,
+            &raw,
+            &utxos,
+            input_index,
+            STANDARD_SCRIPT_VERIFY_FLAGS,
+        ) {
+            use bitcoinconsensus::Error::*;
+            let error = match e {
+                ERR_SCRIPT => ScriptVerifyError::ScriptFailed,
+                ERR_TX_DESERIALIZE | ERR_TX_SIZE_MISMATCH => ScriptVerifyError::TxDeserialize,
+                ERR_INVALID_FLAGS => ScriptVerifyError::InvalidFlags(STANDARD_SCRIPT_VERIFY_FLAGS),
+                other => ScriptVerifyError::Library(format!("{}", other)),
+            };
+            return Err(PolicyScriptFailure { input_index, error, script_error });
+        }
+    }
+    Ok(())
 }
 
 /// Checks both libraries need but would handle differently (kernel aborts

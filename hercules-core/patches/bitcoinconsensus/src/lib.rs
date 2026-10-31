@@ -17,7 +17,7 @@ mod types;
 
 use core::fmt;
 
-use crate::types::{c_int64, c_uchar, c_uint};
+use crate::types::{c_int, c_int64, c_uchar, c_uint};
 
 /// Do not enable any verification.
 pub const VERIFY_NONE: c_uint = 0;
@@ -174,6 +174,56 @@ pub fn verify_with_flags(
     }
 }
 
+/// Hercules (ticket 053): Bitcoin Core's `STANDARD_SCRIPT_VERIFY_FLAGS`, as
+/// the v26 interpreter defines the bits (`hercules_policy.cpp`).
+pub fn standard_flags() -> u32 {
+    unsafe { ffi::bitcoinconsensus_hercules_standard_flags() as u32 }
+}
+
+/// Hercules (ticket 053): verify input `input_index` under any of the
+/// interpreter's flags, the relay policy ones included, which
+/// [`verify_with_flags`] refuses. `Err` carries the library error and, when
+/// the script failed (`ERR_SCRIPT`), Core's `ScriptErrorString`.
+pub fn verify_with_policy_flags(
+    spent_output_script: &[u8],
+    amount: u64,
+    spending_transaction: &[u8],
+    spent_outputs: &[Utxo],
+    input_index: usize,
+    flags: u32,
+) -> Result<(), (Error, String)> {
+    let mut error = Error::ERR_SCRIPT;
+    let mut script_error: c_int = 0;
+    let ret = unsafe {
+        ffi::bitcoinconsensus_hercules_verify_script_policy(
+            spent_output_script.as_ptr(),
+            spent_output_script.len() as c_uint,
+            amount,
+            spending_transaction.as_ptr(),
+            spending_transaction.len() as c_uint,
+            spent_outputs.as_ptr() as *const c_uchar,
+            spent_outputs.len() as c_uint,
+            input_index as c_uint,
+            flags as c_uint,
+            &mut error,
+            &mut script_error,
+        )
+    };
+    if ret == 1 {
+        return Ok(());
+    }
+    let mut buf = [0u8; 128];
+    let n = unsafe {
+        ffi::bitcoinconsensus_hercules_script_error_string(
+            script_error,
+            buf.as_mut_ptr() as *mut core::ffi::c_char,
+            buf.len() as c_uint,
+        )
+    } as usize;
+    let text = String::from_utf8_lossy(&buf[..n.min(buf.len() - 1)]).into_owned();
+    Err((error, text))
+}
+
 /// Mimics the Bitcoin Core UTXO typedef (bitcoinconsenus.h)
 // This is the TxOut data for utxos being spent, i.e., previous outputs.
 #[repr(C)]
@@ -225,6 +275,33 @@ pub mod ffi {
             flags: c_uint,
             err: *mut Error,
         ) -> c_int;
+
+        /// Hercules (ticket 053): `STANDARD_SCRIPT_VERIFY_FLAGS`.
+        pub fn bitcoinconsensus_hercules_standard_flags() -> c_uint;
+
+        /// Hercules (ticket 053): as
+        /// `bitcoinconsensus_verify_script_with_spent_outputs` with any
+        /// interpreter flag; `script_error` gets the `ScriptError`.
+        pub fn bitcoinconsensus_hercules_verify_script_policy(
+            script_pubkey: *const c_uchar,
+            script_pubkeylen: c_uint,
+            amount: u64,
+            tx_to: *const c_uchar,
+            tx_tolen: c_uint,
+            spent_outputs: *const c_uchar,
+            num_spent_outputs: c_uint,
+            n_in: c_uint,
+            flags: c_uint,
+            err: *mut Error,
+            script_error: *mut c_int,
+        ) -> c_int;
+
+        /// Hercules (ticket 053): `ScriptErrorString`, into `buf`.
+        pub fn bitcoinconsensus_hercules_script_error_string(
+            script_error: c_int,
+            buf: *mut core::ffi::c_char,
+            len: c_uint,
+        ) -> c_uint;
     }
 }
 
