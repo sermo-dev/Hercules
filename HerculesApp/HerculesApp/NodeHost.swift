@@ -40,7 +40,17 @@ final class NodeHost {
     /// Nodes opened in this process, for the "no second node" log check.
     private var opens = 0
 
-    private init() {}
+    private init() {
+        // Ticket 049: the node counts blocks it serves on a metered path
+        // against a daily upload cap, so it follows every path change.
+        NetworkPolicy.shared.onMeteredChange = { [weak self] metered in
+            guard let self = self else { return }
+            self.lock.lock()
+            let node = self.current
+            self.lock.unlock()
+            node?.setNetworkMetered(metered: metered)
+        }
+    }
 
     /// The process's node, opened on first use. Opening doesn't wait for
     /// Tor: bootstrap runs in the background and each caller waits only
@@ -62,6 +72,7 @@ final class NodeHost {
         )
         opens += 1
         StoragePaths.log.notice("NodeHost: opened node (\(self.opens) in this process)")
+        node.setNetworkMetered(metered: NetworkPolicy.shared.isMetered)
         current = node
         return (node, false)
     }

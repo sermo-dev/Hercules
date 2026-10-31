@@ -25,6 +25,7 @@ mod sync;
 mod testkit;
 mod tor;
 mod tor_v3;
+mod upload_budget;
 mod utxo;
 mod validation;
 mod wake;
@@ -1199,6 +1200,14 @@ impl HerculesNode {
         self.syncer.is_validation_paused()
     }
 
+    /// Tell the node whether the current network is metered (cellular),
+    /// from the app's `NetworkPolicy` (ticket 049). While it is, blocks
+    /// served to peers count against a daily upload cap
+    /// (`upload_budget`); joining an unmetered network resets it.
+    pub fn set_network_metered(&self, metered: bool) {
+        self.syncer.set_network_metered(metered);
+    }
+
     /// Get mempool status (transaction count, total size, max size).
     pub fn get_mempool_status(&self) -> MempoolStatus {
         self.syncer.get_mempool_status()
@@ -1837,6 +1846,7 @@ mod tests {
         assert!(f.node.get_tor_status().is_none(), "clearnet node reports a Tor status");
         f.node.set_validation_paused(true);
         assert!(f.node.is_validation_paused());
+        f.node.set_network_metered(true);
         f.node.stop_sync();
         f.node.stop_wallet_api();
         assert!(f.node.list_own_txs().unwrap().is_empty());
