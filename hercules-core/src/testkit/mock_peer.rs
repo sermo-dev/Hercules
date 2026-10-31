@@ -57,6 +57,10 @@ pub enum Behavior {
     Disconnect,
     /// Answer every `getheaders` with an empty `headers` message.
     WithholdHeaders,
+    /// Answer every `getheaders` with the chain's first this-many headers
+    /// (from genesis, whatever the locator): real but old headers, replayed
+    /// to outvote an honest peer in the cross-check (ticket 052).
+    ReplayOldHeaders(u32),
     /// Claim this start height in our `version` (a tip we may not have).
     InflatedHeight(i32),
     /// Answer `getheaders` with at most one header (a peer dribbling the
@@ -334,8 +338,16 @@ fn run_session(stream: TcpStream, shared: &Arc<Shared>) -> io::Result<()> {
                 return Ok(());
             }
             NetworkMessage::GetHeaders(gh) => {
+                let replay = behaviors.iter().find_map(|b| match b {
+                    Behavior::ReplayOldHeaders(n) => Some(*n as usize),
+                    _ => None,
+                });
                 let mut headers = if behaviors.iter().any(|b| matches!(b, Behavior::WithholdHeaders)) {
                     Vec::new()
+                } else if let Some(n) = replay {
+                    let mut h = shared.chain.lock().unwrap().headers_after(&[], BlockHash::all_zeros());
+                    h.truncate(n);
+                    h
                 } else {
                     shared
                         .chain

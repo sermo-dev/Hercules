@@ -25,6 +25,7 @@ mod sync;
 mod testkit;
 mod tor;
 mod tor_v3;
+mod tx_download;
 mod upload_budget;
 mod utxo;
 mod validation;

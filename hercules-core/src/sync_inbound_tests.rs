@@ -82,7 +82,9 @@ impl Fixture {
     }
 
     fn pending_gossip(&self) -> Vec<String> {
-        std::mem::take(&mut *self.hs.pending_gossip_addrs.lock().unwrap())
+        let queued = std::mem::take(&mut *self.hs.pending_gossip_addrs.lock().unwrap());
+        assert!(queued.iter().all(|(from, _)| from == ADDR), "gossip attributed to its sender");
+        queued.into_iter().flat_map(|(_, batch)| batch).collect()
     }
 }
 
