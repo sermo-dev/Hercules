@@ -85,24 +85,50 @@ const MAX_HEADER_COUNT: usize = 64;
 const MAX_LINE_LENGTH: usize = 8192;
 /// Idle timeout for keepalive connections (matches Bitcoin Core's default).
 const KEEPALIVE_TIMEOUT_SECS: u64 = 30;
+/// A request, once its first byte is in, must arrive in full within this
+/// (ticket 049): a client sending a byte per read timeout can't hold its
+/// connection for hours. Test builds shrink it so the bound is testable.
+#[cfg(not(test))]
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS);
+#[cfg(test)]
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long one response write may wait for the client to take bytes.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS);
+/// Connections served at once, each on its own thread (ticket 049), so one
+/// slow client can't keep the others out. More are dropped.
+const MAX_CONNECTIONS: usize = 4;
 
-/// Read one HTTP/1.1 request from a buffered reader. The caller owns the
+/// The head of an HTTP/1.1 request: method, path, lower-cased headers.
+type HttpHead = (String, String, HashMap<String, String>);
+
+/// Read one line (through `\n`) of at most `MAX_LINE_LENGTH` bytes (ticket
+/// 049): a longer one is refused after reading just past the limit, never
+/// buffered whole. `Ok(None)` at a clean end of stream.
+fn read_bounded_line<R: Read>(reader: &mut BufReader<R>, what: &str) -> Result<Option<String>, String> {
+    let mut line = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE_LENGTH as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .map_err(|e| format!("read {}: {}", what, e))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if line.len() > MAX_LINE_LENGTH {
+        return Err(format!("{} too long", what));
+    }
+    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+}
+
+/// Read the request line and headers of one HTTP/1.1 request, everything
+/// bounded (ticket 049), so it costs at most `MAX_HEADER_COUNT` lines of
+/// `MAX_LINE_LENGTH` before the caller checks auth. The caller owns the
 /// `BufReader` so it persists across requests on a keepalive connection.
 /// Returns `Err` on disconnect, timeout, or malformed input.
-fn read_http_request<R: Read>(
-    reader: &mut BufReader<R>,
-) -> Result<(String, String, HashMap<String, String>, Vec<u8>), String> {
+fn read_http_head<R: Read>(reader: &mut BufReader<R>) -> Result<HttpHead, String> {
     // Read request line.
-    let mut request_line = String::new();
-    let n = reader
-        .read_line(&mut request_line)
-        .map_err(|e| format!("read request line: {}", e))?;
-    if n == 0 {
-        return Err("client disconnected".into());
-    }
-    if request_line.len() > MAX_LINE_LENGTH {
-        return Err("request line too long".into());
-    }
+    let request_line = read_bounded_line(reader, "request line")?
+        .ok_or_else(|| "client disconnected".to_string())?;
     let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
     if parts.len() < 2 {
         return Err("malformed request line".into());
@@ -113,13 +139,9 @@ fn read_http_request<R: Read>(
     // Read headers.
     let mut headers = HashMap::new();
     for _ in 0..MAX_HEADER_COUNT {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read header: {}", e))?;
-        if line.len() > MAX_LINE_LENGTH {
-            return Err("header line too long".into());
-        }
+        let Some(line) = read_bounded_line(reader, "header line")? else {
+            break;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
@@ -129,23 +151,39 @@ fn read_http_request<R: Read>(
         }
     }
 
-    // Read body based on Content-Length.
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
+    // The body's size is known now, before anything else is read.
+    let content_length = content_length(&headers);
     if content_length > MAX_BODY_SIZE {
         return Err(format!("body too large: {} > {}", content_length, MAX_BODY_SIZE));
     }
+    Ok((method, path, headers))
+}
 
+fn content_length(headers: &HashMap<String, String>) -> usize {
+    headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Read the body of a request whose head `read_http_head` accepted.
+fn read_http_body<R: Read>(reader: &mut BufReader<R>, headers: &HashMap<String, String>) -> Result<Vec<u8>, String> {
+    let content_length = content_length(headers);
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader
             .read_exact(&mut body)
             .map_err(|e| format!("read body: {}", e))?;
     }
+    Ok(body)
+}
 
+/// Read one whole HTTP/1.1 request (head and body).
+fn read_http_request<R: Read>(
+    reader: &mut BufReader<R>,
+) -> Result<(String, String, HashMap<String, String>, Vec<u8>), String> {
+    let (method, path, headers) = read_http_head(reader)?;
+    let body = read_http_body(reader, &headers)?;
     Ok((method, path, headers, body))
 }
 
@@ -670,11 +708,15 @@ const SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(250)
 /// A stream the RPC server can serve: Tor in production, TCP in tests.
 trait RpcStream: Read + Write {
     fn set_rpc_read_timeout(&mut self, timeout: std::time::Duration);
+    fn set_rpc_write_timeout(&mut self, timeout: std::time::Duration);
 }
 
 impl RpcStream for crate::tor::TorStream {
     fn set_rpc_read_timeout(&mut self, timeout: std::time::Duration) {
         self.set_read_timeout(Some(timeout));
+    }
+    fn set_rpc_write_timeout(&mut self, timeout: std::time::Duration) {
+        self.set_write_timeout(Some(timeout));
     }
 }
 
@@ -683,33 +725,70 @@ impl RpcStream for std::net::TcpStream {
     fn set_rpc_read_timeout(&mut self, timeout: std::time::Duration) {
         let _ = self.set_read_timeout(Some(timeout));
     }
+    fn set_rpc_write_timeout(&mut self, timeout: std::time::Duration) {
+        let _ = self.set_write_timeout(Some(timeout));
+    }
+}
+
+/// One served connection's stream (ticket 049): every read waits at most
+/// until `deadline` (the keep-alive idle limit between requests, then
+/// `REQUEST_TIMEOUT` for the request itself) and gives up as soon as the
+/// server shuts down; every write waits at most `WRITE_TIMEOUT`.
+struct RpcConn<'a, S: RpcStream> {
+    stream: S,
+    deadline: Instant,
+    shutdown: &'a AtomicBool,
+}
+
+impl<'a, S: RpcStream> RpcConn<'a, S> {
+    fn new(mut stream: S, shutdown: &'a AtomicBool) -> Self {
+        stream.set_rpc_write_timeout(WRITE_TIMEOUT);
+        RpcConn { stream, deadline: Instant::now(), shutdown }
+    }
+}
+
+impl<S: RpcStream> Read for RpcConn<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "server shutting down"));
+            }
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
+            }
+            // Short reads, so a shutdown is noticed within SHUTDOWN_POLL.
+            self.stream
+                .set_rpc_read_timeout(left.min(SHUTDOWN_POLL).max(std::time::Duration::from_millis(1)));
+            match self.stream.read(buf) {
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
+                other => return other,
+            }
+        }
+    }
+}
+
+impl<S: RpcStream> Write for RpcConn<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// Wait until the next request's first bytes arrive. False if the client
 /// went away, stayed idle past the keep-alive timeout, or the server is
 /// shutting down.
-fn await_next_request<S: RpcStream>(reader: &mut BufReader<&mut S>, shutdown: &AtomicBool) -> bool {
-    let idle_since = std::time::Instant::now();
-    reader.get_mut().set_rpc_read_timeout(SHUTDOWN_POLL);
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return false;
-        }
-        match reader.fill_buf() {
-            Ok(buf) if buf.is_empty() => return false, // disconnected
-            Ok(_) => break,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
-                if idle_since.elapsed() >= std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS) {
-                    return false;
-                }
-            }
-            Err(_) => return false,
-        }
+fn await_next_request<S: RpcStream>(reader: &mut BufReader<RpcConn<'_, S>>) -> bool {
+    reader.get_mut().deadline = Instant::now() + std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS);
+    match reader.fill_buf() {
+        Ok(buf) if buf.is_empty() => return false, // disconnected
+        Ok(_) => {}
+        Err(_) => return false, // idle too long, shutting down, or gone
     }
-    // A request is arriving: give it the full timeout to finish.
-    reader
-        .get_mut()
-        .set_rpc_read_timeout(std::time::Duration::from_secs(KEEPALIVE_TIMEOUT_SECS));
+    // A request is arriving: it has REQUEST_TIMEOUT to finish.
+    reader.get_mut().deadline = Instant::now() + REQUEST_TIMEOUT;
     true
 }
 
@@ -720,23 +799,26 @@ fn await_next_request<S: RpcStream>(reader: &mut BufReader<&mut S>, shutdown: &A
 /// client, or server shutdown (checked while idle and between requests).
 fn handle_connection<S: RpcStream>(
     syncer: &HeaderSync,
-    mut stream: S,
+    stream: S,
     auth_token: &str,
     shutdown: &AtomicBool,
 ) {
-    let mut reader = BufReader::new(&mut stream);
+    let mut reader = BufReader::new(RpcConn::new(stream, shutdown));
 
     loop {
-        if !await_next_request(&mut reader, shutdown) {
+        if !await_next_request(&mut reader) {
             break;
         }
 
         // ── Read one HTTP request ──────────────────────────────────
+        // Bounded before auth (ticket 049): at most MAX_HEADER_COUNT
+        // lines of MAX_LINE_LENGTH and a MAX_BODY_SIZE body, within
+        // REQUEST_TIMEOUT.
         let (method, _path, headers, body) = match read_http_request(&mut reader) {
             Ok(r) => r,
             Err(e) => {
-                // Timeout or clean disconnect — normal keepalive exit.
-                if !e.contains("client disconnected") && !e.contains("timed out") {
+                // Timeout, clean disconnect or shutdown — normal keepalive exit.
+                if !e.contains("client disconnected") && !e.contains("timed out") && !e.contains("shutting down") {
                     warn!("wallet_rpc: bad HTTP request: {}", e);
                     let _ = write_http_response(reader.get_mut(), 400, "Bad Request", b"bad request", true);
                 }
@@ -804,6 +886,44 @@ fn handle_connection<S: RpcStream>(
     }
 }
 
+/// The accept loop: each connection `next` yields is served on a thread of
+/// its own, up to `MAX_CONNECTIONS` at once (ticket 049: before, one slow
+/// or trickling client held the only connection and kept every other
+/// wallet out). Returns once `shutdown` is set and the connections are
+/// done.
+fn serve_streams<S: RpcStream + Send + 'static>(
+    syncer: &Arc<HeaderSync>,
+    auth_token: &str,
+    shutdown: &Arc<AtomicBool>,
+    mut next: impl FnMut() -> Option<S>,
+) {
+    let mut limiter = RateLimiter::new(100, std::time::Duration::from_secs(60));
+    let mut connections: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
+    while !shutdown.load(Ordering::Relaxed) {
+        connections.retain(|c| !c.is_finished());
+        let Some(stream) = next() else {
+            // No pending connection — sleep briefly to avoid busy-wait.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        };
+        if !limiter.allow() {
+            warn!("wallet_rpc: rate limit exceeded, dropping connection");
+            continue;
+        }
+        if connections.len() >= MAX_CONNECTIONS {
+            warn!("wallet_rpc: {} connections open, dropping another", MAX_CONNECTIONS);
+            continue;
+        }
+        let (syncer, token, shutdown) = (Arc::clone(syncer), auth_token.to_string(), Arc::clone(shutdown));
+        connections.push(std::thread::spawn(move || handle_connection(&syncer, stream, &token, &shutdown)));
+    }
+
+    for c in connections {
+        let _ = c.join();
+    }
+}
+
 /// The wallet RPC server. Holds shared state and runs the accept loop.
 pub struct WalletRpcServer {
     syncer: Arc<HeaderSync>,
@@ -826,27 +946,12 @@ impl WalletRpcServer {
         }
     }
 
-    /// Run the accept loop. Blocks until `stop()` is called. Each inbound
-    /// connection is handled inline (wallet connections are rare enough
-    /// that parallelism isn't needed — Tor circuit setup already takes
-    /// seconds, so single-threaded handling adds negligible latency).
+    /// Run the accept loop. Blocks until `stop()` is called, and until
+    /// the connections it started have ended (each ends within
+    /// `SHUTDOWN_POLL` of the stop, or a write timeout).
     pub fn serve(&self) {
         info!("wallet_rpc: server started, waiting for connections");
-        let mut limiter = RateLimiter::new(100, std::time::Duration::from_secs(60));
-
-        while !self.shutdown.load(Ordering::Relaxed) {
-            if let Some(stream) = self.tor.accept_wallet_inbound() {
-                if !limiter.allow() {
-                    warn!("wallet_rpc: rate limit exceeded, dropping connection");
-                    continue;
-                }
-                handle_connection(&self.syncer, stream, &self.auth_token, &self.shutdown);
-            } else {
-                // No pending connection — sleep briefly to avoid busy-wait.
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-
+        serve_streams(&self.syncer, &self.auth_token, &self.shutdown, || self.tor.accept_wallet_inbound());
         info!("wallet_rpc: server stopped");
     }
 
@@ -1267,7 +1372,6 @@ mod tests {
     /// MAX_LINE_LENGTH check, so a client (before authenticating) can make
     /// the server buffer an arbitrarily long request line or header.
     #[test]
-    #[ignore = "BUG: read_http_request buffers a whole line before checking MAX_LINE_LENGTH (unbounded pre-auth memory)"]
     fn oversized_lines_are_refused_without_buffering_them() {
         for prefix in [&b""[..], &b"POST / HTTP/1.1\r\n"[..]] {
             let mut data = prefix.to_vec();
@@ -1440,6 +1544,102 @@ mod tests {
         BufReader::new(client).read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200") && response.contains("Connection: close"), "{}", response);
         handle.join().unwrap();
+    }
+
+    // ── Slow clients (ticket 049) ────────────────────────────────────
+
+    /// Write `bytes` to `client` one at a time, `every` apart, until done
+    /// or the server hangs up.
+    fn trickle(mut client: std::net::TcpStream, bytes: Vec<u8>, every: std::time::Duration) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            for b in bytes {
+                if client.write_all(&[b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(every);
+            }
+        })
+    }
+
+    #[test]
+    fn a_trickling_request_is_cut_off_at_the_request_timeout() {
+        let (client, handle, _dir) = served_connection(Arc::new(AtomicBool::new(false)));
+        let start = Instant::now();
+        let dripper = trickle(
+            client,
+            request(r#"{"jsonrpc":"2.0","method":"get_tip","id":1}"#, Some("token"), "").into_bytes(),
+            std::time::Duration::from_millis(100),
+        );
+        while !handle.is_finished() {
+            assert!(start.elapsed() < REQUEST_TIMEOUT + std::time::Duration::from_secs(3), "connection held past its request timeout");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(start.elapsed() >= REQUEST_TIMEOUT, "cut off early: {:?}", start.elapsed());
+        handle.join().unwrap();
+        dripper.join().unwrap();
+    }
+
+    /// `serve_streams` on a loopback listener; returns its address, the
+    /// shutdown flag and the server thread.
+    fn served_listener() -> (std::net::SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("headers.sqlite3").to_string_lossy().into_owned();
+        let hs = Arc::new(HeaderSync::new(&db, None).unwrap());
+        let listener = std::net::TcpListener::bind(crate::testkit::loopback_bind()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+        let server = std::thread::spawn(move || {
+            serve_streams(&hs, "token", &stop, || {
+                let (s, _) = listener.accept().ok()?;
+                // Accepted sockets inherit the listener's non-blocking mode.
+                s.set_nonblocking(false).unwrap();
+                Some(s)
+            })
+        });
+        (addr, shutdown, server, dir)
+    }
+
+    #[test]
+    fn a_slow_client_does_not_keep_out_another() {
+        let (addr, shutdown, server, _dir) = served_listener();
+        let slow = std::net::TcpStream::connect(addr).unwrap();
+        let dripper = trickle(slow, b"POST / HTTP/1.1\r\n".repeat(100), std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let start = Instant::now();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        client
+            .try_clone()
+            .unwrap()
+            .write_all(request(r#"{"jsonrpc":"2.0","method":"get_tip","id":1}"#, Some("token"), "").as_bytes())
+            .unwrap();
+        let (status, body) = read_response(&mut BufReader::new(client));
+        assert_eq!(status, 200, "{}", body);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "answered after {:?}", start.elapsed());
+
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        dripper.join().unwrap();
+    }
+
+    #[test]
+    fn connections_past_the_cap_are_dropped() {
+        let (addr, shutdown, server, _dir) = served_listener();
+        let open: Vec<std::net::TcpStream> = (0..MAX_CONNECTIONS)
+            .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            .collect();
+        // Let the accept loop take them all.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut extra = std::net::TcpStream::connect(addr).unwrap();
+        extra.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(matches!(extra.read(&mut buf), Ok(0) | Err(_)), "connection past the cap was served");
+        shutdown.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        drop(open);
     }
 
     // ── Properties ───────────────────────────────────────────────────

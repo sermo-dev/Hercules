@@ -1438,6 +1438,30 @@ impl PeerPool {
         }
     }
 
+    /// Raise a peer's height to `height`, a block it has shown it has (it
+    /// sent us that header, or announced a block we have there). Never
+    /// lowers it.
+    pub fn raise_peer_height(&self, addr: &str, height: u32) {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+            slot.height = slot.height.max(height);
+        }
+    }
+
+    /// A header batch from `addr` took our chain to `height` (ticket 049):
+    /// from now on its height is what it demonstrated, not what it claimed
+    /// at handshake. A short batch means the peer has nothing past
+    /// `height` (Core's rule too: a non-full `headers` ends the sync with
+    /// that peer), so its height becomes exactly that, and `best_peer`
+    /// rotates to a peer that may have more. A claim only buys a peer its
+    /// first round.
+    pub fn record_headers_from(&self, addr: &str, height: u32, full_batch: bool) {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+            slot.height = if full_batch { slot.height.max(height) } else { height };
+        }
+    }
+
     /// Update our reported height (used when connecting to new peers).
     pub fn update_our_height(&mut self, height: u32) {
         self.our_height = height;
@@ -1824,6 +1848,28 @@ mod tests {
         assert_eq!(pool.best_peer_addr(), Some("honest.peer:8333".to_string()));
         pool.lower_peer_height("liar.peer:8333", 950_000);
         assert_eq!(pool.get_peer_height("liar.peer:8333"), Some(400_000));
+    }
+
+    #[test]
+    fn header_batches_replace_claimed_heights_with_demonstrated_ones() {
+        // Ticket 049: a claim buys one round. A short batch ends at what the
+        // peer has, so the sync rotates to a peer that may have more.
+        let pool = test_pool();
+        add_slot(&pool, "liar.peer:8333", i32::MAX as u32);
+        add_slot(&pool, "honest.peer:8333", 400);
+        assert_eq!(pool.best_peer_addr(), Some("liar.peer:8333".to_string()));
+        pool.record_headers_from("liar.peer:8333", 1, false);
+        assert_eq!(pool.get_peer_height("liar.peer:8333"), Some(1));
+        assert_eq!(pool.best_peer_addr(), Some("honest.peer:8333".to_string()));
+        // A full batch only ever raises; so does an announcement of a
+        // block we have (`raise_peer_height`).
+        pool.record_headers_from("honest.peer:8333", 2_000, true);
+        assert_eq!(pool.get_peer_height("honest.peer:8333"), Some(2_000));
+        pool.record_headers_from("honest.peer:8333", 1_500, true);
+        assert_eq!(pool.get_peer_height("honest.peer:8333"), Some(2_000));
+        pool.raise_peer_height("liar.peer:8333", 3);
+        pool.raise_peer_height("liar.peer:8333", 2);
+        assert_eq!(pool.get_peer_height("liar.peer:8333"), Some(3));
     }
 
     #[test]

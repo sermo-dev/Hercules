@@ -12,6 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
 use tor_rtcompat::PreferredRuntime;
 
+use crate::p2p::{InboundHandshakes, Peer, PeerStream};
+
 /// Timeout for Tor bootstrap (first connection to the Tor network).
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -20,6 +22,11 @@ const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default read timeout for Tor streams.
 const TOR_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default write timeout for Tor streams (ticket 049): how long one write
+/// or flush may wait for the stream to take bytes (the circuit's flow
+/// control window fills when the far end stops reading).
+const TOR_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── TorError ──────────────────────────────────────────────────────────
 
@@ -63,6 +70,7 @@ pub struct TorStream {
     reader: tokio::io::ReadHalf<arti_client::DataStream>,
     writer: tokio::io::WriteHalf<arti_client::DataStream>,
     read_timeout: Duration,
+    write_timeout: Duration,
 }
 
 impl TorStream {
@@ -73,12 +81,21 @@ impl TorStream {
             reader,
             writer,
             read_timeout: TOR_READ_TIMEOUT,
+            write_timeout: TOR_WRITE_TIMEOUT,
         }
     }
 
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         self.read_timeout = timeout.unwrap_or(TOR_READ_TIMEOUT);
     }
+
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        self.write_timeout = timeout.unwrap_or(TOR_WRITE_TIMEOUT);
+    }
+}
+
+fn write_timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "Tor write timed out")
 }
 
 impl Read for TorStream {
@@ -99,13 +116,23 @@ impl Read for TorStream {
 
 impl Write for TorStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let timeout = self.write_timeout;
         let writer = &mut self.writer;
-        self.handle.block_on(async { writer.write(buf).await })
+        self.handle.block_on(async {
+            tokio::time::timeout(timeout, writer.write(buf))
+                .await
+                .unwrap_or_else(|_| Err(write_timed_out()))
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        let timeout = self.write_timeout;
         let writer = &mut self.writer;
-        self.handle.block_on(async { writer.flush().await })
+        self.handle.block_on(async {
+            tokio::time::timeout(timeout, writer.flush())
+                .await
+                .unwrap_or_else(|_| Err(write_timed_out()))
+        })
     }
 }
 
@@ -127,8 +154,10 @@ pub struct TorManager {
     client: TorClient<PreferredRuntime>,
     bootstrap_progress: Arc<AtomicU8>,
     onion_address: Option<String>,
-    /// Channel receiving inbound connections from the P2P onion service.
-    inbound_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<TorStream>>>,
+    /// Handshakes inbound connections from the P2P onion service off the
+    /// sync thread (ticket 049). Set once a node attaches
+    /// (`serve_inbound`); until then inbound connections are dropped.
+    inbound: Arc<std::sync::OnceLock<Arc<InboundHandshakes>>>,
     /// Handle to the running P2P onion service. Dropping this stops the service.
     _onion_handle: Option<OnionServiceHandle>,
     // ── Wallet API onion service (ticket 014) ────────────────────────
@@ -196,7 +225,7 @@ impl TorManager {
             client,
             bootstrap_progress,
             onion_address: None,
-            inbound_rx: None,
+            inbound: Arc::new(std::sync::OnceLock::new()),
             _onion_handle: None,
             wallet_state: std::sync::Mutex::new(WalletOnionState {
                 address: None,
@@ -358,8 +387,10 @@ impl TorManager {
         self.onion_address = Some(onion_addr.clone());
 
         // Spawn a background task that accepts inbound connections from the
-        // onion service and sends them as TorStream objects through a channel.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<TorStream>(16);
+        // onion service and runs each one's version handshake on the
+        // blocking pool (ticket 049). Only finished peers reach the sync
+        // loop, through `accept_inbound`.
+        let inbound = Arc::clone(&self.inbound);
         let accept_handle = handle.clone();
         handle.spawn(async move {
             use tokio_stream::StreamExt;
@@ -369,21 +400,29 @@ impl TorManager {
                 match rend_request.accept().await {
                     Ok(mut stream_requests) => {
                         // Level 2: Accept stream requests on this circuit
-                        let tx = tx.clone();
+                        let inbound = Arc::clone(&inbound);
                         let h = accept_handle.clone();
                         tokio::spawn(async move {
                             while let Some(stream_req) = stream_requests.next().await {
                                 use tor_cell::relaycell::msg::Connected;
+                                // No node to hand peers to yet, or every
+                                // handshake slot busy: refuse this stream
+                                // but keep accepting on this circuit.
+                                let Some(handshakes) = inbound.get().filter(|hs| hs.try_begin()) else {
+                                    continue;
+                                };
                                 match stream_req.accept(Connected::new_empty()).await {
                                     Ok(data_stream) => {
                                         let tor_stream = TorStream::new(h.clone(), data_stream);
-                                        if tx.try_send(tor_stream).is_err() {
-                                            // Channel full — drop this connection but keep
-                                            // accepting future ones on this circuit.
-                                            continue;
-                                        }
+                                        // Blocking I/O (`TorStream` blocks on
+                                        // this runtime): the blocking pool.
+                                        let handshakes = Arc::clone(handshakes);
+                                        tokio::task::spawn_blocking(move || {
+                                            handshakes.run(PeerStream::Tor(tor_stream))
+                                        });
                                     }
                                     Err(e) => {
+                                        handshakes.abandon();
                                         info!("Tor: failed to accept stream request: {}", e);
                                     }
                                 }
@@ -397,8 +436,6 @@ impl TorManager {
             }
         });
 
-        self.inbound_rx = Some(std::sync::Mutex::new(rx));
-
         self._onion_handle = Some(OnionServiceHandle {
             address: onion_addr.clone(),
             _service: Box::new(service),
@@ -407,12 +444,24 @@ impl TorManager {
         Ok(onion_addr)
     }
 
-    /// Try to accept a pending inbound connection from the P2P onion service.
-    /// Returns `None` if no connection is waiting (non-blocking).
-    pub fn accept_inbound(&self) -> Option<TorStream> {
-        self.inbound_rx
-            .as_ref()
-            .and_then(|rx| rx.lock().unwrap().try_recv().ok())
+    /// Start handshaking P2P onion-service connections for `handshakes`
+    /// (a node's, ticket 049). A client serves one node; later calls are
+    /// ignored.
+    pub fn serve_inbound(&self, handshakes: Arc<InboundHandshakes>) {
+        let _ = self.inbound.set(handshakes);
+    }
+
+    /// Our tip, for the `version` inbound handshakes answer with.
+    pub fn set_inbound_height(&self, height: u32) {
+        if let Some(hs) = self.inbound.get() {
+            hs.set_our_height(height);
+        }
+    }
+
+    /// Take an inbound peer whose handshake has finished, if one is
+    /// waiting (non-blocking).
+    pub fn accept_inbound(&self) -> Option<Peer> {
+        self.inbound.get().and_then(|hs| hs.next_peer())
     }
 
     // ── Wallet API onion service (ticket 014) ────────────────────────
