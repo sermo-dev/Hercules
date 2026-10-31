@@ -28,36 +28,99 @@ enum RelayConfig {
 class NotificationManager: ObservableObject {
     static let shared = NotificationManager()
 
-    @Published var isEnabled: Bool {
-        didSet { UserDefaults.standard.set(isEnabled, forKey: "notificationsEnabled") }
-    }
-    @Published var deviceToken: String?
-    @Published var registrationError: String?
+    /// Mirrors of `relay.state` for SwiftUI. Change them through
+    /// `enableNotifications` / `disableNotifications`.
+    @Published private(set) var isEnabled: Bool
+    @Published private(set) var deviceToken: String?
+    @Published private(set) var registrationError: String?
     @Published var notificationHistory: [BlockNotificationRecord] = []
 
-    var relayServerURL: String {
-        get { UserDefaults.standard.string(forKey: "relayServerURL") ?? RelayConfig.defaultBaseURL }
-        set { UserDefaults.standard.set(newValue, forKey: "relayServerURL") }
-    }
+    /// The relay registration state machine (ticket 054: its own type,
+    /// with injected I/O, so the XCTest target covers it).
+    let relay: RelayRegistration
 
-    private enum Keys {
-        static let registrationFingerprint = "relayRegistrationFingerprint"
-        static let registrationDate = "relayRegistrationDate"
-        static let unregisterPending = "relayUnregisterPending"
+    var relayServerURL: String {
+        get { relay.relayServerURL }
+        set { relay.relayServerURL = newValue }
     }
 
     private init() {
-        isEnabled = UserDefaults.standard.bool(forKey: "notificationsEnabled")
+        relay = RelayRegistration(
+            defaults: .standard,
+            transport: URLSession.shared,
+            registrar: ApplicationPushRegistrar(),
+            secret: RelayInstallSecret.secret(forRelayHost:),
+            defaultURL: RelayConfig.defaultBaseURL,
+            reregisterInterval: RelayConfig.reregisterInterval
+        )
+        isEnabled = relay.state.isEnabled
         if let loaded = NotificationHistory.loadIfReadable() {
             notificationHistory = loaded
             historyLoaded = true
         }
+        relay.onChange = { [weak self] state in
+            self?.isEnabled = state.isEnabled
+            self?.deviceToken = state.deviceToken
+            self?.registrationError = state.registrationError
+        }
+        // A push can launch the app before the first unlock, when the
+        // opt-in reads as off and the launch-time re-registration was
+        // skipped. Re-read it once data is available, and catch up on the
+        // re-registration (ticket 054 review).
+        protectedDataObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            let was = self.relay.state.isEnabled
+            self.relay.reload()
+            if self.relay.state.isEnabled && !was {
+                self.refreshRegistrationOnLaunch()
+            }
+        }
     }
+
+    private var protectedDataObserver: NSObjectProtocol?
 
     /// False if the history file couldn't be read at init (locked since
     /// reboot). `appendRecord` retries the load before saving so the real
     /// history is never replaced by an empty in-memory copy.
     private var historyLoaded = false
+
+    /// Opted in, read live from any thread (wakes decide off the main
+    /// thread). Nil when it can't be known: before the first unlock after a
+    /// reboot, UserDefaults reads as empty, i.e. "off", and a push that
+    /// cold-launched the app must not be dropped for it (ticket 054
+    /// review); it goes on to report "locked since reboot".
+    static var notificationsEnabledNow: Bool? {
+        RelayRegistration.enabledSetting(
+            stored: UserDefaults.standard.bool(forKey: RelayRegistration.Keys.enabled),
+            preferencesReadable: StoragePaths.protectedDataReadable(.system)
+        )
+    }
+
+    /// The gate's inputs as they stand (ticket 054). `snapshotPending`
+    /// defaults to the app's hint (`NodeSetupState`); the processing task
+    /// passes the node's own answer.
+    static func gateInputs(snapshotPending: Bool? = nil, userPaused: Bool = false) -> WakeGate.Inputs {
+        let policy = NetworkPolicy.shared
+        let network: WakeGate.Network
+        if policy.shouldValidate {
+            network = .allowed
+        } else {
+            network = policy.indicator == .offline ? .offline : .metered
+        }
+        let mode = ValidationModePreference.current
+        return WakeGate.Inputs(
+            mode: mode,
+            snapshotPending: snapshotPending ?? NodeSetupState.shared.snapshotPending(mode: mode),
+            network: network,
+            notificationsEnabled: notificationsEnabledNow,
+            freeBytes: StorageGuard.availableBytes(),
+            pauseBelowBytes: StorageGuard.pauseBelowBytes,
+            userPaused: userPaused
+        )
+    }
 
     // MARK: - Permission & Registration
 
@@ -68,13 +131,13 @@ class NotificationManager: ObservableObject {
         ) { granted, error in
             DispatchQueue.main.async {
                 if let error = error {
-                    self.registrationError = error.localizedDescription
+                    self.relay.handleRegistrationError(error.localizedDescription)
                     return
                 }
                 if granted {
                     UIApplication.shared.registerForRemoteNotifications()
                 } else {
-                    self.registrationError = "Notification permission denied"
+                    self.relay.handleRegistrationError("Notification permission denied")
                 }
             }
         }
@@ -90,192 +153,56 @@ class NotificationManager: ObservableObject {
     /// If the user turned notifications off and the relay unregister didn't
     /// complete, fetch the token again so it can be retried.
     func refreshRegistrationOnLaunch() {
-        if isEnabled {
-            UNUserNotificationCenter.current().getNotificationSettings { settings in
-                switch settings.authorizationStatus {
-                case .authorized, .provisional, .ephemeral:
-                    DispatchQueue.main.async {
-                        UIApplication.shared.registerForRemoteNotifications()
-                    }
-                default:
-                    break
-                }
+        guard isEnabled else {
+            relay.refreshOnLaunch(authorized: false)
+            return
+        }
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let authorized: Bool
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral: authorized = true
+            default: authorized = false
             }
-        } else if UserDefaults.standard.bool(forKey: Keys.unregisterPending) {
-            UIApplication.shared.registerForRemoteNotifications()
+            DispatchQueue.main.async {
+                self.relay.refreshOnLaunch(authorized: authorized)
+            }
         }
     }
 
     /// Opt in: request permission, then register with the relay once APNs
     /// hands us a token.
     func enableNotifications() {
-        isEnabled = true
-        UserDefaults.standard.removeObject(forKey: Keys.unregisterPending)
+        relay.enable()
         requestPermission()
     }
 
     /// Opt out: remove this install's row from the relay so it stops pushing
-    /// immediately instead of waiting for the 30-day TTL. Retried on next
-    /// launch if the request fails.
+    /// immediately instead of waiting for the 30-day TTL, and unregister
+    /// from APNs (ticket 054). Retried on next launch, and on any push that
+    /// still arrives, if the request fails.
     func disableNotifications() {
-        isEnabled = false
-        clearRegistrationMarker()
-        UserDefaults.standard.set(true, forKey: Keys.unregisterPending)
-        if let token = deviceToken {
-            deviceToken = nil
-            unregisterFromRelay(token: token, relayURL: relayServerURL)
-        } else {
-            // Token not known in this process yet: fetch it, and
-            // handleDeviceToken will unregister.
-            UIApplication.shared.registerForRemoteNotifications()
-        }
+        relay.disable()
     }
 
     /// Point the app at a different relay. Unregisters from the old one and
     /// registers with the new one when notifications are on.
     func updateRelayURL(_ newURL: String) {
-        let trimmed = newURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let oldURL = relayServerURL
-        guard !trimmed.isEmpty, trimmed != oldURL else { return }
-        relayServerURL = trimmed
-        clearRegistrationMarker()
-        if isEnabled, let token = deviceToken {
-            unregisterFromRelay(token: token, relayURL: oldURL)
-            registerWithRelay(token: token)
-        }
+        relay.updateRelayURL(newURL)
     }
 
     /// Called when APNs returns a device token.
     func handleDeviceToken(_ token: String) {
-        if isEnabled {
-            DispatchQueue.main.async {
-                self.deviceToken = token
-                self.registrationError = nil
-            }
-            registerWithRelay(token: token)
-        } else if UserDefaults.standard.bool(forKey: Keys.unregisterPending) {
-            unregisterFromRelay(token: token, relayURL: relayServerURL)
+        DispatchQueue.main.async {
+            self.relay.handleDeviceToken(token)
         }
     }
 
     /// Called when APNs registration fails (e.g., no developer account).
     func handleRegistrationError(_ error: Error) {
         DispatchQueue.main.async {
-            self.registrationError = error.localizedDescription
+            self.relay.handleRegistrationError(error.localizedDescription)
         }
     }
-
-    // MARK: - Relay Registration
-
-    /// Send the device token and this install's secret to the relay. Skipped
-    /// when the same token was registered with the same relay within
-    /// `RelayConfig.reregisterInterval`.
-    private func registerWithRelay(token: String) {
-        let relayURL = relayServerURL
-        let fingerprint = Self.registrationFingerprint(token: token, relayURL: relayURL)
-        let defaults = UserDefaults.standard
-        if defaults.string(forKey: Keys.registrationFingerprint) == fingerprint,
-           Date().timeIntervalSince1970 - defaults.double(forKey: Keys.registrationDate)
-               < RelayConfig.reregisterInterval {
-            return
-        }
-
-        guard let request = Self.relayRequest(
-            relayURL: relayURL,
-            path: "register",
-            body: ["device_token": token, "platform": "ios"]
-        ) else { return }
-
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            if let error = error {
-                // Not critical: retried on next launch.
-                print("Relay registration failed: \(error.localizedDescription)")
-                return
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            switch status {
-            case 200:
-                defaults.set(fingerprint, forKey: Keys.registrationFingerprint)
-                defaults.set(Date().timeIntervalSince1970, forKey: Keys.registrationDate)
-            case 403:
-                // Token is bound to a different install secret (e.g. the
-                // Keychain item was lost). The old row expires within 30 days.
-                DispatchQueue.main.async {
-                    self.registrationError = "Relay rejected this install's registration"
-                }
-            default:
-                print("Relay registration failed: HTTP \(status)")
-            }
-        }.resume()
-    }
-
-    /// Remove this install's row from the relay.
-    private func unregisterFromRelay(token: String, relayURL: String) {
-        guard let request = Self.relayRequest(
-            relayURL: relayURL,
-            path: "unregister",
-            body: ["device_token": token]
-        ) else { return }
-
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            if let error = error {
-                print("Relay unregister failed: \(error.localizedDescription)")
-                return
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            // 403 means the row belongs to another secret; nothing more we can do.
-            guard status == 200 || status == 403 else {
-                print("Relay unregister failed: HTTP \(status)")
-                return
-            }
-            DispatchQueue.main.async {
-                // Only clear the retry flag if the user hasn't re-enabled in
-                // the meantime and this was the current relay.
-                if !self.isEnabled && relayURL == self.relayServerURL {
-                    UserDefaults.standard.removeObject(forKey: Keys.unregisterPending)
-                } else if self.isEnabled, relayURL == self.relayServerURL, let current = self.deviceToken {
-                    // Re-enabled while the unregister was in flight: make
-                    // sure the row exists again.
-                    self.clearRegistrationMarker()
-                    self.registerWithRelay(token: current)
-                }
-            }
-        }.resume()
-    }
-
-    /// Build a POST to `<relayURL>/<path>` carrying `body` plus the
-    /// per-install secret for that relay. Nil if the URL is invalid or the
-    /// Keychain is unavailable (e.g. before first unlock after reboot).
-    private static func relayRequest(relayURL: String, path: String, body: [String: String]) -> URLRequest? {
-        var base = relayURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        while base.hasSuffix("/") { base.removeLast() }
-        guard let url = URL(string: "\(base)/\(path)"), let host = url.host else { return nil }
-        guard let secret = RelayInstallSecret.secret(forRelayHost: host) else {
-            print("Relay \(path) skipped: install secret unavailable")
-            return nil
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 15
-        var payload = body
-        payload["install_secret"] = secret
-        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-        return request
-    }
-
-    /// Hash of token + relay, so UserDefaults never holds the raw token.
-    private static func registrationFingerprint(token: String, relayURL: String) -> String {
-        let digest = SHA256.hash(data: Data("\(token)|\(relayURL)".utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private func clearRegistrationMarker() {
-        UserDefaults.standard.removeObject(forKey: Keys.registrationFingerprint)
-        UserDefaults.standard.removeObject(forKey: Keys.registrationDate)
-    }
-
     // MARK: - Silent Push Handling
 
     /// Handle a silent push notification. Catches up on the process's shared
@@ -293,6 +220,18 @@ class NotificationManager: ObservableObject {
         userInfo: [AnyHashable: Any],
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
+        // Notifications are off (ticket 054). The relay only pushes because
+        // our unregister hasn't reached it (offline, 429, 5xx): retry that,
+        // and open nothing. A warm process used to run the whole wake here.
+        // Read live, not `isEnabled` (loaded at init, possibly before the
+        // first unlock). Unknown is not "off".
+        guard Self.notificationsEnabledNow != false else {
+            StoragePaths.log.notice("wake: push while notifications are off; retrying the unregister")
+            relay.pushArrivedWhileDisabled()
+            completionHandler(.noData)
+            return
+        }
+
         // The wake's clock starts here: node open and transport bootstrap
         // count against the same budget as block work (ticket 028).
         let budget = WakeBudget(budgetMs: WakeConfig.budgetMs)
@@ -319,13 +258,30 @@ class NotificationManager: ObservableObject {
         // Parse block info from push payload (used as fallback if validation fails)
         let pushBlock = parsePushPayload(userInfo)
 
-        // Network policy gate: refuse to validate over metered links unless
-        // the user has explicitly opted in. Record a paused entry so the
-        // user can see in the notification history that we declined the wake.
-        // No path at all (or none reported within the first-path wait) is
-        // recorded as offline, not as a metered-network skip.
-        if !NetworkPolicy.shared.shouldValidate {
-            let offline = NetworkPolicy.shared.indicator == .offline
+        // The shared wake gate (ticket 054): notifications, validation mode,
+        // network policy, storage, snapshot state.
+        let decision = WakeGate.decide(.push, Self.gateInputs())
+        switch decision {
+        case .run:
+            break
+        case .skip(.notificationsOff):
+            // Turned off while the first path was awaited.
+            relay.pushArrivedWhileDisabled()
+            completionHandler(.noData)
+            return
+        case .skip(.modeNotChosen):
+            // Notifications were enabled before any mode was chosen: there
+            // is no node to catch up yet, and nothing worth telling.
+            StoragePaths.log.notice("wake: no validation mode chosen; skipping push")
+            completionHandler(.noData)
+            return
+        case .skip(.offline), .skip(.metered):
+            // Refuse to validate over metered links unless the user has
+            // explicitly opted in. Record a paused entry so the user can
+            // see in the notification history that we declined the wake.
+            // No path at all (or none reported within the first-path wait)
+            // is recorded as offline, not as a metered-network skip.
+            let offline = decision == .skip(.offline)
             // Republish shared state with isPaused=true so the home-screen
             // widget flips to its red "paused" indicator without waiting
             // for the user to open the app.
@@ -352,11 +308,9 @@ class NotificationManager: ObservableObject {
             }
             completionHandler(.noData)
             return
-        }
-
-        // Low storage (ticket 030): don't let a wake push LMDB/SQLite into
-        // ENOSPC. Record a visible skip instead.
-        if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
+        case .skip(.lowStorage(let free)):
+            // Low storage (ticket 030): don't let a wake push LMDB/SQLite
+            // into ENOSPC. Record a visible skip instead.
             if let push = pushBlock {
                 let record = BlockNotificationRecord(
                     id: UUID(),
@@ -372,6 +326,10 @@ class NotificationManager: ObservableObject {
                 )
                 appendRecord(record)
             }
+            completionHandler(.noData)
+            return
+        case .skip(.snapshotPending), .skip(.userPaused):
+            // Not push outcomes (processing and foreground only).
             completionHandler(.noData)
             return
         }
@@ -573,15 +531,20 @@ class NotificationManager: ObservableObject {
             case let .ran(report, nodeReadyMs, nodeReused, peerCount, cancelReason):
                 let timings = Self.timings(report, trigger: trigger, nodeReadyMs: nodeReadyMs, nodeReused: nodeReused)
                 switch report.outcome {
-                case .completed, .cancelled, .timedOut:
+                case .completed, .unconfirmed, .cancelled, .timedOut:
                     // A status counts only if headers were checked against
-                    // peers (completed), blocks were actually validated, or
-                    // peers disagreed or served an invalid block (those
-                    // alerts survive a cancel); otherwise it is just the
-                    // local tip.
+                    // peers (completed, or unconfirmed: checked, but one
+                    // peer's word for the tip, ticket 054), blocks were
+                    // actually validated, or peers disagreed or served an
+                    // invalid block (those alerts survive a cancel);
+                    // otherwise it is just the local tip.
                     if let status = report.status,
-                       report.outcome == .completed || status.blocksValidated > 0
+                       report.outcome == .completed || report.outcome == .unconfirmed
+                        || status.blocksValidated > 0
                         || status.tipDisagreement || status.invalidChainDetected {
+                        // The node's own answer keeps the app's hint honest.
+                        NodeSetupState.shared.snapshotLoaded =
+                            ValidationModePreference.current == .assumeUtxo && !status.awaitingSnapshot
                         var record = Self.makeRecord(from: status, receivedAt: receivedAt)
                         record.wakeTimings = timings
                         return WakeRun(
@@ -792,23 +755,23 @@ class NotificationManager: ObservableObject {
     }
 
     private static func makeRecord(from status: CatchUpStatus, receivedAt: Date = Date()) -> BlockNotificationRecord {
-        let source: NotificationSource
-        if status.invalidChainDetected {
-            source = .invalidChain
-        } else if status.tipDisagreement {
-            source = .tipDisagreement
-        } else if status.caughtUp {
-            source = .fullValidation
-        } else if status.blocksValidated > 0 {
-            source = .catchUpProgress
-        } else {
-            source = .headerOnly
-        }
+        let source = NotificationSource.catchUp(
+            caughtUp: status.caughtUp,
+            blocksValidated: status.blocksValidated,
+            behind: status.currentHeight < status.targetHeight,
+            tipConfirmed: status.tipConfirmed,
+            awaitingSnapshot: status.awaitingSnapshot,
+            tipDisagreement: status.tipDisagreement,
+            invalidChain: status.invalidChainDetected
+        )
+        // Headers-only before setup is finished: the height is the header
+        // tip, never the "#0" of a node that has validated nothing.
+        let height = source == .awaitingSetup ? status.targetHeight : status.currentHeight
         return BlockNotificationRecord(
             id: UUID(),
-            height: status.currentHeight,
-            blockHash: status.tipBlockHash,
-            timestamp: status.tipTimestamp,
+            height: height,
+            blockHash: source == .awaitingSetup ? "" : status.tipBlockHash,
+            timestamp: source == .awaitingSetup ? 0 : status.tipTimestamp,
             timestampHuman: "",
             validated: status.caughtUp,
             headerValidated: true,
@@ -863,6 +826,13 @@ class NotificationManager: ObservableObject {
         blocksValidated: UInt32 = 1,
         remaining: UInt32 = 0
     ) {
+        // "Finish setup" is said once, not on every block (ticket 054).
+        if record.source == .awaitingSetup {
+            let setup = NodeSetupState.shared
+            guard !setup.finishSetupNotified else { return }
+            setup.finishSetupNotified = true
+        }
+
         let content = UNMutableNotificationContent()
 
         switch record.source {
@@ -873,6 +843,12 @@ class NotificationManager: ObservableObject {
             let startHeight = record.height - blocksValidated + 1
             content.title = "Catching up: blocks #\(startHeight)–#\(record.height)"
             content.body = "\(blocksValidated) blocks validated, \(remaining) remaining"
+        case .unconfirmed:
+            content.title = "Couldn't Confirm the Latest Block"
+            content.body = "Validated through #\(record.height), but only one peer answered, so Hercules can't be sure it's the newest block. It checks again on the next one."
+        case .awaitingSetup:
+            content.title = "Headers Synced — Finish Setup to Validate"
+            content.body = "Open Hercules to load the UTXO snapshot. Until then it only follows block headers."
         case .tipDisagreement:
             content.title = "Chain Tip Disagreement"
             content.body = "Peers disagree on the chain tip at block #\(record.height). Retrying next wake."
@@ -911,11 +887,21 @@ class NotificationManager: ObservableObject {
             content.body = record.validationError ?? ""
         }
 
-        content.sound = .default
+        // Ticket 054: at ~144 blocks a day, routine block news is passive
+        // and silent, and replaces itself in place, so it never buries a
+        // wallet alert. Only an eclipse or invalid-chain alert makes noise.
+        let style = record.source.notificationStyle
+        if style.alerts {
+            content.sound = .default
+            content.interruptionLevel = .active
+        } else {
+            content.sound = nil
+            content.interruptionLevel = .passive
+        }
         content.userInfo = ["height": record.height, "hash": record.blockHash]
 
         let request = UNNotificationRequest(
-            identifier: record.height > 0 ? "block-\(record.height)" : "block-\(record.blockHash)",
+            identifier: style.identifier(height: record.height, blockHash: record.blockHash),
             content: content,
             trigger: nil // Deliver immediately
         )
@@ -971,13 +957,10 @@ class NotificationManager: ObservableObject {
         // Respect the same network policy gate as silent push wakes, once
         // the monitor has reported (this handler can be the cold launch's
         // first code, on a background queue; ticket 051).
+        // The shared gate (ticket 054) adds the validation mode: a refresh
+        // before any mode is chosen has nothing to catch up.
         NetworkPolicy.shared.waitForFirstPath()
-        guard NetworkPolicy.shared.shouldValidate else {
-            gate.fire { task.setTaskCompleted(success: true) }
-            return
-        }
-
-        if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes {
+        guard case .run = WakeGate.decide(.refresh, Self.gateInputs()) else {
             gate.fire { task.setTaskCompleted(success: true) }
             return
         }
@@ -1078,12 +1061,24 @@ class NotificationManager: ObservableObject {
             // traffic. Metered or offline now: try again in a later
             // window (`scheduleProcessingTask` does nothing until a
             // validation mode has been chosen).
-            guard NetworkPolicy.shared.shouldValidate else {
+            // The shared gate (ticket 054), first without the snapshot
+            // state, which needs the node open.
+            switch WakeGate.decide(.processing, Self.gateInputs(snapshotPending: false)) {
+            case .run:
+                break
+            case .skip(.offline), .skip(.metered):
                 Self.scheduleProcessingTask()
                 gate.fire { task.setTaskCompleted(success: true) }
                 return
+            case .skip:
+                gate.fire { task.setTaskCompleted(success: true) }
+                return
             }
-            guard Self.nodeIsSetUp() else {
+            // Then with the node's own answer: AssumeUTXO without its
+            // snapshot has nothing for a long catch-up to do.
+            guard case .run = WakeGate.decide(
+                .processing, Self.gateInputs(snapshotPending: Self.snapshotPendingInNode())
+            ) else {
                 gate.fire { task.setTaskCompleted(success: true) }
                 return
             }
@@ -1096,8 +1091,9 @@ class NotificationManager: ObservableObject {
             var lastRun: WakeRun?
             var lastStatus: CatchUpStatus?
             while rounds < WakeConfig.processingMaxRounds && yields < WakeConfig.processingMaxYields {
-                if expired.value || !NetworkPolicy.shared.shouldValidate { break }
-                if let free = StorageGuard.availableBytes(), free < StorageGuard.pauseBelowBytes { break }
+                if expired.value { break }
+                // Policy and storage again before every round.
+                guard case .run = WakeGate.decide(.processing, Self.gateInputs(snapshotPending: false)) else { break }
                 // Pushes and refreshes go first: they have ~30 s, a round
                 // has minutes. One admitted mid-round cancels the round,
                 // and a round asking while one is in flight is told to
@@ -1200,6 +1196,8 @@ class NotificationManager: ObservableObject {
             source = .fullValidation
         } else if totalBlocks > 0 {
             source = .catchUpProgress
+        } else if !status.tipConfirmed {
+            source = .unconfirmed
         } else {
             source = .headerOnly
         }
@@ -1220,15 +1218,17 @@ class NotificationManager: ObservableObject {
         return record
     }
 
-    /// Whether a long catch-up makes sense yet: a validation mode has been
-    /// chosen and, for AssumeUTXO, the snapshot is in. Before that a
-    /// catch-up would validate from genesis on a node meant for a
-    /// snapshot. Opens the shared node, as the wake would.
-    private static func nodeIsSetUp() -> Bool {
-        guard let mode = ValidationModePreference.current else { return false }
-        guard mode == .assumeUtxo else { return true }
-        guard let (node, _) = try? NodeHost.shared.node() else { return false }
-        return (try? node.needsSnapshot()) == false
+    /// The node's own answer to "AssumeUTXO without its snapshot?" (the
+    /// app's `NodeSetupState` hint is refreshed from it). Opens the shared
+    /// node, as the wake would; true (pending) if it can't be asked. The
+    /// node itself refuses to validate in that state (ticket 054); this
+    /// only spares a processing window that would sync headers for minutes.
+    private static func snapshotPendingInNode() -> Bool {
+        guard ValidationModePreference.current == .assumeUtxo else { return false }
+        guard let (node, _) = try? NodeHost.shared.node(),
+              let needs = try? node.needsSnapshot() else { return true }
+        NodeSetupState.shared.snapshotLoaded = !needs
+        return needs
     }
 
     // MARK: - Locked since reboot
@@ -1260,6 +1260,17 @@ extension BlockNotificationRecord {
     /// push from a relay whose blocknotify script didn't include height.
     var displayTitle: String {
         height > 0 ? "Block #\(height)" : "New Block"
+    }
+}
+
+/// `PushRegistrar` over `UIApplication`, on the main thread.
+final class ApplicationPushRegistrar: PushRegistrar {
+    func registerForRemoteNotifications() {
+        DispatchQueue.main.async { UIApplication.shared.registerForRemoteNotifications() }
+    }
+
+    func unregisterForRemoteNotifications() {
+        DispatchQueue.main.async { UIApplication.shared.unregisterForRemoteNotifications() }
     }
 }
 

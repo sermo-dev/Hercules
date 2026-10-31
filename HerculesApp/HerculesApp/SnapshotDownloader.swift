@@ -5,9 +5,11 @@ import Foundation
 ///
 /// Uses `URLSessionConfiguration.background` so the OS continues the download
 /// when the app is suspended and can resume after network interruption or app
-/// relaunch. The compressed file (~8.8GB) lands in the Caches directory; the
-/// caller is responsible for handing the path to `HerculesNode.loadSnapshot`
-/// and deleting the file once import succeeds.
+/// relaunch. The compressed file (~8.8GB) lands in Application Support,
+/// excluded from backup (ticket 054: not Caches, which iOS purges under the
+/// very storage pressure this download and import create); the caller hands
+/// the path to `HerculesNode.loadSnapshot` and deletes the file once the
+/// import succeeds.
 ///
 /// Singleton because background `URLSession` instances must be re-created with
 /// the same identifier across app launches to receive completion delegate
@@ -27,7 +29,7 @@ class SnapshotDownloader: NSObject, ObservableObject {
     static let expectedBytes: Int64 = 8_720_212_870
 
     /// `SNAPSHOT_SESSION_ID` in Config/Shared.xcconfig.
-    private static let backgroundSessionId = AppIdentifiers.snapshotSessionID
+    private static var backgroundSessionId: String { AppIdentifiers.snapshotSessionID }
 
     enum Status: Equatable {
         case idle
@@ -46,35 +48,61 @@ class SnapshotDownloader: NSObject, ObservableObject {
     /// it once `urlSessionDidFinishEvents(forBackgroundURLSession:)` fires.
     var backgroundCompletionHandler: (() -> Void)?
 
-    private lazy var session: URLSession = {
-        // Background URLSessions are backed by `nsurlsessiond`, a system
-        // daemon that does not exist in the iOS Simulator — attempting to
-        // create a background download task there fails with an opaque
-        // "unknown error" (NSCocoaErrorDomain 4097). Fall back to a default
-        // session in simulator builds. Real devices keep the background
-        // session so the download continues across app suspension.
-        //
-        // `allowsCellularAccess` is read once at session-construction time
-        // from `NetworkPolicy.shared.cellularAllowed`. URLSession does not
-        // re-read this flag if the preference changes mid-session, so a
-        // user toggling Settings → Use Cellular Data while a download is
-        // in flight will see the new policy take effect on the *next* app
-        // launch. The pre-flight gate in `start()` enforces the policy at
-        // download-kick-off time, which is the case that matters: an 8 GB
-        // download that's already running on Wi-Fi won't pivot to cellular
-        // on its own.
-        let allowCellular = NetworkPolicy.shared.cellularAllowed
-        #if targetEnvironment(simulator)
-        let config = URLSessionConfiguration.default
-        config.allowsCellularAccess = allowCellular
-        #else
-        let config = URLSessionConfiguration.background(withIdentifier: Self.backgroundSessionId)
-        config.isDiscretionary = false       // user-initiated, run promptly
-        config.sessionSendsLaunchEvents = true
-        config.allowsCellularAccess = allowCellular
-        #endif
-        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
-    }()
+    // MARK: Session (ticket 054)
+
+    /// The session's network flags, from `NetworkPolicy`. Expensive
+    /// (cellular, Personal Hotspot) and constrained (Low Data Mode) paths
+    /// are metered there, so all three follow the one "Use Cellular Data"
+    /// opt-in; `allowsCellularAccess` alone let a hotspot through.
+    static func makeConfiguration(background: Bool, cellularAllowed: Bool) -> URLSessionConfiguration {
+        let config: URLSessionConfiguration
+        if background {
+            config = .background(withIdentifier: backgroundSessionId)
+            config.isDiscretionary = false       // user-initiated, run promptly
+            config.sessionSendsLaunchEvents = true
+        } else {
+            config = .default
+        }
+        config.allowsCellularAccess = cellularAllowed
+        config.allowsExpensiveNetworkAccess = cellularAllowed
+        config.allowsConstrainedNetworkAccess = cellularAllowed
+        return config
+    }
+
+    // Background URLSessions are backed by `nsurlsessiond`, a system
+    // daemon that does not exist in the iOS Simulator — attempting to
+    // create a background download task there fails with an opaque
+    // "unknown error" (NSCocoaErrorDomain 4097). Fall back to a default
+    // session in simulator builds. Real devices keep the background
+    // session so the download continues across app suspension.
+    #if targetEnvironment(simulator)
+    private static let usesBackgroundSession = false
+    #else
+    private static let usesBackgroundSession = true
+    #endif
+
+    /// The session, its policy, and a policy switch in progress. Under
+    /// `taskLock`. A background configuration can't be changed once the
+    /// session exists, so a policy change replaces the session: the task is
+    /// cancelled with resume data, the session invalidated, and a new one
+    /// (same identifier, new flags) resumes it (`didBecomeInvalidWithError`).
+    private var _session: URLSession?
+    private var sessionCellularAllowed = false
+    private var switchingPolicy = false
+    private var resumeAfterSwitch = false
+
+    private var session: URLSession {
+        taskLock.lock(); defer { taskLock.unlock() }
+        if let s = _session { return s }
+        let allowed = NetworkPolicy.shared.cellularAllowed
+        let s = URLSession(
+            configuration: Self.makeConfiguration(background: Self.usesBackgroundSession, cellularAllowed: allowed),
+            delegate: self, delegateQueue: nil
+        )
+        _session = s
+        sessionCellularAllowed = allowed
+        return s
+    }
 
     // `activeTask` is touched from the delegate operation queue, the main
     // queue, and `getAllTasks` completion handlers. Guard with a lock.
@@ -86,17 +114,71 @@ class SnapshotDownloader: NSObject, ObservableObject {
     }
     /// Tasks `cancel()` cancelled, so their completion isn't taken for iOS
     /// cancelling the download or for a failure worth resuming (ticket
-    /// 051). Under `taskLock`.
+    /// 051), and tasks a policy switch cancelled (ticket 054). Under
+    /// `taskLock`.
     private var userCancelledTaskIDs = Set<Int>()
+    private var policySwitchTaskIDs = Set<Int>()
+    private var defaultsObserver: NSObjectProtocol?
 
     private override init() {
         super.init()
-        // Touch the lazy session at init time so we re-attach to any download
+        // Touch the session at init time so we re-attach to any download
         // that was running when the app was last terminated. The delegate
         // callbacks will fire as the OS catches us up.
         _ = session
         Self.deleteLegacyFiles()
+        Self.moveOutOfCaches()
         rehydrateExistingTask()
+        // "Use Cellular Data" is a UserDefaults toggle: follow it mid-download.
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.followPolicy()
+        }
+    }
+
+    /// The opt-in changed since the session was made: move the download to
+    /// a session whose flags match (ticket 054).
+    private func followPolicy() {
+        let allowed = NetworkPolicy.shared.cellularAllowed
+        taskLock.lock()
+        guard let current = _session, sessionCellularAllowed != allowed, !switchingPolicy else {
+            taskLock.unlock()
+            return
+        }
+        switchingPolicy = true
+        let task = _activeTask
+        if let task = task {
+            policySwitchTaskIDs.insert(task.taskIdentifier)
+            resumeAfterSwitch = true
+            _activeTask = nil
+        }
+        taskLock.unlock()
+        StoragePaths.log.notice("snapshot download: Use Cellular Data changed; moving to a new session")
+        guard let running = task else {
+            current.finishTasksAndInvalidate()
+            return
+        }
+        running.cancel(byProducingResumeData: { data in
+            if let data = data { Self.saveResumeData(data) }
+            current.finishTasksAndInvalidate()
+        })
+    }
+
+    // MARK: Files
+
+    /// Where the download lives: Application Support/Snapshot, excluded
+    /// from backup (ticket 054).
+    private static var snapshotDir: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        var dir = base.appendingPathComponent("Snapshot", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? dir.setResourceValues(values)
+        return dir
     }
 
     private static var cachesDir: URL {
@@ -116,15 +198,34 @@ class SnapshotDownloader: NSObject, ObservableObject {
 
     /// Delete download and resume files left by builds that used other
     /// snapshots (including the retracted 943,500 file, saved as
-    /// `hercules-utxo.*`), so an anchor bump never strands gigabytes in Caches.
+    /// `hercules-utxo.*`), so an anchor bump never strands gigabytes, in
+    /// either the old Caches location or the current one.
     private static func deleteLegacyFiles() {
         let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: cachesDir.path) else { return }
-        for name in names
-        where name.hasPrefix("hercules-")
-            && (name.hasSuffix(".hutx.gz") || name.hasSuffix(".resume"))
-            && !name.hasPrefix(snapshotName + ".") {
-            try? fm.removeItem(at: cachesDir.appendingPathComponent(name))
+        for dir in [cachesDir, snapshotDir] {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { continue }
+            for name in names
+            where name.hasPrefix("hercules-")
+                && (name.hasSuffix(".hutx.gz") || name.hasSuffix(".resume"))
+                && !name.hasPrefix(snapshotName + ".") {
+                try? fm.removeItem(at: dir.appendingPathComponent(name))
+            }
+        }
+    }
+
+    /// A download (or its resume blob) that an older build left in Caches
+    /// moves to the new location instead of being fetched again.
+    private static func moveOutOfCaches() {
+        let fm = FileManager.default
+        for name in ["\(snapshotName).hutx.gz", "\(snapshotName).resume"] {
+            let old = cachesDir.appendingPathComponent(name)
+            let new = snapshotDir.appendingPathComponent(name)
+            guard fm.fileExists(atPath: old.path) else { continue }
+            if fm.fileExists(atPath: new.path) {
+                try? fm.removeItem(at: old)
+            } else {
+                try? fm.moveItem(at: old, to: new)
+            }
         }
     }
 
@@ -150,20 +251,18 @@ class SnapshotDownloader: NSObject, ObservableObject {
         return current
     }
 
-    /// Caches directory destination — temporary storage that survives app
-    /// relaunches but isn't backed up to iCloud. Once the snapshot is imported
-    /// into the UTXO database, the caller deletes this file.
+    /// The completed download. Once the snapshot is imported into the UTXO
+    /// database, the caller deletes this file.
     static func destinationURL() -> URL {
-        return cachesDir.appendingPathComponent("\(snapshotName).hutx.gz")
+        return snapshotDir.appendingPathComponent("\(snapshotName).hutx.gz")
     }
 
     /// Path where we persist `URLSession`-provided resume data so a network
     /// failure or app force-quit doesn't lose hours of download progress.
     /// The blob is small (a few KB) and contains pointers into iOS's private
-    /// partial-download cache plus HTTP Range bookkeeping. Lives next to the
-    /// destination so if iOS purges Caches, both go together.
+    /// partial-download cache plus HTTP Range bookkeeping.
     private static func resumeDataURL() -> URL {
-        return cachesDir.appendingPathComponent("\(snapshotName).resume")
+        return snapshotDir.appendingPathComponent("\(snapshotName).resume")
     }
 
     /// The resume blob for the current snapshot. Its file name derives
@@ -240,6 +339,7 @@ class SnapshotDownloader: NSObject, ObservableObject {
             self.status = .downloading
         }
 
+        let session = self.session
         session.getAllTasks { [weak self] tasks in
             guard let self = self else { return }
             // If iOS already has a task running for our session (e.g. survived
@@ -252,7 +352,8 @@ class SnapshotDownloader: NSObject, ObservableObject {
             // Re-check under the lock to avoid spawning two tasks if start()
             // races with itself.
             self.taskLock.lock()
-            if self._activeTask != nil {
+            if self._activeTask != nil || self.switchingPolicy {
+                if self.switchingPolicy { self.resumeAfterSwitch = true }
                 self.taskLock.unlock()
                 return
             }
@@ -264,9 +365,9 @@ class SnapshotDownloader: NSObject, ObservableObject {
             // resume data on every failure that doesn't yield a fresh blob.
             let task: URLSessionDownloadTask
             if let resumeData = Self.loadResumeData() {
-                task = self.session.downloadTask(withResumeData: resumeData)
+                task = session.downloadTask(withResumeData: resumeData)
             } else {
-                task = self.session.downloadTask(with: Self.downloadURL)
+                task = session.downloadTask(with: Self.downloadURL)
             }
             task.priority = URLSessionTask.highPriority
             self._activeTask = task
@@ -286,6 +387,7 @@ class SnapshotDownloader: NSObject, ObservableObject {
         taskLock.lock()
         let task = _activeTask
         _activeTask = nil
+        resumeAfterSwitch = false
         if let task = task {
             userCancelledTaskIDs.insert(task.taskIdentifier)
         }
@@ -299,10 +401,10 @@ class SnapshotDownloader: NSObject, ObservableObject {
         }
     }
 
-    /// Delete the downloaded snapshot file from Caches. Call after a
-    /// successful import so we don't waste 8GB of storage indefinitely.
-    /// Also clears any resume data — once we've consumed the file, there's
-    /// nothing left to resume.
+    /// Delete the downloaded snapshot file. Call after a successful import
+    /// so we don't waste 8GB of storage indefinitely. Also clears any
+    /// resume data — once we've consumed the file, there's nothing left to
+    /// resume.
     static func deleteDownloadedFile() {
         try? FileManager.default.removeItem(at: destinationURL())
         deleteResumeData()
@@ -320,6 +422,85 @@ class SnapshotDownloader: NSObject, ObservableObject {
                     self.status = .downloading
                 }
             }
+        }
+    }
+
+    // MARK: Decisions (pure, unit-tested; ticket 054)
+
+    /// An HTTP status a finished download may carry: R2 returns 200, or
+    /// 206 when resumed from resume data; 403/404 when the object is
+    /// missing.
+    static func acceptsHTTPStatus(_ code: Int) -> Bool {
+        code == 200 || code == 206
+    }
+
+    /// What to do with resume data when a task fails.
+    enum ResumeAction: Equatable {
+        /// Save the fresh blob the error carried.
+        case save
+        /// Keep the previous blob (a lost network or a system cancel).
+        case keep
+        /// Delete it (e.g. the blob itself was stale).
+        case delete
+    }
+
+    enum CompletionOutcome: Equatable {
+        /// Not ours to report: another URL's task, a cancel we made (the
+        /// user's, or a policy switch), or a stale task while a newer one
+        /// runs.
+        case ignore
+        /// A task from before the current one, with nothing else running
+        /// (e.g. the previous process's, reporting after relaunch): its
+        /// resume data is handled, no status change.
+        case stale(ResumeAction)
+        /// The active download failed.
+        case failed(message: String, resume: ResumeAction)
+    }
+
+    /// `didCompleteWithError` for a task that ended with `error`.
+    static func completionOutcome(
+        error: NSError,
+        isCurrentURL: Bool,
+        cancelledByUs: Bool,
+        isActive: Bool,
+        noneActive: Bool,
+        hasSavedResumeData: Bool
+    ) -> CompletionOutcome {
+        guard isCurrentURL, !cancelledByUs, isActive || noneActive else { return .ignore }
+        let resume: ResumeAction
+        let resumable: Bool
+        if error.userInfo[NSURLSessionDownloadTaskResumeData] is Data {
+            resume = .save
+            resumable = true
+        } else if isTransient(error) {
+            resume = .keep
+            resumable = hasSavedResumeData
+        } else {
+            resume = .delete
+            resumable = false
+        }
+        guard isActive else { return .stale(resume) }
+        let suffix = resumable ? " — retry will resume" : ""
+        return .failed(message: "Download failed: \(error.localizedDescription)\(suffix)", resume: resume)
+    }
+
+    /// The network went away mid-download, or iOS cancelled the task, as
+    /// opposed to the server or the resume data being bad.
+    static func isTransient(_ error: NSError) -> Bool {
+        guard error.domain == NSURLErrorDomain else { return false }
+        switch error.code {
+        case NSURLErrorNotConnectedToInternet,
+             NSURLErrorNetworkConnectionLost,
+             NSURLErrorTimedOut,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorCannotFindHost,
+             NSURLErrorDNSLookupFailed,
+             NSURLErrorInternationalRoamingOff,
+             NSURLErrorDataNotAllowed,
+             NSURLErrorCancelled:
+            return true
+        default:
+            return false
         }
     }
 }
@@ -372,10 +553,8 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
             return
         }
 
-        // Validate HTTP status — R2 returns 200 on success (206 when the
-        // download was resumed from resume data), 403/404 on missing.
         if let http = downloadTask.response as? HTTPURLResponse,
-           http.statusCode != 200 && http.statusCode != 206 {
+           !Self.acceptsHTTPStatus(http.statusCode) {
             try? fm.removeItem(at: dest)
             // Resuming would only replay the same error response forever.
             Self.deleteResumeData()
@@ -403,12 +582,9 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         didCompleteWithError error: Error?
     ) {
         guard let error = error else { return }   // success path handled above
-        // Don't save another URL's resume data under our name or report
-        // its failure (including the cancel from `currentTask`).
-        guard Self.isCurrent(task) else { return }
-        let nsErr = error as NSError
-        // User-initiated cancel — already handled by `cancel()`, which also
-        // wipes the resume data blob and reports the cancel. Nothing to do
+        // A user cancel is already handled by `cancel()`, which also wipes
+        // the resume data blob and reports the cancel; a policy switch
+        // saved its blob and resumes on the new session. Nothing to do
         // here, whatever the error (it may end with a network error rather
         // than NSURLErrorCancelled; saving its resume data would undo the
         // wipe). Any other cancel is iOS's own (force-quit, Background App
@@ -416,9 +592,7 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         // `NSURLErrorBackgroundTaskCancelledReasonKey`); it carries resume
         // data and is handled as a failure below, which also releases a
         // waiting `awaitSnapshotDownload` (ticket 051).
-        if consumeUserCancel(of: task) {
-            return
-        }
+        let cancelledByUs = consumeOurCancel(of: task)
 
         // A task that is no longer ours (a new download has started since)
         // must not clear the new one or fail its waiter. Its resume data is
@@ -427,32 +601,64 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         taskLock.lock()
         let isActive = _activeTask === task
         let noneActive = _activeTask == nil
-        if isActive {
+        if isActive && !cancelledByUs {
             _activeTask = nil
         }
         taskLock.unlock()
-        guard isActive || noneActive else { return }
 
-        // Network/server failure, app force-quit, or a system cancel.
-        // Capture the resume data blob (if any) so the next start() picks
-        // up where we left off via an HTTP Range request. Without fresh
-        // resume data, a lost network or a system cancel keeps the previous
-        // blob (still the best place to resume from); anything else (e.g.
-        // the blob itself was stale) wipes it so we don't try to resume
-        // into a now-broken state.
-        let suffix: String
-        if let resumeData = nsErr.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
-            Self.saveResumeData(resumeData)
-            suffix = " — retry will resume"
-        } else if Self.isTransient(nsErr) {
-            suffix = Self.loadResumeData() != nil ? " — retry will resume" : ""
-        } else {
-            Self.deleteResumeData()
-            suffix = ""
+        let nsErr = error as NSError
+        let outcome = Self.completionOutcome(
+            error: nsErr,
+            isCurrentURL: Self.isCurrent(task),
+            cancelledByUs: cancelledByUs,
+            isActive: isActive,
+            noneActive: noneActive,
+            hasSavedResumeData: Self.loadResumeData() != nil
+        )
+        let resume: ResumeAction
+        switch outcome {
+        case .ignore:
+            return
+        case .stale(let r):
+            resume = r
+        case .failed(_, let r):
+            resume = r
         }
-        guard isActive else { return }
-        DispatchQueue.main.async {
-            self.status = .failed("Download failed: \(error.localizedDescription)\(suffix)")
+        switch resume {
+        case .save:
+            if let data = nsErr.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+                Self.saveResumeData(data)
+            }
+        case .keep:
+            break
+        case .delete:
+            Self.deleteResumeData()
+        }
+        if case .failed(let message, _) = outcome {
+            DispatchQueue.main.async {
+                self.status = .failed(message)
+            }
+        }
+    }
+
+    /// A policy switch invalidated the old session (ticket 054): make the
+    /// next one with the current flags and resume the download on it.
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
+        taskLock.lock()
+        guard session === _session else {
+            taskLock.unlock()
+            return
+        }
+        _session = nil
+        switchingPolicy = false
+        let resume = resumeAfterSwitch
+        resumeAfterSwitch = false
+        taskLock.unlock()
+        _ = self.session
+        // The opt-in may have flipped again meanwhile.
+        followPolicy()
+        if resume {
+            start()
         }
     }
 
@@ -466,30 +672,12 @@ extension SnapshotDownloader: URLSessionDownloadDelegate {
         }
     }
 
-    /// True (once) if `cancel()` cancelled `task`.
-    private func consumeUserCancel(of task: URLSessionTask) -> Bool {
+    /// True (once) if `cancel()` or a policy switch cancelled `task`.
+    private func consumeOurCancel(of task: URLSessionTask) -> Bool {
         taskLock.lock(); defer { taskLock.unlock() }
-        return userCancelledTaskIDs.remove(task.taskIdentifier) != nil
-    }
-
-    /// The network went away mid-download, or iOS cancelled the task, as
-    /// opposed to the server or the resume data being bad.
-    private static func isTransient(_ error: NSError) -> Bool {
-        guard error.domain == NSURLErrorDomain else { return false }
-        switch error.code {
-        case NSURLErrorNotConnectedToInternet,
-             NSURLErrorNetworkConnectionLost,
-             NSURLErrorTimedOut,
-             NSURLErrorCannotConnectToHost,
-             NSURLErrorCannotFindHost,
-             NSURLErrorDNSLookupFailed,
-             NSURLErrorInternationalRoamingOff,
-             NSURLErrorDataNotAllowed,
-             NSURLErrorCancelled:
-            return true
-        default:
-            return false
-        }
+        let user = userCancelledTaskIDs.remove(task.taskIdentifier) != nil
+        let policy = policySwitchTaskIDs.remove(task.taskIdentifier) != nil
+        return user || policy
     }
 
     /// Called when iOS finishes delivering background events to our session.

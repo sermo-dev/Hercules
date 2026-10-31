@@ -6,7 +6,8 @@
 #              every script check), and clippy (reported, not yet gating).
 #   ios        build-ios.sh (device + simulator static libs, UniFFI Swift
 #              bindings, XCFramework), then an unsigned simulator build of
-#              the app and widget.
+#              the app and widget, and the HerculesAppTests unit tests on
+#              a simulator.
 #   scenarios  HerculesApp/Tools/NodeHostScenarios (Swift wake/foreground
 #              coordination checks).
 #
@@ -189,6 +190,23 @@ jobs:
             -configuration Debug \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
+
+      # Ticket 054: the app's Swift unit tests (a logic bundle, no host app)
+      # on the first available iPhone simulator.
+      - name: Unit tests (HerculesAppTests, simulator)
+        run: |
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for runtime, ds in sorted(devices.items(), reverse=True)
+                     if "iOS" in runtime for d in ds if d["name"].startswith("iPhone")))
+          ')
+          echo "Simulator: $DEVICE"
+          xcodebuild test \
+            -project HerculesApp/HerculesApp.xcodeproj \
+            -scheme HerculesAppTests \
+            -destination "id=$DEVICE" \
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Save target dir
         if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.target.outputs.cache-hit != 'true'

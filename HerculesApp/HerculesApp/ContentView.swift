@@ -19,34 +19,8 @@ struct Theme {
 
 // MARK: - Validation Mode
 
-/// How the node builds its UTXO set on first run.
-///
-/// `assumeUtxo` downloads a hash-anchored snapshot — fast but anchored to a
-/// constant baked into the app. `fromGenesis` validates every block from
-/// height 0 — slower (weeks on a phone) but trusts only Bitcoin's consensus
-/// rules. The choice is part of the node's identity for a given DB; switching
-/// is destructive and goes through `NodeViewModel.resetAndRestart`.
-enum ValidationMode: String {
-    case assumeUtxo
-    case fromGenesis
-}
-
-enum ValidationModePreference {
-    static let key = "validationMode"
-
-    static var current: ValidationMode? {
-        get {
-            UserDefaults.standard.string(forKey: key).flatMap(ValidationMode.init(rawValue:))
-        }
-        set {
-            if let m = newValue {
-                UserDefaults.standard.set(m.rawValue, forKey: key)
-            } else {
-                UserDefaults.standard.removeObject(forKey: key)
-            }
-        }
-    }
-}
+// `ValidationMode` and `ValidationModePreference` live in WakeGate.swift
+// (ticket 054), next to the wake gate that reads them.
 
 // MARK: - View Model
 
@@ -158,14 +132,50 @@ class NodeViewModel: ObservableObject {
             .sink { [weak self] _ in self?.pollParticipationStats() }
             .store(in: &downloadCancellables)
 
-        // Restart foreground sync a background wake stopped (ticket 028).
+        // Restart foreground sync a background wake stopped (ticket 028),
+        // or start it because the app is open (ticket 054 section 4).
         NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in
-                guard let self = self, self.resumeSyncWhenActive else { return }
-                self.resumeSyncWhenActive = false
-                self.startSync()
+                guard let self = self else { return }
+                if self.resumeSyncWhenActive {
+                    self.resumeSyncWhenActive = false
+                    self.startSync()
+                } else {
+                    self.autoStartIfWanted()
+                }
             }
             .store(in: &downloadCancellables)
+    }
+
+    /// Section 4 of ticket 054: with the app open, the node follows the
+    /// tip from its own peers rather than waiting for relay pushes. Once
+    /// it is set up (`WakeGate`'s foreground row: a mode, the snapshot in
+    /// or genesis mode, the network policy allowing it), opening the app
+    /// starts sync, unless the user paused it. Never the first start of an
+    /// AssumeUTXO node: that one downloads 8.8 GB and waits for a tap.
+    func autoStartIfWanted() {
+        // The policy reads "offline" until the monitor's first path.
+        NetworkPolicy.shared.afterFirstPath { [weak self] in
+            guard let self = self, !self.isSyncRunning, !self.isResetting else { return }
+            let inputs = NotificationManager.gateInputs(
+                userPaused: NodeSetupState.shared.syncPausedByUser
+            )
+            guard WakeGate.decide(.foreground, inputs) == .run(headersOnly: false) else { return }
+            StoragePaths.log.notice("foreground: app open and node set up; starting sync")
+            self.startSync()
+        }
+    }
+
+    /// The user's Resume (or first Start): clears a remembered Pause.
+    func resumeSync() {
+        NodeSetupState.shared.syncPausedByUser = false
+        startSync()
+    }
+
+    /// The user's Pause: remembered, so opening the app doesn't undo it.
+    func pauseSync() {
+        NodeSetupState.shared.syncPausedByUser = true
+        stopSync()
     }
 
     /// Publish a fresh `SharedNodeState` to the App Group container so the
@@ -288,6 +298,11 @@ class NodeViewModel: ObservableObject {
         guard validationMode != mode else { return }
         validationMode = mode
         ValidationModePreference.current = mode
+        // A wake may have opened the node before there was a mode: tell it
+        // now (ticket 054). The node keeps the first mode it records.
+        DispatchQueue.global(qos: .userInitiated).async {
+            NodeHost.shared.recordValidationMode(mode)
+        }
     }
 
     /// Wipe all on-disk state and restart sync with a new validation mode.
@@ -368,8 +383,9 @@ class NodeViewModel: ObservableObject {
 
                 completion(nil)
 
-                // 5. Kick off a fresh sync with the new mode.
-                self.startSync()
+                // 5. Kick off a fresh sync with the new mode (an explicit
+                // user action, so a remembered Pause is cleared).
+                self.resumeSync()
             }
         }
     }
@@ -502,8 +518,18 @@ class NodeViewModel: ObservableObject {
         // runs the download/import path on a fresh DB; Genesis skips
         // it entirely (block-by-block validation will start from
         // wherever validated_height is — 0 on a clean wipe).
-        let mode = DispatchQueue.main.sync { validationMode } ?? .assumeUtxo
-        if mode == .assumeUtxo, try node.needsSnapshot() {
+        // NodeHost adopted the node's recorded mode at open (ticket 054);
+        // show that one if it differs from ours.
+        let adopted = ValidationModePreference.current
+        let mode = DispatchQueue.main.sync { () -> ValidationMode? in
+            if let adopted = adopted, validationMode != adopted { validationMode = adopted }
+            return validationMode
+        } ?? .assumeUtxo
+        let needsSnapshot = mode == .assumeUtxo ? try node.needsSnapshot() : false
+        if mode == .assumeUtxo && !needsSnapshot {
+            NodeSetupState.shared.snapshotLoaded = true
+        }
+        if mode == .assumeUtxo, needsSnapshot {
             onMain(token) { vm in
                 vm.isConnecting = false
             }
@@ -587,6 +613,8 @@ class NodeViewModel: ObservableObject {
                     callback: snapCallback
                 )
                 SnapshotDownloader.deleteDownloadedFile()
+                NodeSetupState.shared.snapshotLoaded = true
+                NodeSetupState.shared.finishSetupNotified = false
             } catch {
                 if case HerculesError.SnapshotInvalid = error {
                     SnapshotDownloader.deleteDownloadedFile()
@@ -2115,22 +2143,22 @@ struct SyncButton: View {
         if viewModel.isLoadingSnapshot { return "Loading UTXO Snapshot..." }
         if viewModel.isBootstrappingTor { return "Connecting to Tor..." }
         if viewModel.isConnecting { return "Finding Peers via Tor..." }
-        if canStop && isSyncing { return "Stop Sync" }
-        if canStop && isSynced { return "Stop Node" }
-        if canStop { return "Stop Node" }
-        if viewModel.syncStatus != nil { return "Resume Sync" }
+        if canStop && isSyncing { return "Pause Sync" }
+        if canStop && isSynced { return "Pause Node" }
+        if canStop { return "Pause Node" }
+        if viewModel.syncStatus != nil { return "Resume" }
         return "Connect via Tor"
     }
 
     var icon: String {
         if viewModel.isConnecting { return "arrow.triangle.2.circlepath" }
-        if canStop { return "stop.fill" }
+        if canStop { return "pause.fill" }
         if isSynced { return "checkmark.shield.fill" }
         return "bolt.fill"
     }
 
     var body: some View {
-        Button(action: { canStop ? viewModel.stopSync() : viewModel.startSync() }) {
+        Button(action: { canStop ? viewModel.pauseSync() : viewModel.resumeSync() }) {
             HStack(spacing: 10) {
                 if viewModel.isConnecting || isSyncing {
                     ProgressView()
