@@ -466,11 +466,8 @@ impl Mempool {
                         return Err(MempoolError::NonStandardScript { index: i });
                     }
                 }
-
-                // Knots-aligned relay policy: reject inscriptions, token
-                // protocols, data injection, and parasitic patterns.
-                crate::relay_policy::check_relay_policy(&tx)
-                    .map_err(MempoolError::PolicyRejection)?;
+                // The 018 witness filters run once the spent outputs are
+                // known (after Phase 2).
             }
             AcceptMode::Own => {
                 // Network standardness only: an output type other nodes
@@ -615,6 +612,15 @@ impl Mempool {
         // counted as `GetTransactionSigOpCost` does with the standard
         // flags, before any script runs.
         let spent_spks: Vec<&[u8]> = spent.iter().map(|(_, spk)| spk.as_slice()).collect();
+
+        // Knots-aligned relay policy (018): reject inscriptions, token
+        // protocols, data injection, and parasitic patterns. Needs the
+        // spent scriptPubKeys to know which witness element is a script.
+        if mode == AcceptMode::Relay {
+            crate::relay_policy::check_relay_policy_with_spent(&tx, &spent_spks)
+                .map_err(MempoolError::PolicyRejection)?;
+        }
+
         let sigop_cost = crate::contextual_checks::transaction_sigop_cost(
             &tx,
             &spent_spks,
@@ -3175,6 +3181,41 @@ mod tests {
             accept_in(&mut Mempool::new(), over, &utxo, TEST_HEIGHT, AcceptMode::Own),
             Err(MempoolError::AbsurdFee { fee, .. }) if fee == ABSURD_FEE_THRESHOLD + 1
         ));
+    }
+
+    /// The 018 witness filters read the spent output's type: a P2WSH
+    /// witnessScript with an inscription envelope is refused relay (and
+    /// still accepted as an own tx), while the same bytes as a stack item
+    /// of a P2WPKH spend are not scanned.
+    #[test]
+    fn relay_policy_scans_the_witness_script_of_the_spent_output_type() {
+        let ws = ScriptBuf::from_bytes(vec![0x51, 0x00, 0x63, 0x03, b'o', b'r', b'd', 0x68]);
+        let seed = |utxo: &UtxoSet, spk: ScriptBuf| {
+            utxo.test_insert_utxo(
+                [5; 32],
+                0,
+                UtxoEntry { amount: 1_000_000, script_pubkey: spk.into_bytes(), height: 1, is_coinbase: false },
+            )
+            .unwrap();
+            OutPoint { txid: seed_txid(5), vout: 0 }
+        };
+        let (utxo, _d) = fresh_utxo();
+        let coin = seed(&utxo, ScriptBuf::new_p2wsh(&ws.wscript_hash()));
+        let mut tx = spend_ops(&[coin], vec![p2wpkh_out(900_000)]);
+        tx.input[0].witness = Witness::from_slice(&[ws.as_bytes()]);
+        assert!(matches!(
+            accept_in(&mut Mempool::new(), tx.clone(), &utxo, TEST_HEIGHT, AcceptMode::Relay),
+            Err(MempoolError::PolicyRejection(crate::relay_policy::PolicyRejection::InscriptionEnvelope { .. }))
+        ));
+        accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Own).unwrap();
+
+        // Pre-segwit height, so the witness isn't executed: the filter is
+        // all that could refuse it.
+        let (utxo, _d) = fresh_utxo();
+        let coin = seed(&utxo, ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([3; 20])));
+        let mut tx = spend_ops(&[coin], vec![p2wpkh_out(900_000)]);
+        tx.input[0].witness = Witness::from_slice(&[ws.as_bytes(), &[0x51]]);
+        accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, AcceptMode::Relay).unwrap();
     }
 
     /// IsStandardTx's version rule: 1 and 2 are standard, 0, 3 (TRUC,

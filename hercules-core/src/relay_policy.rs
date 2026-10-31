@@ -20,6 +20,9 @@ const MAX_WITNESS_ITEM_SIZE: usize = 1650;
 /// below this. Inscription-style payloads are typically hundreds+ bytes.
 const OP_DROP_DATA_THRESHOLD: usize = 75;
 
+/// First byte of a taproot annex (BIP 341 `ANNEX_TAG`).
+const TAPROOT_ANNEX_TAG: u8 = 0x50;
+
 // ── Rejection reasons ─────────────────────────────────────────────────
 
 /// Why a transaction was rejected by relay policy.
@@ -41,18 +44,99 @@ pub enum PolicyRejection {
 
 // ── Public entry point ────────────────────────────────────────────────
 
-/// Run all relay policy checks against a transaction.
-///
+/// Run all relay policy checks against a transaction whose spent outputs
+/// aren't known, as for a warning before the inputs are looked up. Which
+/// witness element is a script is then inferred from the witness's shape
+/// (see [`witness_script`]); the mempool uses
+/// [`check_relay_policy_with_spent`] instead.
+pub fn check_relay_policy(tx: &Transaction) -> Result<(), PolicyRejection> {
+    check_all(tx, None)
+}
+
+/// Run all relay policy checks, with `spent_scripts[i]` the scriptPubKey
+/// input `i` spends: the script-content filters then read exactly the
+/// P2WSH witnessScript or the tapscript leaf, and never a signature,
+/// public key, control block or annex.
+pub fn check_relay_policy_with_spent(tx: &Transaction, spent_scripts: &[&[u8]]) -> Result<(), PolicyRejection> {
+    check_all(tx, Some(spent_scripts))
+}
+
 /// Checks are ordered cheapest-first so the common case (legitimate
 /// payment) exits quickly. Returns the first rejection found.
-pub fn check_relay_policy(tx: &Transaction) -> Result<(), PolicyRejection> {
+fn check_all(tx: &Transaction, spent: Option<&[&[u8]]>) -> Result<(), PolicyRejection> {
     check_cat21(tx)?;
     check_runes(tx)?;
     check_witness_size(tx)?;
-    check_olga_stamps(tx)?;
-    check_op_drop_data(tx)?;
-    check_inscription_envelope(tx)?;
+    for (i, input) in tx.input.iter().enumerate() {
+        let spent_spk = spent.map(|s| s.get(i).copied().unwrap_or(&[]));
+        if let Some(script) = witness_script(input, spent_spk) {
+            check_olga_stamps(i, script)?;
+            check_op_drop_data(i, script)?;
+            check_inscription_envelope(i, script)?;
+        }
+    }
     Ok(())
+}
+
+/// The script an input's witness executes, if any: the witnessScript of a
+/// P2WSH (or P2SH-wrapped P2WSH) spend, the last element; or the leaf
+/// script of a taproot script-path spend, the element before the control
+/// block once an annex (a last element starting 0x50, BIP 341) is set
+/// aside. P2WPKH and taproot key-path spends execute no witness script.
+///
+/// Knots' witness filters (`IsWitnessStandard`'s datacarrier accounting)
+/// likewise read only the tapscript, never signatures or keys.
+///
+/// With `spent_spk` (the output being spent) this follows the script's
+/// type exactly. Without it the type is inferred: an annex, or a last
+/// element shaped like a control block, marks taproot; two elements ending in a
+/// compressed public key are taken as P2WPKH; any other witness of two or
+/// more elements as P2WSH.
+fn witness_script<'a>(input: &'a bitcoin::TxIn, spent_spk: Option<&[u8]>) -> Option<&'a [u8]> {
+    let witness = &input.witness;
+    let n = witness.len();
+    // Items left once a taproot annex is set aside.
+    let without_annex = if n >= 2 && witness.last().is_some_and(|a| a.first() == Some(&TAPROOT_ANNEX_TAG)) {
+        n - 1
+    } else {
+        n
+    };
+    let leaf = || if without_annex >= 2 { witness.nth(without_annex - 2) } else { None };
+    match spent_spk {
+        Some(spk) => {
+            let spk = bitcoin::Script::from_bytes(spk);
+            if spk.is_p2wsh() {
+                witness.last()
+            } else if spk.is_p2tr() {
+                leaf()
+            } else if spk.is_p2sh() {
+                // The redeem script is the scriptSig's last push.
+                match input.script_sig.instructions().last()?.ok()? {
+                    Instruction::PushBytes(b) if bitcoin::Script::from_bytes(b.as_bytes()).is_p2wsh() => {
+                        witness.last()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        None => {
+            // Only a taproot spend has an annex.
+            if without_annex < n || (n >= 2 && is_control_block_shaped(witness.last()?)) {
+                return leaf();
+            }
+            let last = witness.last()?;
+            let p2wpkh_shaped = n == 2 && last.len() == 33 && matches!(last[0], 0x02 | 0x03);
+            (n >= 2 && !p2wpkh_shaped).then_some(last)
+        }
+    }
+}
+
+/// BIP 341 control block: 33 + 32m bytes (m <= 128), and a tapscript leaf
+/// version (0xc0, low bit the output key's parity).
+fn is_control_block_shaped(item: &[u8]) -> bool {
+    item.len() >= 33 && (item.len() - 33) % 32 == 0 && (item.len() - 33) / 32 <= 128 && item[0] & 0xfe == 0xc0
 }
 
 // ── Individual checks ─────────────────────────────────────────────────
@@ -100,20 +184,10 @@ fn check_witness_size(tx: &Transaction) -> Result<(), PolicyRejection> {
 }
 
 /// OLGA / Bitcoin Stamps: data embedded in P2WSH witness scripts with
-/// a `stamp:` prefix. For P2WSH spends the last witness element is the
-/// witness script.
-fn check_olga_stamps(tx: &Transaction) -> Result<(), PolicyRejection> {
-    for (i, input) in tx.input.iter().enumerate() {
-        // P2WSH spends have >= 2 witness elements (items + witness script).
-        if input.witness.len() < 2 {
-            continue;
-        }
-        // The witness script is the last element.
-        if let Some(ws) = input.witness.last() {
-            if ws.len() >= 6 && ws.windows(6).any(|w| w.eq_ignore_ascii_case(b"stamp:")) {
-                return Err(PolicyRejection::OlgaStamps { input_index: i });
-            }
-        }
+/// a `stamp:` prefix.
+fn check_olga_stamps(input_index: usize, script: &[u8]) -> Result<(), PolicyRejection> {
+    if script.len() >= 6 && script.windows(6).any(|w| w.eq_ignore_ascii_case(b"stamp:")) {
+        return Err(PolicyRejection::OlgaStamps { input_index });
     }
     Ok(())
 }
@@ -121,34 +195,21 @@ fn check_olga_stamps(tx: &Transaction) -> Result<(), PolicyRejection> {
 /// `<data> OP_DROP` injection: data pushed then immediately dropped.
 /// Only flags pushes larger than `OP_DROP_DATA_THRESHOLD` to avoid
 /// false-positives on normal hash preimage reveals and pubkeys.
-fn check_op_drop_data(tx: &Transaction) -> Result<(), PolicyRejection> {
-    for (i, input) in tx.input.iter().enumerate() {
-        // Only script-path spends carry meaningful script data.
-        if input.witness.len() < 2 {
-            continue;
-        }
-        for elem in input.witness.iter() {
-            if elem.len() < 3 {
-                continue;
+fn check_op_drop_data(input_index: usize, script: &[u8]) -> Result<(), PolicyRejection> {
+    let mut prev_push_len: usize = 0;
+    for instruction in bitcoin::Script::from_bytes(script).instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(bytes)) => {
+                prev_push_len = bytes.len();
             }
-            let script = bitcoin::Script::from_bytes(elem);
-            let mut prev_push_len: usize = 0;
-
-            for instruction in script.instructions() {
-                match instruction {
-                    Ok(Instruction::PushBytes(bytes)) => {
-                        prev_push_len = bytes.len();
-                    }
-                    Ok(Instruction::Op(op)) if op == OP_DROP => {
-                        if prev_push_len > OP_DROP_DATA_THRESHOLD {
-                            return Err(PolicyRejection::OpDropData { input_index: i });
-                        }
-                        prev_push_len = 0;
-                    }
-                    _ => {
-                        prev_push_len = 0;
-                    }
+            Ok(Instruction::Op(op)) if op == OP_DROP => {
+                if prev_push_len > OP_DROP_DATA_THRESHOLD {
+                    return Err(PolicyRejection::OpDropData { input_index });
                 }
+                prev_push_len = 0;
+            }
+            _ => {
+                prev_push_len = 0;
             }
         }
     }
@@ -163,37 +224,23 @@ fn check_op_drop_data(tx: &Transaction) -> Result<(), PolicyRejection> {
 /// In bitcoin 0.32, `OP_FALSE` (opcode 0x00) is parsed as
 /// `Instruction::PushBytes(bytes)` with `bytes.is_empty()`, NOT as
 /// `Instruction::Op(OP_PUSHBYTES_0)`.
-fn check_inscription_envelope(tx: &Transaction) -> Result<(), PolicyRejection> {
-    for (i, input) in tx.input.iter().enumerate() {
-        if input.witness.len() < 2 {
-            continue;
-        }
-        for elem in input.witness.iter() {
-            if elem.len() < 4 {
-                continue;
+fn check_inscription_envelope(input_index: usize, script: &[u8]) -> Result<(), PolicyRejection> {
+    let script = bitcoin::Script::from_bytes(script);
+    let mut saw_false = false;
+    for instruction in script.instructions() {
+        match instruction {
+            // OP_FALSE == OP_PUSHBYTES_0 == push of zero bytes
+            Ok(Instruction::PushBytes(bytes)) if bytes.is_empty() => {
+                saw_false = true;
             }
-            let script = bitcoin::Script::from_bytes(elem);
-            let mut saw_false = false;
-
-            for instruction in script.instructions() {
-                match instruction {
-                    // OP_FALSE == OP_PUSHBYTES_0 == push of zero bytes
-                    Ok(Instruction::PushBytes(bytes)) if bytes.is_empty() => {
-                        saw_false = true;
-                    }
-                    Ok(Instruction::Op(op)) if op == OP_IF && saw_false => {
-                        // Found OP_FALSE OP_IF — this is an envelope.
-                        // Capture the next push as the protocol tag for logging.
-                        let tag = capture_envelope_tag(script);
-                        return Err(PolicyRejection::InscriptionEnvelope {
-                            input_index: i,
-                            tag,
-                        });
-                    }
-                    _ => {
-                        saw_false = false;
-                    }
-                }
+            Ok(Instruction::Op(op)) if op == OP_IF && saw_false => {
+                // Found OP_FALSE OP_IF — this is an envelope.
+                // Capture the next push as the protocol tag for logging.
+                let tag = capture_envelope_tag(script);
+                return Err(PolicyRejection::InscriptionEnvelope { input_index, tag });
+            }
+            _ => {
+                saw_false = false;
             }
         }
     }
@@ -554,13 +601,122 @@ mod tests {
     /// inputs; and a pubkey is fixed per address, so every spend from an
     /// unlucky address is refused relay.
     #[test]
-    #[ignore = "BUG (policy): inscription/OP_DROP scans parse signatures and pubkeys as scripts; ~1 in 8,000 ordinary P2WPKH inputs is refused relay (every spend of an unlucky address)"]
     fn p2wpkh_pubkey_that_parses_as_an_envelope_is_allowed() {
         let mut pubkey = vec![0x02, 0xaa, 0xbb, 0x00, 0x63];
         pubkey.resize(33, 0x42);
         // A signature-shaped first element that parses to nothing special.
         let tx = with_witness(vec![vec![0x30; 72], pubkey]);
         assert!(check_relay_policy(&tx).is_ok(), "{:?}", check_relay_policy(&tx));
+    }
+
+    // ── Which element is scanned, by the spent output's type ─────────
+
+    fn envelope_script() -> Vec<u8> {
+        vec![0x51, 0x00, 0x63, 0x03, b'o', b'r', b'd', 0x68]
+    }
+
+    fn spk(s: ScriptBuf) -> Vec<u8> {
+        s.into_bytes()
+    }
+
+    fn p2wsh_spk() -> Vec<u8> {
+        spk(ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::all_zeros()))
+    }
+
+    fn p2tr_spk() -> Vec<u8> {
+        let mut s = vec![0x51, 0x20];
+        s.extend([0x11; 32]);
+        s
+    }
+
+    fn check_spent(tx: &Transaction, spent: &[u8]) -> Result<(), PolicyRejection> {
+        check_relay_policy_with_spent(tx, &[spent])
+    }
+
+    /// With the spent output known, a P2WPKH spend is never script-scanned,
+    /// whatever its signature and key bytes look like, while the same
+    /// bytes as a P2WSH witnessScript are.
+    #[test]
+    fn known_p2wpkh_spend_is_never_scanned_but_p2wsh_witness_script_is() {
+        let p2wpkh = spk(ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()));
+        // Even an envelope-shaped "signature" (no inference can rescue this one).
+        let tx = with_witness(vec![envelope_script(), vec![0x03; 33]]);
+        assert!(check_spent(&tx, &p2wpkh).is_ok());
+        assert!(matches!(check_spent(&tx, &p2wsh_spk()), Ok(())), "the witnessScript is the last element");
+        let tx = with_witness(vec![vec![0x01], envelope_script()]);
+        assert!(matches!(check_spent(&tx, &p2wsh_spk()), Err(PolicyRejection::InscriptionEnvelope { input_index: 0, .. })));
+        // Stamps and OP_DROP data read the same element.
+        let mut stamp = vec![0x51, 0x20];
+        stamp.extend_from_slice(b"stamp:");
+        assert!(matches!(
+            check_spent(&with_witness(vec![vec![0x01], stamp.clone()]), &p2wsh_spk()),
+            Err(PolicyRejection::OlgaStamps { .. })
+        ));
+        assert!(check_spent(&with_witness(vec![stamp, vec![0x51]]), &p2wsh_spk()).is_ok());
+        assert!(check_spent(&with_witness(vec![vec![0x01], vec![0x51]]), &p2wpkh).is_ok());
+    }
+
+    /// Taproot: only the leaf script before the control block is scanned,
+    /// with an annex set aside; a key-path spend (with or without annex)
+    /// has no script.
+    #[test]
+    fn taproot_scan_reads_only_the_leaf_script() {
+        let control = {
+            let mut c = vec![0xc0];
+            c.extend([0x22; 32]);
+            c
+        };
+        let annex = vec![TAPROOT_ANNEX_TAG, 0x00, 0x63];
+        let reject = |w: Vec<Vec<u8>>| {
+            let tx = with_witness(w);
+            assert!(matches!(check_spent(&tx, &p2tr_spk()), Err(PolicyRejection::InscriptionEnvelope { .. })));
+            assert!(matches!(check_relay_policy(&tx), Err(PolicyRejection::InscriptionEnvelope { .. })), "inferred");
+        };
+        let allow = |w: Vec<Vec<u8>>| {
+            let tx = with_witness(w);
+            assert!(check_spent(&tx, &p2tr_spk()).is_ok(), "{:?}", check_spent(&tx, &p2tr_spk()));
+            assert!(check_relay_policy(&tx).is_ok(), "inferred: {:?}", check_relay_policy(&tx));
+        };
+        reject(vec![vec![0x01; 64], envelope_script(), control.clone()]);
+        reject(vec![vec![0x01; 64], envelope_script(), control.clone(), annex.clone()]);
+        // The envelope only in a stack element (a signature, a preimage),
+        // the control block or the annex: not executed, not scanned.
+        allow(vec![envelope_script(), vec![0x51], control.clone()]);
+        let mut odd_control = control.clone();
+        odd_control.extend(envelope_script());
+        odd_control.resize(65, 0x00);
+        allow(vec![vec![0x51], odd_control]);
+        allow(vec![vec![0x01; 64], vec![0x51], control.clone(), envelope_script_as_annex()]);
+        // Key path: a signature, optionally with an annex.
+        allow(vec![envelope_script()]);
+        let tx = with_witness(vec![vec![0x01; 64], annex]);
+        assert!(check_spent(&tx, &p2tr_spk()).is_ok());
+        assert!(check_relay_policy(&tx).is_ok());
+    }
+
+    fn envelope_script_as_annex() -> Vec<u8> {
+        let mut a = vec![TAPROOT_ANNEX_TAG];
+        a.extend(envelope_script());
+        a
+    }
+
+    /// P2SH-wrapped P2WSH reads the witnessScript; P2SH-P2WPKH and legacy
+    /// P2SH read nothing from the witness.
+    #[test]
+    fn p2sh_wrapped_witness_scripts() {
+        let p2sh = spk(ScriptBuf::new_p2sh(&bitcoin::ScriptHash::all_zeros()));
+        let wrap = |redeem: Vec<u8>, witness: Vec<Vec<u8>>| {
+            let mut tx = with_witness(witness);
+            tx.input[0].script_sig = bitcoin::script::Builder::new()
+                .push_slice(<&bitcoin::script::PushBytes>::try_from(&redeem[..]).unwrap())
+                .into_script();
+            tx
+        };
+        let tx = wrap(p2wsh_spk(), vec![vec![0x01], envelope_script()]);
+        assert!(matches!(check_spent(&tx, &p2sh), Err(PolicyRejection::InscriptionEnvelope { .. })));
+        let p2wpkh = spk(ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros()));
+        assert!(check_spent(&wrap(p2wpkh, vec![vec![0x01], envelope_script()]), &p2sh).is_ok());
+        assert!(check_spent(&wrap(vec![0x51], vec![vec![0x01], envelope_script()]), &p2sh).is_ok());
     }
 
     proptest::proptest! {
