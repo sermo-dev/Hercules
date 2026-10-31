@@ -475,7 +475,6 @@ fn compressed_script_types_0_to_3_decompress_to_standard_scripts() {
 /// 67-byte `41 04 <x> <y> ac`; a `21 02 <x> ac` stand-in is a different
 /// output, so a block spending the coin would fail script validation.
 #[test]
-#[ignore = "BUG (consensus-critical, snapshot content): uncompressed P2PK (types 4/5) emitted as 35-byte compressed-key scripts; fixed by PR #27"]
 fn uncompressed_p2pk_types_4_and_5_decompress_to_the_full_key() {
     use bitcoin::secp256k1::PublicKey;
     let block1_key = hex::decode(
@@ -508,7 +507,6 @@ fn raw_scripts_round_trip_up_to_max_script_size() {
 /// Core's ScriptCompression replaces scripts over MAX_SCRIPT_SIZE (they
 /// are unspendable) with a single OP_RETURN.
 #[test]
-#[ignore = "BUG (snapshot content): raw scripts over 10,000 bytes are kept verbatim (Core: OP_RETURN, so UTXO count/MuHash differ); fixed by PR #27"]
 fn raw_scripts_over_max_script_size_become_op_return() {
     let s = vec![0x51u8; 10_001];
     assert_eq!(single(raw_script(&s)), vec![0x6a]);
@@ -600,7 +598,6 @@ fn malformed_dumps_fail_without_claiming_success() {
 }
 
 #[test]
-#[ignore = "BUG (pipeline robustness): dump version is not checked and trailing bytes after the last coin are ignored; fixed by PR #27"]
 fn unsupported_version_and_trailing_bytes_are_rejected() {
     let good = dump(&[([7; 32], vec![coin(0, raw_script(&[0x51]))])], None);
     let mut v1 = good.clone();

@@ -42,8 +42,8 @@ fn fresh() -> (UtxoSet, TempDir, PathBuf) {
 
 /// The anchor a snapshot commits to. One constructor, so a new anchor field
 /// is a one-line change here.
-fn anchor(height: u32, block_hash: [u8; 32], utxo_hash: [u8; 32]) -> SnapshotAnchor {
-    SnapshotAnchor { height, block_hash, utxo_hash }
+fn anchor(height: u32, block_hash: [u8; 32], utxo_hash: [u8; 32], utxo_count: u64) -> SnapshotAnchor {
+    SnapshotAnchor { height, block_hash, utxo_hash, utxo_count }
 }
 
 /// One HUTX entry, exactly as it appears in the file (the coinbase byte is
@@ -103,7 +103,9 @@ impl Hutx {
     }
 
     fn anchor(&self) -> SnapshotAnchor {
-        anchor(self.height, self.block_hash, self.hash())
+        // The real entry count: what a published anchor commits to, even
+        // when the header lies about it.
+        anchor(self.height, self.block_hash, self.hash(), self.entries.len() as u64)
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -514,20 +516,22 @@ fn snapshot_header_count_must_match_the_body() {
     assert!(matches!(err, SnapshotLoadError::Invalid(_)), "{}", err);
     assert_untouched(&utxo, &path);
 
-    // Fewer announced than present, hash over all of them: the hash of
-    // what was read can't match.
+    // Fewer announced than the anchor commits to: refused on the header's
+    // count, before any entry is read (the anchor pins `utxo_count`).
     let (utxo, _d, path) = fresh();
     let under = Hutx { count: Some(5), ..Hutx::new(entries.clone()) };
     let err = load(&utxo, &under.bytes(), Some(&under.anchor())).unwrap_err();
-    assert!(matches!(err, SnapshotLoadError::Invalid(ref m) if m.contains("verification failed")), "{}", err);
+    assert!(matches!(err, SnapshotLoadError::Invalid(ref m) if m.contains("count mismatch")), "{}", err);
     assert_untouched(&utxo, &path);
 
-    // Fewer announced and hashed: the extra bytes are never read, so they
-    // can't add a single coin to what the anchor commits to.
+    // A 5-coin snapshot (anchor commits to 5 coins and their hash) with a
+    // sixth entry's bytes appended: the extra bytes are never read, so
+    // they can't add a single coin to what the anchor commits to.
     let (utxo, _d, _) = fresh();
     let hash5 = Hutx::content_hash(&entries[..5]);
     let trailing = Hutx { count: Some(5), hash: Some(hash5), ..Hutx::new(entries) };
-    load(&utxo, &trailing.bytes(), Some(&trailing.anchor())).unwrap();
+    let anchor5 = anchor(trailing.height, trailing.block_hash, hash5, 5);
+    load(&utxo, &trailing.bytes(), Some(&anchor5)).unwrap();
     assert_eq!(utxo.count().unwrap(), 5);
     assert!(utxo.get(&Txid::from_byte_array([5; 32]), 0).unwrap().is_none());
     assert_eq!(utxo.compute_hash().unwrap(), hash5);
@@ -576,7 +580,6 @@ fn snapshot_absurd_entry_count_fails_without_touching_the_env() {
 /// The app deletes a snapshot file only on `Invalid`. A header count no
 /// real set can have says the file is bad, not that storage is short.
 #[test]
-#[ignore = "BUG: an absurd header utxo_count is reported as Storage (app keeps the corrupt file and retries forever); fixed by PR #27 (anchor utxo_count checked before ensure_map_capacity)"]
 fn snapshot_absurd_entry_count_is_a_bad_file() {
     let (utxo, _d, _) = fresh();
     let hutx = Hutx { count: Some(u64::MAX), ..Hutx::new(vec![HutxEntry::new(1, 0, 1)]) };
@@ -586,7 +589,6 @@ fn snapshot_absurd_entry_count_is_a_bad_file() {
 
 /// Refusing to load into a non-empty set must not destroy that set.
 #[test]
-#[ignore = "BUG: load_snapshot on a non-empty set returns Storage but its cleanup path wipes the existing set; fixed by PR #27 (emptiness checked before the marker/env are touched)"]
 fn rejected_load_into_a_nonempty_set_keeps_the_set() {
     let (utxo, _d, path) = fresh();
     utxo.apply_block(&block_of(1, vec![coinbase(1, vec![out(50, vec![0x51])])]), 1).unwrap();

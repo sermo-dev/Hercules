@@ -129,16 +129,19 @@ const FORK_FOLLOW_BUDGET: Duration = Duration::from_secs(10 * 60);
 /// Version of the block validation rules. Bump whenever a change to
 /// validation could flip a verdict, so `failed_blocks` rows recorded under
 /// the old rules are dropped at startup and those blocks reconsidered
-/// (ticket 024). Combined with the crate version in `rules_tag`, so any
-/// app update reconsiders them too. No test pins the number (tests go
-/// through `rules_tag()`), so a bump is this one line.
+/// (ticket 024). Combined with the crate version in `rules_tag`, which
+/// changes only when `Cargo.toml`'s version does (not with the app's
+/// marketing version), so a fix needs this bump. No test pins the number
+/// (tests go through `rules_tag()`), so a bump is this one line.
 ///
 /// History:
 /// - 2: script verification moved from libbitcoinconsensus v26 to
 ///   libbitcoinkernel (ticket 047), and the verifier's errors are classified
 ///   through `ScriptVerifyError` instead of `bitcoinconsensus::Error`.
 /// - 3: ticket 026 (contextual consensus rules; BIP 34 accepts heights 1..=16).
-const VALIDATION_RULES_VERSION: u32 = 3;
+/// - 4: the retracted 943,500 snapshot stored uncompressed P2PK coins with
+///   the wrong script, so valid blocks spending them failed CHECKSIG.
+const VALIDATION_RULES_VERSION: u32 = 4;
 
 /// Rules tag stored with each `failed_blocks` row. Includes the script
 /// backend, so switching between libbitcoinkernel and the legacy library
@@ -414,6 +417,7 @@ const NO_ANCHOR: SnapshotAnchor = SnapshotAnchor {
     height: u32::MAX,
     block_hash: [0u8; 32],
     utxo_hash: [0u8; 32],
+    utxo_count: 0,
 };
 
 /// How to construct a `HeaderSync`. Production goes through
@@ -812,6 +816,20 @@ impl HeaderSync {
                 "UTXO set empty but validated_height was {}, resetting to rebuild",
                 validated
             );
+            // Every failed-block verdict was reached against the set that
+            // is now gone, which may have been wrong (a retracted snapshot
+            // condemns valid blocks spending its bad coins). Reconsider them
+            // all, and lift the bans they caused.
+            let unbanned = store
+                .clear_failed_blocks()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            if !unbanned.is_empty() {
+                info!(
+                    "UTXO set reset: reconsidering failed blocks, lifting {} ban(s)",
+                    unbanned.len()
+                );
+            }
+            lift_bans(peers_db_path.as_deref(), &unbanned);
         }
 
         // Ticket 024: a crash between a UTXO rollback and the matching
@@ -5806,6 +5824,7 @@ mod tests {
                 height,
                 block_hash,
                 utxo_hash: meta.utxo_hash,
+                utxo_count: meta.utxo_count,
             },
         )
     }
@@ -5834,6 +5853,59 @@ mod tests {
         assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
         assert_eq!(hs.utxo.count().unwrap(), 1);
         assert!(hs.ready_to_validate_blocks().unwrap());
+    }
+
+    #[test]
+    fn reopen_discards_set_from_retracted_snapshot() {
+        // A device that imported the retracted 943,500 file (no recorded
+        // content hash) must be sent back to the snapshot download.
+        let chain = cheap_chain(10, 0);
+        let (dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain, 1).unwrap();
+        hs.load_snapshot(&path, |_, _| true).unwrap();
+        assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
+        assert!(!hs.needs_snapshot().unwrap());
+        hs.utxo.test_set_snapshot_utxo_hash(None);
+        // A verdict reached against the bad set, under the current rules
+        // (so version pruning alone would keep it), and the ban it caused.
+        let condemned = chain[9].block_hash();
+        hs.store.mark_failed(condemned, 10, "script failure", &rules_tag()).unwrap();
+        hs.store.record_failed_block_ban("203.0.113.7:8333", condemned).unwrap();
+        let peers_path = dir.path().join("peers.sqlite3");
+        crate::peer_store::PeerStore::open(peers_path.to_str().unwrap())
+            .unwrap()
+            .save_ban("203.0.113.7:8333", Instant::now() + Duration::from_secs(3600))
+            .unwrap();
+        drop(hs);
+
+        let hs = fresh_sync(&dir);
+        assert_eq!(hs.utxo.count().unwrap(), 0);
+        assert_eq!(hs.utxo.assume_valid_floor().unwrap(), 0);
+        assert_eq!(hs.store.validated_height().unwrap(), 0);
+        assert!(hs.needs_snapshot().unwrap());
+        // Headers are kept; only validation state is reset.
+        assert_eq!(hs.store.get_hash_at_height(10).unwrap(), Some(chain[9].block_hash()));
+        // The verdict and its ban went with the set.
+        assert!(hs.store.failed_hashes().unwrap().is_empty());
+        let bans = crate::peer_store::PeerStore::open(peers_path.to_str().unwrap())
+            .unwrap()
+            .load_active_bans()
+            .unwrap();
+        assert!(!bans.contains_key("203.0.113.7:8333"), "{:?}", bans);
+    }
+
+    #[test]
+    fn reopen_keeps_set_from_current_snapshot() {
+        let chain = cheap_chain(10, 0);
+        let (dir, hs, path) = anchored_fixture(&chain);
+        hs.store.store_headers(&chain, 1).unwrap();
+        hs.load_snapshot(&path, |_, _| true).unwrap();
+        drop(hs);
+
+        let hs = fresh_sync(&dir);
+        assert_eq!(hs.utxo.count().unwrap(), 1);
+        assert_eq!(hs.store.validated_height().unwrap(), TEST_ANCHOR_HEIGHT);
+        assert!(!hs.needs_snapshot().unwrap());
     }
 
     #[test]
@@ -5906,6 +5978,7 @@ mod tests {
                 height: TEST_ANCHOR_HEIGHT,
                 block_hash: chain[4].block_hash().to_byte_array(),
                 utxo_hash: file_anchor.utxo_hash,
+                utxo_count: file_anchor.utxo_count,
             };
             hs.store.store_headers(&chain, 1).unwrap();
 

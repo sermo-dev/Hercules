@@ -473,6 +473,7 @@ fn anchor_conflict_bans_peer_and_honest_chain_wins() {
         height: 10,
         block_hash: honest_chain.hash_at(10).to_byte_array(),
         utxo_hash: [0u8; 32],
+        utxo_count: 0,
     };
 
     let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&honest_chain));
@@ -500,7 +501,12 @@ fn pending_snapshot_activates_when_headers_reach_anchor() {
     let mut node = Node::new(&[&peer_a, &peer_b]);
     let path = node.dir.path().join("snapshot.hutx");
     std::fs::write(&path, &buf).unwrap();
-    node.hs.anchor = SnapshotAnchor { height: ANCHOR, block_hash, utxo_hash: meta.utxo_hash };
+    node.hs.anchor = SnapshotAnchor {
+        height: ANCHOR,
+        block_hash,
+        utxo_hash: meta.utxo_hash,
+        utxo_count: meta.utxo_count,
+    };
 
     // Loaded before any headers: pending, validated_height untouched.
     node.hs.load_snapshot(path.to_str().unwrap(), |_, _| true).unwrap();
@@ -555,6 +561,7 @@ fn eclipsed_low_work_headers_are_replaced_by_honest_chain() {
         height: ANCHOR,
         block_hash: honest_chain.hash_at(ANCHOR).to_byte_array(),
         utxo_hash: [0u8; 32],
+        utxo_count: 0,
     };
     // More than the honest chain's own work: only the anchor satisfies it.
     let headers: Vec<Header> = honest_chain.blocks().iter().map(|b| b.header).collect();
@@ -591,6 +598,7 @@ fn recover_from_cheap_chain(honest_chain: &FixtureChain, cheap_chain: &FixtureCh
         height: anchor,
         block_hash: honest_chain.hash_at(anchor).to_byte_array(),
         utxo_hash: [0u8; 32],
+        utxo_count: 0,
     };
     let headers: Vec<Header> = honest_chain.blocks().iter().map(|b| b.header).collect();
     let mut one = [0u8; 32];
@@ -669,6 +677,7 @@ fn low_work_fixture() -> (Node, FixtureChain, FixtureChain) {
         height: ANCHOR,
         block_hash: honest_chain.hash_at(ANCHOR).to_byte_array(),
         utxo_hash: [0u8; 32],
+        utxo_count: 0,
     };
     let headers: Vec<Header> = honest_chain.blocks().iter().map(|b| b.header).collect();
     let mut one = [0u8; 32];

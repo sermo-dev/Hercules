@@ -113,7 +113,7 @@ impl FixtureChain {
                 }
                 let txid = tx.compute_txid();
                 for (vout, out) in tx.output.iter().enumerate() {
-                    if !out.script_pubkey.is_op_return() {
+                    if !crate::utxo::is_unspendable(&out.script_pubkey) {
                         set.insert(OutPoint::new(txid, vout as u32), out.clone());
                     }
                 }

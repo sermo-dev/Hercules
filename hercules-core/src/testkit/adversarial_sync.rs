@@ -541,7 +541,7 @@ fn own_tx_is_never_announced_to_inbound_peers() {
 fn catch_up_without_a_snapshot_validates_from_genesis_and_clears_needs_snapshot() {
     let c = chain(30);
     let mut node = Node::new(&[]);
-    node.hs.anchor = SnapshotAnchor { height: 20, block_hash: c.hash_at(20).to_byte_array(), utxo_hash: [0; 32] };
+    node.hs.anchor = SnapshotAnchor { height: 20, block_hash: c.hash_at(20).to_byte_array(), utxo_hash: [0; 32], utxo_count: 0 };
     let headers: Vec<bitcoin::block::Header> = (1..=30).map(|h| c.block(h).header).collect();
     node.hs.store.store_headers(&headers, 1).unwrap();
     assert!(node.hs.needs_snapshot().unwrap());
@@ -561,7 +561,7 @@ fn catch_up_without_a_snapshot_validates_from_genesis_and_clears_needs_snapshot(
 fn catch_up_below_minimum_work_validates_nothing() {
     let c = chain(30);
     let mut node = Node::new(&[]);
-    node.hs.anchor = SnapshotAnchor { height: 40, block_hash: [9; 32], utxo_hash: [0; 32] };
+    node.hs.anchor = SnapshotAnchor { height: 40, block_hash: [9; 32], utxo_hash: [0; 32], utxo_count: 0 };
     let headers: Vec<bitcoin::block::Header> = c.blocks().iter().map(|b| b.header).collect();
     let mut one = [0u8; 32];
     one[0] = 1;
