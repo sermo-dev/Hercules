@@ -96,6 +96,7 @@ The real fix is ticket 029's private broadcast (short-lived isolated Tor connect
 - `is_routable`: reject RFC1918, CGNAT, mapped, ULA and link-local addresses, as Core's `IsRoutable`.
 - Count "propagated" only from a peer we didn't send the tx to.
 - Ping every peer; drop non-responders; add simple inbound eviction (oldest idle) when inbound slots are full.
+- **Peer store that won't open (found merging PR #32):** `PeerPool::new` logs a warning and runs the whole session without persisting bans or scores. The WAL-switch race that caused it is fixed (`store::set_wal`), but any other open error still silently drops ban persistence. Retry once, then surface it in the status (a session that can't remember bans should say so).
 
 ## Files touched
 
