@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 
 use bitcoin::block::Block;
 use bitcoin::hashes::Hash;
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 use heed::types::{Bytes, Unit};
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, MdbError, PutFlags};
 use sha2::{Digest, Sha256};
@@ -280,12 +280,40 @@ const META_KEY_SNAPSHOT_UTXO_HASH: &[u8] = b"snapshot_utxo_hash";
 /// written before it existed, and after a test-only `rollback_block`.
 const META_KEY_BEST_BLOCK: &[u8] = b"best_block";
 
+/// Key inside the `meta` DB for the height below which undo data has been
+/// pruned (4 LE): no block below it can be rolled back, and
+/// `rollback_block_to` refuses one with a local error instead of deleting
+/// its outputs and restoring nothing (ticket 050). Written in the same txn
+/// as the prune. Absent until the first prune.
+const META_KEY_UNDO_PRUNED_BELOW: &[u8] = b"undo_pruned_below";
+
+/// Key inside the `meta` DB for the env's layout version (4 LE), written
+/// when the env is created and checked on every open (ticket 050).
+const META_KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
+
+/// Layout version of the env this build reads and writes.
+///
+/// History:
+/// - 1: the layout described on `UtxoSet` (`utxos`, `undo`, `height_index`,
+///   `meta`) as of ticket 050. Envs written before versioning have no key
+///   and are this layout, so they are stamped 1 as they are.
+pub const LMDB_SCHEMA_VERSION: u32 = 1;
+
 /// `META_KEY_BEST_BLOCK` value: height (4 LE) || hash (32).
 fn encode_best_block(height: u32, hash: &[u8; 32]) -> [u8; 36] {
     let mut v = [0u8; 36];
     v[..4].copy_from_slice(&height.to_le_bytes());
     v[4..].copy_from_slice(hash);
     v
+}
+
+/// A 4-byte little-endian `meta` value, or `None` if the key is absent.
+fn decode_meta_u32(bytes: Option<&[u8]>, name: &str) -> Result<Option<u32>, UtxoError> {
+    match bytes {
+        Some(b) if b.len() == 4 => Ok(Some(u32::from_le_bytes(b.try_into().unwrap()))),
+        Some(b) => Err(UtxoError(format!("corrupt {}: len {}", name, b.len()))),
+        None => Ok(None),
+    }
 }
 
 /// LMDB key length for the `height_index` DB: height (4 BE) + txid (32) + vout (4 BE).
@@ -335,12 +363,21 @@ pub struct SnapshotMeta {
 }
 
 /// A single unspent transaction output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UtxoEntry {
     pub amount: u64,
     pub script_pubkey: Vec<u8>,
     pub height: u32,
     pub is_coinbase: bool,
+}
+
+/// A coin a block spent, exactly as `apply_block` recorded it in the undo
+/// data. Coins created and spent within the same block are not included
+/// (they never reach the set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpentCoin {
+    pub outpoint: OutPoint,
+    pub coin: UtxoEntry,
 }
 
 /// Persistent UTXO set backed by LMDB (via the `heed` crate).
@@ -363,12 +400,15 @@ pub struct UtxoEntry {
 ///   Also gives `has_utxos_at_height` a single cursor seek.
 ///
 /// * `meta` — `key = ascii name`, value = arbitrary bytes. Cross-restart
-///   metadata that doesn't fit the per-UTXO or per-height schemas (currently
-///   just the assume-valid floor written by `load_snapshot`).
+///   metadata that doesn't fit the per-UTXO or per-height schemas (the
+///   `META_KEY_*` constants: snapshot floor and hashes, best block, undo
+///   horizon, layout version).
 ///
-/// All schema versioning is implicit in the snapshot format hash check —
-/// loading a snapshot computed under different on-disk semantics will fail
-/// the SHA256 verification before any data lands.
+/// The env's layout is versioned by `META_KEY_SCHEMA_VERSION`
+/// (`LMDB_SCHEMA_VERSION`, ticket 050): `open` refuses an env from a newer
+/// build. The snapshot file format is versioned separately
+/// (`SNAPSHOT_VERSION`) and its content checked by hash before any data
+/// lands.
 pub struct UtxoSet {
     /// `ManuallyDrop` so `Drop` can release it while holding the env
     /// registry lock (see `EnvSlot`).
@@ -606,6 +646,30 @@ impl UtxoSet {
             let meta: Database<Bytes, Bytes> = set_env
                 .create_database(&mut wtxn, Some("meta"))
                 .map_err(|e| UtxoError(format!("create meta db: {}", e)))?;
+            // Refuse a layout from a newer build (the app was downgraded):
+            // reading it as ours could corrupt it. An env with no version
+            // predates versioning and is today's layout.
+            let version = decode_meta_u32(
+                meta.get(&wtxn, META_KEY_SCHEMA_VERSION)
+                    .map_err(|e| UtxoError(format!("read schema_version: {}", e)))?,
+                "schema_version",
+            )?;
+            match version {
+                Some(v) if v > LMDB_SCHEMA_VERSION => {
+                    return Err(UtxoError(format!(
+                        "the UTXO database at {} has layout version {}, newer than this \
+                         build supports ({}): the app was downgraded. Update the app, or \
+                         reset the node to start over",
+                        path.display(),
+                        v,
+                        LMDB_SCHEMA_VERSION
+                    )));
+                }
+                Some(_) => {}
+                None => meta
+                    .put(&mut wtxn, META_KEY_SCHEMA_VERSION, &LMDB_SCHEMA_VERSION.to_le_bytes())
+                    .map_err(|e| UtxoError(format!("put schema_version: {}", e)))?,
+            }
             wtxn.commit()
                 .map_err(|e| UtxoError(format!("commit create-tx: {}", e)))?;
             Ok::<_, UtxoError>((utxos, undo, height_index, meta))
@@ -703,6 +767,29 @@ impl UtxoSet {
         self.grow_map(current + sizing().headroom)
     }
 
+    /// Run the write txn `txn` (which must abort, writing nothing, when it
+    /// fails), growing the map and retrying on `MDB_MAP_FULL` (ticket 030).
+    fn with_map_full_retry<T>(
+        &self,
+        what: &str,
+        mut txn: impl FnMut() -> Result<T, WriteError>,
+    ) -> Result<T, UtxoError> {
+        let mut attempt = 0;
+        loop {
+            match txn() {
+                Ok(v) => return Ok(v),
+                Err(WriteError::Other(e)) => return Err(e),
+                Err(WriteError::MapFull(msg)) => {
+                    attempt += 1;
+                    if attempt > MAP_FULL_RETRIES {
+                        return Err(UtxoError(msg));
+                    }
+                    self.grow_after_map_full(what)?;
+                }
+            }
+        }
+    }
+
     /// Make sure the map can hold at least `bytes` (growing it if needed),
     /// or fail with a clear message. Used before an AssumeUTXO download so a
     /// device that can't map the set finds out before fetching ~9 GB.
@@ -744,26 +831,17 @@ impl UtxoSet {
     /// Handles in-block spends correctly (outputs created and spent
     /// within the same block never touch the database).
     ///
+    /// Returns the coins the block spent, in input order: exactly what was
+    /// written to its undo data (ticket 050; wallet events, fees and BIP 352
+    /// input keys need them, and `spent_coins_at` reads them back).
+    ///
     /// On `MDB_MAP_FULL` the txn is aborted (nothing written), the map is
     /// grown in place, and the block is applied again (ticket 030).
-    pub fn apply_block(&self, block: &Block, height: u32) -> Result<(), UtxoError> {
-        let mut attempt = 0;
-        loop {
-            match self.apply_block_txn(block, height) {
-                Ok(()) => return Ok(()),
-                Err(WriteError::Other(e)) => return Err(e),
-                Err(WriteError::MapFull(msg)) => {
-                    attempt += 1;
-                    if attempt > MAP_FULL_RETRIES {
-                        return Err(UtxoError(msg));
-                    }
-                    self.grow_after_map_full("apply_block")?;
-                }
-            }
-        }
+    pub fn apply_block(&self, block: &Block, height: u32) -> Result<Vec<SpentCoin>, UtxoError> {
+        self.with_map_full_retry("apply_block", || self.apply_block_txn(block, height))
     }
 
-    fn apply_block_txn(&self, block: &Block, height: u32) -> Result<(), WriteError> {
+    fn apply_block_txn(&self, block: &Block, height: u32) -> Result<Vec<SpentCoin>, WriteError> {
         // Phase 1: Analyze the block to find in-block spends so we can skip
         // writing then immediately deleting outputs that are spent in the
         // same block. (`HashSet` of (txid, vout) since we only need
@@ -799,6 +877,7 @@ impl UtxoSet {
         // Index inside the block for the undo key — multiple inputs can be
         // recorded against the same height, so we tie-break with a counter.
         let mut undo_idx: u32 = 0;
+        let mut spent = Vec::new();
 
         // Phase 2a: copy each spent UTXO into `undo` then delete it from `utxos`
         // (and from `height_index`, where it was registered when created).
@@ -846,6 +925,7 @@ impl UtxoSet {
                 self.height_index
                     .delete(&mut wtxn, &hi_k)
                     .map_err(lmdb("delete height_index"))?;
+                spent.push(SpentCoin { outpoint: input.previous_output, coin: entry });
             }
         }
 
@@ -918,7 +998,86 @@ impl UtxoSet {
 
         wtxn.commit()
             .map_err(lmdb("commit"))?;
-        Ok(())
+        Ok(spent)
+    }
+
+    /// The coins the block applied at `height` spent, read back from its
+    /// undo data in the order `apply_block` returned them: for a block
+    /// found already applied after a crash, whose connect hooks must still
+    /// see them. `None` when that undo data no longer exists (pruned, or at
+    /// or below a snapshot's floor).
+    pub fn spent_coins_at(&self, height: u32) -> Result<Option<Vec<SpentCoin>>, UtxoError> {
+        let _gate = self.read_gate()?;
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let pruned_below = decode_meta_u32(
+            self.meta
+                .get(&rtxn, META_KEY_UNDO_PRUNED_BELOW)
+                .map_err(|e| UtxoError(format!("read undo_pruned_below: {}", e)))?,
+            "undo_pruned_below",
+        )?
+        .unwrap_or(0);
+        let floor = decode_meta_u32(
+            self.meta
+                .get(&rtxn, META_KEY_ASSUME_VALID_FLOOR)
+                .map_err(|e| UtxoError(format!("read assume_valid_floor: {}", e)))?,
+            "assume_valid_floor",
+        )?
+        .unwrap_or(0);
+        if height < pruned_below || (floor > 0 && height <= floor) {
+            return Ok(None);
+        }
+        let iter = self
+            .undo
+            .prefix_iter(&rtxn, &height.to_be_bytes())
+            .map_err(|e| UtxoError(format!("undo prefix iter: {}", e)))?;
+        let mut spent = Vec::new();
+        for r in iter {
+            let (_, v) = r.map_err(|e| UtxoError(format!("undo iter: {}", e)))?;
+            let (txid, vout, coin) = decode_undo_value(v)?;
+            spent.push(SpentCoin {
+                outpoint: OutPoint::new(Txid::from_byte_array(txid), vout),
+                coin,
+            });
+        }
+        Ok(Some(spent))
+    }
+
+    /// Height below which undo data has been pruned (see
+    /// `META_KEY_UNDO_PRUNED_BELOW`), or 0 if nothing has been pruned.
+    pub fn undo_pruned_below(&self) -> Result<u32, UtxoError> {
+        let _gate = self.read_gate()?;
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        Ok(decode_meta_u32(
+            self.meta
+                .get(&rtxn, META_KEY_UNDO_PRUNED_BELOW)
+                .map_err(|e| UtxoError(format!("read undo_pruned_below: {}", e)))?,
+            "undo_pruned_below",
+        )?
+        .unwrap_or(0))
+    }
+
+    /// Lowest height that still has undo data, or `None` if there is none.
+    pub fn lowest_undo_height(&self) -> Result<Option<u32>, UtxoError> {
+        let _gate = self.read_gate()?;
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| UtxoError(format!("read tx: {}", e)))?;
+        let first = self
+            .undo
+            .first(&rtxn)
+            .map_err(|e| UtxoError(format!("undo first: {}", e)))?;
+        match first {
+            Some((k, _)) if k.len() >= 4 => Ok(Some(u32::from_be_bytes(k[..4].try_into().unwrap()))),
+            Some((k, _)) => Err(UtxoError(format!("corrupt undo key len {}", k.len()))),
+            None => Ok(None),
+        }
     }
 
     /// The block the UTXO set is at, as `(height, block hash)`, or `None`
@@ -1067,20 +1226,7 @@ impl UtxoSet {
                 height, floor
             )));
         }
-        let mut attempt = 0;
-        loop {
-            match self.rollback_block_txn(height, parent_hash) {
-                Ok(()) => return Ok(()),
-                Err(WriteError::Other(e)) => return Err(e),
-                Err(WriteError::MapFull(msg)) => {
-                    attempt += 1;
-                    if attempt > MAP_FULL_RETRIES {
-                        return Err(UtxoError(msg));
-                    }
-                    self.grow_after_map_full("rollback_block")?;
-                }
-            }
-        }
+        self.with_map_full_retry("rollback_block", || self.rollback_block_txn(height, parent_hash))
     }
 
     fn rollback_block_txn(
@@ -1094,6 +1240,25 @@ impl UtxoSet {
             .env
             .write_txn()
             .map_err(lmdb("begin tx"))?;
+
+        // Without its undo data a block can't be rolled back: deleting its
+        // outputs and restoring nothing would corrupt the set (ticket 050).
+        // Checked in this txn so a concurrent prune can't slip in between.
+        let pruned_below = decode_meta_u32(
+            self.meta
+                .get(&wtxn, META_KEY_UNDO_PRUNED_BELOW)
+                .map_err(lmdb("read undo_pruned_below"))?,
+            "undo_pruned_below",
+        )?
+        .unwrap_or(0);
+        if height < pruned_below {
+            return Err(UtxoError(format!(
+                "rollback_block: undo data for height {} was pruned (kept from {}); \
+                 a reorg this deep can't be followed from local data",
+                height, pruned_below
+            ))
+            .into());
+        }
 
         // Step 1: collect (txid, vout) pairs created at this height.
         // We can't delete during iteration in heed, so buffer first.
@@ -1176,15 +1341,22 @@ impl UtxoSet {
         Ok(())
     }
 
-    /// Delete undo data for blocks below the given height.
-    /// Call this to reclaim disk space for deeply-buried blocks
-    /// that will never be rolled back.
+    /// Delete undo data for blocks below the given height, reclaiming
+    /// space for deeply-buried blocks that will never be rolled back. The
+    /// new horizon is recorded as `undo_pruned_below` in the same txn, so
+    /// `rollback_block_to` refuses those heights from then on; it never
+    /// moves down. The caller bounds the work per call by how far above the
+    /// lowest undo height it asks for (`HeaderSync::maybe_prune`).
+    ///
+    /// Retried after growing the map on `MDB_MAP_FULL`: deleting rewrites
+    /// pages, which needs free ones.
     pub fn prune_undo_below(&self, height: u32) -> Result<(), UtxoError> {
+        self.with_map_full_retry("prune_undo_below", || self.prune_undo_below_txn(height))
+    }
+
+    fn prune_undo_below_txn(&self, height: u32) -> Result<(), WriteError> {
         let _gate = self.read_gate()?;
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| UtxoError(format!("begin tx: {}", e)))?;
+        let mut wtxn = self.env.write_txn().map_err(lmdb("begin tx"))?;
 
         // Range delete: [0..height_be).
         let upper = height.to_be_bytes();
@@ -1195,9 +1367,20 @@ impl UtxoSet {
         );
         self.undo
             .delete_range(&mut wtxn, &range)
-            .map_err(|e| UtxoError(format!("prune undo: {}", e)))?;
-        wtxn.commit()
-            .map_err(|e| UtxoError(format!("commit prune: {}", e)))?;
+            .map_err(lmdb("prune undo"))?;
+        let pruned_below = decode_meta_u32(
+            self.meta
+                .get(&wtxn, META_KEY_UNDO_PRUNED_BELOW)
+                .map_err(lmdb("read undo_pruned_below"))?,
+            "undo_pruned_below",
+        )?
+        .unwrap_or(0);
+        if height > pruned_below {
+            self.meta
+                .put(&mut wtxn, META_KEY_UNDO_PRUNED_BELOW, &height.to_le_bytes())
+                .map_err(lmdb("put undo_pruned_below"))?;
+        }
+        wtxn.commit().map_err(lmdb("commit prune"))?;
         Ok(())
     }
 
@@ -1794,30 +1977,61 @@ impl UtxoSet {
         self.map_size().saturating_sub(used) < trigger
     }
 
-    /// Wipe every named DB inside the env in a single transaction. Used by
-    /// the snapshot-load error path to clear partial state from earlier
-    /// batched commits before returning the error to the caller.
+    /// Wipe every named DB inside the env in a single transaction (the
+    /// layout version stays). Used by the snapshot-load error path to clear
+    /// partial state from earlier batched commits before returning the
+    /// error to the caller, and by `wipe`.
+    ///
+    /// Retried after growing the map on `MDB_MAP_FULL` (ticket 050): a load
+    /// that failed because the map filled up must still be able to clear
+    /// what it wrote, or its partial rows would sit behind the marker until
+    /// the next launch.
     fn clear_all(&self) -> Result<(), UtxoError> {
+        self.with_map_full_retry("clear_all", || self.clear_all_txn())
+    }
+
+    fn clear_all_txn(&self) -> Result<(), WriteError> {
         let _gate = self.read_gate()?;
-        let mut wtxn = self
-            .env
-            .write_txn()
-            .map_err(|e| UtxoError(format!("clear_all begin tx: {}", e)))?;
-        self.utxos
-            .clear(&mut wtxn)
-            .map_err(|e| UtxoError(format!("clear_all utxos: {}", e)))?;
-        self.undo
-            .clear(&mut wtxn)
-            .map_err(|e| UtxoError(format!("clear_all undo: {}", e)))?;
+        let mut wtxn = self.env.write_txn().map_err(lmdb("clear_all begin tx"))?;
+        self.utxos.clear(&mut wtxn).map_err(lmdb("clear_all utxos"))?;
+        self.undo.clear(&mut wtxn).map_err(lmdb("clear_all undo"))?;
         self.height_index
             .clear(&mut wtxn)
-            .map_err(|e| UtxoError(format!("clear_all height_index: {}", e)))?;
+            .map_err(lmdb("clear_all height_index"))?;
+        self.meta.clear(&mut wtxn).map_err(lmdb("clear_all meta"))?;
         self.meta
-            .clear(&mut wtxn)
-            .map_err(|e| UtxoError(format!("clear_all meta: {}", e)))?;
-        wtxn.commit()
-            .map_err(|e| UtxoError(format!("clear_all commit: {}", e)))?;
+            .put(&mut wtxn, META_KEY_SCHEMA_VERSION, &LMDB_SCHEMA_VERSION.to_le_bytes())
+            .map_err(lmdb("clear_all schema_version"))?;
+        wtxn.commit().map_err(lmdb("clear_all commit"))?;
         Ok(())
+    }
+
+    /// Empty the set in place, crash-safely (ticket 050): the `.loading`
+    /// marker goes down first and is removed only once the cleared env is
+    /// synced, so a kill anywhere in between still ends in a wipe on the
+    /// next `open`. For a set found not to belong to our header chain; the
+    /// caller resets `validated_height`.
+    pub fn wipe(&self) -> Result<(), UtxoError> {
+        let marker = loading_marker_path(self.env.path());
+        fs::write(&marker, b"wipe in progress\n").map_err(|e| {
+            UtxoError(format!("write loading marker {}: {}", marker.display(), e))
+        })?;
+        self.clear_all()?;
+        self.env
+            .force_sync()
+            .map_err(|e| UtxoError(format!("force_sync after wipe: {}", e)))?;
+        fs::remove_file(&marker).map_err(|e| {
+            UtxoError(format!("remove loading marker {}: {}", marker.display(), e))
+        })
+    }
+
+    /// True while the env's `.loading` marker is on disk: a snapshot load
+    /// (or `wipe`) is running, or one failed without cleaning up. Either
+    /// way the rows are partial and unverified, so nothing may validate
+    /// against them or count them as a set (ticket 050). The next `open`
+    /// wipes them.
+    pub fn load_in_progress(&self) -> bool {
+        loading_marker_path(self.env.path()).exists()
     }
 
     /// Check if any UTXOs exist at the given block height.
@@ -1955,7 +2169,7 @@ fn map_size_candidates_with(data_len: u64, sz: &MapSizing) -> Vec<u64> {
 /// `env_dir`. Stored as a sibling file (`<env_dir><suffix>`) rather than
 /// inside the env directory so it can't collide with LMDB's own files
 /// and survives a `remove_dir_all(env_dir)` wipe.
-fn loading_marker_path(env_dir: &Path) -> PathBuf {
+pub(crate) fn loading_marker_path(env_dir: &Path) -> PathBuf {
     let mut p = env_dir.to_path_buf();
     let new_name = match env_dir.file_name() {
         Some(name) => {
@@ -2213,8 +2427,31 @@ impl UtxoSet {
         Ok(())
     }
 
+    /// MuHash of the set as it is now, serialized as `load_snapshot` does
+    /// (Core's `gettxoutsetinfo muhash`).
+    pub(crate) fn test_muhash(&self) -> [u8; 32] {
+        let _gate = self.read_gate().unwrap();
+        let rtxn = self.env.read_txn().unwrap();
+        let mut muhash = MuHash3072::new();
+        for r in self.utxos.iter(&rtxn).unwrap() {
+            let (k, v) = r.unwrap();
+            let txid: [u8; 32] = k[..32].try_into().unwrap();
+            let vout = u32::from_be_bytes(k[32..36].try_into().unwrap());
+            let e = decode_utxo_value(v).unwrap();
+            muhash = muhash.insert(&serialize_coin_for_muhash(
+                &txid,
+                vout,
+                e.height,
+                e.is_coinbase,
+                e.amount as i64,
+                &e.script_pubkey,
+            ));
+        }
+        muhash.finalize()
+    }
+
     /// Count of undo entries currently persisted (across all heights).
-    fn test_count_undo(&self) -> Result<u64, UtxoError> {
+    pub(crate) fn test_count_undo(&self) -> Result<u64, UtxoError> {
         let _gate = self.read_gate()?;
         let rtxn = self
             .env
@@ -2435,6 +2672,57 @@ mod tests {
         utxo.apply_block(&genesis_block(), 0).unwrap();
         // Same coinbase again: same txid, output 0 still unspent.
         let _ = utxo.apply_block(&genesis_block(), 1);
+    }
+
+    /// Ticket 050: every write txn (apply, rollback, prune, `clear_all`)
+    /// goes through `with_map_full_retry`, which grows the map on
+    /// `MDB_MAP_FULL` and runs the txn again, a bounded number of times.
+    #[test]
+    fn map_full_writes_grow_the_map_and_retry() {
+        let _small = SmallMaps::install();
+        let (utxo, _dir) = fresh();
+        let before = utxo.map_size();
+        let calls = std::cell::Cell::new(0);
+        let got = utxo
+            .with_map_full_retry("test", || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(WriteError::MapFull("full".into()))
+                } else {
+                    Ok(7)
+                }
+            })
+            .unwrap();
+        assert_eq!((got, calls.get()), (7, 2));
+        assert!(utxo.map_size() > before, "map not grown");
+
+        calls.set(0);
+        let err = utxo
+            .with_map_full_retry("test", || -> Result<(), WriteError> {
+                calls.set(calls.get() + 1);
+                Err(WriteError::MapFull("still full".into()))
+            })
+            .unwrap_err();
+        assert!(err.0.contains("still full"), "{}", err);
+        assert_eq!(calls.get(), MAP_FULL_RETRIES + 1);
+    }
+
+    /// `clear_all` (a failed snapshot load's cleanup) and undo pruning
+    /// still work after the map has had to grow under them.
+    #[test]
+    fn prune_and_clear_all_work_in_a_grown_map() {
+        let _small = SmallMaps::install();
+        let (utxo, _dir) = fresh();
+        let initial = utxo.map_size();
+        for tag in 0..40 {
+            utxo.apply_block(&fat_block(tag, 300, 500), tag).unwrap();
+        }
+        assert!(utxo.map_size() > initial);
+        utxo.prune_undo_below(20).unwrap();
+        assert_eq!(utxo.undo_pruned_below().unwrap(), 20);
+        utxo.clear_all().unwrap();
+        assert_eq!(utxo.count().unwrap(), 0);
+        assert_eq!(utxo.undo_pruned_below().unwrap(), 0, "meta cleared");
     }
 
     #[test]
