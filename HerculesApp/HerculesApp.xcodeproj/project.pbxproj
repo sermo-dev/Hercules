@@ -7,28 +7,43 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1F6AAB36663479EB4F3DC571 /* RelayRegistrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 826D3189954938949D5796C6 /* RelayRegistrationTests.swift */; };
 		207BCB9D380A6282E1252A39 /* HerculesApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */; };
+		24D9010C5E7E2010C01352F1 /* WakeGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F85858AD86B64004E3908CCB /* WakeGateTests.swift */; };
 		272C877A3AB0BC8FA432A8DD /* AppIdentifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41A3C4F8176070EC1047DA1B /* AppIdentifiers.swift */; };
+		2F064CFE2EE52183DFB7E510 /* SnapshotDownloaderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC9EB29066B6B49769888884 /* SnapshotDownloaderTests.swift */; };
 		30FE03463F60EE0268673195 /* hercules.swift in Sources */ = {isa = PBXBuildFile; fileRef = D447B442663275E674A34B07 /* hercules.swift */; };
 		3DB679FA6EDB8024379C44D5 /* StoragePaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E16302A07901026D4D7245 /* StoragePaths.swift */; };
+		484A13058934FF95DD244A10 /* NotificationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */; };
 		57F102B1AEC3AAFB708A1D34 /* SnapshotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */; };
 		5DCCBD033FCAC94054F52860 /* AppIdentifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41A3C4F8176070EC1047DA1B /* AppIdentifiers.swift */; };
 		5EDE5A815A9EBFDB673C9944 /* herculesFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 23538480402D68A26C4B93B3 /* herculesFFI.xcframework */; };
+		6CEFA079DE86C96B23928B79 /* NotificationHistoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D28B19D88CE6A273DF2AE15 /* NotificationHistoryTests.swift */; };
 		6E11490B9C8FBFC3B743B3B1 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 314CE09F95D9CE2AEFB5822D /* ContentView.swift */; };
 		7278C10C3CC2424F1099807B /* NodeHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */; };
+		8A6727C5BFD9E720E48762C5 /* RelayRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A92FF8270FA0575D8657BB0 /* RelayRegistration.swift */; };
 		8FCF4BC9300EA0B5AE98A0B7 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */; };
 		916E16D86ED9743267AE8804 /* SharedNodeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AC4E7AF001C5D6258259379 /* SharedNodeState.swift */; };
+		921DA2013632DEA0C2E62FAA /* WakeGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F90A8C975388D8BC5CDA560 /* WakeGate.swift */; };
 		9CE626A19F68023E91505EC3 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 963EEE892D1B27F1508C5040 /* PrivacyInfo.xcprivacy */; };
 		9E9C169F7571AD37D2B73530 /* HerculesWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC2415BD33A7DBAD601ACFF /* HerculesWidget.swift */; };
+		9FA83522860713E3C0572DBE /* WakeGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F90A8C975388D8BC5CDA560 /* WakeGate.swift */; };
 		A128B0A9D11BC0123589A67B /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F6A2BE5D8836DC97A10384A /* AppDelegate.swift */; };
+		A41B45E31F36429F8DADC459 /* SnapshotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */; };
+		A6BA39D75F6549D7AD34E5A5 /* StoragePaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = 71E16302A07901026D4D7245 /* StoragePaths.swift */; };
 		AA3A717247168C156786CE85 /* WakeCoordination.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80ECE0624FEAEF806943E691 /* WakeCoordination.swift */; };
 		AAE2B41435A592373EFD3166 /* HerculesWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 2B38B13EB04B0700E9F9264E /* HerculesWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		B3EF5D8882B4179A23DF8B64 /* NotificationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */; };
 		BC2233A312C88F1BCD98652D /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91B6627F64A7DEA672DD126A /* SettingsView.swift */; };
 		CB293751781200CE7EC2D89D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 422A25EDC51BDB37202B75C3 /* Assets.xcassets */; };
+		CC30FA1E619ABE6A6E568921 /* WakeCoordination.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80ECE0624FEAEF806943E691 /* WakeCoordination.swift */; };
+		CCF6F045B49F9CE607E4C567 /* NetworkPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04EA95902151C9A47F19E41C /* NetworkPolicy.swift */; };
 		CFECBEFA458FD23C2B457AF9 /* NetworkPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04EA95902151C9A47F19E41C /* NetworkPolicy.swift */; };
+		DDB1CCC06DE2EF994464D89B /* RelayRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A92FF8270FA0575D8657BB0 /* RelayRegistration.swift */; };
 		DE72398A9DC30BA76DDDFE0F /* SharedNodeState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AC4E7AF001C5D6258259379 /* SharedNodeState.swift */; };
+		DEB7E9B062C7C30D277ECF67 /* AppIdentifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41A3C4F8176070EC1047DA1B /* AppIdentifiers.swift */; };
 		EC9ABB59AA6F7ADCACF891B3 /* NodeActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */; };
+		F2697873CBD44AB1EEC012C9 /* NetworkPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F45D9CA2BDA2E0582115FE6F /* NetworkPolicyTests.swift */; };
 		F313F11A848D8F6B84BC798E /* AboutView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26E678542C2644F95BA080C9 /* AboutView.swift */; };
 		FEA13ADA8F49AAA14C5EB73F /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 369D4212C2AB889A298C77F9 /* NotificationManager.swift */; };
 /* End PBXBuildFile section */
@@ -59,11 +74,13 @@
 
 /* Begin PBXFileReference section */
 		04EA95902151C9A47F19E41C /* NetworkPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPolicy.swift; sourceTree = "<group>"; };
+		1F90A8C975388D8BC5CDA560 /* WakeGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeGate.swift; sourceTree = "<group>"; };
 		23538480402D68A26C4B93B3 /* herculesFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = herculesFFI.xcframework; path = ../build/herculesFFI.xcframework; sourceTree = "<group>"; };
 		26E678542C2644F95BA080C9 /* AboutView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AboutView.swift; sourceTree = "<group>"; };
 		2B38B13EB04B0700E9F9264E /* HerculesWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = HerculesWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		314CE09F95D9CE2AEFB5822D /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		369D4212C2AB889A298C77F9 /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		3D28B19D88CE6A273DF2AE15 /* NotificationHistoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationHistoryTests.swift; sourceTree = "<group>"; };
 		3EEC499055C8047EC500166F /* HerculesApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = HerculesApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		41A3C4F8176070EC1047DA1B /* AppIdentifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIdentifiers.swift; sourceTree = "<group>"; };
 		422A25EDC51BDB37202B75C3 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -72,19 +89,25 @@
 		4CB3647C90E7FDE042B14BD4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		4F6A2BE5D8836DC97A10384A /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		5DF36E0E80A83078F748A223 /* HerculesApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesApp.entitlements; sourceTree = "<group>"; };
+		6A92FF8270FA0575D8657BB0 /* RelayRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayRegistration.swift; sourceTree = "<group>"; };
 		71E16302A07901026D4D7245 /* StoragePaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoragePaths.swift; sourceTree = "<group>"; };
 		73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotDownloader.swift; sourceTree = "<group>"; };
 		80ECE0624FEAEF806943E691 /* WakeCoordination.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeCoordination.swift; sourceTree = "<group>"; };
+		826D3189954938949D5796C6 /* RelayRegistrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayRegistrationTests.swift; sourceTree = "<group>"; };
 		878EC023A41B44D164615C73 /* NodeActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeActivityAttributes.swift; sourceTree = "<group>"; };
 		8DEAAEE7A7E5ADACDD159B1E /* HerculesApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerculesApp.swift; sourceTree = "<group>"; };
 		91B6627F64A7DEA672DD126A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		963EEE892D1B27F1508C5040 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		989C1E01A03C29CBAF7AFB7C /* HerculesAppTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = HerculesAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1D43EA3963B18DAD924BE53 /* HerculesWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = HerculesWidget.entitlements; sourceTree = "<group>"; };
 		A39D7E95A1FE6D2B01A6BF53 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		A600EFFC0C250060AEA8ACF0 /* NodeHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeHost.swift; sourceTree = "<group>"; };
+		AC9EB29066B6B49769888884 /* SnapshotDownloaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotDownloaderTests.swift; sourceTree = "<group>"; };
 		BCC2415BD33A7DBAD601ACFF /* HerculesWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HerculesWidget.swift; sourceTree = "<group>"; };
 		D447B442663275E674A34B07 /* hercules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = hercules.swift; sourceTree = "<group>"; };
 		F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationHistory.swift; sourceTree = "<group>"; };
+		F45D9CA2BDA2E0582115FE6F /* NetworkPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPolicyTests.swift; sourceTree = "<group>"; };
+		F85858AD86B64004E3908CCB /* WakeGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeGateTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -99,12 +122,25 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		02B0CBC5BB53BDE3640B0FCC /* HerculesAppTests */ = {
+			isa = PBXGroup;
+			children = (
+				F45D9CA2BDA2E0582115FE6F /* NetworkPolicyTests.swift */,
+				3D28B19D88CE6A273DF2AE15 /* NotificationHistoryTests.swift */,
+				826D3189954938949D5796C6 /* RelayRegistrationTests.swift */,
+				AC9EB29066B6B49769888884 /* SnapshotDownloaderTests.swift */,
+				F85858AD86B64004E3908CCB /* WakeGateTests.swift */,
+			);
+			path = HerculesAppTests;
+			sourceTree = "<group>";
+		};
 		300DDEC89BDEA68EDF7F8B2A = {
 			isa = PBXGroup;
 			children = (
 				7407BCD6247DDF5D0BFE8FF4 /* build */,
 				4C56C52DE8CC21C6C44A127B /* Config */,
 				957038D4FC38FBCACED7B86B /* HerculesApp */,
+				02B0CBC5BB53BDE3640B0FCC /* HerculesAppTests */,
 				BBD38F1C61BE191ACB4C0440 /* HerculesWidget */,
 				A6D5CF95C1D6155B155BD61C /* Frameworks */,
 				64BBDBCFC4B340FF730B3C7B /* Products */,
@@ -123,6 +159,7 @@
 			isa = PBXGroup;
 			children = (
 				3EEC499055C8047EC500166F /* HerculesApp.app */,
+				989C1E01A03C29CBAF7AFB7C /* HerculesAppTests.xctest */,
 				2B38B13EB04B0700E9F9264E /* HerculesWidget.appex */,
 			);
 			name = Products;
@@ -154,11 +191,13 @@
 				F17463F8F153D0D8BC52B73A /* NotificationHistory.swift */,
 				369D4212C2AB889A298C77F9 /* NotificationManager.swift */,
 				963EEE892D1B27F1508C5040 /* PrivacyInfo.xcprivacy */,
+				6A92FF8270FA0575D8657BB0 /* RelayRegistration.swift */,
 				91B6627F64A7DEA672DD126A /* SettingsView.swift */,
 				4AC4E7AF001C5D6258259379 /* SharedNodeState.swift */,
 				73E6E22C07C32CA12FD0923E /* SnapshotDownloader.swift */,
 				71E16302A07901026D4D7245 /* StoragePaths.swift */,
 				80ECE0624FEAEF806943E691 /* WakeCoordination.swift */,
+				1F90A8C975388D8BC5CDA560 /* WakeGate.swift */,
 			);
 			path = HerculesApp;
 			sourceTree = "<group>";
@@ -205,6 +244,23 @@
 			productReference = 3EEC499055C8047EC500166F /* HerculesApp.app */;
 			productType = "com.apple.product-type.application";
 		};
+		3B9B4C918B2C189F0863F315 /* HerculesAppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 02599D17004D1DADEA1857DD /* Build configuration list for PBXNativeTarget "HerculesAppTests" */;
+			buildPhases = (
+				F8E61583C38BBF015626C24D /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = HerculesAppTests;
+			packageProductDependencies = (
+			);
+			productName = HerculesAppTests;
+			productReference = 989C1E01A03C29CBAF7AFB7C /* HerculesAppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		9302AB11EE10CF4415022A20 /* HerculesWidget */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 8C747CFF6ACF250381AE7C95 /* Build configuration list for PBXNativeTarget "HerculesWidget" */;
@@ -234,6 +290,9 @@
 					202667254CED1A6DA7DF1DD0 = {
 						DevelopmentTeam = "";
 					};
+					3B9B4C918B2C189F0863F315 = {
+						DevelopmentTeam = "";
+					};
 					9302AB11EE10CF4415022A20 = {
 						DevelopmentTeam = "";
 					};
@@ -254,6 +313,7 @@
 			projectRoot = "";
 			targets = (
 				202667254CED1A6DA7DF1DD0 /* HerculesApp */,
+				3B9B4C918B2C189F0863F315 /* HerculesAppTests */,
 				9302AB11EE10CF4415022A20 /* HerculesWidget */,
 			);
 		};
@@ -286,12 +346,34 @@
 				7278C10C3CC2424F1099807B /* NodeHost.swift in Sources */,
 				B3EF5D8882B4179A23DF8B64 /* NotificationHistory.swift in Sources */,
 				FEA13ADA8F49AAA14C5EB73F /* NotificationManager.swift in Sources */,
+				DDB1CCC06DE2EF994464D89B /* RelayRegistration.swift in Sources */,
 				BC2233A312C88F1BCD98652D /* SettingsView.swift in Sources */,
 				916E16D86ED9743267AE8804 /* SharedNodeState.swift in Sources */,
 				57F102B1AEC3AAFB708A1D34 /* SnapshotDownloader.swift in Sources */,
 				3DB679FA6EDB8024379C44D5 /* StoragePaths.swift in Sources */,
 				AA3A717247168C156786CE85 /* WakeCoordination.swift in Sources */,
+				921DA2013632DEA0C2E62FAA /* WakeGate.swift in Sources */,
 				30FE03463F60EE0268673195 /* hercules.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F8E61583C38BBF015626C24D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DEB7E9B062C7C30D277ECF67 /* AppIdentifiers.swift in Sources */,
+				CCF6F045B49F9CE607E4C567 /* NetworkPolicy.swift in Sources */,
+				F2697873CBD44AB1EEC012C9 /* NetworkPolicyTests.swift in Sources */,
+				484A13058934FF95DD244A10 /* NotificationHistory.swift in Sources */,
+				6CEFA079DE86C96B23928B79 /* NotificationHistoryTests.swift in Sources */,
+				8A6727C5BFD9E720E48762C5 /* RelayRegistration.swift in Sources */,
+				1F6AAB36663479EB4F3DC571 /* RelayRegistrationTests.swift in Sources */,
+				A41B45E31F36429F8DADC459 /* SnapshotDownloader.swift in Sources */,
+				2F064CFE2EE52183DFB7E510 /* SnapshotDownloaderTests.swift in Sources */,
+				A6BA39D75F6549D7AD34E5A5 /* StoragePaths.swift in Sources */,
+				CC30FA1E619ABE6A6E568921 /* WakeCoordination.swift in Sources */,
+				9FA83522860713E3C0572DBE /* WakeGate.swift in Sources */,
+				24D9010C5E7E2010C01352F1 /* WakeGateTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -395,6 +477,25 @@
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
+		};
+		384EEEB1690A118C3A964605 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_ID).tests";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
 		};
 		425B932F52FEFE82D2157C16 /* Debug */ = {
 			isa = XCBuildConfiguration;
@@ -522,6 +623,25 @@
 			};
 			name = Release;
 		};
+		BCBD29AB8F6BB93B755FC7DE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = NO;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(APP_BUNDLE_ID).tests";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
 		CF3CBB4F69E12138D4625F32 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -547,6 +667,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		02599D17004D1DADEA1857DD /* Build configuration list for PBXNativeTarget "HerculesAppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				384EEEB1690A118C3A964605 /* Debug */,
+				BCBD29AB8F6BB93B755FC7DE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		2077C3FF3BC861D9048B488D /* Build configuration list for PBXProject "HerculesApp" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

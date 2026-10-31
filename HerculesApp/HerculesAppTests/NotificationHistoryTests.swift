@@ -22,7 +22,7 @@ final class NotificationHistoryTests: XCTestCase {
         XCTAssertEqual(source(), .headerOnly)
         // Alerts win over everything.
         XCTAssertEqual(source(caughtUp: true, invalid: true), .invalidChain)
-        XCTAssertEqual(source(disagreement: true, awaiting: true), .tipDisagreement)
+        XCTAssertEqual(source(awaiting: true, disagreement: true), .tipDisagreement)
         // Snapshot not loaded: never "Block #0 Header Verified".
         XCTAssertEqual(source(awaiting: true), .awaitingSetup)
         XCTAssertEqual(source(confirmed: false, awaiting: true), .awaitingSetup)
