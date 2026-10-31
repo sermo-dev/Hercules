@@ -1309,9 +1309,14 @@ fn duplicated_transaction_block_is_a_bad_delivery() {
 #[test]
 fn corrupted_blocks_from_every_peer_are_reported_without_spinning() {
     let chain = chain_with_spends(110);
+    // Synced to 101 first, without a clock: the 6 s window below is for
+    // block 102 alone. Syncing all 101 blocks inside it failed whenever
+    // the machine was loaded (a parallel test run), on main too.
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(101));
     let m1 = MockPeer::spawn(&chain, vec![Behavior::ServeMutated(102)]);
     let m2 = MockPeer::spawn(&chain, vec![Behavior::ServeWitnessless(102)]);
-    let node = Node::new(&[&m1, &m2]);
+    node.use_peers(&[&m1, &m2]);
 
     let (errors, res) = node.sync_errors_for(Duration::from_secs(6));
     assert!(res.is_ok(), "{:?}", res);
