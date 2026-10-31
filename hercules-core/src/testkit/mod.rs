@@ -11,6 +11,10 @@ pub mod mock_peer;
 #[cfg(test)]
 mod consensus_rules;
 
+/// Both sides of every block-level consensus limit (data-path test pass).
+#[cfg(test)]
+mod consensus_boundaries;
+
 pub use fixture_chain::{FixtureChain, Invalid};
 pub use lmdb_gate::{lmdb_slot, LmdbSlot};
 pub use mock_peer::{Behavior, MockPeer};

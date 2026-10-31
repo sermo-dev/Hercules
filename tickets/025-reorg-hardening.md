@@ -1,5 +1,27 @@
 # Ticket 025: Reorg Hardening — Validate the New Branch Before Abandoning the Old One
 
+## Review update (2026-10-28)
+
+The team review of main @ 7732755 raised this ticket's priority and found gaps in its scope. **Priority: High, before wallet work.** Today any 1-block reorg of our tip makes every background wake fail until the user opens the app: `sync.rs:4639` builds a single-hash locator, and `4676-4681` gives up with "reorg?". That breaks arrival notifications and leaves stale confirmations, exactly what 035/040 will display. **Revised estimate: 1–1.5 weeks.**
+
+Parts of the background below are out of date:
+- 024 already added `rollback_utxo_to` and the UTXO `best_block` marker.
+- Line numbers have moved; the reorg is now `apply_reorg` (`sync.rs:1560-1615`).
+- 050 introduces the shared `connect_block` that the revert path should reuse.
+
+**Added to scope:**
+
+1. **Hash-keyed block_store.** Blocks are keyed by height with `INSERT OR REPLACE` (`block_store.rs:36-41, 59-62`). Connecting a new-branch block deletes the old-branch block at that height, so "reconnect our old blocks from block_store" can't work.
+   - Change to a hash-keyed schema (several blocks per height, with an active flag), with a migration (uses 050's schema versions).
+   - Cope with missing rows: the store runs `synchronous=NORMAL` and can lose recent blocks on power loss, so the revert must be able to refetch them.
+2. **Undo records carry hash and prev-hash.** Store each applied block's hash and prev-hash with its undo data in LMDB, so rollback sets `best_block` from the UTXO set's own record (drop the `UNKNOWN_BLOCK_HASH` workaround).
+3. **One SQLite transaction for the header switch.** `apply_reorg` currently uses three: delete, `set_validated_height`, store.
+4. **Disconnect hook.** `on_block_disconnected(height, block, spent_coins)` alongside 050's connect hooks. Today a reorg only calls `own_txs.demote_confirmed_above` (`sync.rs:1612`). 035's inverse wallet events depend on it.
+5. **Mempool after a reorg (Core's `removeForReorg`).** Re-add disconnected transactions (already in scope), then re-check finality and BIP 68 for every mempool entry against the new tip. This was deferred from 026. Emit the removals on 053's event stream.
+6. **Prune/reorg coupling enforced in code**, via 050's `undo_pruned_below` guard, not just the comment at `sync.rs:44-53`.
+
+**Dependencies added:** 050 (`connect_block`, schema versions, undo guard) and 053 (mempool event stream).
+
 ## Summary
 
 Hercules handles chain reorganizations in the main sync loop, but in the wrong order. It validates the new branch's *headers*, then immediately rolls back the UTXO set and deletes our headers above the fork point. Only after that does it start downloading and validating the new branch's *blocks*. If those blocks are withheld or invalid, the node is left rolled back with no valid tip.
@@ -134,4 +156,4 @@ All of these run through the 027 harness on regtest:
 
 ## Roadmap position
 
-Safety tier, after 024 and 027: **022 → 023 → 024 → 027 → 025/026**.
+Pre-wallet hardening block, last before 035: **049 → 050 → 053 → 054 → 052 → 025**, then 035. (Originally: safety tier after 024 and 027; 026 has since landed.)

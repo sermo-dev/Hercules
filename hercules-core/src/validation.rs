@@ -1192,4 +1192,280 @@ mod tests {
         );
         assert!(matches!(result, Err(ValidationError::BadDifficulty { .. })), "{:?}", result);
     }
+
+    // ── Data-path pass: real retargets, oracles, exact boundaries ────
+
+    fn hdr(hex_str: &str) -> bitcoin::block::Header {
+        deserialize(&hex::decode(hex_str).unwrap()).unwrap()
+    }
+
+    /// Real mainnet retargets: (height H, header H-2016 = epoch start,
+    /// header H-1, header H). Raw headers, public chain data.
+    fn mainnet_retargets() -> Vec<(u32, bitcoin::block::Header, bitcoin::block::Header, bitcoin::block::Header)> {
+        vec![
+            // First retarget: the epoch took far longer than two weeks, so
+            // the 4x clamp applies and the result is capped at the PoW limit.
+            (
+                2016,
+                genesis_header(),
+                hdr("01000000e25509cde707c3d02a693e4fe9e7cdd57c38a0d2c8d6341f20dae84b000000000c113df1185e162ee92d031fe21d1400ff7d705a3e9b9c860eea855313cd8ca26c087f49ffff001d30b73231"),
+                hdr("010000006397bb6abd4fc521c0d3f6071b5650389f0b4551bc40b4e6b067306900000000ace470aecda9c8818c8fe57688cd2a772b5a57954a00df0420a7dd546b6d2c576b0e7f49ffff001d33f0192f"),
+            ),
+            // First difficulty increase: 0x1d00ffff -> 0x1d00d86a.
+            (
+                32256,
+                hdr("01000000e6bf7fd7f7790a63786faa878d0dc7fd8f2ff365732e45862c66075100000000700d342f65c7b6834dffb615358a1897016f0448913372190cbe3d27a4b53355b1512b4bffff001dbfb02519"),
+                hdr("0100000049c1daab3b6536ff1b2633c3a316a6e06ec287676cdeec4ca7baae6b00000000ac10b36b8f354b3353207de15940a5edbc05bb8364af75b4b5409e7823f2b48923ec3a4bffff001dbd5fa412"),
+                hdr("010000004b0360d834a330ec7833e30e1f523ee05a0793361e29a73421964f980000000027b64a020af294e903feed93768705336a20090612a043f47af462a2f5e5b564f8ee3a4b6ad8001dd3a43707"),
+            ),
+            // The largest decrease on record (2021 China mining ban).
+            (
+                689472,
+                hdr("040000207346ca53de43c0a2176e8a12f3bf1788613b892844460100000000000000000018c096ec291c41b8192048a22398bcbcb238fb5e52a4a5c37ca318a536fff92e7465c660f91e0e175f89e127"),
+                hdr("0400002010c7e39c457b1037a11ed5ae40b5552292a4d509e266000000000000000000003de5a2921399777aa73ed267590b64996940122c5e4b70857b8da9df0309f7dabd02e060f91e0e17500b5b04"),
+                hdr("0420d1297c65a9842c11702870b6fd4fc29c7a0e431dab16c8cb090000000000000000002d035269665426c99644d1cf3cdde1caac14de3c0737b0c29b3868eb164f0178de04e060ce9813172f3f2398"),
+            ),
+            // The last retarget before the AssumeUTXO anchor (943,500).
+            (
+                943488,
+                hdr("00a04e38373d0c01c28991ba80faec5d306ae89732ab13800b7201000000000000000000b9ff0d1552f4c89dbb9c1b4825da6c49354ea5037cc16aa837c0f20244a1d94a0bc2bd69911a021700e00e14"),
+                hdr("0000003a0d341c29548cd4f35eb3dda1721983df65f5cf3ba8e401000000000000000000862623e067e30da1020d1ad71f7b39f8bbd1dcdf61c171c2ac238a77a87141e42987cf69911a0217fcf6d8d1"),
+                hdr("0080f52c6930038c2610c7b36fe5363acf2af590e7eb08d93fb600000000000000000000e9dfa2b7f7d61fec8f003a73092d493b8f5a60d19567a0e9621e16612bbf7fab4888cf69840602179cb05d27"),
+            ),
+        ]
+    }
+
+    /// The retarget arithmetic (clamp, 256-bit multiply/divide, PoW-limit
+    /// cap, compact rounding) reproduces every real retarget, and
+    /// `validate_headers` reads the epoch start at exactly H - 2016.
+    #[test]
+    fn real_mainnet_retargets_are_reproduced_exactly() {
+        let params = ChainParams::mainnet();
+        for (h, start, last, new) in mainnet_retargets() {
+            assert_eq!(new.prev_blockhash, last.block_hash(), "fixture linkage at {}", h);
+            let span = last.time as i64 - start.time as i64;
+            assert_eq!(calculate_next_target(last.bits, span, MAINNET_POW_LIMIT), new.bits, "retarget at {}", h);
+
+            let start_time = start.time;
+            let epoch = |want: u32| move |at: u32| -> Result<u32, String> {
+                if at == want { Ok(start_time) } else { Err(format!("asked for {}", at)) }
+            };
+            let check = |hdr: &bitcoin::block::Header, lookup: &dyn Fn(u32) -> Result<u32, String>| {
+                validate_headers(params, &[*hdr], last.block_hash(), h - 1, &[last.time], last.bits, lookup)
+            };
+            check(&new, &epoch(h - 2016)).unwrap_or_else(|e| panic!("real header {}: {}", h, e));
+            // Off-by-one epoch starts are never consulted.
+            for wrong in [Some(h - 2015), h.checked_sub(2017)].into_iter().flatten() {
+                assert!(check(&new, &epoch(wrong)).is_err(), "{} consulted epoch start {}", h, wrong);
+            }
+            // Any other bits at the boundary are refused before PoW.
+            let mut tampered = new;
+            tampered.bits = CompactTarget::from_consensus(new.bits.to_consensus() - 1);
+            assert!(matches!(check(&tampered, &epoch(h - 2016)), Err(ValidationError::BadDifficulty { .. })));
+            // One block earlier (not a boundary) the same change is refused.
+            if new.bits != last.bits {
+                assert!(matches!(
+                    validate_headers(params, &[last], last.prev_blockhash, h - 2, &[], new.bits, &epoch(0)),
+                    Err(ValidationError::BadDifficulty { .. })
+                ));
+            }
+        }
+    }
+
+    fn arb_mainnet_bits() -> impl proptest::strategy::Strategy<Value = CompactTarget> {
+        use proptest::prelude::*;
+        // Normalized compact targets from the PoW limit down to tiny ones.
+        (0x04u32..=0x1d, 0x0080_00u32..=0x7f_ffff).prop_filter_map("above the PoW limit", |(exp, mant)| {
+            let bits = CompactTarget::from_consensus((exp << 24) | mant);
+            let target = bitcoin::pow::Target::from_compact(bits);
+            (target <= bitcoin::pow::Target::from_compact(CompactTarget::from_consensus(MAINNET_POW_LIMIT)))
+                .then_some(bits)
+        })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Differential: rust-bitcoin's independent port of Core's
+        /// `CalculateNextWorkRequired` agrees for any target and timespan,
+        /// including negative timespans (timestamps may go backwards) and
+        /// both clamps.
+        #[test]
+        fn retarget_matches_rust_bitcoin(bits in arb_mainnet_bits(), span in -3 * TARGET_TIMESPAN..10 * TARGET_TIMESPAN) {
+            let ours = calculate_next_target(bits, span, MAINNET_POW_LIMIT);
+            let theirs = CompactTarget::from_next_work_required(bits, span.max(0) as u64, bitcoin::params::Params::MAINNET);
+            proptest::prop_assert_eq!(ours, theirs);
+        }
+
+        /// Differential: chainwork per header equals rust-bitcoin's
+        /// `Target::to_work` (Core's GetBlockProof: ~t / (t + 1) + 1).
+        #[test]
+        fn work_matches_rust_bitcoin(bits in arb_mainnet_bits()) {
+            let target = bitcoin::pow::Target::from_compact(bits);
+            proptest::prop_assert_eq!(work_for_compact_target(bits), target.to_work().to_le_bytes());
+        }
+
+        /// u256 helpers against u128 arithmetic on values that fit.
+        #[test]
+        fn u256_helpers_match_u128(a in proptest::prelude::any::<u128>(), b in 1u128..) {
+            let le = |x: u128| { let mut o = [0u8; 32]; o[..16].copy_from_slice(&x.to_le_bytes()); o };
+            let (a32, b32) = (le(a), le(b));
+            proptest::prop_assert_eq!(u256_div_u256(a32, b32), le(a / b));
+            proptest::prop_assert_eq!(u256_gt(&a32, &b32), a > b);
+            proptest::prop_assert_eq!(u256_gte(a32, b32), a >= b);
+            if a >= b {
+                proptest::prop_assert_eq!(u256_sub(a32, b32), le(a - b));
+            }
+            if let Some(s) = a.checked_add(b) {
+                proptest::prop_assert_eq!(u256_add(a32, b32), le(s));
+            }
+            let small = (b % (1 << 63)) as u64 + 1;
+            proptest::prop_assert_eq!(u256_div_u64(a32, small), le(a / small as u128));
+            if let Some(p) = a.checked_mul(small as u128) {
+                proptest::prop_assert_eq!(u256_mul_u64(a32, small), le(p));
+            }
+        }
+    }
+
+    fn now_secs() -> u32 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32
+    }
+
+    fn regtest_header_at(prev: &bitcoin::block::Header, time: u32) -> bitcoin::block::Header {
+        let mut h = mined_regtest_header(prev);
+        h.time = time;
+        h.nonce = 0;
+        while h.validate_pow(h.target()).is_err() {
+            h.nonce += 1;
+        }
+        h
+    }
+
+    /// MAX_FUTURE_BLOCK_TIME: now + 2 h is accepted, one second more is
+    /// not. The clock is read inside `validate_headers`, so the rejection
+    /// is only asserted for a run where the second didn't tick over.
+    #[test]
+    fn future_time_limit_is_exactly_two_hours() {
+        let params = ChainParams::regtest();
+        let prev = params.genesis_header();
+        let check = |h: bitcoin::block::Header| {
+            validate_headers(params, &[h], prev.block_hash(), 0, &[prev.time], prev.bits, &|_| Err("unused".into()))
+        };
+        let now = now_secs();
+        check(regtest_header_at(&prev, now + 7200)).expect("now + 7200 s is allowed");
+        for _ in 0..50 {
+            let before = now_secs();
+            let header = regtest_header_at(&prev, before + 7201);
+            let result = check(header);
+            if now_secs() == before {
+                assert!(
+                    matches!(result, Err(ValidationError::FutureTimestamp { max_allowed, .. }) if max_allowed == before + 7200),
+                    "{:?}",
+                    result
+                );
+                return;
+            }
+        }
+        panic!("clock ticked during every attempt");
+    }
+
+    /// Version rules switch on at exactly the activation height, inside a
+    /// single batch: a v1 header at BIP34 height - 1 is fine, at the
+    /// height it isn't (and the error names that height).
+    #[test]
+    fn version_rule_activates_at_exactly_its_height() {
+        let params: &'static ChainParams =
+            Box::leak(Box::new(ChainParams { bip34_height: 2, bip66_height: 100, bip65_height: 100, ..*ChainParams::regtest() }));
+        let prev = params.genesis_header();
+        let v1 = |parent: &bitcoin::block::Header| {
+            let mut h = mined_regtest_header(parent);
+            h.version = bitcoin::block::Version::from_consensus(1);
+            while h.validate_pow(h.target()).is_err() {
+                h.nonce += 1;
+            }
+            h
+        };
+        let h1v1 = v1(&prev);
+        let h2 = v1(&h1v1);
+        let r = validate_headers(params, &[h1v1, h2], prev.block_hash(), 0, &[prev.time], prev.bits, &|_| Err("unused".into()));
+        assert!(matches!(r, Err(ValidationError::BadVersion { height: 2, version: 1 })), "{:?}", r);
+        validate_headers(params, &[h1v1], prev.block_hash(), 0, &[prev.time], prev.bits, &|_| Err("unused".into()))
+            .expect("v1 is fine one block before activation");
+    }
+
+    /// Errors name the height of the first bad header in a batch, and
+    /// headers before it are not enough to make the batch pass.
+    #[test]
+    fn batch_errors_name_the_failing_height() {
+        let params = ChainParams::regtest();
+        let prev = params.genesis_header();
+        let a = mined_regtest_header(&prev);
+        let b = mined_regtest_header(&a);
+        let mut c = mined_regtest_header(&b);
+        c.prev_blockhash = a.block_hash(); // skips b
+        let r = validate_headers(params, &[a, b, c], prev.block_hash(), 40, &[prev.time], prev.bits, &|_| Err("unused".into()));
+        assert!(matches!(r, Err(ValidationError::BadPrevHash { height: 43, .. })), "{:?}", r);
+    }
+
+    /// Median-time-past over an unsorted 11-block window: equal to the
+    /// median is too early, one second later is fine.
+    #[test]
+    fn mtp_boundary_with_an_unsorted_window() {
+        let params = ChainParams::regtest();
+        let prev = params.genesis_header();
+        // Median of these 11 is base + 50.
+        let base = prev.time - 1_000;
+        let window: Vec<u32> = [90u32, 10, 50, 100, 0, 70, 20, 80, 30, 60, 40].iter().map(|d| base + d).collect();
+        let check = |t: u32| {
+            validate_headers(params, &[regtest_header_at(&prev, t)], prev.block_hash(), 20, &window, prev.bits, &|_| {
+                Err("unused".into())
+            })
+        };
+        assert!(matches!(check(base + 50), Err(ValidationError::BadTimestamp { median_past, .. }) if median_past == base + 50));
+        check(base + 51).expect("one second past the median");
+    }
+
+    #[test]
+    fn check_anchor_at_batch_edges() {
+        let params = ChainParams::regtest();
+        let g = params.genesis_header();
+        let a = mined_regtest_header(&g);
+        let b = mined_regtest_header(&a);
+        let batch = [a, b];
+        // Anchor at the first and the last header of the batch.
+        assert!(check_anchor(&batch, 10, 10, &a.block_hash()).is_ok());
+        assert!(check_anchor(&batch, 10, 11, &b.block_hash()).is_ok());
+        assert!(matches!(check_anchor(&batch, 10, 10, &b.block_hash()), Err(ValidationError::AnchorMismatch { height: 10, .. })));
+        assert!(matches!(check_anchor(&batch, 10, 11, &a.block_hash()), Err(ValidationError::AnchorMismatch { height: 11, .. })));
+        // Just past either end: not this batch's business.
+        assert!(check_anchor(&batch, 10, 12, &g.block_hash()).is_ok());
+        assert!(check_anchor(&batch, 10, 9, &g.block_hash()).is_ok());
+        assert!(check_anchor(&[], 10, 10, &g.block_hash()).is_ok());
+    }
+
+    /// Core's GetMedianTimePast uses every ancestor when there are fewer
+    /// than 11, so block 1 must be later than genesis. Here the check is
+    /// skipped below 11 ancestors (heights 1..=10).
+    #[test]
+    #[ignore = "BUG (consensus, low severity): MTP rule skipped for headers at heights 1..=10 (fewer than 11 timestamps); Core uses all available ancestors"]
+    fn mtp_applies_with_fewer_than_eleven_ancestors() {
+        let params = ChainParams::regtest();
+        let prev = params.genesis_header();
+        let same_time = regtest_header_at(&prev, prev.time);
+        let r = validate_headers(params, &[same_time], prev.block_hash(), 0, &[prev.time], prev.bits, &|_| Err("unused".into()));
+        assert!(matches!(r, Err(ValidationError::BadTimestamp { .. })), "{:?}", r);
+    }
+
+    /// A failure to read *our own* header store for the epoch start is a
+    /// local fault, not evidence against the peer's header.
+    #[test]
+    #[ignore = "BUG: a local epoch_start_time lookup failure is reported as BadDifficulty, indistinguishable from an invalid header (the sender can be penalized for our fault)"]
+    fn epoch_start_lookup_failure_is_not_a_bad_difficulty_verdict() {
+        let (h, _, last, new) = mainnet_retargets().remove(1);
+        let r = validate_headers(ChainParams::mainnet(), &[new], last.block_hash(), h - 1, &[last.time], last.bits, &|_| {
+            Err("database is locked".into())
+        });
+        assert!(r.is_err());
+        assert!(!matches!(r, Err(ValidationError::BadDifficulty { .. })), "{:?}", r);
+    }
 }

@@ -362,6 +362,11 @@ pub struct UtxoSet {
     undo: Database<Bytes, Bytes>,
     height_index: Database<Bytes, Unit>,
     meta: Database<Bytes, Bytes>,
+    /// Test builds: a slot in the per-process LMDB lock budget, held for
+    /// this handle's life (see `testkit::lmdb_gate`). Dropped after `Drop`
+    /// has closed the env.
+    #[cfg(test)]
+    _lmdb_slot: crate::testkit::LmdbSlot,
 }
 
 impl UtxoSet {
@@ -396,6 +401,10 @@ impl UtxoSet {
     }
 
     fn open_at(path: &Path) -> Result<UtxoSet, UtxoError> {
+        // Before any LMDB call, so a throttled test waits here instead of
+        // failing `mdb_txn_begin` with EINVAL.
+        #[cfg(test)]
+        let lmdb_slot = crate::testkit::lmdb_slot();
         // SAFETY: heed marks `open` unsafe because LMDB requires the same
         // mmap'd file isn't simultaneously opened with conflicting flags from
         // another process. We're a single-process iOS app and never share the
@@ -536,6 +545,8 @@ impl UtxoSet {
             undo,
             height_index,
             meta,
+            #[cfg(test)]
+            _lmdb_slot: lmdb_slot,
         })
     }
 
@@ -1774,8 +1785,12 @@ fn release_env(canonical: &Path, env: Env) {
     }
 }
 
+/// `n` rounded up to a multiple of `granule`, saturating at `u64::MAX`.
+/// A corrupt snapshot header can announce ~2^64 entries; the plain
+/// product overflowed there (a panic in debug builds, a map size wrapped
+/// to 0 in release) instead of failing the capacity check.
 fn round_up(n: u64, granule: u64) -> u64 {
-    n.div_ceil(granule) * granule
+    n.div_ceil(granule).saturating_mul(granule)
 }
 
 /// Map sizes to try, largest first, for an env whose `data.mdb` is
@@ -3121,3 +3136,8 @@ mod tests {
         assert!(!utxo.has_utxos_at_height(0).unwrap());
     }
 }
+
+/// Snapshot-format, apply/rollback and corruption edge cases.
+#[cfg(test)]
+#[path = "utxo_tests.rs"]
+mod edge_tests;

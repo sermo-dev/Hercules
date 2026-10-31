@@ -366,16 +366,11 @@ fn coinbase_script_length_boundaries() {
 /// with real median-time-past and real coin heights: the new rules must
 /// reject none of them. Data is public chain data fetched by
 /// `tools/fetch_mainnet_context.py` into `$HERCULES_MAINNET_CTX_DIR`
-/// (several MB per block, so not checked in).
+/// (several MB per typical block). Two small blocks are checked in; see
+/// `checked_in_mainnet_blocks_pass_contextual_rules`.
 #[test]
 #[ignore = "needs HERCULES_MAINNET_CTX_DIR (see tools/fetch_mainnet_context.py)"]
 fn mainnet_blocks_pass_contextual_rules() {
-    use crate::contextual_checks::{transaction_sigop_cost, SEQUENCE_LOCKTIME_DISABLE_FLAG as DISABLE};
-    use crate::utxo::UtxoEntry;
-    use bitcoin::consensus::deserialize;
-    use bitcoin::hashes::Hash;
-    use std::collections::{HashMap, HashSet};
-
     let dir = std::env::var("HERCULES_MAINNET_CTX_DIR").expect("HERCULES_MAINNET_CTX_DIR");
     let mut files: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
@@ -384,10 +379,52 @@ fn mainnet_blocks_pass_contextual_rules() {
         .collect();
     files.sort();
     assert!(!files.is_empty(), "no mainnet_ctx_*.json in {}", dir);
-
-    let params = ChainParams::mainnet();
     for path in files {
         let j: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        validate_mainnet_ctx(&j, false).unwrap_or_else(|e| panic!("{}", e));
+    }
+}
+
+/// Two small post-anchor mainnet blocks (57 and 96 txs, P2WPKH/P2TR/P2SH
+/// spends, BIP 68 inputs) with all their context, checked in (~140 KB)
+/// so real-block contextual and script validation runs in every
+/// `cargo test`. Fetched with `tools/fetch_mainnet_context.py`; the block
+/// hash is re-checked against the raw header on load.
+const CHECKED_IN_MAINNET_CTX: [&str; 2] =
+    [include_str!("testdata/mainnet_ctx_944885.json"), include_str!("testdata/mainnet_ctx_945209.json")];
+
+#[test]
+fn checked_in_mainnet_blocks_pass_contextual_rules() {
+    for ctx in CHECKED_IN_MAINNET_CTX {
+        let j: serde_json::Value = serde_json::from_str(ctx).unwrap();
+        validate_mainnet_ctx(&j, false).unwrap_or_else(|e| panic!("{}", e));
+    }
+}
+
+/// The same blocks with one spent coin's amount off by a satoshi must
+/// fail script validation (SegWit and Taproot signatures commit to the
+/// amount), so the passing run above really verifies real signatures.
+#[test]
+fn checked_in_mainnet_blocks_fail_with_a_tampered_prevout_amount() {
+    for ctx in CHECKED_IN_MAINNET_CTX {
+        let j: serde_json::Value = serde_json::from_str(ctx).unwrap();
+        let err = validate_mainnet_ctx(&j, true).expect_err("tampered amount accepted");
+        assert!(err.contains("ScriptFailure"), "{}", err);
+    }
+}
+
+/// Validate one fetched mainnet block context. With `tamper`, the first
+/// spent coin outside the block is seeded with one extra satoshi.
+fn validate_mainnet_ctx(j: &serde_json::Value, tamper: bool) -> Result<(), String> {
+    use crate::contextual_checks::{transaction_sigop_cost, SEQUENCE_LOCKTIME_DISABLE_FLAG as DISABLE};
+    use crate::utxo::UtxoEntry;
+    use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::Hash;
+    use std::collections::{HashMap, HashSet};
+
+    let params = ChainParams::mainnet();
+    let mut tampered = !tamper;
+    {
         let height = j["height"].as_u64().unwrap() as u32;
         let block: bitcoin::Block = deserialize(&hex::decode(j["block_hex"].as_str().unwrap()).unwrap()).unwrap();
         assert_eq!(block.block_hash().to_string(), j["hash"].as_str().unwrap());
@@ -415,11 +452,16 @@ fn mainnet_blocks_pass_contextual_rules() {
                 let spk = hex::decode(p[1].as_str().unwrap()).unwrap();
                 let op = txin.previous_output;
                 if !in_block.contains(&op.txid) {
+                    // Tamper with the first coin whose script commits to
+                    // its amount (any SegWit or Taproot output).
+                    let commits = spk.first().is_some_and(|b| *b == 0x00 || *b == 0x51) && spk.len() >= 22;
+                    let extra = (!tampered && commits) as u64;
+                    tampered |= commits;
                     utxo.test_insert_utxo(
                         op.txid.to_byte_array(),
                         op.vout,
                         UtxoEntry {
-                            amount: p[0].as_u64().unwrap(),
+                            amount: p[0].as_u64().unwrap() + extra,
                             script_pubkey: spk.clone(),
                             height: p[2].as_u64().unwrap() as u32,
                             is_coinbase: false,
@@ -438,9 +480,9 @@ fn mainnet_blocks_pass_contextual_rules() {
         }
         sigop_cost += transaction_sigop_cost(&block.txdata[0], &[], params.script_flags(height));
 
-        validate_block(&block, height, params).unwrap_or_else(|e| panic!("{}: {}", height, e));
-        validate_block_scripts(&block, height, &utxo, params, &times)
-            .unwrap_or_else(|e| panic!("{}: {}", height, e));
+        assert!(tampered, "no amount-committing input to tamper with");
+        validate_block(&block, height, params).map_err(|e| format!("{}: {:?}", height, e))?;
+        validate_block_scripts(&block, height, &utxo, params, &times).map_err(|e| format!("{}: {:?}", height, e))?;
         eprintln!(
             "mainnet {}: ok — {} txs, sigop cost {}, MTP {}, {} BIP 68 inputs ({} time-based)",
             height,
@@ -451,6 +493,7 @@ fn mainnet_blocks_pass_contextual_rules() {
             time_locks
         );
     }
+    Ok(())
 }
 
 // ── Rule 7: BIP 34 at heights 1..=16 ─────────────────────────────────

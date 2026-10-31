@@ -5,6 +5,8 @@
 - **Decided:** clearnet is the default for sync and relay. Tor is an opt-in setting.
 - **Decided:** the user's own transactions always go out via short-lived Tor connections ("private broadcast"), even in clearnet mode.
 
+- **Review update (2026-10-28):** private broadcast is a **prerequisite for wallet sends** in both modes. Today `set_private_broadcast` is dead code (`sync.rs:1446-1447`): in clearnet mode own transactions are never announced at all (`sync.rs:1425-1431`), and in Tor mode they go to every peer, including those linked to our onion. Ticket 052 has the Tor-mode stopgap and the rules the private path must follow.
+
 ## Summary
 
 Proposal: make **clearnet** the default P2P transport and make **Tor an opt-in setting**. The user's own transactions should still leave the phone privately through a "private broadcast" path, so the main privacy cost of clearnet (linking a transaction to the IP that first sent it) is mitigated even in the default mode.

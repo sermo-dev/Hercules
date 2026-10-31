@@ -11,7 +11,9 @@
 //! it. A test binary is not: `cargo test -- --test-threads 32` runs dozens
 //! of nodes in one process and their writes collide.
 //!
-//! Harness nodes take a slot for their lifetime. Slots are counted per
+//! Every `UtxoSet` opened in a test build takes a slot for its lifetime
+//! (`UtxoSet::open`), so direct LMDB tests are covered as well as harness
+//! nodes, which also take one. Slots are counted per
 //! acquiring thread: a thread that already holds one takes more for free
 //! (a test with a donor node and a node under test), so a test never waits
 //! on itself. A slot may be dropped on any thread (nodes are shared with

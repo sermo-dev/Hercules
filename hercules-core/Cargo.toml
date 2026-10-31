@@ -51,8 +51,8 @@ uniffi = { version = "0.28", features = ["build"] }
 
 [dev-dependencies]
 tempfile = "3"
-# Property tests (`prop_` prefix; nightly CI raises PROPTEST_CASES).
-proptest = "1.12"
+# Property-based tests (round-trips, invariants, parsers never panic).
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "uniffi-bindgen"

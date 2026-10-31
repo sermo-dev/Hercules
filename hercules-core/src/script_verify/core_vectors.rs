@@ -26,6 +26,8 @@ use crate::chain_params::*;
 pub const SCRIPT_TESTS: &str = include_str!("testdata/script_tests.json");
 pub const TX_VALID: &str = include_str!("testdata/tx_valid.json");
 pub const TX_INVALID: &str = include_str!("testdata/tx_invalid.json");
+/// Core's legacy `SignatureHash` vectors (same release).
+pub const SIGHASH: &str = include_str!("testdata/sighash.json");
 
 #[derive(Debug, Clone)]
 pub struct Case {
