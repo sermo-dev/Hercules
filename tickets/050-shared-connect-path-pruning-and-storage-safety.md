@@ -47,6 +47,7 @@ Line numbers are at main 7732755.
 - **`reset_database` doesn't remove `own_txs.sqlite3`.** Own transactions from the old chain state survive the reset.
 - **No `MDB_MAP_FULL` retry when pruning undo, and none in `clear_all`.** `utxo.rs:1617-1631`: if a failed snapshot load's cleanup also hits `MapFull`, the marker stays but the reused node treats the partial set as genesis-mode (`needs_snapshot() == false`) until the next launch wipes it.
 - **`blocks.sqlite3` never shrinks after deletes** (no `auto_vacuum`), and `block_store.prune_below` isn't in a transaction with anything.
+- **An interrupted snapshot import starts over.** The `.loading` marker wipes a partial import (correct), but there's no checkpoint, so a 30-minute import killed at 90% restarts from zero. Consider resumable import (by entry offset, with the running SHA-256 state saved) once the rest of this ticket lands; it's optional.
 - **No schema versions.** There is no `schema_version` in LMDB `meta` and no `PRAGMA user_version` in the SQLite stores. 025 needs a block_store migration and 035/037 add wallet tables, so versioning must exist first.
 
 ## Proposed fix

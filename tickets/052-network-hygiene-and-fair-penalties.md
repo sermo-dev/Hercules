@@ -56,6 +56,7 @@ The real fix is ticket 029's private broadcast (short-lived isolated Tor connect
 - **All four** `ONION_SEEDS` entries (`p2p.rs:61-63`) fail v3 checksum validation, so none can be dialed (the 4th is also 55 characters). Found by the PR #30 test pass, which has an ignored reproducer.
 - `is_routable` (`sync.rs:393`) accepts RFC1918, CGNAT, IPv4-mapped, ULA and link-local addresses on any port. In clearnet mode a peer can make us dial hosts on the user's LAN.
 - An `inv` echoed back by the peer we sent our tx to marks it "propagated" (`sync.rs:4044`). A censoring peer can fake delivery.
+- `peer_scores` in `peers.sqlite3` grows without bound (every address ever scored). Expire entries with the address book's eviction.
 - We never send pings, so dead inbound connections keep their slot; there is no inbound eviction.
 
 ## Proposed fix

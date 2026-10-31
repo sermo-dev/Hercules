@@ -76,6 +76,27 @@ The same happens if notifications were enabled before any mode was chosen.
 - **Snapshot file location:** move the completed snapshot out of `Library/Caches` (`SnapshotDownloader.swift:104-107`) to Application Support with `isExcludedFromBackup`, and delete it after import. iOS purges Caches under storage pressure, which this flow causes.
 - **Quieter block notifications:** use the `.passive` interruption level with no sound, or replace one notification in place (`NotificationManager.swift:722-731`, `914`). At ~144 a day they would drown out wallet payment alerts.
 
+### 4. When the app is open, sync from peers directly (owner request, 2026-10-30)
+
+Today a push that arrives while a foreground sync is running is already skipped (`NodeHost.admitWake` → `.foregroundActive`). But foreground sync starts only when the user taps Start, or restarts after a wake stopped it in the same process (`ContentView.swift:161-167`, `resumeSyncWhenActive`). After any relaunch or jetsam, an open app sits idle, and new blocks arrive only through push wakes.
+
+- **Persist "sync wanted".** When the node is set up (`WakeGate`: mode chosen, snapshot loaded or genesis mode, policy allows), opening the app starts the foreground sync automatically. The Start button becomes Pause/Resume, and a user Pause is remembered.
+- **While foreground sync runs, pushes and refreshes are no-ops** (already true), and the app doesn't depend on the relay at all. The node follows the tip through its own peers and `inv` announcements.
+- **On backgrounding**, foreground sync stops as today, and pushes take over.
+- The relay is then only the background trigger. Blocks always come from peers in both cases; the relay never supplies chain data.
+
+### 5. A Swift unit test target
+
+There is no XCTest target; `Tools/NodeHostScenarios` is a swiftc script that CI now runs (PR #30). Add a `HerculesAppTests` target (xcodegen `project.yml`) and run it in CI's simulator job:
+
+- `WakeGate`: the full decision table for push, refresh and processing.
+- `NetworkPolicy`: with a fake monitor, `afterFirstPath` timeout vs notify, with the body running exactly once.
+- `SnapshotDownloader`: session flags match the policy; the `didCompleteWithError` cases (user cancel, system cancel with resume data, transient error, stale task, 206).
+- Relay registration state machine, with an injected `URLSession`: enable/disable, `unregisterPending`, 403, 429, URL change, re-enable during unregister.
+- `NotificationHistory` / `StoragePaths` / auto-start "sync wanted" persistence.
+
+Move the NodeHostScenarios checks into it over time.
+
 ## Files touched
 
 | File | Action |
@@ -88,6 +109,8 @@ The same happens if notifications were enabled before any mode was chosen.
 | `HerculesApp/HerculesApp/SnapshotDownloader.swift` | Network flags; file location |
 | `HerculesApp/HerculesApp/ContentView.swift`, `NodeHost.swift` | Pass the mode at open |
 | `Tools/NodeHostScenarios` | `WakeGate` scenarios |
+| `HerculesApp/project.yml`, new `HerculesAppTests/` | XCTest target |
+| `.github/workflows/ci.yml` | Run the XCTest target in the simulator job |
 
 ## Dependencies
 
@@ -98,8 +121,10 @@ The same happens if notifications were enabled before any mode was chosen.
 
 ## Estimated effort
 
-3 days:
+4 days:
 - wake agreement and fanout: 1.5 days
+- auto-start foreground sync: 0.5 day
+- XCTest target and first tests: 0.5 day (it grows with later tickets)
 - Rust gate and persisted mode: 0.5 day
 - Swift gate and notification fixes: 0.5 day
 - downloader fixes: 0.5 day

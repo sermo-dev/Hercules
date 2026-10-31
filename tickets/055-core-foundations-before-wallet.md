@@ -99,7 +99,20 @@ Line numbers are at main 7732755.
 - `Drop` on `WalletRpcHandle` stops the server.
 - The Settings toggle reflects `Starting`.
 
-### 5. Build
+### 5. Fuzz targets
+
+Property tests (proptest, PRs #29/#30) run a few hundred random cases inside `cargo test`. A fuzzer (`cargo-fuzz` / libFuzzer) instead runs for minutes or hours, watches which code paths each input reaches, and mutates inputs toward unexplored branches. That finds the crash that needs one specific byte pattern.
+
+- `hercules-core/fuzz/` with targets for:
+  - `Peer::receive` framing and every message decoder;
+  - the HUTX snapshot loader;
+  - `wallet_rpc` request parsing (`read_http_request`, `base64_decode`, `verify_auth`);
+  - `submit_own_tx` hex;
+  - the wake path's inputs.
+- Needs a small `#[doc(hidden)] pub mod fuzz_api` exposing those entry points, since the crate is a staticlib with a mostly private API.
+- CI: the nightly job runs each target for a fixed time (e.g. 5 min), keeps the corpus in the Actions cache, and any crash fails the job with the reproducing input attached.
+
+### 6. Build
 
 - `rust-toolchain.toml`; `--locked` in `build-ios.sh` and CI.
 - Bindgen as a separate bin crate or `[dev-dependencies]` tool.
@@ -124,8 +137,9 @@ Line numbers are at main 7732755.
 
 ## Estimated effort
 
-3–4 days:
+4–5 days:
 - workspace split: 1.5 days, mechanical
+- fuzz targets and nightly job: 1 day
 - panic policy and `expect`s: 0.5 day
 - logger: 0.5 day
 - wallet API race: 0.5 day
