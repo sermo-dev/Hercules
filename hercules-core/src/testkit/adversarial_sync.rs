@@ -79,7 +79,6 @@ fn chain(n: u32) -> FixtureChain {
 /// then one byte at a time, each inside the timeout, holds the sync thread
 /// indefinitely; `stop_sync` is never even checked.
 #[test]
-#[ignore = "BUG: main-loop get_headers has no overall deadline; a trickling peer holds the sync thread and stop_sync"]
 fn trickling_header_reply_cannot_hold_the_sync_loop_past_stop() {
     let c = chain(20);
     let a = MockPeer::spawn(&c, vec![]);
@@ -106,7 +105,6 @@ fn trickling_header_reply_cannot_hold_the_sync_loop_past_stop() {
 /// block 50,000 times and never reads blocks the monitor loop in `send`:
 /// stop is never honored (and a wake can't get the session).
 #[test]
-#[ignore = "BUG: no write timeout and no getdata batching; a non-reading peer blocks the monitor loop and stop_sync"]
 fn non_reading_peer_cannot_hold_the_sync_loop_past_stop() {
     let c = chain(30);
     let a = MockPeer::spawn(&c, vec![]);
@@ -160,7 +158,6 @@ fn wake_catch_up_is_bounded_by_its_budget_against_a_trickling_peer() {
 /// though honest peers have more blocks. (The main loop caps such a peer's
 /// height and asks others; the wake path has no second round.)
 #[test]
-#[ignore = "BUG: wake reports caught_up when the tallest-claiming peer withholds headers (no second peer asked)"]
 fn inflated_height_peer_withholding_headers_does_not_make_a_wake_report_caught_up() {
     let c = chain(20);
     let mut node = Node::new(&[]);
@@ -185,7 +182,6 @@ fn inflated_height_peer_withholding_headers_does_not_make_a_wake_report_caught_u
 /// cross-check) per header, ~900k over Tor on mainnet. Core stops a
 /// header chain with a peer on its first non-full batch.
 #[test]
-#[ignore = "BUG: a tallest-claiming peer serving one header per batch dominates header sync (one round trip per header)"]
 fn one_header_per_batch_peer_does_not_dominate_header_sync() {
     let c = chain(400);
     let a = MockPeer::spawn(&c, vec![]);
@@ -196,6 +192,47 @@ fn one_header_per_batch_peer_does_not_dominate_header_sync() {
     assert!(ok, "headers never synced: {:?}", res);
     let rounds = dripper.log().iter().filter(|m| matches!(m, NetworkMessage::GetHeaders(_))).count();
     assert!(rounds < 50, "{} getheaders rounds spent on a one-header-per-batch peer for 400 headers", rounds);
+}
+
+/// Ticket 049 stall timeout: a sync peer serving full batches below the
+/// minimum header rate is dropped and deprioritized (slow is not
+/// invalid: never banned), and the others finish the sync.
+#[test]
+fn sync_peer_serving_full_batches_too_slowly_is_dropped() {
+    let c = chain(4_100);
+    let a = MockPeer::spawn(&c, vec![]);
+    let b = MockPeer::spawn(&c, vec![]);
+    let slow = MockPeer::spawn(
+        &c,
+        vec![Behavior::InflatedHeight(5_000), Behavior::DelayResponses(Duration::from_secs(2))],
+    );
+    let mut node = Node::new(&[&slow, &a, &b]);
+    // At most ~1,000 headers/s from `slow`, within the 3 s test request
+    // timeout; honest mocks serve a batch in well under a second.
+    node.hs.headers_stall_limit = (Duration::from_secs(1), 1_200.0);
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, |hs| hs.store.tip().ok().flatten().map(|t| t.0) == Some(4_100));
+    assert!(ok, "headers never synced: {:?}", res);
+    assert!(!node.is_banned(&slow.addr()), "slow is not invalid");
+    assert!(node.score(&slow.addr()).is_some_and(|s| s < FRESH_SCORE), "slow sync peer kept: {:?}", node.score(&slow.addr()));
+}
+
+/// Ticket 049: an outbound peer announcing blocks that don't exist is
+/// asked for them (the announcer is asked, as Core does) and, having
+/// nothing, pays for each one until it is banned. Honest peers pay nothing.
+#[test]
+fn outbound_peer_announcing_made_up_blocks_is_banned() {
+    let c = chain(10);
+    let a = MockPeer::spawn(&c, vec![]);
+    let b = MockPeer::spawn(&c, vec![]);
+    let spammer = MockPeer::spawn(&c, vec![Behavior::SpamBlockInv(Duration::from_millis(50))]);
+    let node = Node::new(&[&a, &b, &spammer]);
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, |_| node.is_banned(&spammer.addr()));
+    assert!(ok, "spammer never banned: {:?}", res);
+    assert_eq!(node.validated(), 10);
+    for p in [&a, &b] {
+        assert!(!node.is_banned(&p.addr()));
+        assert!(node.score(&p.addr()).map_or(true, |s| s >= FRESH_SCORE), "honest {} penalized", p.addr());
+    }
 }
 
 #[test]
@@ -380,7 +417,6 @@ fn banned_peer_is_not_redialed_after_a_restart() {
 /// it is synced, and block announcements from the others just send it
 /// back to the same peer: stuck behind until that peer disconnects.
 #[test]
-#[ignore = "BUG: a high-score peer that stops advancing hides taller honest peers; announcements re-ask the same peer"]
 fn high_score_peer_that_stops_advancing_cannot_hide_the_chain() {
     let mut c = chain(12);
     let veteran = MockPeer::spawn(&c, vec![]);
@@ -482,7 +518,6 @@ fn own_tx_is_announced_to_outbound_peers_promptly() {
 /// every few tens of ms keeps the relay queue (own transactions included)
 /// from ever draining.
 #[test]
-#[ignore = "BUG: block-inv spam breaks the monitor loop before drain_relay_queue, starving own-tx announcements"]
 fn block_inv_spam_does_not_starve_own_tx_announcements() {
     let (mut node, c, tx) = own_tx_fixture();
     let a = MockPeer::spawn(&c, vec![]);

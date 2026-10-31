@@ -160,6 +160,123 @@ fn rules_tag() -> String {
 /// limit so a chatty peer can't fill the gossip queue with one message.
 const MAX_GOSSIP_ADDRS_PER_MSG: usize = 1000;
 
+// ── What one peer can make us do (ticket 049) ───────────────────────
+
+/// Bitcoin Core's MAX_LOCATOR_SZ (net_processing.cpp): a `getheaders`
+/// whose locator is longer disconnects the peer (ProcessMessage,
+/// NetMsgType::GETHEADERS). Each entry costs us a header-store lookup.
+const MAX_LOCATOR_SZ: usize = 101;
+
+/// Bitcoin Core's MAX_INV_SZ: most entries in one `inv` or `getdata`.
+/// Core treats more as misbehavior; we disconnect.
+const MAX_INV_SZ: usize = 50_000;
+
+/// Bitcoin Core's MAX_GETDATA_SZ: most items we ask for in one `getdata`
+/// (an `inv` announcing more transactions gets the first this many asked
+/// for). Core doesn't apply it to incoming `getdata`, and neither do we:
+/// those are served incrementally (`serve_getdata_step`).
+const MAX_GETDATA_SZ: usize = 1000;
+
+/// Most queued `getdata` items one serving step looks at, so a queue of
+/// 50,000 unknown hashes is answered a thousand `notfound`s at a time,
+/// between other peers' messages, instead of all at once.
+const GETDATA_ITEMS_PER_STEP: usize = 1000;
+
+/// Most block entries of one `inv` we look up (each is a header-store
+/// query). An honest peer announces one block at a time, or a handful
+/// after a reorg; Core announces at most MAX_BLOCKS_TO_ANNOUNCE = 8.
+const MAX_BLOCK_INV_LOOKUPS: usize = 8;
+
+/// Blocks we serve one peer per `BLOCK_SERVE_WINDOW`. We keep only the
+/// last 288 blocks (NODE_NETWORK_LIMITED, BIP 159), so one window's worth
+/// is everything an honest peer can want from us; past it, block requests
+/// get `notfound` until the window rolls over.
+const MAX_BLOCKS_SERVED_PER_PEER: u32 = 288;
+const BLOCK_SERVE_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// Penalty for an outbound peer that announced a block we don't have and
+/// then, asked for headers, had nothing beyond our tip (ticket 049). An
+/// honest peer always has the header of a block it announces, so a peer
+/// announcing made-up hashes (to make us spend header round trips) is
+/// banned after a dozen or so.
+const UNFULFILLED_ANNOUNCEMENT_PENALTY: u32 = 5;
+
+/// Inbound peers are never asked for headers, so their block
+/// announcements only wake the monitor loop for the best peer, and at
+/// most this often between them all.
+const INBOUND_ANNOUNCEMENT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Monitor-loop chores that run on their own clocks (ticket 049), however
+/// often a block announcement breaks the loop.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+const STATUS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Most peers a wake asks for headers when the first ones claimed more
+/// than our tip and had nothing (`HeaderSync::wake_headers`).
+const WAKE_HEADER_PEERS: usize = 3;
+
+/// Header-sync stall timeout (ticket 049), after Core's
+/// HEADERS_DOWNLOAD_TIMEOUT_BASE / _PER_HEADER: a sync peer serving full
+/// batches must average `MIN_HEADERS_RATE` headers per second of request
+/// time, judged once it has had `HEADERS_STALL_GRACE` of it. A slower one
+/// is dropped (and deprioritized, never banned: slow is not invalid), so a
+/// peer dribbling full batches just inside the request timeout can't turn
+/// a half-hour sync into many hours. Only the time spent waiting on the
+/// peer counts, never our own validation (ticket 024: our slowness is not
+/// the peer's fault). 100/s is a 2,000-header batch per 20 s; honest
+/// peers manage that many times over, even over Tor.
+const HEADERS_STALL_GRACE: Duration = Duration::from_secs(60);
+const MIN_HEADERS_RATE: f64 = 100.0;
+const HEADERS_STALL_PENALTY: u32 = 10;
+
+/// The header rate of the current sync peer, for the stall timeout.
+struct HeadersStall {
+    /// The floor: at least `.1` headers per second once `.0` has passed
+    /// (`HeaderSync::headers_stall_limit`).
+    limit: (Duration, f64),
+    addr: String,
+    headers: u64,
+    waited: Duration,
+}
+
+impl HeadersStall {
+    fn new(limit: (Duration, f64)) -> HeadersStall {
+        HeadersStall { limit, addr: String::new(), headers: 0, waited: Duration::ZERO }
+    }
+
+    /// Count a full batch of `count` headers that took `waited` from
+    /// `addr`. True if `addr` has had its grace and is below the rate.
+    fn too_slow(&mut self, addr: &str, count: usize, waited: Duration) -> bool {
+        if self.addr != addr {
+            *self = HeadersStall { addr: addr.to_string(), ..HeadersStall::new(self.limit) };
+        }
+        self.headers += count as u64;
+        self.waited += waited;
+        let (grace, rate) = self.limit;
+        self.waited >= grace && (self.headers as f64) < rate * self.waited.as_secs_f64()
+    }
+}
+
+/// Block announcements waiting for the main loop (ticket 049).
+#[derive(Default)]
+struct BlockAnnouncements {
+    /// The first outbound peer to announce a block we don't have since
+    /// the last header round, and that block. The next round asks it, as
+    /// Core does (ProcessMessage, NetMsgType::INV: getheaders to the
+    /// announcer), not the best peer, which may have stopped advancing.
+    outbound: Option<(String, BlockHash)>,
+    /// When an inbound announcement last woke the monitor loop.
+    last_inbound_wake: Option<Instant>,
+}
+
+/// Monitor-loop clocks, kept across loop entries (ticket 049): restarting
+/// them on every entry let a stream of block announcements postpone
+/// maintenance forever.
+struct MonitorTimers {
+    last_maintain: Instant,
+    last_status: Instant,
+}
+
 /// Outcome of cross-checking a header batch against independent peers.
 enum HeaderCrossCheck {
     /// Agreement reached (or only one peer available — best-effort accept).
@@ -532,6 +649,13 @@ struct PeerRelayState {
     /// Bitcoin Core caps GetAddr responses to one per connection — repeated
     /// requests are scrapers we should ignore. We mirror that behavior.
     getaddr_responded: bool,
+    /// `getdata` items not served yet (ticket 049), like Core's
+    /// `m_getdata_requests`: served a step at a time, and while any are
+    /// left nothing else is read from this peer (back-pressure).
+    getdata_queue: std::collections::VecDeque<Inventory>,
+    /// Blocks served this `BLOCK_SERVE_WINDOW`, and when it started.
+    blocks_served: u32,
+    serve_window_start: Option<Instant>,
 }
 
 /// Insert `txid` into the per-peer dedup set, capped at
@@ -688,6 +812,13 @@ pub struct HeaderSync {
     /// Set by handle_inv when a new block is announced — breaks the monitor
     /// loop early so we fetch the new block immediately instead of waiting.
     new_block_announced: AtomicBool,
+    /// Who announced it (ticket 049): the next header round asks them.
+    block_announcements: Mutex<BlockAnnouncements>,
+    /// Inbound connections' handshakes, run off the sync thread by the Tor
+    /// accept task (ticket 049).
+    inbound_handshakes: Arc<crate::p2p::InboundHandshakes>,
+    /// Daily cap on blocks served while on a metered network (ticket 049).
+    upload_budget: crate::upload_budget::UploadBudget,
     /// Last time we re-broadcast our own onion address to all peers. Initial
     /// value is `Instant::now()` (set on construction), so the first periodic
     /// re-broadcast fires 24h after node start. The on-connect self-ad in
@@ -727,6 +858,9 @@ pub struct HeaderSync {
     scratch_stall_rounds: AtomicU32,
     /// How many such rounds must pass before the replacement is allowed.
     scratch_stall_threshold: u32,
+    /// The header-sync stall timeout's grace and minimum rate
+    /// (`HEADERS_STALL_GRACE`, `MIN_HEADERS_RATE`); tests shrink them.
+    headers_stall_limit: (Duration, f64),
 }
 
 impl HeaderSync {
@@ -903,8 +1037,12 @@ impl HeaderSync {
             info!("HeaderSync: Tor enabled — all connections routed through Tor");
         }
         let tor_required = tor.is_some();
+        let inbound_handshakes = Arc::new(crate::p2p::InboundHandshakes::new(params.magic));
         let tor = match tor {
-            Some(t) => OnceLock::from(t),
+            Some(t) => {
+                t.serve_inbound(Arc::clone(&inbound_handshakes));
+                OnceLock::from(t)
+            }
             None => OnceLock::new(),
         };
 
@@ -933,6 +1071,11 @@ impl HeaderSync {
             inbound_peer_count: AtomicU32::new(0),
             outbound_peer_count: AtomicU32::new(0),
             new_block_announced: AtomicBool::new(false),
+            block_announcements: Mutex::new(BlockAnnouncements::default()),
+            inbound_handshakes,
+            upload_budget: crate::upload_budget::UploadBudget::new(
+                crate::upload_budget::METERED_DAILY_UPLOAD_CAP,
+            ),
             last_self_ad: Mutex::new(Instant::now()),
             anchor: params.anchor.unwrap_or(NO_ANCHOR),
             min_chain_work: params.min_chain_work,
@@ -943,6 +1086,7 @@ impl HeaderSync {
             pending_unbans: Mutex::new(Vec::new()),
             scratch_stall_rounds: AtomicU32::new(0),
             scratch_stall_threshold: SCRATCH_STALL_ROUNDS,
+            headers_stall_limit: (HEADERS_STALL_GRACE, MIN_HEADERS_RATE),
         })
     }
 
@@ -2299,9 +2443,17 @@ impl HeaderSync {
     /// Hand over the Tor client once it has bootstrapped. Later calls are
     /// ignored: a node keeps one Tor client for its lifetime.
     pub fn attach_tor(&self, tor: Arc<TorManager>) {
+        tor.serve_inbound(Arc::clone(&self.inbound_handshakes));
         if self.tor.set(tor).is_ok() {
             info!("HeaderSync: Tor attached — all connections routed through Tor");
         }
+    }
+
+    /// Whether the current network is metered (cellular), from the app's
+    /// network policy (ticket 049). While it is, serving blocks counts
+    /// against a daily upload cap; joining an unmetered network resets it.
+    pub fn set_network_metered(&self, metered: bool) {
+        self.upload_budget.set_metered(metered);
     }
 
     fn tor(&self) -> Option<&Arc<TorManager>> {
@@ -2717,6 +2869,10 @@ impl HeaderSync {
         // the height we're stuck on (so it is fetched from someone else).
         let mut header_sources: Vec<(u32, u32, String)> = Vec::new();
         let mut bad_deliveries: Option<(u32, Vec<String>)> = None;
+        // Ticket 049: the monitor loop's clocks outlive each entry, and the
+        // sync peer's header rate is tracked across rounds.
+        let mut timers = MonitorTimers { last_maintain: Instant::now(), last_status: Instant::now() };
+        let mut headers_stall = HeadersStall::new(self.headers_stall_limit);
 
         loop {
             // Check for shutdown request
@@ -2737,8 +2893,14 @@ impl HeaderSync {
                 .validated_height()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-            // Get best peer for headers
-            let best_peer = pool.best_peer();
+            // Ask the outbound peer that announced a block we lack, if
+            // any (ticket 049), else the best peer for headers.
+            let announced = self.take_block_announcement();
+            let announcer = announced
+                .as_ref()
+                .and_then(|(addr, hash)| Some((pool.checkout_peer_by_addr(addr)?, *hash)));
+            let asked_announcer = announcer.as_ref().map(|(_, hash)| *hash);
+            let best_peer = announcer.map(|(peer, _)| peer).or_else(|| pool.best_peer());
             if best_peer.is_none() {
                 warn!("No peers available, trying to refill pool");
                 pool.maintain();
@@ -2757,13 +2919,27 @@ impl HeaderSync {
                 .get_locator_hashes()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
 
-            // Request headers from best peer
+            // Request headers from best peer. `get_headers` has its own
+            // deadline (ticket 049), so a trickling peer can't hold us.
+            let asked_at = Instant::now();
             let mut headers = match peer.get_headers(locator, BlockHash::all_zeros()) {
                 Ok(h) => {
+                    let waited = asked_at.elapsed();
                     pool.return_peer(peer);
                     // Reward peers that successfully serve us headers — even an
                     // empty response counts (it means we're caught up to them).
                     pool.reward(&active_addr, 1);
+                    if h.len() == 2000 && headers_stall.too_slow(&active_addr, h.len(), waited) {
+                        // Ticket 049 stall timeout: slow, not invalid.
+                        warn!(
+                            "Peer {} is serving headers below {} per second; dropping it",
+                            active_addr, self.headers_stall_limit.1
+                        );
+                        pool.disconnect_and_deprioritize(&active_addr, HEADERS_STALL_PENALTY);
+                        headers_stall = HeadersStall::new(self.headers_stall_limit);
+                        pool.maintain();
+                        continue;
+                    }
                     h
                 }
                 Err(e) => {
@@ -2792,32 +2968,16 @@ impl HeaderSync {
             };
 
             if headers.is_empty() {
-                // Peer height sanity: if a peer claims height far above our tip
-                // but can't serve any headers beyond it, they're lying. Ban them.
-                if let Some(claimed) = pool.get_peer_height(&active_addr) {
-                    if claimed > tip_height + 2016 {
-                        warn!(
-                            "Peer {} claims height {} but has no headers above {}, banning",
-                            active_addr, claimed, tip_height
-                        );
-                        pool.misbehaving(&active_addr, 100);
-                        pool.maintain();
-                        continue;
+                // It announced a block, then had nothing past our tip.
+                if let Some(hash) = asked_announcer {
+                    if self.store.find_height_of_hash(hash).ok().flatten().is_none() {
+                        warn!("Peer {} announced block {} it can't serve headers for", active_addr, hash);
+                        pool.misbehaving(&active_addr, UNFULFILLED_ANNOUNCEMENT_PENALTY);
                     }
-                    // A smaller gap is no proof of lying (it may have
-                    // reorged), but this peer has nothing for us: stop
-                    // preferring it for its claimed height and ask the
-                    // next-best peer, rather than concluding we're synced
-                    // from the one peer that won't serve headers.
-                    if claimed > tip_height {
-                        info!(
-                            "Peer {} claims height {} but has no headers above {}; asking others",
-                            active_addr, claimed, tip_height
-                        );
-                        pool.lower_peer_height(&active_addr, tip_height);
-                        pool.misbehaving(&active_addr, EMPTY_HEADERS_PENALTY);
-                        continue;
-                    }
+                }
+                if self.claimed_more_than(&mut pool, &active_addr, tip_height) {
+                    pool.maintain();
+                    continue;
                 }
 
                 // Headers caught up — download and validate blocks
@@ -3122,13 +3282,16 @@ impl HeaderSync {
                 ));
 
                 pool.update_our_height(tip_height);
+                if let Some(tor) = self.tor() {
+                    tor.set_inbound_height(tip_height);
+                }
 
                 // Active message-processing loop (replaces passive 30s sleep).
                 // Polls each peer for messages, handles serving requests,
-                // and periodically checks for new blocks.
+                // and periodically checks for new blocks. The chores run
+                // first on every pass, on their own clocks (ticket 049), so
+                // a block announcement breaking the loop can't skip them.
                 let monitor_start = Instant::now();
-                let mut last_maintain = Instant::now();
-                let mut last_status = Instant::now();
 
                 // Reset the flag before entering the loop
                 self.new_block_announced.store(false, Ordering::Relaxed);
@@ -3138,31 +3301,21 @@ impl HeaderSync {
                         break;
                     }
 
+                    self.monitor_chores(&mut pool, &mut timers, &|pool: &PeerPool| {
+                        let best = pool.best_peer_addr().unwrap_or_default();
+                        on_progress(self.make_status(
+                            tip_height,
+                            peer_height,
+                            pool,
+                            &best,
+                            false,
+                            validated,
+                            None,
+                        ));
+                    });
+
                     // Process one message from each connected peer (round-robin)
                     self.service_peer_messages(&mut pool);
-
-                    // Drain any addresses that the message handlers queued
-                    // from `addr` / `addrv2` gossip into the PeerPool's
-                    // AddrManager. This needs to happen outside the
-                    // for_each_peer call because that path holds the slot
-                    // mutex and can't take a `&mut PeerPool`.
-                    let gossip = std::mem::take(
-                        &mut *self.pending_gossip_addrs.lock().unwrap(),
-                    );
-                    if !gossip.is_empty() {
-                        pool.ingest_gossip_addrs(gossip);
-                    }
-
-                    // Opportunistic refill: if the outbound pool has shrunk
-                    // (peers dropped, banned, or removed by service_peer_messages
-                    // for protocol errors), top it back up immediately rather
-                    // than waiting for the next 30s `last_maintain` tick. This
-                    // is the fix for "connected peers drop below 8 and don't
-                    // recover" — by the time we noticed the drop on the
-                    // periodic timer, anywhere from 0–30s of sync was wasted.
-                    if pool.outbound_count() < pool.outbound_target() {
-                        pool.maintain();
-                    }
 
                     // Avoid busy-spinning when no peers are connected
                     if pool.count() == 0 {
@@ -3173,86 +3326,6 @@ impl HeaderSync {
                     if self.new_block_announced.swap(false, Ordering::Relaxed) {
                         info!("Breaking monitor loop early — new block announced");
                         break;
-                    }
-
-                    // Drain the relay queue (send pending tx inv messages)
-                    self.drain_relay_queue(&pool);
-
-                    // Accept pending inbound connections from Tor onion
-                    // service. Cap per-iteration so a sudden burst of
-                    // inbound circuits can't starve the header-sync work
-                    // below — each accept runs a full handshake, which
-                    // is expensive enough that >10 in a single tick would
-                    // visibly stall progress. Anything beyond the cap
-                    // waits for the next monitor-loop pass.
-                    const MAX_INBOUND_ACCEPTS_PER_TICK: usize = 10;
-                    if let Some(tor) = self.tor() {
-                        let mut accepted_this_tick = 0;
-                        while accepted_this_tick < MAX_INBOUND_ACCEPTS_PER_TICK {
-                            let Some(inbound_stream) = tor.accept_inbound() else {
-                                break;
-                            };
-                            accepted_this_tick += 1;
-                            let peer_stream = crate::p2p::PeerStream::Tor(inbound_stream);
-                            match crate::p2p::Peer::accept(peer_stream, tip_height as i32, self.params.magic) {
-                                Ok(peer) => {
-                                    if !pool.add_inbound_peer(peer) {
-                                        info!("Inbound peer rejected: at capacity");
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Inbound handshake failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-
-                    // Periodic 24h re-broadcast of our own onion address.
-                    // Cheap when nothing is due — just a Mutex check + elapsed
-                    // comparison — so safe to evaluate every loop iteration.
-                    {
-                        let mut last = self.last_self_ad.lock().unwrap();
-                        if last.elapsed() >= SELF_AD_REBROADCAST_INTERVAL {
-                            *last = Instant::now();
-                            drop(last);
-                            self.rebroadcast_self_ad(&pool);
-                        }
-                    }
-
-                    // Periodic maintenance
-                    if last_maintain.elapsed() >= Duration::from_secs(30) {
-                        pool.maintain();
-                        self.mempool.lock().unwrap().expire_old();
-                        self.rebroadcast_due_own_txs(unix_now_u32() as u64);
-                        self.update_peer_counts(&pool);
-                        // Clean up relay_state: remove entries for disconnected
-                        // peers. The per-peer known_txids cap is enforced at
-                        // the INV insertion site (MAX_KNOWN_TXIDS_PER_PEER), so
-                        // there's nothing to cap here.
-                        {
-                            let connected: HashSet<String> = pool.peer_info()
-                                .iter()
-                                .map(|p| p.addr.clone())
-                                .collect();
-                            let mut state = self.relay_state.lock().unwrap();
-                            state.retain(|addr, _| connected.contains(addr));
-                        }
-                        last_maintain = Instant::now();
-                    }
-
-                    // Periodic status report
-                    if last_status.elapsed() >= Duration::from_secs(10) {
-                        let best = pool.best_peer_addr().unwrap_or_default();
-                        on_progress(self.make_status(
-                            tip_height,
-                            peer_height,
-                            &pool,
-                            &best,
-                            false,
-                            validated,
-                            None,
-                        ));
-                        last_status = Instant::now();
                     }
                 }
 
@@ -3635,6 +3708,7 @@ impl HeaderSync {
                         // destructive rollback and store the new headers.
                         let (new_tip, new_validated) = self.apply_reorg(fork_at, new_headers)?;
                         header_sources.push((fork_at + 1, new_tip, active_addr.clone()));
+                        pool.record_headers_from(&active_addr, new_tip, headers.len() == 2000);
                         self.scratch_stall_rounds.store(0, Ordering::Relaxed);
                         peer_height = std::cmp::max(peer_height, new_tip);
 
@@ -3705,6 +3779,7 @@ impl HeaderSync {
 
             let new_height = tip_height + batch_size;
             header_sources.push((new_start, new_height, active_addr.clone()));
+            pool.record_headers_from(&active_addr, new_height, batch_size == 2000);
             self.scratch_stall_rounds.store(0, Ordering::Relaxed);
             peer_height = std::cmp::max(peer_height, new_height);
 
@@ -3735,9 +3810,99 @@ impl HeaderSync {
     /// Connects to a single peer, checks for new headers, and optionally
     // ── Active message processing (Phase 5) ─────────────────────────
 
+    /// The monitor loop's chores, run at the top of every pass (ticket
+    /// 049): own-tx and relay announcements, inbound peers, gossip, pool
+    /// refill, the self-ad, and the 30 s maintenance and 10 s status report
+    /// on clocks that survive the loop being re-entered. Before this, a
+    /// peer announcing a fresh block hash every few hundred ms broke the
+    /// loop ahead of all of them, so own transactions never left the phone.
+    fn monitor_chores(
+        &self,
+        pool: &mut PeerPool,
+        timers: &mut MonitorTimers,
+        report_status: &dyn Fn(&PeerPool),
+    ) {
+        // Drain the relay queue (send pending tx inv messages)
+        self.drain_relay_queue(pool);
+
+        // Inbound peers from the Tor onion service, already handshaken off
+        // this thread (`p2p::InboundHandshakes`), so taking them is cheap.
+        if let Some(tor) = self.tor() {
+            while let Some(peer) = tor.accept_inbound() {
+                if !pool.add_inbound_peer(peer) {
+                    info!("Inbound peer rejected: at capacity");
+                }
+            }
+        }
+
+        // Drain any addresses that the message handlers queued
+        // from `addr` / `addrv2` gossip into the PeerPool's
+        // AddrManager. This needs to happen outside the
+        // for_each_peer call because that path holds the slot
+        // mutex and can't take a `&mut PeerPool`.
+        let gossip = std::mem::take(&mut *self.pending_gossip_addrs.lock().unwrap());
+        if !gossip.is_empty() {
+            pool.ingest_gossip_addrs(gossip);
+        }
+
+        // Opportunistic refill: if the outbound pool has shrunk
+        // (peers dropped, banned, or removed by service_peer_messages
+        // for protocol errors), top it back up immediately rather
+        // than waiting for the next 30s maintenance tick. This
+        // is the fix for "connected peers drop below 8 and don't
+        // recover" — by the time we noticed the drop on the
+        // periodic timer, anywhere from 0–30s of sync was wasted.
+        if pool.outbound_count() < pool.outbound_target() {
+            pool.maintain();
+        }
+
+        // Periodic 24h re-broadcast of our own onion address.
+        // Cheap when nothing is due — just a Mutex check + elapsed
+        // comparison — so safe to evaluate every loop iteration.
+        {
+            let mut last = self.last_self_ad.lock().unwrap();
+            if last.elapsed() >= SELF_AD_REBROADCAST_INTERVAL {
+                *last = Instant::now();
+                drop(last);
+                self.rebroadcast_self_ad(pool);
+            }
+        }
+
+        // Periodic maintenance
+        if timers.last_maintain.elapsed() >= MAINTENANCE_INTERVAL {
+            pool.maintain();
+            self.mempool.lock().unwrap().expire_old();
+            self.rebroadcast_due_own_txs(unix_now_u32() as u64);
+            self.update_peer_counts(pool);
+            // Clean up relay_state: remove entries for disconnected
+            // peers. The per-peer known_txids cap is enforced at
+            // the INV insertion site (MAX_KNOWN_TXIDS_PER_PEER), so
+            // there's nothing to cap here.
+            {
+                let connected: HashSet<String> =
+                    pool.peer_info().iter().map(|p| p.addr.clone()).collect();
+                let mut state = self.relay_state.lock().unwrap();
+                state.retain(|addr, _| connected.contains(addr));
+            }
+            timers.last_maintain = Instant::now();
+        }
+
+        // Periodic status report
+        if timers.last_status.elapsed() >= STATUS_INTERVAL {
+            report_status(pool);
+            timers.last_status = Instant::now();
+        }
+    }
+
     /// Poll each connected peer for a message and handle it.
     /// Uses short timeouts to avoid blocking — one round-robin pass
     /// through all peers typically takes ~100ms * peer_count.
+    ///
+    /// A peer with `getdata` still queued gets its next serving step
+    /// instead, and nothing more is read from it until the queue is empty:
+    /// Core's back-pressure (ProcessMessages serves `m_getdata_requests`
+    /// first and returns while any are left). A handler error (a failed
+    /// send, or a request over a limit) disconnects the peer (ticket 049).
     fn service_peer_messages(&self, pool: &mut PeerPool) {
         let poll_timeout = Duration::from_millis(100);
         // Reborrow `pool` as a shared reference so the closure can capture it
@@ -3749,14 +3914,12 @@ impl HeaderSync {
         let pool_shared: &PeerPool = pool;
 
         pool_shared.for_each_peer(|addr, _is_inbound, peer| {
+            if self.has_queued_getdata(addr) {
+                return self.serve_getdata_step(addr, peer).map(|_| ());
+            }
             match peer.poll_message(poll_timeout) {
-                Ok(Some(msg)) => {
-                    if let Err(e) = self.handle_peer_message(addr, msg, peer, pool_shared) {
-                        warn!("Error handling message from {}: {}", addr, e);
-                    }
-                    Ok(())
-                }
-                Ok(None) => Ok(()), // timeout, no message
+                Ok(Some(msg)) => self.handle_peer_message(addr, msg, peer, pool_shared),
+                Ok(None) => Ok(()), // nothing (complete) yet
                 Err(e) => Err(format!("{}", e)), // connection error — remove peer
             }
         });
@@ -3785,7 +3948,7 @@ impl HeaderSync {
             }
 
             NetworkMessage::Inv(inv_list) => {
-                self.handle_inv(addr, &inv_list, peer)?;
+                self.handle_inv(addr, &inv_list, peer, pool)?;
             }
 
             NetworkMessage::Tx(tx) => {
@@ -3796,13 +3959,7 @@ impl HeaderSync {
                 let mut state = self.relay_state.lock().unwrap();
                 state
                     .entry(addr.to_string())
-                    .or_insert_with(|| PeerRelayState {
-                        wants_sendheaders: false,
-                        feefilter_rate: 0,
-                        known_txids: HashSet::new(),
-                        own_txids: HashSet::new(),
-                        getaddr_responded: false,
-                    })
+                    .or_default()
                     .wants_sendheaders = true;
             }
 
@@ -3812,37 +3969,17 @@ impl HeaderSync {
                 let mut state = self.relay_state.lock().unwrap();
                 state
                     .entry(addr.to_string())
-                    .or_insert_with(|| PeerRelayState {
-                        wants_sendheaders: false,
-                        feefilter_rate: 0,
-                        known_txids: HashSet::new(),
-                        own_txids: HashSet::new(),
-                        getaddr_responded: false,
-                    })
+                    .or_default()
                     .feefilter_rate = clamped;
             }
 
             NetworkMessage::MemPool => {
-                let txids = self.mempool.lock().unwrap().get_all_txids();
-                // Own txs no peer has announced back yet stay out: listing
-                // them would reveal us as their source (and, in clearnet
-                // mode, leak them before 029 sends them).
-                let txids: Vec<Txid> = txids
-                    .into_iter()
-                    .filter(|txid| !self.own_txs.is_pending(txid))
-                    .collect();
-                if !txids.is_empty() {
-                    // Listed own (propagated) txs count as announced to
-                    // this peer, so it may fetch them.
-                    let own: Vec<Txid> =
-                        txids.iter().copied().filter(|t| self.own_txs.is_active(t)).collect();
-                    if !own.is_empty() {
-                        let mut state = self.relay_state.lock().unwrap();
-                        state.entry(addr.to_string()).or_default().own_txids.extend(own);
-                    }
-                    let inv: Vec<Inventory> = txids.into_iter().map(Inventory::Transaction).collect();
-                    peer.send_inv(inv).map_err(|e| format!("mempool inv: {}", e))?;
-                }
+                // BIP 35, answered as a default Bitcoin Core node does
+                // (ticket 049): we don't advertise NODE_BLOOM and grant no
+                // mempool permission, so the peer is disconnected
+                // (ProcessMessage, NetMsgType::MEMPOOL: "mempool request
+                // with bloom filters disabled"). Not misbehavior.
+                return Err("mempool request with bloom filters disabled".into());
             }
 
             NetworkMessage::GetAddr => {
@@ -3854,13 +3991,7 @@ impl HeaderSync {
                     let mut state = self.relay_state.lock().unwrap();
                     let entry = state
                         .entry(addr.to_string())
-                        .or_insert_with(|| PeerRelayState {
-                            wants_sendheaders: false,
-                            feefilter_rate: 0,
-                            known_txids: HashSet::new(),
-                            own_txids: HashSet::new(),
-                            getaddr_responded: false,
-                        });
+                        .or_default();
                     if entry.getaddr_responded {
                         return Ok(());
                     }
@@ -3966,6 +4097,17 @@ impl HeaderSync {
         get_hdrs: &GetHeadersMessage,
         peer: &mut crate::p2p::Peer,
     ) -> Result<(), String> {
+        // Core disconnects a peer whose locator is longer than
+        // MAX_LOCATOR_SZ (ProcessMessage, NetMsgType::GETHEADERS): each
+        // entry is a lookup, and an honest locator is ~30 entries.
+        if get_hdrs.locator_hashes.len() > MAX_LOCATOR_SZ {
+            return Err(format!(
+                "getheaders locator size {} > {}",
+                get_hdrs.locator_hashes.len(),
+                MAX_LOCATOR_SZ
+            ));
+        }
+
         // Find the best matching locator hash
         let mut start_height = None;
         for locator_hash in &get_hdrs.locator_hashes {
@@ -4008,7 +4150,11 @@ impl HeaderSync {
         Ok(())
     }
 
-    /// Handle a getdata request — serve blocks or transactions.
+    /// Handle a getdata request — serve blocks or transactions. The items
+    /// are queued and served a step at a time (ticket 049), like Core's
+    /// `m_getdata_requests`: the first step now, the rest by
+    /// `service_peer_messages` between other peers' messages, so one
+    /// `getdata` can't hold the sync thread (or `stop`) for 50,000 sends.
     fn handle_getdata(
         &self,
         addr: &str,
@@ -4016,23 +4162,54 @@ impl HeaderSync {
         peer: &mut crate::p2p::Peer,
     ) -> Result<(), String> {
         // Bitcoin protocol limits getdata to 50,000 entries
-        if inv_list.len() > 50_000 {
-            return Err(format!("getdata too large: {} entries (max 50000)", inv_list.len()));
+        if inv_list.len() > MAX_INV_SZ {
+            return Err(format!("getdata too large: {} entries (max {})", inv_list.len(), MAX_INV_SZ));
         }
+        self.relay_state
+            .lock()
+            .unwrap()
+            .entry(addr.to_string())
+            .or_default()
+            .getdata_queue
+            .extend(inv_list.iter().copied());
+        self.serve_getdata_step(addr, peer).map(|_| ())
+    }
 
+    /// True while `addr` has `getdata` items waiting to be served.
+    fn has_queued_getdata(&self, addr: &str) -> bool {
+        self.relay_state
+            .lock()
+            .unwrap()
+            .get(addr)
+            .is_some_and(|s| !s.getdata_queue.is_empty())
+    }
+
+    /// Serve the front of `addr`'s getdata queue, as Core's ProcessGetData
+    /// does: transactions (and items we don't have) up to
+    /// `GETDATA_ITEMS_PER_STEP`, and at most one block, since blocks are
+    /// the expensive part. Everything we can't serve goes into one
+    /// `notfound`. Returns whether items are left.
+    fn serve_getdata_step(&self, addr: &str, peer: &mut crate::p2p::Peer) -> Result<bool, String> {
         let mut not_found = Vec::new();
-
-        for item in inv_list {
+        for _ in 0..GETDATA_ITEMS_PER_STEP {
+            let item = {
+                let mut state = self.relay_state.lock().unwrap();
+                match state.get_mut(addr).and_then(|s| s.getdata_queue.pop_front()) {
+                    Some(item) => item,
+                    None => break,
+                }
+            };
             match item {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
-                    match self.block_store.get_block_by_hash(hash) {
-                        Ok(Some(block)) => {
+                    match self.block_store.get_block_by_hash(&hash) {
+                        Ok(Some(block)) if self.may_serve_block(addr, &block) => {
                             peer.send_block(block)
                                 .map_err(|e| format!("send block: {}", e))?;
                             self.stats.lock().unwrap().blocks_served += 1;
+                            break;
                         }
                         _ => {
-                            not_found.push(*item);
+                            not_found.push(item);
                         }
                     }
                 }
@@ -4040,22 +4217,22 @@ impl HeaderSync {
                     // An own tx is served only to a peer we announced it
                     // to or that announced it to us; anyone else asking
                     // is probing whether we have it (i.e. are its source).
-                    if self.own_txs.is_active(txid) && !self.peer_knows_own_tx(addr, txid) {
-                        not_found.push(*item);
+                    if self.own_txs.is_active(&txid) && !self.peer_knows_own_tx(addr, &txid) {
+                        not_found.push(item);
                         continue;
                     }
                     let mempool = self.mempool.lock().unwrap();
-                    if let Some(tx) = mempool.get(txid) {
+                    if let Some(tx) = mempool.get(&txid) {
                         let tx_clone = tx.clone();
                         drop(mempool);
                         peer.send_tx(tx_clone)
                             .map_err(|e| format!("send tx: {}", e))?;
                     } else {
-                        not_found.push(*item);
+                        not_found.push(item);
                     }
                 }
                 _ => {
-                    not_found.push(*item);
+                    not_found.push(item);
                 }
             }
         }
@@ -4064,31 +4241,72 @@ impl HeaderSync {
             peer.send_not_found(not_found)
                 .map_err(|e| format!("send notfound: {}", e))?;
         }
-        Ok(())
+        Ok(self.has_queued_getdata(addr))
+    }
+
+    /// Whether `addr` may have `block` now (ticket 049): within its
+    /// `MAX_BLOCKS_SERVED_PER_PEER` for this window, and within the
+    /// metered-network upload cap. Counts it if so.
+    fn may_serve_block(&self, addr: &str, block: &bitcoin::Block) -> bool {
+        let now = Instant::now();
+        {
+            let mut state = self.relay_state.lock().unwrap();
+            let s = state.entry(addr.to_string()).or_default();
+            if s.serve_window_start.map_or(true, |t| now.duration_since(t) >= BLOCK_SERVE_WINDOW) {
+                s.serve_window_start = Some(now);
+                s.blocks_served = 0;
+            }
+            if s.blocks_served >= MAX_BLOCKS_SERVED_PER_PEER {
+                debug!("Not serving {} more blocks this hour", addr);
+                return false;
+            }
+        }
+        if !self.upload_budget.try_spend(block.total_size() as u64) {
+            debug!("Metered upload cap reached; not serving a block to {}", addr);
+            return false;
+        }
+        let mut state = self.relay_state.lock().unwrap();
+        state.entry(addr.to_string()).or_default().blocks_served += 1;
+        true
     }
 
     /// Handle an inv announcement — request unknown blocks/txs.
+    ///
+    /// Ticket 049 bounds what one `inv` costs: at most
+    /// `MAX_BLOCK_INV_LOOKUPS` block entries are looked up, and at most
+    /// `MAX_GETDATA_SZ` transactions asked for. A block we have counts as
+    /// the peer having it (Core's UpdateBlockAvailability); one we don't is
+    /// a `BlockAnnouncements` entry, and the next header round asks the
+    /// announcer.
     fn handle_inv(
         &self,
         addr: &str,
         inv_list: &[Inventory],
         peer: &mut crate::p2p::Peer,
+        pool: &PeerPool,
     ) -> Result<(), String> {
         // Bitcoin protocol limits inv messages to 50,000 entries
-        if inv_list.len() > 50_000 {
-            return Err(format!("inv too large: {} entries (max 50000)", inv_list.len()));
+        if inv_list.len() > MAX_INV_SZ {
+            return Err(format!("inv too large: {} entries (max {})", inv_list.len(), MAX_INV_SZ));
         }
 
         let mut request = Vec::new();
+        let mut block_lookups = 0;
 
         for item in inv_list {
             match item {
                 Inventory::Block(hash) | Inventory::WitnessBlock(hash) => {
+                    if block_lookups == MAX_BLOCK_INV_LOOKUPS {
+                        continue;
+                    }
+                    block_lookups += 1;
                     // Check if we already have this block header
-                    if self.store.find_height_of_hash(*hash).ok().flatten().is_none() {
-                        info!("New block announced by {}: {}", addr, hash);
-                        // Signal the monitor loop to break early and fetch
-                        self.new_block_announced.store(true, Ordering::Relaxed);
+                    match self.store.find_height_of_hash(*hash).ok().flatten() {
+                        Some(height) => pool.raise_peer_height(addr, height),
+                        None => {
+                            info!("New block announced by {}: {}", addr, hash);
+                            self.note_block_announcement(addr, *hash, pool.is_inbound(addr));
+                        }
                     }
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
@@ -4113,7 +4331,7 @@ impl HeaderSync {
                             entry.own_txids.insert(*txid);
                         }
                     }
-                    if !self.mempool.lock().unwrap().contains(txid) {
+                    if request.len() < MAX_GETDATA_SZ && !self.mempool.lock().unwrap().contains(txid) {
                         // Request with witness data for segwit transactions
                         request.push(Inventory::WitnessTransaction(*txid));
                     }
@@ -4127,6 +4345,73 @@ impl HeaderSync {
                 .map_err(|e| format!("getdata for inv: {}", e))?;
         }
         Ok(())
+    }
+
+    /// Note `addr`'s announcement of a block we don't have and wake the
+    /// monitor loop (ticket 049). The first outbound announcer is asked
+    /// for headers next round; inbound announcers (never asked: they
+    /// can't be held to it) wake the loop at most once per
+    /// `INBOUND_ANNOUNCEMENT_INTERVAL`.
+    fn note_block_announcement(&self, addr: &str, hash: BlockHash, inbound: bool) {
+        {
+            let mut announcements = self.block_announcements.lock().unwrap();
+            if inbound {
+                if announcements
+                    .last_inbound_wake
+                    .is_some_and(|t| t.elapsed() < INBOUND_ANNOUNCEMENT_INTERVAL)
+                {
+                    return;
+                }
+                announcements.last_inbound_wake = Some(Instant::now());
+            } else if announcements.outbound.is_none() {
+                announcements.outbound = Some((addr.to_string(), hash));
+            }
+        }
+        // Signal the monitor loop to break early and fetch
+        self.new_block_announced.store(true, Ordering::Relaxed);
+    }
+
+    /// The outbound peer (and block) to ask for headers next, if one
+    /// announced a block we don't have.
+    fn take_block_announcement(&self) -> Option<(String, BlockHash)> {
+        self.block_announcements.lock().unwrap().outbound.take()
+    }
+
+    /// `addr` answered `getheaders` with nothing past `tip_height`. If it
+    /// claimed more at handshake, that claim is dropped (ticket 024's
+    /// rules, shared by the main loop and wakes): far more than we have
+    /// with nothing to show is a lie, and a ban; a smaller gap may be a
+    /// reorg, so its height is capped at our tip and it costs a little.
+    /// True if it claimed more (ask someone else).
+    fn claimed_more_than(&self, pool: &mut PeerPool, addr: &str, tip_height: u32) -> bool {
+        let Some(claimed) = pool.get_peer_height(addr) else {
+            return false;
+        };
+        // Peer height sanity: if a peer claims height far above our tip
+        // but can't serve any headers beyond it, they're lying. Ban them.
+        if claimed > tip_height + 2016 {
+            warn!(
+                "Peer {} claims height {} but has no headers above {}, banning",
+                addr, claimed, tip_height
+            );
+            pool.misbehaving(addr, 100);
+            return true;
+        }
+        // A smaller gap is no proof of lying (it may have
+        // reorged), but this peer has nothing for us: stop
+        // preferring it for its claimed height and ask the
+        // next-best peer, rather than concluding we're synced
+        // from the one peer that won't serve headers.
+        if claimed > tip_height {
+            info!(
+                "Peer {} claims height {} but has no headers above {}; asking others",
+                addr, claimed, tip_height
+            );
+            pool.lower_peer_height(addr, tip_height);
+            pool.misbehaving(addr, EMPTY_HEADERS_PENALTY);
+            return true;
+        }
+        false
     }
 
     /// Handle an incoming transaction — validate and add to mempool.
@@ -4352,32 +4637,9 @@ impl HeaderSync {
             return Ok(BlockNotification::no_update(tip_height, &tip_header));
         }
 
-        let peer = pool.best_peer();
-        if peer.is_none() {
-            return Err(SyncError::Peer("no peers available".into()));
-        }
-        let mut peer = peer.unwrap();
-        let peer_addr = peer.addr().to_string();
-
-        let headers = match peer.get_headers_within(
-            vec![tip_hash],
-            BlockHash::all_zeros(),
-            Some(budget.remaining()),
-        ) {
-            Ok(h) => {
-                pool.return_peer(peer);
-                h
-            }
+        let Some((peer_addr, headers)) = self.wake_headers(&mut pool, tip_hash, tip_height, budget)? else {
             // Out of budget waiting for headers: nothing learned.
-            Err(_) if budget.should_stop() => {
-                return Ok(BlockNotification::no_update(tip_height, &tip_header));
-            }
-            Err(e) => {
-                if matches!(e, PeerError::WrongMagic { .. }) {
-                    pool.ban_peer(&peer_addr);
-                }
-                return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
-            }
+            return Ok(BlockNotification::no_update(tip_height, &tip_header));
         };
 
         if headers.is_empty() {
@@ -4667,30 +4929,9 @@ impl HeaderSync {
             return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
         }
 
-        let mut peer = pool
-            .best_peer()
-            .ok_or_else(|| SyncError::Peer("no peers available".into()))?;
-        let peer_addr = peer.addr().to_string();
-
-        let headers = match peer.get_headers_within(
-            vec![tip_hash],
-            BlockHash::all_zeros(),
-            Some(budget.remaining()),
-        ) {
-            Ok(h) => {
-                pool.return_peer(peer);
-                h
-            }
+        let Some((peer_addr, headers)) = self.wake_headers(&mut pool, tip_hash, tip_height, budget)? else {
             // Out of budget waiting for headers: headers stay unchecked.
-            Err(_) if budget.should_stop() => {
-                return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
-            }
-            Err(e) => {
-                if matches!(e, PeerError::WrongMagic { .. }) {
-                    pool.ban_peer(&peer_addr);
-                }
-                return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
-            }
+            return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
         };
 
         let mut new_tip = tip_height;
@@ -5005,6 +5246,50 @@ impl HeaderSync {
             error: header_error,
             ..self.make_catchup_status(caught_up, blocks_validated, validated_height, new_tip)
         })
+    }
+
+    /// A wake's header request: the best peer's answer to a one-hash
+    /// locator at our tip, with the peer's address. If that peer claimed
+    /// more than our tip and had nothing, its claim is dropped
+    /// (`claimed_more_than`) and the next best is asked, up to
+    /// `WAKE_HEADER_PEERS` (ticket 049): otherwise one withholding peer
+    /// claiming the tallest chain made every wake validate only the local
+    /// backlog and report caught up. `None`: the budget ran out first.
+    fn wake_headers(
+        &self,
+        pool: &mut PeerPool,
+        tip_hash: BlockHash,
+        tip_height: u32,
+        budget: &WakeBudget,
+    ) -> Result<Option<(String, Vec<Header>)>, SyncError> {
+        let mut asked = 0;
+        loop {
+            let mut peer = pool
+                .best_peer()
+                .ok_or_else(|| SyncError::Peer("no peers available".into()))?;
+            let peer_addr = peer.addr().to_string();
+            match peer.get_headers_within(vec![tip_hash], BlockHash::all_zeros(), Some(budget.remaining())) {
+                Ok(headers) => {
+                    pool.return_peer(peer);
+                    asked += 1;
+                    if headers.is_empty()
+                        && self.claimed_more_than(pool, &peer_addr, tip_height)
+                        && asked < WAKE_HEADER_PEERS
+                        && !budget.should_stop()
+                    {
+                        continue;
+                    }
+                    return Ok(Some((peer_addr, headers)));
+                }
+                Err(_) if budget.should_stop() => return Ok(None),
+                Err(e) => {
+                    if matches!(e, PeerError::WrongMagic { .. }) {
+                        pool.ban_peer(&peer_addr);
+                    }
+                    return Err(SyncError::Peer(format!("{}: {}", peer_addr, e)));
+                }
+            }
+        }
     }
 
     /// Build a CatchUpStatus, reading block hash/timestamp from the store.
@@ -5697,17 +5982,50 @@ mod tests {
         }
     }
 
+    // ── Header-sync stall timeout and monitor clocks (ticket 049) ─────
+
+    #[test]
+    fn headers_stall_judges_only_after_the_grace_and_per_peer() {
+        let mut stall = HeadersStall::new((Duration::from_secs(10), 100.0));
+        let s = Duration::from_secs;
+        // 2,000 per 9 s is below 100/s but still inside the grace.
+        assert!(!stall.too_slow("a", 2000, s(9)));
+        assert!(stall.too_slow("a", 2000, s(40)), "4,000 in 49 s");
+        // A new sync peer starts over.
+        assert!(!stall.too_slow("b", 2000, s(9)));
+        assert!(!stall.too_slow("b", 2000, s(2)), "4,000 in 11 s is fast enough");
+    }
+
+    #[test]
+    fn monitor_maintenance_runs_on_its_own_clock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hs = regtest_syncer(&dir);
+        let mut pool = PeerPool::new_for_test_with(ChainParams::regtest());
+        let stale = || hs.relay_state.lock().unwrap().insert("gone:8333".into(), PeerRelayState::default());
+        let reported = std::cell::Cell::new(0);
+        let report = |_: &PeerPool| reported.set(reported.get() + 1);
+
+        // Not due: nothing happens, however often the loop is re-entered.
+        let mut timers = MonitorTimers { last_maintain: Instant::now(), last_status: Instant::now() };
+        stale();
+        hs.monitor_chores(&mut pool, &mut timers, &report);
+        assert!(hs.relay_state.lock().unwrap().contains_key("gone:8333"));
+        assert_eq!(reported.get(), 0);
+
+        // Due (the clock survived earlier entries): it runs, and resets.
+        timers.last_maintain -= MAINTENANCE_INTERVAL;
+        timers.last_status -= STATUS_INTERVAL;
+        hs.monitor_chores(&mut pool, &mut timers, &report);
+        assert!(!hs.relay_state.lock().unwrap().contains_key("gone:8333"), "maintenance skipped");
+        assert_eq!(reported.get(), 1);
+        assert!(timers.last_maintain.elapsed() < Duration::from_secs(5));
+    }
+
     // ── record_known_txid (per-peer dedup cap) ────────────────────────
 
     /// Build a `PeerRelayState` with an empty txid set for the cap tests.
     fn empty_relay_state() -> PeerRelayState {
-        PeerRelayState {
-            wants_sendheaders: false,
-            feefilter_rate: 0,
-            known_txids: HashSet::new(),
-            own_txids: HashSet::new(),
-            getaddr_responded: false,
-        }
+        PeerRelayState::default()
     }
 
     /// Synthesize `n` distinct txids for use as test inputs. Each is the

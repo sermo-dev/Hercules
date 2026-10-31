@@ -33,6 +33,42 @@ pub(crate) const BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3);
 const TOR_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const TOR_BLOCK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The whole version handshake, however the bytes arrive (ticket 049): a
+/// peer dribbling its `version` one byte per read timeout can't hold a
+/// connection attempt (or the inbound accept) for longer.
+#[cfg(not(test))]
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long one write may wait for the peer to take any bytes (ticket
+/// 049). Without it a peer that stops reading blocks `send`, and the sync
+/// thread with it, forever. A message as a whole also gets
+/// `MIN_TRANSFER_RATE`.
+#[cfg(not(test))]
+const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const TOR_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Slowest a peer may move one message's bytes, either way, once the
+/// message has started (ticket 049): it gets the base read or write
+/// timeout plus its length at this rate (a 4 MB block: 160 s on top). A
+/// peer trickling bytes just inside every per-read timeout is dropped
+/// rather than holding the connection for hours.
+const MIN_TRANSFER_RATE: u64 = 25_000;
+
+/// Most bytes one `read` asks for: payloads are read in pieces of this
+/// size, so a frame header claiming 4 MB costs nothing until the bytes
+/// actually arrive.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Time allowed for a message of `len` bytes beyond `base`, at
+/// `MIN_TRANSFER_RATE`.
+fn transfer_allowance(len: usize) -> Duration {
+    Duration::from_millis(len as u64 * 1000 / MIN_TRANSFER_RATE)
+}
+
 /// Maximum P2P message payload size (4 MB, matches Bitcoin Core's MAX_SIZE).
 /// Prevents OOM from malicious peers sending crafted headers claiming huge payloads.
 const MAX_P2P_PAYLOAD: u32 = 4_000_000;
@@ -88,6 +124,47 @@ impl PeerStream {
             PeerStream::Mem(_) => Ok(()),
         }
     }
+
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            PeerStream::Direct(tcp) => tcp.set_write_timeout(timeout),
+            PeerStream::Tor(tor) => {
+                tor.set_write_timeout(timeout);
+                Ok(())
+            }
+            #[cfg(test)]
+            PeerStream::Mem(_) => Ok(()),
+        }
+    }
+
+    /// The standing per-read timeout for this transport.
+    fn read_timeout(&self) -> Duration {
+        match self {
+            PeerStream::Direct(_) => READ_TIMEOUT,
+            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
+            #[cfg(test)]
+            PeerStream::Mem(_) => READ_TIMEOUT,
+        }
+    }
+
+    /// The overall deadline for one block download on this transport.
+    fn block_download_timeout(&self) -> Duration {
+        match self {
+            PeerStream::Direct(_) => BLOCK_DOWNLOAD_TIMEOUT,
+            PeerStream::Tor(_) => TOR_BLOCK_DOWNLOAD_TIMEOUT,
+            #[cfg(test)]
+            PeerStream::Mem(_) => BLOCK_DOWNLOAD_TIMEOUT,
+        }
+    }
+
+    fn write_timeout(&self) -> Duration {
+        match self {
+            PeerStream::Direct(_) => WRITE_TIMEOUT,
+            PeerStream::Tor(_) => TOR_WRITE_TIMEOUT,
+            #[cfg(test)]
+            PeerStream::Mem(_) => WRITE_TIMEOUT,
+        }
+    }
 }
 
 impl Read for PeerStream {
@@ -108,6 +185,27 @@ impl Read for PeerStream {
 struct ReadDeadline {
     at: Instant,
     cap: Duration,
+    /// `at` is the caller's own budget (a wake's), so running into it is
+    /// `DeadlineReached`, never the peer's fault. Otherwise it is a request
+    /// timeout (ticket 049), and running into it is the peer's `Timeout`.
+    budget: bool,
+}
+
+impl ReadDeadline {
+    /// A request's own timeout `own`, tightened to the caller's `limit` if
+    /// that is sooner. `None` for a zero limit: no time to even ask.
+    fn request(own: Duration, limit: Option<Duration>, cap: Duration) -> Option<ReadDeadline> {
+        let now = Instant::now();
+        match limit {
+            Some(l) if l.is_zero() => None,
+            Some(l) if l < own => Some(ReadDeadline { at: now + l, cap, budget: true }),
+            _ => Some(ReadDeadline { at: now + own, cap, budget: false }),
+        }
+    }
+
+    fn passed(&self) -> bool {
+        Instant::now() >= self.at
+    }
 }
 
 /// `PeerStream` reads bounded by a `ReadDeadline`.
@@ -165,6 +263,13 @@ pub struct Peer {
     /// v1 `addr`. Required for advertising our own .onion address — TorV3
     /// can't be encoded in the v1 form.
     wants_addrv2: bool,
+    /// The bytes of a message still arriving (ticket 049), kept across
+    /// reads: a read that times out mid-message (common over Tor and
+    /// cellular) never loses the framing. Never holds more than one frame.
+    partial: Vec<u8>,
+    /// When the first byte in `partial` arrived: the message must be
+    /// complete within `message_allowance` of it.
+    partial_since: Option<Instant>,
 }
 
 /// Source of inbound peers' pool addresses (`inbound#N`), unique for the
@@ -172,6 +277,19 @@ pub struct Peer {
 static NEXT_INBOUND_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Peer {
+    fn new(stream: PeerStream, addr: String, magic: Magic, inbound: bool) -> Peer {
+        Peer {
+            stream,
+            addr,
+            magic,
+            their_version: None,
+            inbound,
+            wants_addrv2: false,
+            partial: Vec::new(),
+            partial_since: None,
+        }
+    }
+
     /// Discover peer addresses from DNS seeds (clearnet).
     pub fn discover_peers() -> Vec<String> {
         let mut addrs = Vec::new();
@@ -235,14 +353,7 @@ impl Peer {
             .set_read_timeout(Some(READ_TIMEOUT))
             .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
 
-        let mut peer = Peer {
-            stream: PeerStream::Direct(stream),
-            addr: addr.to_string(),
-            magic,
-            their_version: None,
-            inbound: false,
-            wants_addrv2: false,
-        };
+        let mut peer = Peer::new(PeerStream::Direct(stream), addr.to_string(), magic, false);
 
         peer.handshake(our_height)?;
         info!("Handshake complete with {}", addr);
@@ -268,14 +379,7 @@ impl Peer {
             .connect(addr)
             .map_err(|e| PeerError::Connection(format!("{}: {}", addr, e)))?;
 
-        let mut peer = Peer {
-            stream: PeerStream::Tor(tor_stream),
-            addr: addr.to_string(),
-            magic,
-            their_version: None,
-            inbound: false,
-            wants_addrv2: false,
-        };
+        let mut peer = Peer::new(PeerStream::Tor(tor_stream), addr.to_string(), magic, false);
 
         peer.handshake(our_height)?;
         info!("Handshake complete with {} via Tor", addr);
@@ -293,21 +397,26 @@ impl Peer {
     }
 
     /// Accept an inbound connection: run the version handshake as responder.
-    /// (Wait for their version first, then send ours + verack.)
+    /// (Wait for their version first, then send ours + verack.) The whole
+    /// exchange is bounded by `HANDSHAKE_TIMEOUT` (ticket 049); production
+    /// runs it off the sync thread (`InboundHandshakes`).
     pub fn accept(stream: PeerStream, our_height: i32, magic: Magic) -> Result<Peer, PeerError> {
-        let mut peer = Peer {
-            stream,
-            addr: String::new(), // filled after receiving their version
-            magic,
-            their_version: None,
-            inbound: true,
-            wants_addrv2: false,
-        };
+        // Filled after receiving their version.
+        let mut peer = Peer::new(stream, String::new(), magic, true);
+        let deadline = peer.handshake_deadline();
+        let result = peer.accept_within(our_height, deadline);
+        peer.restore_read_timeout()?;
+        result.map_err(Peer::handshake_timeout)?;
+        let user_agent = peer.peer_user_agent().unwrap_or_default();
+        info!("Accepted inbound peer: {} ({})", peer.addr, user_agent);
+        Ok(peer)
+    }
 
+    fn accept_within(&mut self, our_height: i32, deadline: ReadDeadline) -> Result<(), PeerError> {
         // Receive their version first
         let mut got_version = false;
         for _ in 0..10 {
-            let msg = peer.receive()?;
+            let msg = self.receive_until(Some(deadline))?;
             match msg {
                 NetworkMessage::Version(v) => {
                     if v.version < 70015 {
@@ -318,11 +427,11 @@ impl Peer {
                     // Keyed by a connection id, not anything the peer
                     // chose (its version nonce): a peer must not be able
                     // to pick, collide with, or reuse a pool identity.
-                    peer.addr = format!(
+                    self.addr = format!(
                         "inbound#{}",
                         NEXT_INBOUND_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     );
-                    peer.their_version = Some(v);
+                    self.their_version = Some(v);
                     got_version = true;
                     break;
                 }
@@ -356,44 +465,65 @@ impl Peer {
             start_height: our_height,
             relay: true,
         };
-        peer.send(NetworkMessage::Version(our_version))?;
+        self.send(NetworkMessage::Version(our_version))?;
         // BIP 155: announce addrv2 support before our verack. Same rationale
         // as the outbound path — without this, peers strip our TorV3 self-ad
         // from gossip and inbound discovery never bootstraps.
-        peer.send(NetworkMessage::SendAddrV2)?;
-        peer.send(NetworkMessage::Verack)?;
+        self.send(NetworkMessage::SendAddrV2)?;
+        self.send(NetworkMessage::Verack)?;
 
         // Wait for their verack. Track sendaddrv2 here too — the inbound
         // peer may send it in the same window.
-        let mut got_verack = false;
         for _ in 0..10 {
-            let msg = peer.receive()?;
+            let msg = self.receive_until(Some(deadline))?;
             match msg {
-                NetworkMessage::Verack => {
-                    got_verack = true;
-                    break;
-                }
+                NetworkMessage::Verack => return Ok(()),
                 NetworkMessage::SendAddrV2 => {
-                    peer.wants_addrv2 = true;
+                    self.wants_addrv2 = true;
                 }
                 NetworkMessage::Ping(nonce) => {
-                    peer.send(NetworkMessage::Pong(nonce))?;
+                    self.send(NetworkMessage::Pong(nonce))?;
                 }
                 _ => {}
             }
         }
 
-        if !got_verack {
-            return Err(PeerError::Handshake("inbound peer did not send verack".into()));
-        }
-
-        let user_agent = peer.peer_user_agent().unwrap_or_default();
-        info!("Accepted inbound peer: {} ({})", peer.addr, user_agent);
-        Ok(peer)
+        Err(PeerError::Handshake("inbound peer did not send verack".into()))
     }
 
-    /// Perform the version/verack handshake (outbound/initiator mode).
+    /// The overall handshake deadline, starting now. Running into it is
+    /// the peer's fault (`budget: false`).
+    fn handshake_deadline(&self) -> ReadDeadline {
+        ReadDeadline {
+            at: Instant::now() + HANDSHAKE_TIMEOUT,
+            cap: self.stream.read_timeout(),
+            budget: false,
+        }
+    }
+
+    /// A handshake that ran out of time says so.
+    fn handshake_timeout(e: PeerError) -> PeerError {
+        match e {
+            PeerError::Timeout => PeerError::Handshake(format!(
+                "no handshake within {}s",
+                HANDSHAKE_TIMEOUT.as_secs_f32()
+            )),
+            other => other,
+        }
+    }
+
+    /// Perform the version/verack handshake (outbound/initiator mode),
+    /// within `HANDSHAKE_TIMEOUT` (ticket 049): a wake's connect deadline
+    /// stops new connection attempts, so one in progress must end on its
+    /// own.
     fn handshake(&mut self, our_height: i32) -> Result<(), PeerError> {
+        let deadline = self.handshake_deadline();
+        let result = self.handshake_within(our_height, deadline);
+        self.restore_read_timeout()?;
+        result.map_err(Peer::handshake_timeout)
+    }
+
+    fn handshake_within(&mut self, our_height: i32, deadline: ReadDeadline) -> Result<(), PeerError> {
         // For the version message, use a dummy address if we can't parse
         // (e.g., .onion addresses don't map to SocketAddr).
         let receiver_addr = self
@@ -439,7 +569,7 @@ impl Peer {
         let mut got_verack = false;
 
         for _ in 0..10 {
-            let msg = self.receive()?;
+            let msg = self.receive_until(Some(deadline))?;
             match msg {
                 NetworkMessage::Version(v) => {
                     // Reject peers running protocol versions too old to
@@ -497,31 +627,47 @@ impl Peer {
         Ok(())
     }
 
-    /// Send a Bitcoin P2P message.
+    /// Send a Bitcoin P2P message, within `WRITE_TIMEOUT` per write and
+    /// `MIN_TRANSFER_RATE` overall (ticket 049). Running out of either is
+    /// an error, and the caller drops the peer.
     pub fn send(&mut self, msg: NetworkMessage) -> Result<(), PeerError> {
-        let raw = RawNetworkMessage::new(self.magic, msg);
-        // bitcoin's consensus_encode requires bitcoin::io::Write, not std::io::Write.
-        // We match on the variant to get the concrete type which bitcoin_io knows about.
-        match &mut self.stream {
-            PeerStream::Direct(tcp) => {
-                raw.consensus_encode(tcp)
-                    .map_err(|e| PeerError::Send(format!("{}", e)))?;
-                tcp.flush()
-                    .map_err(|e| PeerError::Send(format!("flush: {}", e)))?;
+        let mut bytes = Vec::new();
+        RawNetworkMessage::new(self.magic, msg)
+            .consensus_encode(&mut bytes)
+            .map_err(|e| PeerError::Send(format!("{}", e)))?;
+        let cap = self.stream.write_timeout();
+        let at = Instant::now() + cap + transfer_allowance(bytes.len());
+        let mut sent = 0;
+        while sent < bytes.len() {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(PeerError::Send(format!(
+                    "write deadline passed ({} of {} bytes taken)",
+                    sent,
+                    bytes.len()
+                )));
             }
-            PeerStream::Tor(tor) => {
-                raw.consensus_encode(&mut bitcoin::io::FromStd::new(&mut *tor))
-                    .map_err(|e| PeerError::Send(format!("{}", e)))?;
-                tor.flush()
-                    .map_err(|e| PeerError::Send(format!("flush: {}", e)))?;
-            }
-            #[cfg(test)]
-            PeerStream::Mem(m) => {
-                raw.consensus_encode(&mut bitcoin::io::FromStd::new(&mut *m))
-                    .map_err(|e| PeerError::Send(format!("{}", e)))?;
+            // A zero timeout means "block forever" to the socket API.
+            self.stream
+                .set_write_timeout(Some(left.min(cap).max(Duration::from_millis(1))))
+                .map_err(|e| PeerError::Send(format!("set write timeout: {}", e)))?;
+            match self.stream.write(&bytes[sent..]) {
+                Ok(0) => return Err(PeerError::Send("connection closed".into())),
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+                    return Err(PeerError::Send(format!(
+                        "write timed out ({} of {} bytes taken)",
+                        sent,
+                        bytes.len()
+                    )));
+                }
+                Err(e) => return Err(PeerError::Send(format!("{}", e))),
             }
         }
-        Ok(())
+        self.stream
+            .flush()
+            .map_err(|e| PeerError::Send(format!("flush: {}", e)))
     }
 
     /// Receive a Bitcoin P2P message.
@@ -529,75 +675,137 @@ impl Peer {
     /// Reads the 24-byte P2P header first to validate payload size before
     /// allocation, preventing OOM from crafted headers (MAX_SIZE = 4 MB,
     /// matching Bitcoin Core). Returns `PeerError::Timeout` on read timeout
-    /// for reliable detection by `poll_message()`.
+    /// for reliable detection by `poll_message()`. A message already under
+    /// way must finish within `message_allowance`.
+    #[cfg(test)]
     pub fn receive(&mut self) -> Result<NetworkMessage, PeerError> {
         self.receive_until(None)
     }
 
     /// `receive` with every read bounded by `deadline`, if set.
     fn receive_until(&mut self, deadline: Option<ReadDeadline>) -> Result<NetworkMessage, PeerError> {
-        let stream = &mut self.stream;
-        let mut read_exact = |buf: &mut [u8]| match deadline {
-            Some(deadline) => DeadlineReader { stream: &mut *stream, deadline }.read_exact(buf),
-            None => stream.read_exact(buf),
-        };
-
-        // A timeout after our own deadline is ours, not the peer's fault.
-        let timed_out = || match deadline {
-            Some(d) if Instant::now() >= d.at => PeerError::DeadlineReached,
-            _ => PeerError::Timeout,
-        };
-
-        // Read the 24-byte P2P message header
-        let mut header = [0u8; 24];
-        read_exact(&mut header).map_err(|e| {
-            if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
-                timed_out()
-            } else {
-                PeerError::Receive(format!("{}", e))
-            }
-        })?;
-
-        // Bytes 0..4 are the network magic. A peer on another network (or
-        // one desynchronized from the message framing) is useless to us;
-        // fail before reading its payload so the caller drops it.
-        if header[..4] != self.magic.to_bytes() {
-            return Err(PeerError::WrongMagic {
-                got: header[..4].try_into().unwrap(),
-                expected: self.magic,
-            });
+        match self.read_message(deadline)? {
+            Some(msg) => Ok(msg),
+            // A timeout at our own deadline is ours, not the peer's fault.
+            None => match deadline {
+                Some(d) if d.budget && d.passed() => Err(PeerError::DeadlineReached),
+                _ => Err(PeerError::Timeout),
+            },
         }
+    }
 
-        // Payload length is at bytes 16..20 (little-endian u32)
-        let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap());
-        if payload_len > MAX_P2P_PAYLOAD {
-            return Err(PeerError::Receive(format!(
-                "message payload {} bytes exceeds limit {}",
-                payload_len, MAX_P2P_PAYLOAD
-            )));
-        }
+    /// How long a message of `payload_len` bytes may take from its first
+    /// byte: the standing read timeout plus `MIN_TRANSFER_RATE`.
+    fn message_allowance(&self, payload_len: usize) -> Duration {
+        self.stream.read_timeout() + transfer_allowance(24 + payload_len)
+    }
 
-        // Read the payload
-        let mut payload = vec![0u8; payload_len as usize];
-        if payload_len > 0 {
-            read_exact(&mut payload).map_err(|e| {
-                if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) {
-                    timed_out()
-                } else {
-                    PeerError::Receive(format!("{}", e))
+    /// Read until a whole message is buffered (`Some`) or a read times out
+    /// (`None`; the bytes so far stay in `partial`, ticket 049). Every read
+    /// is bounded by `deadline`, if set (else by the standing read
+    /// timeout), and once a message has started it must finish within
+    /// `message_allowance`: running out of that is an error.
+    fn read_message(&mut self, deadline: Option<ReadDeadline>) -> Result<Option<NetworkMessage>, PeerError> {
+        loop {
+            // Bytes 0..4 are the network magic. A peer on another network
+            // (or one desynchronized from the message framing) is useless
+            // to us; fail before reading its payload so the caller drops it.
+            let mut want = 24;
+            if self.partial.len() >= 24 {
+                if self.partial[..4] != self.magic.to_bytes() {
+                    let got = self.partial[..4].try_into().unwrap();
+                    self.clear_partial();
+                    return Err(PeerError::WrongMagic { got, expected: self.magic });
                 }
-            })?;
+                // Payload length is at bytes 16..20 (little-endian u32)
+                let payload_len = u32::from_le_bytes(self.partial[16..20].try_into().unwrap());
+                if payload_len > MAX_P2P_PAYLOAD {
+                    self.clear_partial();
+                    return Err(PeerError::Receive(format!(
+                        "message payload {} bytes exceeds limit {}",
+                        payload_len, MAX_P2P_PAYLOAD
+                    )));
+                }
+                want = 24 + payload_len as usize;
+            }
+            if self.partial.len() >= 24 && self.partial.len() == want {
+                // Decode from the complete message buffer
+                let frame = std::mem::take(&mut self.partial);
+                self.partial_since = None;
+                let raw = RawNetworkMessage::consensus_decode(&mut frame.as_slice())
+                    .map_err(|e| PeerError::Receive(format!("{}", e)))?;
+                return Ok(Some(raw.payload().clone()));
+            }
+
+            // The message deadline, once its first byte is in.
+            let payload_len = want - 24;
+            let message_at = self.partial_since.map(|since| since + self.message_allowance(payload_len));
+            if message_at.is_some_and(|at| Instant::now() >= at) {
+                let have = self.partial.len();
+                self.clear_partial();
+                return Err(PeerError::Receive(format!(
+                    "message too slow: {} of {} bytes in {}s",
+                    have,
+                    want.max(24),
+                    self.message_allowance(payload_len).as_secs()
+                )));
+            }
+            // Without a deadline of the caller's the standing read timeout
+            // bounds each read, so the message deadline is overrun by at
+            // most one of those.
+            let bound = match (deadline, message_at) {
+                (Some(d), Some(at)) => Some(ReadDeadline { at: d.at.min(at), ..d }),
+                (d, _) => d,
+            };
+
+            let have = self.partial.len();
+            let n = (want - have).min(READ_CHUNK);
+            self.partial.resize(have + n, 0);
+            let result = match bound {
+                Some(deadline) => DeadlineReader { stream: &mut self.stream, deadline }
+                    .read(&mut self.partial[have..]),
+                None => self.stream.read(&mut self.partial[have..]),
+            };
+            self.partial.truncate(have + *result.as_ref().unwrap_or(&0));
+            match result {
+                Ok(0) => {
+                    self.clear_partial();
+                    return Err(PeerError::Receive("connection closed by peer".into()));
+                }
+                Ok(_) => {
+                    if have == 0 {
+                        self.partial_since = Some(Instant::now());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+                    // Loop once more if it was the message deadline, which
+                    // is reported above.
+                    if message_at.is_some_and(|at| Instant::now() >= at) {
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                Err(e) => {
+                    self.clear_partial();
+                    return Err(PeerError::Receive(format!("{}", e)));
+                }
+            }
         }
+    }
 
-        // Decode from the complete message buffer
-        let mut buf = Vec::with_capacity(24 + payload_len as usize);
-        buf.extend_from_slice(&header);
-        buf.extend_from_slice(&payload);
+    fn clear_partial(&mut self) {
+        self.partial.clear();
+        self.partial_since = None;
+    }
 
-        let mut slice = buf.as_slice();
-        let raw = RawNetworkMessage::consensus_decode(&mut slice)
-            .map_err(|e| PeerError::Receive(format!("{}", e)))?;
-        Ok(raw.payload().clone())
+    /// Put the standing per-read timeout back after a call that bounded
+    /// reads differently.
+    fn restore_read_timeout(&mut self) -> Result<(), PeerError> {
+        let normal = self.stream.read_timeout();
+        self.stream
+            .set_read_timeout(Some(normal))
+            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))
     }
 
     /// Request block headers starting from the given locator hashes.
@@ -611,34 +819,23 @@ impl Peer {
     }
 
     /// `get_headers` bounded by `limit` across every read of the exchange
-    /// (ticket 028), like `get_block_within`.
+    /// (ticket 028), like `get_block_within`. Without a limit (or with a
+    /// longer one) the exchange still ends after the standing read timeout
+    /// (ticket 049: the main loop's requests get a deadline too); running
+    /// into that is the peer's `Timeout`, not `DeadlineReached`.
     pub fn get_headers_within(
         &mut self,
         locator_hashes: Vec<BlockHash>,
         stop_hash: BlockHash,
         limit: Option<Duration>,
     ) -> Result<Vec<bitcoin::block::Header>, PeerError> {
-        let normal_timeout = match &self.stream {
-            PeerStream::Direct(_) => READ_TIMEOUT,
-            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
-            #[cfg(test)]
-            PeerStream::Mem(_) => READ_TIMEOUT,
-        };
-        let deadline = match limit {
-            Some(l) if l.is_zero() => return Err(PeerError::DeadlineReached),
-            Some(l) => Some(ReadDeadline {
-                at: Instant::now() + l,
-                cap: normal_timeout,
-            }),
-            None => None,
+        let normal_timeout = self.stream.read_timeout();
+        let Some(deadline) = ReadDeadline::request(normal_timeout, limit, normal_timeout) else {
+            return Err(PeerError::DeadlineReached);
         };
         let result = self.exchange_headers(locator_hashes, stop_hash, deadline);
-        if deadline.is_some() {
-            // The deadline reader changed the socket timeout per read.
-            self.stream
-                .set_read_timeout(Some(normal_timeout))
-                .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
-        }
+        // The deadline reader changed the socket timeout per read.
+        self.restore_read_timeout()?;
         result
     }
 
@@ -646,7 +843,7 @@ impl Peer {
         &mut self,
         locator_hashes: Vec<BlockHash>,
         stop_hash: BlockHash,
-        deadline: Option<ReadDeadline>,
+        deadline: ReadDeadline,
     ) -> Result<Vec<bitcoin::block::Header>, PeerError> {
         let get_headers = GetHeadersMessage {
             version: PROTOCOL_VERSION,
@@ -658,7 +855,7 @@ impl Peer {
 
         // Read messages until we get Headers
         for _ in 0..10 {
-            let msg = self.receive_until(deadline)?;
+            let msg = self.receive_until(Some(deadline))?;
             match msg {
                 NetworkMessage::Headers(headers) => {
                     return Ok(headers);
@@ -691,46 +888,27 @@ impl Peer {
     /// iOS window. The limit is an absolute deadline across every read of
     /// the request, not a per-read timeout. Running into it is
     /// `DeadlineReached` (not the peer's fault); a zero limit sends nothing.
+    /// Without a limit the block download timeout is the absolute deadline
+    /// (ticket 049), and running into it is `BlockNotReceived`.
     pub fn get_block_within(
         &mut self,
         block_hash: BlockHash,
         limit: Option<Duration>,
     ) -> Result<Block, PeerError> {
         // Use longer timeout for block downloads (blocks can be up to ~4MB)
-        let download_timeout = match &self.stream {
-            PeerStream::Direct(_) => BLOCK_DOWNLOAD_TIMEOUT,
-            PeerStream::Tor(_) => TOR_BLOCK_DOWNLOAD_TIMEOUT,
-            #[cfg(test)]
-            PeerStream::Mem(_) => BLOCK_DOWNLOAD_TIMEOUT,
+        let download_timeout = self.stream.block_download_timeout();
+        let Some(deadline) = ReadDeadline::request(download_timeout, limit, download_timeout) else {
+            return Err(PeerError::DeadlineReached);
         };
-        let deadline = match limit {
-            Some(l) if l.is_zero() => return Err(PeerError::DeadlineReached),
-            Some(l) => Some(ReadDeadline {
-                at: Instant::now() + l,
-                cap: download_timeout,
-            }),
-            None => None,
-        };
-        let normal_timeout = match &self.stream {
-            PeerStream::Direct(_) => READ_TIMEOUT,
-            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
-            #[cfg(test)]
-            PeerStream::Mem(_) => READ_TIMEOUT,
-        };
-
-        self.stream
-            .set_read_timeout(Some(download_timeout))
-            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
 
         let inv = vec![Inventory::WitnessBlock(block_hash)];
-        self.send(NetworkMessage::GetData(inv))?;
-
-        let result = self.receive_block(block_hash, deadline);
+        let result = match self.send(NetworkMessage::GetData(inv)) {
+            Ok(()) => self.receive_block(block_hash, Some(deadline)),
+            Err(e) => Err(e),
+        };
 
         // Restore normal read timeout
-        self.stream
-            .set_read_timeout(Some(normal_timeout))
-            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+        self.restore_read_timeout()?;
 
         result
     }
@@ -810,32 +988,20 @@ impl Peer {
         self.wants_addrv2
     }
 
-    /// Poll for a single incoming message with the given timeout.
-    /// Returns `Ok(Some(msg))` if a message was received, `Ok(None)` on timeout,
-    /// or `Err` on connection failure. Unlike `idle_wait`, this returns the
-    /// message to the caller for dispatch rather than handling it internally.
+    /// Poll for a single incoming message, reading for at most `timeout`.
+    /// Returns `Ok(Some(msg))` if a whole message is in, `Ok(None)` if not
+    /// (yet: a message still arriving stays buffered for the next poll,
+    /// ticket 049), or `Err` on connection failure or a message that
+    /// overran its deadline. Unlike `idle_wait`, this returns the message
+    /// to the caller for dispatch rather than handling it internally.
     pub fn poll_message(&mut self, timeout: Duration) -> Result<Option<NetworkMessage>, PeerError> {
-        let normal_timeout = match &self.stream {
-            PeerStream::Direct(_) => READ_TIMEOUT,
-            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
-            #[cfg(test)]
-            PeerStream::Mem(_) => READ_TIMEOUT,
-        };
-
-        self.stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
-
-        let result = self.receive();
+        let deadline = ReadDeadline { at: Instant::now() + timeout, cap: timeout, budget: true };
+        let result = self.read_message(Some(deadline));
 
         // Restore normal timeout
-        let _ = self.stream.set_read_timeout(Some(normal_timeout));
+        let _ = self.restore_read_timeout();
 
-        match result {
-            Ok(msg) => Ok(Some(msg)),
-            Err(PeerError::Timeout) => Ok(None), // no message available
-            Err(e) => Err(e),
-        }
+        result
     }
 
     // ── Sending helpers for serving and relay ─────────────────────────
@@ -905,39 +1071,112 @@ impl Peer {
     /// Wait for a duration while responding to pings to keep the connection alive.
     /// Returns Ok on timeout (normal), Err if the peer disconnects.
     pub fn idle_wait(&mut self, duration: std::time::Duration) -> Result<(), PeerError> {
-        let start = std::time::Instant::now();
-        let normal_timeout = match &self.stream {
-            PeerStream::Direct(_) => READ_TIMEOUT,
-            PeerStream::Tor(_) => TOR_READ_TIMEOUT,
-            #[cfg(test)]
-            PeerStream::Mem(_) => READ_TIMEOUT,
+        let deadline = ReadDeadline {
+            at: Instant::now() + duration,
+            cap: duration,
+            budget: true,
         };
-
-        while start.elapsed() < duration {
-            let remaining = duration.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-
-            self.stream
-                .set_read_timeout(Some(remaining))
-                .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
-
-            match self.receive() {
-                Ok(NetworkMessage::Ping(nonce)) => {
+        loop {
+            match self.read_message(Some(deadline)) {
+                Ok(Some(NetworkMessage::Ping(nonce))) => {
                     self.send(NetworkMessage::Pong(nonce))?;
                 }
-                Ok(_) => {} // ignore other messages during idle
-                Err(_) => break, // timeout or disconnect
+                Ok(Some(_)) => {} // ignore other messages during idle
+                Ok(None) | Err(_) => break, // timeout or disconnect
             }
         }
 
         // Restore standard read timeout
-        self.stream
-            .set_read_timeout(Some(normal_timeout))
-            .map_err(|e| PeerError::Connection(format!("set timeout: {}", e)))?;
+        self.restore_read_timeout()
+    }
+}
 
-        Ok(())
+// ── Inbound handshakes off the sync thread (ticket 049) ───────────────
+
+/// At most this many inbound handshakes run at once; connections beyond it
+/// are dropped (the pool takes `MAX_INBOUND` anyway).
+const MAX_INBOUND_HANDSHAKES: usize = 8;
+
+/// Finished inbound peers waiting for the sync loop to pick them up.
+const INBOUND_READY_QUEUE: usize = 16;
+
+/// Inbound connections are handshaken here, each on a thread of its own
+/// (the Tor accept task's blocking pool), never on the sync thread: a
+/// silent or trickling inbound peer costs one of `MAX_INBOUND_HANDSHAKES`
+/// slots for at most `HANDSHAKE_TIMEOUT`, and the sync loop only ever sees
+/// finished, version-checked peers (`next_peer`).
+pub struct InboundHandshakes {
+    magic: Magic,
+    /// Our tip, for the `version` we answer with.
+    our_height: std::sync::atomic::AtomicI32,
+    in_flight: std::sync::atomic::AtomicUsize,
+    ready_tx: std::sync::mpsc::SyncSender<Peer>,
+    ready_rx: std::sync::Mutex<std::sync::mpsc::Receiver<Peer>>,
+}
+
+impl InboundHandshakes {
+    pub fn new(magic: Magic) -> InboundHandshakes {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(INBOUND_READY_QUEUE);
+        InboundHandshakes {
+            magic,
+            our_height: std::sync::atomic::AtomicI32::new(0),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            ready_tx,
+            ready_rx: std::sync::Mutex::new(ready_rx),
+        }
+    }
+
+    pub fn set_our_height(&self, height: u32) {
+        self.our_height
+            .store(height.min(i32::MAX as u32) as i32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Claim a handshake slot before handing a connection to `run`; false
+    /// when `MAX_INBOUND_HANDSHAKES` are already running (drop it).
+    pub fn try_begin(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_INBOUND_HANDSHAKES).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    /// Give back a slot claimed by `try_begin` without running a handshake
+    /// (the connection failed first).
+    pub fn abandon(&self) {
+        self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Run the handshake on `stream` (blocking, within `HANDSHAKE_TIMEOUT`)
+    /// in a slot claimed by `try_begin`, and queue the peer if it succeeds.
+    pub fn run(&self, stream: PeerStream) {
+        struct Slot<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        let _slot = Slot(&self.in_flight);
+        let height = self.our_height.load(std::sync::atomic::Ordering::Relaxed);
+        match Peer::accept(stream, height, self.magic) {
+            Ok(peer) => {
+                if self.ready_tx.try_send(peer).is_err() {
+                    info!("Inbound peer dropped: too many waiting for the sync loop");
+                }
+            }
+            Err(e) => info!("Inbound handshake failed: {}", e),
+        }
+    }
+
+    /// A finished inbound peer, if one is waiting (non-blocking).
+    pub fn next_peer(&self) -> Option<Peer> {
+        self.ready_rx.lock().unwrap().try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1061,14 +1300,7 @@ pub(crate) mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set server read timeout");
 
-        let peer = Peer {
-            stream: PeerStream::Direct(client),
-            addr: addr.to_string(),
-            magic: Magic::BITCOIN,
-            their_version: None,
-            inbound: false,
-            wants_addrv2: false,
-        };
+        let peer = Peer::new(PeerStream::Direct(client), addr.to_string(), Magic::BITCOIN, false);
         (peer, server_side)
     }
 
@@ -1589,14 +1821,7 @@ pub(crate) mod tests {
     pub(crate) fn mem_peer(script: Vec<Chunk>, magic: Magic) -> (Peer, Arc<Mutex<Vec<u8>>>) {
         let written = Arc::new(Mutex::new(Vec::new()));
         let stream = MemStream { input: script.into(), written: written.clone() };
-        let peer = Peer {
-            stream: PeerStream::Mem(stream),
-            addr: "198.51.100.7:8333".into(),
-            magic,
-            their_version: None,
-            inbound: false,
-            wants_addrv2: false,
-        };
+        let peer = Peer::new(PeerStream::Mem(stream), "198.51.100.7:8333".into(), magic, false);
         (peer, written)
     }
 
@@ -2033,7 +2258,6 @@ pub(crate) mod tests {
     /// fails as wrong magic, and the peer is dropped. Over Tor a message
     /// split across cells routinely arrives like this.
     #[test]
-    #[ignore = "BUG: poll_message loses framing when a message straddles its read timeout (honest peer dropped as WrongMagic)"]
     fn poll_message_keeps_framing_when_a_message_straddles_the_timeout() {
         let ping = encode(Magic::BITCOIN, NetworkMessage::Ping(77));
         for split in [10, 24, 26] {
@@ -2084,7 +2308,6 @@ pub(crate) mod tests {
     /// so a peer that requests data and never reads blocks `send` (and the
     /// thread running it, e.g. the sync loop serving `getdata`) forever.
     #[test]
-    #[ignore = "BUG: no write timeout; a peer that stops reading blocks send() (and the sync thread) forever"]
     fn send_to_a_peer_that_never_reads_is_bounded() {
         let (mut peer, server) = loopback_peer_pair();
         let mut big = synthetic_block(1);
@@ -2112,7 +2335,6 @@ pub(crate) mod tests {
     /// timeout, holds the handshake (and the sync loop) for as long as it
     /// likes: ~2 hours at one byte per 59 s against Tor's 60 s.
     #[test]
-    #[ignore = "BUG: inbound handshake has no overall deadline; a trickling peer stalls the sync thread"]
     fn accept_bounds_a_trickling_handshake() {
         let listener = TcpListener::bind(crate::testkit::loopback_bind()).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2133,6 +2355,158 @@ pub(crate) mod tests {
         let took = start.elapsed();
         dripper.join().unwrap();
         assert!(took < Duration::from_secs(3), "accept held for {:?} by a trickling peer", took);
+    }
+
+    // ── Deadlines (ticket 049) ───────────────────────────────────────
+
+    /// A listener whose one connection gets `bytes` written `every` apart
+    /// (one write per chunk), then is held open until the test ends.
+    fn dripping_listener(chunks: Vec<Vec<u8>>, every: Duration) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(crate::testkit::loopback_bind()).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            for chunk in chunks {
+                if s.write_all(&chunk).is_err() {
+                    return;
+                }
+                std::thread::sleep(every);
+            }
+            // Hold the connection until the peer hangs up.
+            let _ = s.read(&mut [0u8; 1]);
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn connect_bounds_a_trickling_handshake() {
+        // A wake's connect deadline stops new attempts, not one under way:
+        // the handshake must end by itself.
+        let bytes = encode(Magic::BITCOIN, their_version(70016));
+        let (addr, dripper) = dripping_listener(bytes.chunks(1).map(<[u8]>::to_vec).collect(), Duration::from_millis(100));
+        let start = Instant::now();
+        let result = Peer::connect(&addr, 0, Magic::BITCOIN);
+        let took = start.elapsed();
+        assert!(matches!(&result, Err(PeerError::Handshake(m)) if m.contains("no handshake")), "{:?}", result.err());
+        assert!(took >= HANDSHAKE_TIMEOUT && took < HANDSHAKE_TIMEOUT + Duration::from_secs(3), "took {:?}", took);
+        drop(result);
+        dripper.join().unwrap();
+    }
+
+    #[test]
+    fn get_headers_without_a_limit_ends_at_its_own_deadline_as_the_peers_timeout() {
+        // The main loop's requests have no wake budget, but still end: a
+        // silent peer gets `Timeout` (its fault), not `DeadlineReached`.
+        let (mut peer, _server) = loopback_peer_pair();
+        let start = Instant::now();
+        let result = peer.get_headers(vec![], BlockHash::all_zeros());
+        assert!(matches!(result, Err(PeerError::Timeout)), "{:?}", result.map(|h| h.len()));
+        assert!(start.elapsed() < READ_TIMEOUT + Duration::from_secs(2), "{:?}", start.elapsed());
+        // A budget shorter than the request timeout is the budget's.
+        let result = peer.get_headers_within(vec![], BlockHash::all_zeros(), Some(Duration::from_millis(100)));
+        assert!(matches!(result, Err(PeerError::DeadlineReached)));
+    }
+
+    #[test]
+    fn a_message_split_by_a_pause_is_delivered_and_the_peer_kept() {
+        // Header, a pause longer than the 100 ms poll, then the payload:
+        // the monitor loop's polls see nothing until it is whole.
+        let ping = encode(Magic::BITCOIN, NetworkMessage::Ping(9));
+        let (mut peer, mut server) = loopback_peer_pair();
+        let writer = std::thread::spawn(move || {
+            server.write_all(&ping[..24]).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            server.write_all(&ping[24..]).unwrap();
+            server
+        });
+        let start = Instant::now();
+        let got = loop {
+            match peer.poll_message(Duration::from_millis(100)) {
+                Ok(Some(m)) => break m,
+                Ok(None) => assert!(start.elapsed() < Duration::from_secs(5), "never delivered"),
+                Err(e) => panic!("peer dropped: {}", e),
+            }
+        };
+        assert!(matches!(got, NetworkMessage::Ping(9)));
+        let _server = writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_message_trickling_below_the_minimum_rate_drops_the_peer() {
+        // A frame header claiming 1000 payload bytes, then a byte every
+        // 100 ms: each poll returns nothing (never an error, never a
+        // blocked loop) until the message is past its allowance.
+        let mut frame_bytes = frame(Magic::BITCOIN, b"hercjunk", &[0u8; 1000], None);
+        frame_bytes.truncate(600);
+        let mut chunks = vec![frame_bytes[..24].to_vec()];
+        chunks.extend(frame_bytes[24..].chunks(1).map(<[u8]>::to_vec));
+        let (addr, dripper) = dripping_listener(chunks, Duration::from_millis(100));
+        let stream = TcpStream::connect(&addr).unwrap();
+        let mut peer = Peer::new(PeerStream::Direct(stream), addr, Magic::BITCOIN, false);
+        let allowance = peer.message_allowance(1000);
+        let start = Instant::now();
+        let err = loop {
+            let poll = Instant::now();
+            match peer.poll_message(Duration::from_millis(100)) {
+                Ok(Some(m)) => panic!("{} delivered", msg_name(&m)),
+                Ok(None) => {
+                    assert!(poll.elapsed() < Duration::from_secs(1), "a poll blocked for {:?}", poll.elapsed());
+                    assert!(start.elapsed() < allowance + Duration::from_secs(3), "never dropped");
+                }
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(&err, PeerError::Receive(m) if m.contains("too slow")), "{}", err);
+        assert!(start.elapsed() >= allowance - Duration::from_millis(200), "dropped early: {:?}", start.elapsed());
+        drop(peer);
+        dripper.join().unwrap();
+    }
+
+    #[test]
+    fn inbound_handshakes_finish_off_thread_within_a_bounded_number_of_slots() {
+        let hs = Arc::new(InboundHandshakes::new(Magic::BITCOIN));
+        hs.set_our_height(77);
+        for _ in 0..MAX_INBOUND_HANDSHAKES {
+            assert!(hs.try_begin());
+        }
+        assert!(!hs.try_begin(), "more handshakes than slots");
+        hs.abandon();
+        assert_eq!(hs.in_flight(), MAX_INBOUND_HANDSHAKES - 1);
+        for _ in 0..MAX_INBOUND_HANDSHAKES - 1 {
+            hs.abandon();
+        }
+
+        // A good handshake comes out as a peer that has had our height; a
+        // bad one doesn't; either way the slot is given back.
+        let good = PeerStream::Mem(MemStream {
+            input: script_of(vec![their_version(70016), NetworkMessage::Verack]).into(),
+            written: Arc::new(Mutex::new(Vec::new())),
+        });
+        let written = match &good {
+            PeerStream::Mem(m) => m.written.clone(),
+            _ => unreachable!(),
+        };
+        let bad = PeerStream::Mem(MemStream { input: script_of(vec![their_version(1)]).into(), written: Arc::default() });
+        let threads: Vec<_> = [good, bad]
+            .into_iter()
+            .map(|stream| {
+                assert!(hs.try_begin());
+                let hs = Arc::clone(&hs);
+                std::thread::spawn(move || hs.run(stream))
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let peer = hs.next_peer().expect("finished peer");
+        assert!(peer.inbound && peer.addr().starts_with("inbound#"));
+        assert!(hs.next_peer().is_none(), "the failed handshake produced a peer");
+        assert_eq!(hs.in_flight(), 0);
+        let sent = decode_all(&written.lock().unwrap());
+        match &sent[0] {
+            NetworkMessage::Version(v) => assert_eq!(v.start_height, 77),
+            other => panic!("{}", msg_name(other)),
+        }
     }
 
     // ── Seeds and names ──────────────────────────────────────────────

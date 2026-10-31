@@ -197,6 +197,7 @@ interface HerculesNode {
     void stop_sync();
     void set_validation_paused(boolean paused);
     boolean is_validation_paused();
+    void set_network_metered(boolean metered);
     TorStatus? get_tor_status();
     MempoolStatus get_mempool_status();
     NodeStatus get_node_status();
