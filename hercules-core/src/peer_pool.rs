@@ -84,6 +84,14 @@ const MAX_KNOWN_ADDRS: usize = 10_000;
 /// it stall the loop for tens of seconds chasing a long tail of dead peers.
 const REFILL_BUDGET: Duration = Duration::from_secs(2);
 
+/// A wake's connect pass (ticket 054, 028's fanout): connections dialed
+/// at once, the fewest it settles for while time allows (two peers can
+/// confirm a tip between them), and how long it keeps dialing to get
+/// them. The pass also stops at the wake's own connect deadline.
+const WAKE_CONNECT_PARALLEL: usize = 3;
+const WAKE_MIN_PEERS: usize = 2;
+const WAKE_CONNECT_BUDGET: Duration = Duration::from_secs(8);
+
 /// Minimum number of viable candidates before we'll re-query DNS seeds. The
 /// AddrManager is the primary source of peer addresses; DNS is only consulted
 /// as a fallback when the manager has been depleted (initial bootstrap or
@@ -940,15 +948,27 @@ impl PeerPool {
         let our_onion_pubkey: Option<[u8; 32]> =
             self.tor.as_ref().and_then(|t| t.our_onion_pubkey());
 
-        for addr in candidates {
-            if connected >= needed {
+        // A wake (it has a connect deadline) dials in parallel, and keeps
+        // dialing past `REFILL_BUDGET` until it has `WAKE_MIN_PEERS` (ticket
+        // 054): one sequential attempt per round trip, checked against the
+        // budget only between attempts, left a Tor wake with one peer, and
+        // one peer's word for the tip.
+        let wake = connect_deadline.is_some();
+        let parallel = if wake { WAKE_CONNECT_PARALLEL } else { 1 };
+        let mut pending: std::collections::VecDeque<String> = candidates.into();
+
+        loop {
+            if connected >= needed || pending.is_empty() {
                 break;
             }
             if connect_deadline.is_some_and(|d| Instant::now() >= d) {
                 info!("PeerPool: connect deadline reached after {} new connections", connected);
                 break;
             }
-            if refill_started.elapsed() >= REFILL_BUDGET {
+            let short_of_wake_minimum = wake
+                && current + connected < WAKE_MIN_PEERS
+                && refill_started.elapsed() < WAKE_CONNECT_BUDGET;
+            if refill_started.elapsed() >= REFILL_BUDGET && !short_of_wake_minimum {
                 info!(
                     "PeerPool: refill budget ({}s) exhausted after {} new connections",
                     REFILL_BUDGET.as_secs(),
@@ -957,77 +977,118 @@ impl PeerPool {
                 break;
             }
 
-            // Re-check the bucket against this pass's claims (the snapshot
-            // above only reflects buckets occupied at the start of refill).
-            if let Some(bucket) = netgroup(&addr, diversity) {
-                if claimed_buckets.contains(&bucket) {
-                    continue;
+            // The next batch: candidates from distinct buckets that this
+            // pass hasn't claimed (the snapshot above only reflects buckets
+            // occupied at the start of refill). One that shares a bucket
+            // with another in the batch waits for a later one.
+            let want = parallel.min(needed - connected);
+            let mut batch: Vec<String> = Vec::with_capacity(want);
+            let mut batch_buckets: HashSet<String> = HashSet::new();
+            let mut i = 0;
+            while batch.len() < want && i < pending.len() {
+                match netgroup(&pending[i], diversity) {
+                    Some(b) if claimed_buckets.contains(&b) => {
+                        pending.remove(i);
+                    }
+                    Some(b) if batch_buckets.contains(&b) => i += 1,
+                    bucket => {
+                        batch_buckets.extend(bucket);
+                        batch.extend(pending.remove(i));
+                    }
                 }
+            }
+            if batch.is_empty() {
+                break;
             }
 
             let magic = self.params.magic;
-            let result = if let Some(ref tor) = self.tor {
-                Peer::connect_tor(tor, &addr, self.our_height as i32, magic)
+            let our_height = self.our_height as i32;
+            let tor = self.tor.clone();
+            let dial = |addr: &str| match tor {
+                Some(ref tor) => Peer::connect_tor(tor, addr, our_height, magic),
+                None => Peer::connect(addr, our_height, magic),
+            };
+            let results: Vec<(String, Result<Peer, PeerError>)> = if batch.len() == 1 {
+                batch.into_iter().map(|addr| {
+                    let r = dial(&addr);
+                    (addr, r)
+                }).collect()
             } else {
-                Peer::connect(&addr, self.our_height as i32, magic)
+                std::thread::scope(|s| {
+                    let dials: Vec<_> = batch
+                        .into_iter()
+                        .map(|addr| {
+                            let dial = &dial;
+                            s.spawn(move || {
+                                let r = dial(&addr);
+                                (addr, r)
+                            })
+                        })
+                        .collect();
+                    dials
+                        .into_iter()
+                        .filter_map(|h| h.join().ok())
+                        .collect()
+                })
             };
 
-            match result {
-                Ok(mut peer) => {
-                    let user_agent = peer.peer_user_agent().unwrap_or_default();
-                    let height = peer.peer_height().unwrap_or(0).max(0) as u32;
-                    info!(
-                        "PeerPool: connected to {} ({}) at height {}",
-                        addr, user_agent, height
-                    );
-                    self.addrs.record_success(&addr);
+            for (addr, result) in results {
+                match result {
+                    Ok(mut peer) => {
+                        let user_agent = peer.peer_user_agent().unwrap_or_default();
+                        let height = peer.peer_height().unwrap_or(0).max(0) as u32;
+                        info!(
+                            "PeerPool: connected to {} ({}) at height {}",
+                            addr, user_agent, height
+                        );
+                        self.addrs.record_success(&addr);
 
-                    // Self-advertise unsolicited so this peer learns our
-                    // onion address immediately and can start gossiping it
-                    // onward. `send_self_advertisement` no-ops if the peer
-                    // didn't negotiate addrv2, so we don't need to filter
-                    // here. A failure on the self-ad is non-fatal — the
-                    // peer is still usable for header sync, we just won't
-                    // get inbound discovery via this particular path.
-                    if let Some(pubkey) = our_onion_pubkey {
-                        if let Err(e) = peer.send_self_advertisement(pubkey, 8333) {
-                            warn!("PeerPool: self-ad to {} failed: {}", addr, e);
+                        // Self-advertise unsolicited so this peer learns our
+                        // onion address immediately and can start gossiping it
+                        // onward. `send_self_advertisement` no-ops if the peer
+                        // didn't negotiate addrv2, so we don't need to filter
+                        // here. A failure on the self-ad is non-fatal — the
+                        // peer is still usable for header sync, we just won't
+                        // get inbound discovery via this particular path.
+                        if let Some(pubkey) = our_onion_pubkey {
+                            if let Err(e) = peer.send_self_advertisement(pubkey, 8333) {
+                                warn!("PeerPool: self-ad to {} failed: {}", addr, e);
+                            }
                         }
+
+                        // Restore any persisted score so a known-good peer comes
+                        // back at its earned reputation, not as a stranger.
+                        let score = self
+                            .store
+                            .as_ref()
+                            .and_then(|s| s.load_score(&addr).ok().flatten())
+                            .unwrap_or(SCORE_DEFAULT);
+
+                        if let Some(bucket) = netgroup(&addr, diversity) {
+                            claimed_buckets.insert(bucket);
+                        }
+
+                        let slot = PeerSlot {
+                            peer: Some(peer),
+                            addr,
+                            user_agent,
+                            height,
+                            score,
+                            inbound: false,
+                            demerit: 0,
+                            checked_out_at: None,
+                        };
+
+                        self.slots.lock().unwrap().push(slot);
+                        connected += 1;
                     }
-
-                    // Restore any persisted score so a known-good peer comes
-                    // back at its earned reputation, not as a stranger.
-                    let score = self
-                        .store
-                        .as_ref()
-                        .and_then(|s| s.load_score(&addr).ok().flatten())
-                        .unwrap_or(SCORE_DEFAULT);
-
-                    if let Some(bucket) = netgroup(&addr, diversity) {
-                        claimed_buckets.insert(bucket);
+                    Err(e) => {
+                        warn!("PeerPool: failed to connect to {}: {}", addr, e);
+                        self.addrs.record_failure(&addr);
                     }
-
-                    let slot = PeerSlot {
-                        peer: Some(peer),
-                        addr,
-                        user_agent,
-                        height,
-                        score,
-                        inbound: false,
-                        demerit: 0,
-            checked_out_at: None,
-                    };
-
-                    self.slots.lock().unwrap().push(slot);
-                    connected += 1;
-                }
-                Err(e) => {
-                    warn!("PeerPool: failed to connect to {}: {}", addr, e);
-                    self.addrs.record_failure(&addr);
                 }
             }
         }
-
         if connected > 0 {
             let total = self.slots.lock().unwrap().len();
             info!(
@@ -1499,6 +1560,66 @@ impl PeerPool {
             }
         }
         best.map(|s| s.addr.clone())
+    }
+
+    /// The next peer a wake asks for headers (ticket 054): an available
+    /// outbound peer not in `asked`. The first is the highest-weighted
+    /// (reputation, never a claimed height). After that a second opinion
+    /// is wanted, so a peer claiming more than `tip_height` goes first (it
+    /// may have what the others withheld), then one independent
+    /// (`cross_check_group`) of every peer in `agreeing`, then weight;
+    /// the earliest slot on a tie.
+    pub fn wake_header_peer(
+        &self,
+        asked: &[String],
+        agreeing: &[String],
+        tip_height: u32,
+    ) -> Option<String> {
+        let diversity = self.params.enforce_netgroup_diversity;
+        let taken: HashSet<String> =
+            agreeing.iter().map(|a| cross_check_group(a, diversity)).collect();
+        let second_opinion = !asked.is_empty();
+        let slots = self.slots.lock().unwrap();
+        let rank = |s: &PeerSlot| {
+            let taller = second_opinion && s.height > tip_height;
+            let independent = !taken.contains(&cross_check_group(&s.addr, diversity));
+            (taller, independent, s.weight())
+        };
+        let mut best: Option<&PeerSlot> = None;
+        for s in slots.iter() {
+            if s.inbound || s.peer.is_none() || asked.iter().any(|a| a == &s.addr) {
+                continue;
+            }
+            if best.map_or(true, |b| rank(s) > rank(b)) {
+                best = Some(s);
+            }
+        }
+        best.map(|s| s.addr.clone())
+    }
+
+    /// How many of `addrs` are independent of each other: the number of
+    /// distinct `cross_check_group`s among them (ticket 054: two peers in
+    /// one /16 agreeing is one opinion).
+    pub fn independent_count(&self, addrs: &[String]) -> usize {
+        let diversity = self.params.enforce_netgroup_diversity;
+        addrs
+            .iter()
+            .map(|a| cross_check_group(a, diversity))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Every available outbound peer not in `excluded`, highest weight
+    /// first (earliest slot on a tie): a wake spreads its block requests
+    /// over them (ticket 054).
+    pub fn available_outbound_excluding(&self, excluded: &[String]) -> Vec<String> {
+        let slots = self.slots.lock().unwrap();
+        let mut found: Vec<&PeerSlot> = slots
+            .iter()
+            .filter(|s| !s.inbound && s.peer.is_some() && !excluded.iter().any(|e| e == &s.addr))
+            .collect();
+        found.sort_by_key(|s| std::cmp::Reverse(s.weight()));
+        found.into_iter().map(|s| s.addr.clone()).collect()
     }
 
     /// Pick an available outbound peer not in `excluded`, highest score

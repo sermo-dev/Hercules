@@ -24,7 +24,7 @@ use crate::chain_params::ChainParams;
 use crate::mempool::Mempool;
 use crate::p2p::{msg_name, PeerError};
 use crate::peer_pool::{PeerInfo, PeerPool, PeerSource};
-use crate::store::HeaderStore;
+use crate::store::{HeaderStore, NodeMode};
 use crate::tor::TorManager;
 use crate::utxo::{SnapshotLoadError, SnapshotMeta, UtxoSet};
 use crate::wake::{WakeBudget, WakePhase};
@@ -267,6 +267,27 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(10);
 /// than our tip and had nothing (`HeaderSync::wake_headers`).
 const WAKE_HEADER_PEERS: usize = 3;
 
+/// Most `getheaders` a wake's header phase sends (ticket 054): the sync
+/// peer, a second opinion, and room for a retry after a failed peer or a
+/// check on one that claimed more.
+const WAKE_HEADER_ASKS: usize = 4;
+
+/// The least time a wake gives one peer for one block while another peer
+/// could still be asked (ticket 054): half of what is left, but no less.
+const WAKE_BLOCK_MIN_SHARE: Duration = Duration::from_secs(5);
+
+/// Most headers one `headers` message may carry (Core's MAX_HEADERS_RESULTS).
+const MAX_HEADERS_PER_MSG: usize = 2000;
+
+/// How old a tip a single peer may vouch for (`wake_tip_confirmed`).
+const WAKE_RECENT_TIP_SECS: u32 = 60 * 60;
+
+/// A peer said it had nothing past our tip, then another showed headers
+/// past it (ticket 054, 016's withholding signal). Small: an honest peer
+/// that hasn't received a block found seconds ago looks the same, and a
+/// wake runs right after one is found.
+const WITHHELD_HEADERS_PENALTY: u32 = 5;
+
 /// Header-sync stall timeout (ticket 049), after Core's
 /// HEADERS_DOWNLOAD_TIMEOUT_BASE / _PER_HEADER: a sync peer serving full
 /// batches must average `MIN_HEADERS_RATE` headers per second of request
@@ -361,6 +382,63 @@ enum WitnessHeaders {
     /// Invalid in itself (proof-of-work, linkage, timestamps, anchor):
     /// costs the peer `INVALID_HEADERS_PENALTY`.
     Invalid(String),
+}
+
+/// How a wake's header phase ended (ticket 054).
+enum WakeHeaderPhase {
+    /// No peer answered within the budget: nothing was learned.
+    Unchecked,
+    /// The cross-check found peers disagreeing (possible eclipse).
+    Disagreement,
+    /// At least one peer answered.
+    Checked(WakeHeaders),
+}
+
+/// What a wake learned about the header tip (ticket 054).
+struct WakeHeaders {
+    /// Header tip after the phase.
+    tip: u32,
+    /// `(first, last, addr)` per batch stored (`header_source`).
+    sources: Vec<(u32, u32, String)>,
+    /// A batch was refused (invalid, or not on our tip). The backlog we
+    /// already have headers for is still validated (ticket 024).
+    error: Option<String>,
+    /// Peers agree there is nothing past `tip` (`wake_tip_confirmed`).
+    confirmed: bool,
+}
+
+/// One header batch from a wake peer, after the checks every stored
+/// batch goes through.
+enum WakeBatch {
+    Stored,
+    Refused(String),
+    /// The cross-check ran out of budget before anyone disagreed.
+    Inconclusive,
+    /// The cross-check rejected it: peers disagree.
+    Disagreement,
+}
+
+/// Ticket 054's rule for a wake to call the tip current: two independent
+/// peers showed nothing past it, or one did while the chain has minimum
+/// work and the tip is recent (a wake may find only one peer, e.g. over
+/// Tor; a withholding peer can then hide at most the last hour). Anything
+/// else is "unconfirmed", never "caught up".
+fn wake_tip_confirmed(independent_agreeing: usize, has_min_work: bool, tip_time: u32, now: u32) -> bool {
+    independent_agreeing >= 2
+        || (independent_agreeing == 1
+            && has_min_work
+            && now.saturating_sub(tip_time) <= WAKE_RECENT_TIP_SECS)
+}
+
+/// How long a wake lets one peer take over one block, with `remaining`
+/// left and `candidates` peers it could ask (ticket 054): all of it for
+/// the last one, otherwise half, but at least `WAKE_BLOCK_MIN_SHARE`.
+fn wake_block_share(remaining: Duration, candidates: usize) -> Duration {
+    if candidates > 1 {
+        (remaining / 2).max(WAKE_BLOCK_MIN_SHARE).min(remaining)
+    } else {
+        remaining
+    }
 }
 
 /// Why a downloaded block was rejected (ticket 024). Each class gets a
@@ -737,6 +815,14 @@ pub struct CatchUpStatus {
     /// UI can say "rejected an invalid block" rather than show a generic
     /// error; `error` carries the details.
     pub invalid_chain_detected: bool,
+    /// Peers confirmed there is nothing past `target_height` (ticket 054:
+    /// two independent peers agreed, or one did on a recent tip with
+    /// minimum work). False when headers were checked but not confirmed:
+    /// the wake is then `Unconfirmed`, never "caught up".
+    pub tip_confirmed: bool,
+    /// AssumeUTXO mode with no snapshot loaded (ticket 054): the wake
+    /// synced headers only and validated nothing.
+    pub awaiting_snapshot: bool,
 }
 
 /// Trust and verification info exposed to the UI.
@@ -1382,7 +1468,13 @@ impl HeaderSync {
             .assume_valid_floor()
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
         if floor == 0 {
-            return Ok(true);
+            // No snapshot loaded. In genesis mode (or before a mode was
+            // recorded) that means validating from genesis; in AssumeUTXO
+            // mode it means the snapshot hasn't landed yet, and validating
+            // from genesis would silently turn the node into a weeks-long
+            // genesis sync that `needs_snapshot` then no longer reports
+            // (ticket 054).
+            return Ok(self.mode()? != Some(NodeMode::AssumeUtxo));
         }
         let validated = self
             .store
@@ -1616,9 +1708,25 @@ impl HeaderSync {
     /// Check if the UTXO set is empty (needs snapshot or full sync from
     /// genesis). Also true while the env holds a partial load (its
     /// `.loading` marker is down): those rows are not a set (ticket 050).
+    ///
+    /// In AssumeUTXO mode (ticket 054) it is true until a snapshot is
+    /// loaded, whatever else happened: activation never falls back to a
+    /// genesis sync there, so a set without a snapshot floor is never the
+    /// node's set. In genesis mode it is always false.
     pub fn needs_snapshot(&self) -> Result<bool, SyncError> {
         if self.utxo.load_in_progress() {
             return Ok(true);
+        }
+        match self.mode()? {
+            Some(NodeMode::AssumeUtxo) => {
+                let floor = self
+                    .utxo
+                    .assume_valid_floor()
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                return Ok(floor == 0);
+            }
+            Some(NodeMode::Genesis) => return Ok(false),
+            None => {}
         }
         let count = self
             .utxo
@@ -1629,6 +1737,69 @@ impl HeaderSync {
             .validated_height()
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
         Ok(count == 0 && validated == 0)
+    }
+
+    /// The recorded validation mode (ticket 054); `None` until the app
+    /// has told the node which one the user chose.
+    pub fn mode(&self) -> Result<Option<NodeMode>, SyncError> {
+        self.store
+            .validation_mode()
+            .map_err(|e| SyncError::Store(format!("{}", e)))
+    }
+
+    /// Record the user's validation mode the first time the node learns it
+    /// (ticket 054), and return the node's mode from then on. The node is
+    /// the source of truth: once recorded, a different `mode` (the app's
+    /// own copy drifted, e.g. restored from a backup) is ignored with a
+    /// warning, since only a reset may change it.
+    ///
+    /// A database from before the mode was recorded, asked for AssumeUTXO
+    /// while it holds no snapshot but has validated blocks, has already
+    /// been turned into a genesis sync by the bug this ticket fixes. It is
+    /// recorded as genesis, which is what it is: recording AssumeUTXO
+    /// would stop it validating for good (its set isn't empty, so no
+    /// snapshot can load). The app shows the mode it gets back, and the
+    /// user can switch with a reset.
+    pub fn set_validation_mode(&self, mode: NodeMode) -> Result<NodeMode, SyncError> {
+        if let Some(recorded) = self.mode()? {
+            if recorded != mode {
+                warn!(
+                    "validation mode {:?} requested, but this node was set up as {:?}; keeping it",
+                    mode, recorded
+                );
+            }
+            return Ok(recorded);
+        }
+        let mut effective = mode;
+        if mode == NodeMode::AssumeUtxo && !self.utxo.load_in_progress() {
+            let floor = self
+                .utxo
+                .assume_valid_floor()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            let validated = self
+                .store
+                .validated_height()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?;
+            if floor == 0 && validated > 0 {
+                warn!(
+                    "AssumeUTXO requested, but this node has validated {} blocks from genesis \
+                     without a snapshot; recording it as a genesis node",
+                    validated
+                );
+                effective = NodeMode::Genesis;
+            }
+        }
+        self.store
+            .set_validation_mode(effective)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        info!("validation mode recorded: {:?}", effective);
+        Ok(effective)
+    }
+
+    /// AssumeUTXO mode with no snapshot loaded yet (ticket 054): wakes
+    /// sync headers only, and the app should say setup isn't finished.
+    pub fn awaiting_snapshot(&self) -> Result<bool, SyncError> {
+        Ok(self.mode()? == Some(NodeMode::AssumeUtxo) && self.needs_snapshot()?)
     }
 
     /// Pause block validation. Header sync continues.
@@ -5238,7 +5409,7 @@ impl HeaderSync {
     ) -> Result<CatchUpStatus, SyncError> {
 
         // Read current state
-        let (tip_height, tip_hash, tip_header) = self
+        let (tip_height, _, _) = self
             .store
             .tip()
             .map_err(|e| SyncError::Store(format!("{}", e)))?
@@ -5279,129 +5450,31 @@ impl HeaderSync {
             return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
         }
 
-        let Some((peer_addr, headers)) = self.wake_headers(&mut pool, tip_hash, tip_height, budget)? else {
+        // Headers, agreed on by more than one peer where possible (ticket
+        // 054): a wake must not call the tip current on one peer's word.
+        let phase = match self.wake_header_phase(&mut pool, budget)? {
             // Out of budget waiting for headers: headers stay unchecked.
-            return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
+            WakeHeaderPhase::Unchecked => {
+                return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
+            }
+            WakeHeaderPhase::Disagreement => {
+                // Headers were checked: peers disagree (possible eclipse),
+                // even if the budget ran out after the divergence.
+                budget.mark(WakePhase::HeadersChecked);
+                let mut status = self.make_catchup_status(false, 0, validated_height, tip_height);
+                status.tip_disagreement = true;
+                status.error = Some("header tip cross-check failed: peer disagreement".into());
+                return Ok(status);
+            }
+            WakeHeaderPhase::Checked(phase) => phase,
         };
-
-        let mut new_tip = tip_height;
-        // Bad headers cost the peer and are dropped, but the backlog we
-        // already have headers for is still validated (ticket 024).
-        let mut header_error: Option<String> = None;
-
-        'batch: {
-            if headers.is_empty() {
-                break 'batch;
-            }
-            if headers.len() > 2000 {
-                pool.misbehaving(&peer_addr, 100);
-                header_error = Some(format!("peer sent {} headers (max 2000)", headers.len()));
-                break 'batch;
-            }
-            // As in `validate_latest_block`: a batch that doesn't extend our
-            // tip is a reorg (ticket 025), not misbehavior.
-            if headers[0].prev_blockhash != tip_hash {
-                header_error = Some(format!(
-                    "headers from {} don't extend our tip {} (reorg?)",
-                    peer_addr, tip_hash
-                ));
-                break 'batch;
-            }
-            if let Some(failed) = self.first_failed_header(&headers)? {
-                pool.disconnect_and_deprioritize(&peer_addr, RELAYED_INVALID_CHAIN_PENALTY);
-                header_error = Some(format!("peer sent headers through invalid block {}", failed));
-                break 'batch;
-            }
-
-            // Eclipse-resistance: cross-check the new headers against an
-            // independent peer BEFORE validating or storing. If the cross-check
-            // rejects, we drop the batch without touching the header store —
-            // same ordering as the main sync loop. Called once per wake, not
-            // per block — the per-block cost would be prohibitive during catch-up.
-            let cross_check_locator = self
-                .store
-                .get_locator_hashes()
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-            let active_first_hash = headers[0].block_hash();
-            let strict = !self.has_min_chain_work()?;
-            match self.cross_check_headers(
-                &mut pool,
-                &cross_check_locator,
-                &peer_addr,
-                active_first_hash,
-                strict,
-                Some(budget),
-            ) {
-                HeaderCrossCheck::Accept => {}
-                // The budget ran out before any peer disagreed: not an
-                // eclipse signal. Headers stay unchecked.
-                HeaderCrossCheck::Inconclusive => {
-                    info!("catch_up_blocks: budget spent during header cross-check");
-                    return Ok(self.make_catchup_status(false, 0, validated_height, tip_height));
-                }
-                HeaderCrossCheck::Reject => {
-                    // Headers were checked: peers disagree (possible eclipse),
-                    // even if the budget ran out after the divergence.
-                    budget.mark(WakePhase::HeadersChecked);
-                    warn!("catch_up_blocks: header cross-check rejected batch from {}", peer_addr);
-                    let mut status = self.make_catchup_status(
-                        false,
-                        0,
-                        validated_height,
-                        tip_height,
-                    );
-                    status.tip_disagreement = true;
-                    status.error = Some("header tip cross-check failed: peer disagreement".into());
-                    return Ok(status);
-                }
-            }
-
-            let timestamps = self
-                .store
-                .last_timestamps(11)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-            let store = &self.store;
-            let epoch_lookup = |height: u32| -> Result<u32, String> {
-                store
-                    .get_timestamp_at(height)
-                    .map_err(|e| format!("{}", e))?
-                    .ok_or_else(|| format!("no header at height {}", height))
-            };
-
-            if let Err(e) = self.check_batch_anchor(&headers, tip_height + 1) {
-                pool.misbehaving(&peer_addr, ANCHOR_CONFLICT_PENALTY);
-                header_error = Some(e);
-                break 'batch;
-            }
-
-            if let Err(e) = validate_headers(
-                self.params,
-                &headers,
-                tip_hash,
-                tip_height,
-                &timestamps,
-                tip_header.bits,
-                &epoch_lookup,
-            ) {
-                warn!("catch_up_blocks: invalid headers from {}: {}", peer_addr, e);
-                pool.misbehaving(&peer_addr, INVALID_HEADERS_PENALTY);
-                header_error = Some(format!("invalid headers from peer: {}", e));
-                break 'batch;
-            }
-
-            let new_start = tip_height + 1;
-            self.store
-                .store_headers(&headers, new_start)
-                .map_err(|e| SyncError::Store(format!("{}", e)))?;
-
-            new_tip = tip_height + headers.len() as u32;
-            info!(
-                "catch_up_blocks: synced headers {}-{} (PoW validated, cross-checked)",
-                new_start, new_tip
-            );
-        }
         budget.mark(WakePhase::HeadersChecked);
+        let WakeHeaders {
+            tip: mut new_tip,
+            sources,
+            error: header_error,
+            confirmed: tip_confirmed,
+        } = phase;
 
         // No block validation until the chain has minimum work and any
         // pending snapshot is bound to it (may advance validated_height).
@@ -5409,6 +5482,7 @@ impl HeaderSync {
             info!("catch_up_blocks: chain below minimum work or snapshot pending, skipping block validation");
             return Ok(CatchUpStatus {
                 error: header_error,
+                tip_confirmed,
                 ..self.make_catchup_status(false, 0, validated_height, new_tip)
             });
         }
@@ -5422,6 +5496,11 @@ impl HeaderSync {
         // Peers that served a bad copy of the block at `validated_height
         // + 1` (ticket 024); cleared whenever a block is connected.
         let mut bad_peers: Vec<String> = Vec::new();
+        // Peers that ran out their share of the budget (this wake only),
+        // and how many blocks each was asked for (ticket 054).
+        let mut slow_peers: Vec<String> = Vec::new();
+        let mut block_uses: HashMap<String, u32> = HashMap::new();
+        let mut last_block_error: Option<String> = None;
 
         while validated_height < new_tip
             && blocks_validated < max_blocks
@@ -5441,19 +5520,31 @@ impl HeaderSync {
                 break;
             }
 
-            let block_peer = if bad_peers.is_empty() {
-                pool.any_peer()
-            } else {
-                pool.peer_addr_excluding(&bad_peers)
-                    .and_then(|addr| pool.checkout_peer_by_addr(&addr))
-            };
+            // Requests rotate over the wake's peers, least used first, and
+            // while another peer could still be asked one gets only a share
+            // of the time left (ticket 054): otherwise the first slot's peer
+            // answering just inside the budget took the whole wake, every
+            // wake, and validated nothing. A peer that runs out its share is
+            // dropped for this wake without a penalty (the limit is ours).
+            let excluded: Vec<String> = bad_peers.iter().chain(slow_peers.iter()).cloned().collect();
+            let candidates = pool.available_outbound_excluding(&excluded);
+            let pick = candidates
+                .iter()
+                .min_by_key(|a| block_uses.get(*a).copied().unwrap_or(0))
+                .cloned();
+            let share = wake_block_share(budget.remaining(), candidates.len());
+            let block_peer = pick.and_then(|addr| pool.checkout_peer_by_addr(&addr));
             let mut block_peer = match block_peer {
                 Some(p) => p,
                 None => {
-                    let error = if bad_peers.is_empty() {
-                        "no peers available for block download".to_string()
-                    } else {
+                    let error = if !bad_peers.is_empty() {
                         format!("Peers are serving corrupted blocks at height {}", next_height)
+                    } else if let Some(e) = last_block_error.take() {
+                        e
+                    } else if !slow_peers.is_empty() {
+                        format!("Peers too slow to serve block {} within the wake", next_height)
+                    } else {
+                        "no peers available for block download".to_string()
                     };
                     return Ok(CatchUpStatus {
                         error: Some(error),
@@ -5462,8 +5553,9 @@ impl HeaderSync {
                 }
             };
             let block_peer_addr = block_peer.addr().to_string();
+            *block_uses.entry(block_peer_addr.clone()).or_insert(0) += 1;
 
-            let block = match block_peer.get_block_within(block_hash, Some(budget.remaining())) {
+            let block = match block_peer.get_block_within(block_hash, Some(share)) {
                 Ok(b) => {
                     pool.return_peer(block_peer);
                     budget.mark(WakePhase::BlockDownloaded);
@@ -5475,14 +5567,34 @@ impl HeaderSync {
                     info!("catch_up_blocks: budget spent downloading {}: {}", next_height, e);
                     break;
                 }
+                // Its share ran out; the block is asked of someone else. The
+                // connection is dropped: a late block would still be in it.
+                Err(PeerError::DeadlineReached) => {
+                    info!(
+                        "catch_up_blocks: {} didn't serve block {} within {} ms; asking another peer",
+                        block_peer_addr,
+                        next_height,
+                        share.as_millis()
+                    );
+                    pool.remove_peer(&block_peer_addr);
+                    slow_peers.push(block_peer_addr);
+                    continue;
+                }
+                // Any other failure: the next peer is asked, within the
+                // budget, rather than ending the wake (ticket 054).
                 Err(e) => {
+                    warn!(
+                        "catch_up_blocks: block {} from {} failed: {}",
+                        next_height, block_peer_addr, e
+                    );
                     if matches!(e, PeerError::WrongMagic { .. }) {
                         pool.ban_peer(&block_peer_addr);
+                    } else {
+                        pool.remove_peer(&block_peer_addr);
                     }
-                    return Ok(CatchUpStatus {
-                        error: Some(format!("block download at {}: {}", next_height, e)),
-                        ..self.make_catchup_status(false, blocks_validated, validated_height, new_tip)
-                    });
+                    last_block_error = Some(format!("block download at {}: {}", next_height, e));
+                    slow_peers.push(block_peer_addr);
+                    continue;
                 }
             };
 
@@ -5518,8 +5630,9 @@ impl HeaderSync {
                     self.reject_invalid_block(next_height, block_hash, &reason)?;
                     // Only the peer whose headers (this call) put the block
                     // in our chain vouched for it.
-                    if (tip_height + 1..=new_tip).contains(&next_height) {
-                        self.ban_announcer(&mut pool, &peer_addr, block_hash);
+                    if let Some(announcer) = header_source(&sources, next_height) {
+                        let announcer = announcer.to_string();
+                        self.ban_announcer(&mut pool, &announcer, block_hash);
                     }
                     return Ok(CatchUpStatus {
                         error: Some(format!(
@@ -5549,7 +5662,9 @@ impl HeaderSync {
             );
         }
 
-        let caught_up = validated_height >= new_tip;
+        // Caught up only on a tip the peers confirmed (ticket 054): one
+        // peer's "nothing new" is no proof there is nothing new.
+        let caught_up = validated_height >= new_tip && tip_confirmed;
         info!(
             "catch_up_blocks: done — validated {} blocks, height {}/{}, caught_up={}",
             blocks_validated, validated_height, new_tip, caught_up
@@ -5560,8 +5675,284 @@ impl HeaderSync {
         let caught_up = caught_up && header_error.is_none();
         Ok(CatchUpStatus {
             error: header_error,
+            tip_confirmed,
             ..self.make_catchup_status(caught_up, blocks_validated, validated_height, new_tip)
         })
+    }
+
+    /// A wake's header phase (ticket 054). Asks peers for headers past
+    /// our tip with a one-hash locator until two independent ones agree
+    /// there is nothing more, up to `WAKE_HEADER_ASKS`:
+    ///
+    /// - The first peer is the highest-weighted (`wake_header_peer`);
+    ///   later ones are second opinions, a peer claiming more first.
+    /// - A peer that fails is dropped and the next asked within the
+    ///   budget, rather than failing the wake.
+    /// - New headers go through the same checks as before (cross-check,
+    ///   anchor, validation) and are stored. Peers that said there was
+    ///   nothing new before them lose a little score
+    ///   (`WITHHELD_HEADERS_PENALTY`).
+    /// - A second opinion whose chain doesn't hold our tip (it may not
+    ///   have our newest block yet) is no opinion.
+    ///
+    /// `confirmed` follows `wake_tip_confirmed`; a full batch (more to
+    /// fetch) or headers a peer offered but we couldn't check are never
+    /// confirmed.
+    fn wake_header_phase(
+        &self,
+        pool: &mut PeerPool,
+        budget: &WakeBudget,
+    ) -> Result<WakeHeaderPhase, SyncError> {
+        let mut asked: Vec<String> = Vec::new();
+        // Peers that showed nothing past the current tip, and those of
+        // them not yet charged for it (`claimed_more_than` charges a
+        // peer that claimed more; that is the same offence).
+        let mut agreeing: Vec<String> = Vec::new();
+        let mut chargeable: Vec<String> = Vec::new();
+        let mut sources: Vec<(u32, u32, String)> = Vec::new();
+        let mut error: Option<String> = None;
+        let mut answered = false;
+        let mut last_failure: Option<String> = None;
+        // Someone has headers past the tip that we didn't store.
+        let mut contested = false;
+
+        while asked.len() < WAKE_HEADER_ASKS && !budget.should_stop() {
+            let (tip_height, tip_hash, tip_header) = self
+                .store
+                .tip()
+                .map_err(|e| SyncError::Store(format!("{}", e)))?
+                .ok_or_else(|| SyncError::Store("store has no headers".into()))?;
+            let Some(addr) = pool.wake_header_peer(&asked, &agreeing, tip_height) else {
+                break;
+            };
+            asked.push(addr.clone());
+            let Some(mut peer) = pool.checkout_peer_by_addr(&addr) else {
+                continue;
+            };
+            let headers = match peer.get_headers_within(
+                vec![tip_hash],
+                BlockHash::all_zeros(),
+                Some(budget.remaining()),
+            ) {
+                Ok(headers) => {
+                    pool.return_peer(peer);
+                    headers
+                }
+                Err(_) if budget.should_stop() => break,
+                Err(e) => {
+                    warn!("catch_up_blocks: {} failed to answer for headers: {}", addr, e);
+                    if matches!(e, PeerError::WrongMagic { .. }) {
+                        pool.ban_peer(&addr);
+                    } else {
+                        pool.remove_peer(&addr);
+                    }
+                    last_failure = Some(format!("{}: {}", addr, e));
+                    continue;
+                }
+            };
+            answered = true;
+
+            if headers.is_empty() {
+                if !self.claimed_more_than(pool, &addr, tip_height) {
+                    agreeing.push(addr.clone());
+                    chargeable.push(addr);
+                }
+                if pool.independent_count(&agreeing) >= 2 {
+                    break;
+                }
+                continue;
+            }
+
+            let first_answer = sources.is_empty() && agreeing.is_empty();
+            if headers[0].prev_blockhash != tip_hash && !first_answer {
+                info!(
+                    "catch_up_blocks: {}'s headers don't build on our tip {}; no opinion",
+                    addr, tip_hash
+                );
+                continue;
+            }
+            match self.wake_store_batch(pool, &addr, &headers, tip_height, tip_hash, &tip_header, budget)? {
+                WakeBatch::Stored => {
+                    for quiet in chargeable.drain(..).filter(|a| *a != addr) {
+                        warn!(
+                            "catch_up_blocks: {} had no headers past {}, {} had {}",
+                            quiet,
+                            tip_height,
+                            addr,
+                            headers.len()
+                        );
+                        pool.misbehaving(&quiet, WITHHELD_HEADERS_PENALTY);
+                    }
+                    let last = tip_height + headers.len() as u32;
+                    sources.push((tip_height + 1, last, addr.clone()));
+                    agreeing.clear();
+                    if headers.len() >= MAX_HEADERS_PER_MSG {
+                        // More to fetch than a wake can validate.
+                        contested = true;
+                        break;
+                    }
+                    // A short batch is the peer saying this is its tip.
+                    agreeing.push(addr.clone());
+                    chargeable.push(addr);
+                }
+                WakeBatch::Refused(e) => {
+                    error = Some(e);
+                    break;
+                }
+                WakeBatch::Inconclusive if first_answer => {
+                    return Ok(WakeHeaderPhase::Unchecked);
+                }
+                WakeBatch::Inconclusive => {
+                    contested = true;
+                    break;
+                }
+                WakeBatch::Disagreement => return Ok(WakeHeaderPhase::Disagreement),
+            }
+        }
+
+        if !answered {
+            return match last_failure {
+                _ if budget.should_stop() => Ok(WakeHeaderPhase::Unchecked),
+                Some(e) => Err(SyncError::Peer(e)),
+                None => Err(SyncError::Peer("no peers available".into())),
+            };
+        }
+
+        let (tip, _, tip_header) = self
+            .store
+            .tip()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?
+            .ok_or_else(|| SyncError::Store("store has no headers".into()))?;
+        let independent = pool.independent_count(&agreeing);
+        let confirmed = !contested
+            && error.is_none()
+            && wake_tip_confirmed(independent, self.has_min_chain_work()?, tip_header.time, unix_now_u32());
+        if !confirmed {
+            info!(
+                "catch_up_blocks: tip {} unconfirmed ({} independent peer(s) agree)",
+                tip, independent
+            );
+        }
+        Ok(WakeHeaderPhase::Checked(WakeHeaders {
+            tip,
+            sources,
+            error,
+            confirmed,
+        }))
+    }
+
+    /// One wake header batch from `addr` extending our tip
+    /// (`tip_height`, `tip_hash`, `tip_header`): the checks the wake path
+    /// always ran (ticket 024's penalties, 016's cross-check, the anchor,
+    /// header validation), then stored.
+    #[allow(clippy::too_many_arguments)]
+    fn wake_store_batch(
+        &self,
+        pool: &mut PeerPool,
+        peer_addr: &str,
+        headers: &[Header],
+        tip_height: u32,
+        tip_hash: BlockHash,
+        tip_header: &Header,
+        budget: &WakeBudget,
+    ) -> Result<WakeBatch, SyncError> {
+        if headers.len() > MAX_HEADERS_PER_MSG {
+            pool.misbehaving(peer_addr, 100);
+            return Ok(WakeBatch::Refused(format!(
+                "peer sent {} headers (max 2000)",
+                headers.len()
+            )));
+        }
+        // As in `validate_latest_block`: a batch that doesn't extend our
+        // tip is a reorg (ticket 025), not misbehavior.
+        if headers[0].prev_blockhash != tip_hash {
+            return Ok(WakeBatch::Refused(format!(
+                "headers from {} don't extend our tip {} (reorg?)",
+                peer_addr, tip_hash
+            )));
+        }
+        if let Some(failed) = self.first_failed_header(headers)? {
+            pool.disconnect_and_deprioritize(peer_addr, RELAYED_INVALID_CHAIN_PENALTY);
+            return Ok(WakeBatch::Refused(format!(
+                "peer sent headers through invalid block {}",
+                failed
+            )));
+        }
+
+        // Eclipse-resistance: cross-check the new headers against an
+        // independent peer BEFORE validating or storing. If the cross-check
+        // rejects, we drop the batch without touching the header store —
+        // same ordering as the main sync loop.
+        let cross_check_locator = self
+            .store
+            .get_locator_hashes()
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        let active_first_hash = headers[0].block_hash();
+        let strict = !self.has_min_chain_work()?;
+        match self.cross_check_headers(
+            pool,
+            &cross_check_locator,
+            peer_addr,
+            active_first_hash,
+            strict,
+            Some(budget),
+        ) {
+            HeaderCrossCheck::Accept => {}
+            // The budget ran out before any peer disagreed: not an
+            // eclipse signal. Headers stay unchecked.
+            HeaderCrossCheck::Inconclusive => {
+                info!("catch_up_blocks: budget spent during header cross-check");
+                return Ok(WakeBatch::Inconclusive);
+            }
+            HeaderCrossCheck::Reject => {
+                warn!("catch_up_blocks: header cross-check rejected batch from {}", peer_addr);
+                return Ok(WakeBatch::Disagreement);
+            }
+        }
+
+        let timestamps = self
+            .store
+            .last_timestamps(11)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+
+        let store = &self.store;
+        let epoch_lookup = |height: u32| -> Result<u32, String> {
+            store
+                .get_timestamp_at(height)
+                .map_err(|e| format!("{}", e))?
+                .ok_or_else(|| format!("no header at height {}", height))
+        };
+
+        if let Err(e) = self.check_batch_anchor(headers, tip_height + 1) {
+            pool.misbehaving(peer_addr, ANCHOR_CONFLICT_PENALTY);
+            return Ok(WakeBatch::Refused(e));
+        }
+
+        if let Err(e) = validate_headers(
+            self.params,
+            headers,
+            tip_hash,
+            tip_height,
+            &timestamps,
+            tip_header.bits,
+            &epoch_lookup,
+        ) {
+            warn!("catch_up_blocks: invalid headers from {}: {}", peer_addr, e);
+            pool.misbehaving(peer_addr, INVALID_HEADERS_PENALTY);
+            return Ok(WakeBatch::Refused(format!("invalid headers from peer: {}", e)));
+        }
+
+        let new_start = tip_height + 1;
+        self.store
+            .store_headers(headers, new_start)
+            .map_err(|e| SyncError::Store(format!("{}", e)))?;
+        info!(
+            "catch_up_blocks: synced headers {}-{} from {} (PoW validated, cross-checked)",
+            new_start,
+            tip_height + headers.len() as u32,
+            peer_addr
+        );
+        Ok(WakeBatch::Stored)
     }
 
     /// A wake's header request: the best peer's answer to a one-hash
@@ -5634,6 +6025,8 @@ impl HeaderSync {
             error: None,
             tip_disagreement: false,
             invalid_chain_detected: false,
+            tip_confirmed: false,
+            awaiting_snapshot: self.awaiting_snapshot().unwrap_or(false),
         }
     }
 
@@ -6737,3 +7130,8 @@ mod adversarial_tests;
 #[cfg(test)]
 #[path = "testkit/connect_paths.rs"]
 mod connect_path_tests;
+
+// Ticket 054: wake agreement, retry and the setup gate.
+#[cfg(test)]
+#[path = "testkit/wake_agreement.rs"]
+mod wake_agreement_tests;
