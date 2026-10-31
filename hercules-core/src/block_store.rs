@@ -273,4 +273,65 @@ mod tests {
         store.store_block(&block, 0).unwrap(); // should replace, not error
         assert_eq!(store.count().unwrap(), 1);
     }
+
+    // ── Data-path pass ───────────────────────────────────────────────
+
+    /// The genesis block with a distinct header per `tag` (distinct hash).
+    fn tagged(tag: u32) -> Block {
+        let mut b = genesis_block();
+        b.header.nonce = tag;
+        b
+    }
+
+    #[test]
+    fn prune_below_is_exclusive_and_counts_what_it_removed() {
+        let store = BlockStore::open(":memory:").unwrap();
+        for h in 10..=14 {
+            store.store_block(&tagged(h), h).unwrap();
+        }
+        assert_eq!(store.prune_below(12).unwrap(), 2);
+        assert_eq!(store.lowest_height().unwrap(), Some(12));
+        assert!(store.has_block(&tagged(12).block_hash()).unwrap());
+        assert!(!store.has_block(&tagged(11).block_hash()).unwrap());
+        assert_eq!(store.prune_below(12).unwrap(), 0, "idempotent");
+        assert_eq!(store.prune_below(u32::MAX).unwrap(), 3);
+        assert_eq!((store.lowest_height().unwrap(), store.highest_height().unwrap()), (None, None));
+    }
+
+    /// A reorg stores a different block at an existing height: the old
+    /// one must no longer be served by hash.
+    #[test]
+    fn reorg_replacement_stops_serving_the_old_block() {
+        let store = BlockStore::open(":memory:").unwrap();
+        let (old, new) = (tagged(1), tagged(2));
+        store.store_block(&old, 100).unwrap();
+        store.store_block(&new, 100).unwrap();
+        assert!(store.get_block_by_hash(&old.block_hash()).unwrap().is_none());
+        assert_eq!(store.get_block_by_hash(&new.block_hash()).unwrap().unwrap(), new);
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn blocks_survive_reopen_and_corrupt_rows_are_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("blocks.sqlite3");
+        let p = path.to_str().unwrap();
+        {
+            let store = BlockStore::open(p).unwrap();
+            store.store_block(&tagged(1), 1).unwrap();
+            store.store_block(&tagged(2), 2).unwrap();
+        }
+        let store = BlockStore::open(p).unwrap();
+        assert_eq!(store.get_block_by_hash(&tagged(2).block_hash()).unwrap().unwrap(), tagged(2));
+        store.conn.lock().unwrap().execute("UPDATE blocks SET data = X'0000' WHERE height = 1", []).unwrap();
+        assert!(store.get_block_by_hash(&tagged(1).block_hash()).is_err());
+        assert!(store.has_block(&tagged(1).block_hash()).unwrap(), "row still present");
+    }
+
+    /// BIP 159 serving window, kept equal to the 288-block reorg/undo
+    /// horizon sync prunes both stores to (`MAX_REORG_DEPTH`).
+    #[test]
+    fn serving_window_is_288_blocks() {
+        assert_eq!(BlockStore::serving_window(), 288);
+    }
 }

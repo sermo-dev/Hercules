@@ -388,4 +388,34 @@ mod tests {
         assert_eq!(p.script_flags(1), all);
         assert_eq!(p.script_flags(1_000_000), all);
     }
+
+    proptest::proptest! {
+        /// Soft forks only add rules: the flag set at a later height
+        /// contains every flag of an earlier one, on both chains, and is
+        /// complete from Taproot on.
+        #[test]
+        fn script_flags_only_grow_with_height(a in proptest::prelude::any::<u32>(), b in proptest::prelude::any::<u32>()) {
+            let (lo, hi) = (a.min(b), a.max(b));
+            for p in [ChainParams::mainnet(), ChainParams::regtest()] {
+                let (f_lo, f_hi) = (p.script_flags(lo), p.script_flags(hi));
+                proptest::prop_assert_eq!(f_lo & f_hi, f_lo, "{:?}: flags lost between {} and {}", p.network, lo, hi);
+            }
+            if lo >= 709_632 {
+                proptest::prop_assert_eq!(ChainParams::mainnet().script_flags(lo), 0x20e15);
+            }
+        }
+    }
+
+    /// Header-version deployments activate in Core's order, and the
+    /// AssumeUTXO anchor sits above all of them (Hercules validates only
+    /// blocks where every rule is on).
+    #[test]
+    fn deployment_order_and_anchor_position() {
+        let m = ChainParams::mainnet();
+        assert!(m.bip34_height < m.bip66_height && m.bip66_height < m.bip65_height);
+        assert!(m.bip65_height < m.csv_height && m.csv_height < m.segwit_height);
+        let anchor = m.anchor.expect("mainnet has an anchor").height;
+        assert!(anchor > 709_632 && anchor > m.segwit_height);
+        assert_eq!(m.script_flags(anchor + 1), 0x20e15);
+    }
 }

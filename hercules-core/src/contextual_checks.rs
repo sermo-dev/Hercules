@@ -1020,4 +1020,214 @@ mod tests {
         cb.input[0].script_sig = ScriptBuf::from_bytes(vec![0x03, 0x8c]);
         assert!(!coinbase_commits_height(&cb, 943_500));
     }
+
+    // ── Data-path pass: oracles and invariants ───────────────────────
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Script bytes biased towards what the sigop parser cares about:
+        /// CHECKSIG family, OP_1..OP_16 before CHECKMULTISIG, every push
+        /// form (including truncated ones), and arbitrary bytes.
+        fn arb_script() -> impl Strategy<Value = Vec<u8>> {
+            let byte = prop_oneof![
+                3 => prop::sample::select(vec![0xacu8, 0xad, 0xae, 0xaf]),
+                2 => 0x51u8..=0x60,
+                1 => Just(0x00u8),
+                1 => 0x01u8..=0x4b,
+                1 => prop::sample::select(vec![0x4cu8, 0x4d, 0x4e]),
+                2 => any::<u8>(),
+            ];
+            prop::collection::vec(byte, 0..120)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1024))]
+
+            /// Differential: rust-bitcoin's `count_sigops_legacy` (an
+            /// independent port of Core's GetSigOpCount, stopping at the
+            /// first unparsable op), and for accurate counting a reference
+            /// written from Core over rust-bitcoin's tokenizer (see
+            /// `rust_bitcoin_accurate_sigops_diverge_from_core`).
+            #[test]
+            fn sigop_count_matches_independent_implementations(script in arb_script()) {
+                let s = bitcoin::Script::from_bytes(&script);
+                prop_assert_eq!(script_sigop_count(&script, false), s.count_sigops_legacy() as u64);
+                prop_assert_eq!(script_sigop_count(&script, false), core_reference_sigops(&script, false));
+                prop_assert_eq!(script_sigop_count(&script, true), core_reference_sigops(&script, true));
+            }
+
+            /// The P2SH / witness parsers never panic, and a redeem or
+            /// witness script's count is the accurate count.
+            #[test]
+            fn sigop_cost_parsers_are_total(
+                sig in arb_script(),
+                spk in arb_script(),
+                witness in prop::collection::vec(arb_script(), 0..4),
+                flags in any::<u32>(),
+            ) {
+                let mut t = tx(2, 0, &[SEQUENCE_FINAL]);
+                t.input[0].script_sig = ScriptBuf::from_bytes(sig.clone());
+                t.input[0].witness = Witness::from_slice(&witness);
+                let cost = transaction_sigop_cost(&t, &[&spk], flags);
+                prop_assert!(cost >= legacy_sigop_count(&t) * WITNESS_SCALE_FACTOR);
+                let _ = witness_sigop_count(&sig, &spk, &t.input[0].witness, flags);
+                let _ = is_push_only(&sig);
+                let _ = last_push(&sig);
+            }
+
+            #[test]
+            fn bip34_prefix_is_push_int_for_every_height(h in any::<u32>()) {
+                let expected = Builder::new().push_int(h as i64).into_script().into_bytes();
+                prop_assert_eq!(bip34_height_prefix(h), expected);
+            }
+
+            /// Median-time-past is the middle of the sorted window of up to
+            /// 11 timestamps ending at `height`, whatever their order.
+            #[test]
+            fn mtp_is_the_median_of_the_window(times in prop::collection::vec(any::<u32>(), 1..40), pick in any::<prop::sample::Index>()) {
+                let height = pick.index(times.len()) as u32;
+                let lookup = |h: u32| -> Result<u32, String> { times.get(h as usize).copied().ok_or("none".into()) };
+                let first = height.saturating_sub(10) as usize;
+                let mut window: Vec<u32> = times[first..=height as usize].to_vec();
+                window.sort_unstable();
+                prop_assert_eq!(median_time_past(&lookup, height).unwrap(), window[window.len() / 2] as i64);
+                // The memoized version agrees, twice.
+                let mut m = MedianTimes::new(&lookup);
+                prop_assert_eq!(m.at(height).unwrap(), window[window.len() / 2] as i64);
+                prop_assert_eq!(m.at(height).unwrap(), window[window.len() / 2] as i64);
+            }
+
+            /// IsFinalTx in closed form: lock 0, or lock below the cutoff
+            /// (height or time by LOCKTIME_THRESHOLD), or every input final.
+            #[test]
+            fn is_final_tx_closed_form(
+                lock in any::<u32>(),
+                height in any::<u32>(),
+                time in any::<u32>(),
+                seqs in prop::collection::vec(prop_oneof![Just(SEQUENCE_FINAL), any::<u32>()], 1..4),
+            ) {
+                let t = tx(2, lock, &seqs);
+                let cutoff = if lock < LOCKTIME_THRESHOLD { height as i64 } else { time as i64 };
+                let expected = lock == 0 || (lock as i64) < cutoff || seqs.iter().all(|s| *s == SEQUENCE_FINAL);
+                prop_assert_eq!(is_final_tx(&t, height, time as i64), expected);
+            }
+
+            /// BIP 68 lock points in closed form for height locks; off for
+            /// version < 2, the disable flag, or when not enforced.
+            #[test]
+            fn height_sequence_locks_closed_form(
+                version in prop_oneof![Just(1i32), Just(2), any::<i32>()],
+                seqs in prop::collection::vec(any::<u32>(), 1..4),
+                coin_heights in prop::collection::vec(0u32..1_000_000, 4),
+                enforce in any::<bool>(),
+            ) {
+                // Height locks only (time locks need an MTP source).
+                let seqs: Vec<u32> = seqs.into_iter().map(|s| s & !SEQUENCE_LOCKTIME_TYPE_FLAG).collect();
+                let t = tx(version, 0, &seqs);
+                let heights = &coin_heights[..seqs.len()];
+                let never = |_: u32| -> Result<u32, String> { Err("no time locks here".into()) };
+                let mut mtp = MedianTimes::new(&never);
+                let lock = calculate_sequence_locks(&t, enforce, heights, &mut mtp).unwrap();
+                let mut min_height = -1i64;
+                if enforce && version as u32 >= 2 {
+                    for (s, h) in seqs.iter().zip(heights) {
+                        if s & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0 {
+                            min_height = min_height.max(*h as i64 + (s & SEQUENCE_LOCKTIME_MASK) as i64 - 1);
+                        }
+                    }
+                }
+                prop_assert_eq!(lock, LockPoints { min_height, min_time: -1 });
+                // Satisfied exactly from the block after min_height.
+                if min_height >= 0 && min_height < u32::MAX as i64 {
+                    prop_assert!(!evaluate_sequence_locks(min_height as u32, i64::MAX, lock));
+                    prop_assert!(evaluate_sequence_locks(min_height as u32 + 1, i64::MAX, lock));
+                }
+            }
+        }
+
+        /// Core's `CScript::GetSigOpCount(fAccurate)`, with rust-bitcoin
+        /// as the tokenizer: `lastOpcode` is updated after *every* opcode.
+        fn core_reference_sigops(script: &[u8], accurate: bool) -> u64 {
+            use bitcoin::script::Instruction;
+            let mut n = 0u64;
+            let mut last: Option<u8> = None;
+            for ins in bitcoin::Script::from_bytes(script).instructions() {
+                let op = match ins {
+                    Err(_) => break,
+                    // Pushes are never OP_1..OP_16 (those are opcodes).
+                    Ok(Instruction::PushBytes(_)) => None,
+                    Ok(Instruction::Op(o)) => Some(o.to_u8()),
+                };
+                match op {
+                    Some(0xac) | Some(0xad) => n += 1,
+                    Some(0xae) | Some(0xaf) => {
+                        n += match last {
+                            Some(l @ 0x51..=0x60) if accurate => (l - 0x50) as u64,
+                            _ => 20,
+                        }
+                    }
+                    _ => {}
+                }
+                last = op;
+            }
+            n
+        }
+
+        /// Found by the differential test: rust-bitcoin 0.32's accurate
+        /// `count_sigops` keeps the last OP_N across an intervening
+        /// CHECKSIG, so `OP_1 OP_CHECKSIG OP_CHECKMULTISIG` counts the
+        /// multisig as 1. Core resets on every opcode (20). Ours follows
+        /// Core; pinned here so nobody "fixes" it to match the library.
+        #[test]
+        fn rust_bitcoin_accurate_sigops_diverge_from_core() {
+            let script = [0x51, 0xac, 0xae];
+            assert_eq!(script_sigop_count(&script, true), 1 + 20);
+            assert_eq!(core_reference_sigops(&script, true), 21);
+            assert_eq!(bitcoin::Script::from_bytes(&script).count_sigops(), 2, "rust-bitcoin's count");
+        }
+
+        /// Accurate counting of a P2WSH 2-of-3 witness script and a P2SH
+        /// 15-of-15 redeem script: the key count, not 20.
+        #[test]
+        fn witness_and_p2sh_multisig_use_the_key_count() {
+            let ms = |m: u8, n: u8| {
+                let mut s = vec![0x50 + m];
+                for _ in 0..n {
+                    s.push(33);
+                    s.extend_from_slice(&[0x02; 33]);
+                }
+                s.extend_from_slice(&[0x50 + n, 0xae]);
+                s
+            };
+            let ws = ms(2, 3);
+            let wsh = {
+                use bitcoin::hashes::{sha256, Hash};
+                let mut spk = vec![0x00, 0x20];
+                spk.extend_from_slice(sha256::Hash::hash(&ws).as_byte_array());
+                spk
+            };
+            let witness = Witness::from_slice(&[vec![], vec![0x30; 71], vec![0x30; 71], ws.clone()]);
+            assert_eq!(witness_sigop_count(&[], &wsh, &witness, SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_P2SH), 3);
+            assert_eq!(witness_sigop_count(&[], &wsh, &witness, SCRIPT_VERIFY_P2SH), 0, "pre-SegWit: none");
+
+            let redeem = ms(15, 15);
+            let mut sig = vec![0x00];
+            sig.push(0x4d);
+            sig.extend_from_slice(&(redeem.len() as u16).to_le_bytes());
+            sig.extend_from_slice(&redeem);
+            let p2sh = {
+                let mut spk = vec![0xa9, 0x14];
+                spk.extend_from_slice(&[0x11; 20]);
+                spk.push(0x87);
+                spk
+            };
+            let mut t = tx(2, 0, &[SEQUENCE_FINAL]);
+            t.input[0].script_sig = ScriptBuf::from_bytes(sig);
+            assert_eq!(p2sh_sigop_count(&t, &[&p2sh]), 15);
+            assert_eq!(transaction_sigop_cost(&t, &[&p2sh], SCRIPT_VERIFY_P2SH), 15 * WITNESS_SCALE_FACTOR);
+            assert_eq!(transaction_sigop_cost(&t, &[&p2sh], 0), 0, "pre-BIP16: no P2SH sigops");
+        }
+    }
 }

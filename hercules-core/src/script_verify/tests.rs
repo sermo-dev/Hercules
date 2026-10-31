@@ -186,6 +186,88 @@ fn core_vectors_match_core_expected_results() {
     check_expected(&vector_cases());
 }
 
+/// Every Core vector is loaded except a known few (the 5 script_tests
+/// that need Core's taproot builder, `#SCRIPT#`/`#CONTROLBLOCK#`, and the
+/// tx vectors that are coinbases or don't deserialize), and the number
+/// checked against Core's own verdict doesn't shrink. A loader change that
+/// silently drops vectors fails here.
+#[test]
+fn core_vector_coverage_is_pinned() {
+    let script = core_vectors::script_tests();
+    let valid = core_vectors::tx_tests(true);
+    let invalid = core_vectors::tx_tests(false);
+    assert_eq!(
+        (script.cases.len(), script.skipped, valid.cases.len(), valid.skipped, invalid.cases.len(), invalid.skipped),
+        (1232, 5, 119, 2, 89, 4)
+    );
+    let with_verdict = vector_cases().iter().filter(|c| c.expect_valid.is_some()).count();
+    assert!(with_verdict >= 436, "{} cases with Core's verdict", with_verdict);
+}
+
+/// Core's `OP_CODESEPARATOR`-stripping scriptCode serialization
+/// (`CTransactionSignatureSerializer::SerializeScriptCode`), for scripts
+/// that parse to the end. `None` if a push is truncated: Core then
+/// serializes a partial script, which no `&Script` can express.
+fn core_script_code(script: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(script.len());
+    let mut pc = 0;
+    while pc < script.len() {
+        let op = script[pc];
+        let (header, len) = match op {
+            0x01..=0x4b => (1, op as usize),
+            0x4c => (2, *script.get(pc + 1)? as usize),
+            0x4d => (3, u16::from_le_bytes(script.get(pc + 1..pc + 3)?.try_into().unwrap()) as usize),
+            0x4e => (5, u32::from_le_bytes(script.get(pc + 1..pc + 5)?.try_into().unwrap()) as usize),
+            _ => (1, 0),
+        };
+        let end = pc.checked_add(header)?.checked_add(len)?;
+        if end > script.len() {
+            return None;
+        }
+        if op != 0xab {
+            out.extend_from_slice(&script[pc..end]);
+        }
+        pc = end;
+    }
+    Some(out)
+}
+
+/// Core's legacy `SignatureHash` vectors (sighash.json: every hash type,
+/// ANYONECANPAY, NONE, the SIGHASH_SINGLE out-of-range "1" result, random
+/// scripts with OP_CODESEPARATORs) against rust-bitcoin's
+/// `legacy_signature_hash`, which the fixture chain signs with today and
+/// the wallet will. (Verification itself uses the kernel's own
+/// SignatureHash, covered by the script vectors above.)
+#[test]
+fn core_sighash_vectors_match_rust_bitcoin() {
+    use bitcoin::hashes::Hash;
+    use bitcoin::sighash::SighashCache;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(core_vectors::SIGHASH).unwrap();
+    let (mut checked, mut skipped) = (0, 0);
+    for row in rows.iter().skip(1) {
+        let a = row.as_array().unwrap();
+        let tx: Transaction = bitcoin::consensus::deserialize(&hex::decode(a[0].as_str().unwrap()).unwrap()).unwrap();
+        let script = hex::decode(a[1].as_str().unwrap()).unwrap();
+        let index = a[2].as_u64().unwrap() as usize;
+        let hash_type = a[3].as_i64().unwrap() as i32 as u32;
+        let Some(code) = core_script_code(&script) else {
+            skipped += 1;
+            continue;
+        };
+        let got = SighashCache::new(&tx)
+            .legacy_signature_hash(index, bitcoin::Script::from_bytes(&code), hash_type)
+            .unwrap();
+        // Core prints uint256 in reversed byte order.
+        let mut bytes = got.to_byte_array();
+        bytes.reverse();
+        assert_eq!(hex::encode(bytes), a[4].as_str().unwrap(), "vector {:?}", a);
+        checked += 1;
+    }
+    assert_eq!(checked + skipped, rows.len() - 1);
+    eprintln!("sighash.json: {} checked, {} skipped (truncated push)", checked, skipped);
+    assert_eq!((checked, skipped), (500, 0));
+}
+
 #[test]
 fn fixture_chain_spends_verify_as_expected() {
     check_expected(&fixture_chain_cases());

@@ -972,4 +972,178 @@ mod tests {
         assert!(store.failed_hashes().unwrap().is_empty());
         assert!(store.clear_failed_blocks().unwrap().is_empty());
     }
+
+    // ── Data-path pass: locator shape, reorgs, persistence, migration ─
+
+    /// `n` linked headers on top of genesis, with distinct hashes and
+    /// increasing timestamps (`salt` makes a different branch).
+    fn chain_from(parent: Header, n: u32, salt: u32) -> Vec<Header> {
+        let mut out = Vec::with_capacity(n as usize);
+        let mut prev = parent;
+        for i in 0..n {
+            let h = Header {
+                prev_blockhash: prev.block_hash(),
+                time: prev.time + 600,
+                nonce: salt.wrapping_mul(1_000_003).wrapping_add(i),
+                ..prev
+            };
+            out.push(h);
+            prev = h;
+        }
+        out
+    }
+
+    fn store_with(n: u32) -> (HeaderStore, Vec<Header>) {
+        let store = HeaderStore::open(":memory:").unwrap();
+        let mut all = vec![genesis_header()];
+        all.extend(chain_from(genesis_header(), n, 0));
+        store.store_headers(&all, 0).unwrap();
+        (store, all)
+    }
+
+    /// Locators start at the tip, step back 1 at a time for 10 entries,
+    /// then double, always end at genesis, and stay logarithmic.
+    #[test]
+    fn locator_shape_for_many_tip_heights() {
+        let (store, all) = store_with(5_000);
+        for tip in [0u32, 1, 2, 9, 10, 11, 12, 20, 100, 1_023, 1_024, 5_000] {
+            store.delete_headers_above(tip).unwrap();
+            let loc = store.get_locator_hashes().unwrap();
+            let heights: Vec<u32> =
+                loc.iter().map(|h| store.find_height_of_hash(*h).unwrap().expect("locator hash is stored")).collect();
+            assert_eq!(heights[0], tip, "tip {}", tip);
+            assert_eq!(*heights.last().unwrap(), 0, "ends at genesis (tip {})", tip);
+            assert!(heights.windows(2).all(|w| w[0] > w[1]), "strictly descending: {:?}", heights);
+            let consecutive = heights.windows(2).take_while(|w| w[0] - w[1] == 1).count() + 1;
+            assert!(consecutive >= heights.len().min(10), "first 10 consecutive: {:?}", heights);
+            let bound = 12 + (32 - tip.max(1).leading_zeros()) as usize;
+            assert!(heights.len() <= bound, "tip {}: {} entries", tip, heights.len());
+            // Re-add what was deleted for the next round.
+            store.store_headers(&all[tip as usize + 1..], tip + 1).unwrap();
+        }
+    }
+
+    /// A reorg as sync performs it: delete above the fork, store the new
+    /// branch. Old hashes vanish; lookups and timestamps follow the new
+    /// branch; heights below the fork are untouched.
+    #[test]
+    fn reorg_replaces_the_branch_above_the_fork() {
+        let (store, old) = store_with(20);
+        let fork = 12u32;
+        let new_branch = chain_from(old[fork as usize], 5, 7);
+        store.delete_headers_above(fork).unwrap();
+        store.store_headers(&new_branch, fork + 1).unwrap();
+
+        let (tip, tip_hash, _) = store.tip().unwrap().unwrap();
+        assert_eq!((tip, tip_hash), (17, new_branch[4].block_hash()));
+        for h in (fork + 1)..=20 {
+            assert_eq!(store.find_height_of_hash(old[h as usize].block_hash()).unwrap(), None, "stale {}", h);
+        }
+        for (i, hdr) in new_branch.iter().enumerate() {
+            assert_eq!(store.find_height_of_hash(hdr.block_hash()).unwrap(), Some(fork + 1 + i as u32));
+        }
+        assert_eq!(store.get_hash_at_height(fork).unwrap(), Some(old[fork as usize].block_hash()));
+        let expected: Vec<u32> = old[8..=12].iter().chain(&new_branch[..2]).map(|h| h.time).collect();
+        assert_eq!(store.timestamps_up_to(14, 7).unwrap(), expected);
+        assert_eq!(store.count().unwrap(), 18);
+    }
+
+    /// Storing a different header at an existing height replaces it (and
+    /// its hash), as a one-header reorg does.
+    #[test]
+    fn storing_over_an_existing_height_replaces_the_header() {
+        let (store, old) = store_with(3);
+        let rival = chain_from(old[2], 1, 9)[0];
+        store.store_headers(&[rival], 3).unwrap();
+        assert_eq!(store.get_hash_at_height(3).unwrap(), Some(rival.block_hash()));
+        assert_eq!(store.find_height_of_hash(old[3].block_hash()).unwrap(), None);
+        assert_eq!(store.count().unwrap(), 4);
+    }
+
+    #[test]
+    fn timestamp_reads_at_the_edges() {
+        let (store, all) = store_with(30);
+        let times: Vec<u32> = all.iter().map(|h| h.time).collect();
+        assert_eq!(store.last_timestamps(11).unwrap(), times[20..].to_vec());
+        assert_eq!(store.last_timestamps(1_000).unwrap(), times);
+        assert_eq!(store.timestamps_up_to(5, 11).unwrap(), times[..=5].to_vec(), "fewer than requested near genesis");
+        assert_eq!(store.timestamps_up_to(1_000, 3).unwrap(), times[28..].to_vec(), "beyond the tip");
+        assert!(store.get_timestamps_between(10, 9).unwrap().is_empty());
+        assert_eq!(store.get_timestamps_between(29, 40).unwrap(), times[29..].to_vec());
+        // The HeaderTimes view insists on every height being present.
+        use crate::contextual_checks::HeaderTimes;
+        assert_eq!(HeaderTimes::timestamps_between(&store, 25, 30).unwrap(), times[25..=30].to_vec());
+        let err = HeaderTimes::timestamps_between(&store, 25, 31).unwrap_err();
+        assert!(err.contains("found 6 of 7"), "{}", err);
+        assert!(HeaderTimes::timestamp_at(&store, 31).is_err());
+        assert_eq!(store.header_id_at(30), Some(all[30].block_hash().to_byte_array()));
+        assert_eq!(store.header_id_at(31), None);
+    }
+
+    #[test]
+    fn headers_and_validated_height_survive_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("headers.sqlite3");
+        let p = path.to_str().unwrap();
+        let all = {
+            let (mem, all) = store_with(50);
+            drop(mem);
+            let store = HeaderStore::open(p).unwrap();
+            store.store_headers(&all, 0).unwrap();
+            store.set_validated_height(42).unwrap();
+            all
+        };
+        let store = HeaderStore::open(p).unwrap();
+        assert_eq!(store.count().unwrap(), 51);
+        assert_eq!(store.validated_height().unwrap(), 42);
+        assert_eq!(store.tip().unwrap().unwrap().1, all[50].block_hash());
+        assert_eq!(store.get_header_at_height(17).unwrap().unwrap().1, all[17]);
+        store.set_validated_height(u32::MAX).unwrap();
+        assert_eq!(store.validated_height().unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn corrupt_rows_are_errors_not_defaults() {
+        let (store, _) = store_with(2);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE metadata SET value = 'x' WHERE key = 'validated_height'", []).unwrap();
+            conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('validated_height', 'not a number')", [])
+                .unwrap();
+            conn.execute("UPDATE headers SET header = X'00' WHERE height = 2", []).unwrap();
+            conn.execute("UPDATE headers SET hash = X'0102' WHERE height = 1", []).unwrap();
+        }
+        assert!(store.validated_height().is_err());
+        assert!(store.tip().is_err(), "unparsable tip header");
+        assert!(store.get_header_at_height(2).is_err());
+        assert!(store.get_headers_in_range(0, 2).is_err());
+        assert!(store.get_hash_at_height(1).is_err(), "short hash");
+        assert!(store.get_locator_hashes().is_err());
+    }
+
+    /// Ticket 024's development-era `failed_blocks` table (no `rules`
+    /// column) is dropped and recreated on open; its rows had no rules
+    /// version, so they can't be trusted.
+    #[test]
+    fn failed_blocks_without_rules_column_are_dropped_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("headers.sqlite3");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE failed_blocks (hash BLOB PRIMARY KEY, height INTEGER NOT NULL, reason TEXT NOT NULL);
+                 INSERT INTO failed_blocks VALUES (X'01', 5, 'old');",
+            )
+            .unwrap();
+        }
+        let store = HeaderStore::open(path.to_str().unwrap()).unwrap();
+        assert!(store.failed_hashes().unwrap().is_empty());
+        let hash = genesis_header().block_hash();
+        store.mark_failed(hash, 0, "bad", "v1").unwrap();
+        assert!(store.failed_hashes().unwrap().contains(&hash));
+        // Opening again keeps the new-format rows.
+        drop(store);
+        let store = HeaderStore::open(path.to_str().unwrap()).unwrap();
+        assert!(store.failed_hashes().unwrap().contains(&hash));
+    }
 }

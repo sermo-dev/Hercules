@@ -46,6 +46,9 @@ const MAX_TX_WEIGHT: u64 = 400_000;
 /// Coinbase maturity: 100 blocks before coinbase outputs are spendable.
 const COINBASE_MATURITY: u32 = 100;
 
+/// Bitcoin's MAX_MONEY in satoshis (CheckTransaction's MoneyRange bound).
+const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
 /// Maximum transaction expiry time (14 days).
 const MAX_TX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
 
@@ -346,6 +349,32 @@ impl Mempool {
             return Err(MempoolError::MalformedTx);
         }
 
+        // The rest of Core's CheckTransaction: no outpoint spent twice
+        // (`bad-txns-inputs-duplicate`) and every output, and their total,
+        // within MAX_MONEY (`bad-txns-vout-toolarge`,
+        // `bad-txns-txouttotal-toolarge`). The script check below verifies
+        // inputs one at a time, so without this a tx spending one coin
+        // twice would have that coin's value counted twice and be relayed
+        // to peers that treat it as consensus-invalid.
+        let mut outpoints = HashSet::with_capacity(tx.input.len());
+        for (input_index, input) in tx.input.iter().enumerate() {
+            if !outpoints.insert(input.previous_output) {
+                return Err(MempoolError::DuplicateInput { input_index });
+            }
+        }
+        let mut output_total: u64 = 0;
+        for output in &tx.output {
+            let amount = output.value.to_sat();
+            if amount > MAX_MONEY {
+                return Err(MempoolError::ValueOutOfRange { what: "output", amount });
+            }
+            // Both terms are at most MAX_MONEY here: no overflow.
+            output_total += amount;
+            if output_total > MAX_MONEY {
+                return Err(MempoolError::ValueOutOfRange { what: "output total", amount: output_total });
+            }
+        }
+
         if self.txs.contains_key(&txid) {
             return Err(MempoolError::AlreadyInMempool);
         }
@@ -502,8 +531,11 @@ impl Mempool {
             };
 
             // Coinbase maturity (only confirmed coinbases can be flagged
-            // here; mempool parents synthesize is_coinbase=false above).
-            if utxo.is_coinbase && current_height.saturating_sub(utxo.height) < COINBASE_MATURITY {
+            // here; mempool parents synthesize is_coinbase=false above),
+            // judged for the next block like finality and BIP 68: Core's
+            // CheckTxInputs gets spend height = tip + 1, and block
+            // validation allows the spend at coin height + 100.
+            if utxo.is_coinbase && next_height.saturating_sub(utxo.height) < COINBASE_MATURITY {
                 return Err(MempoolError::ImmatureCoinbase {
                     input_index: input_idx,
                     coinbase_height: utxo.height,
@@ -515,6 +547,10 @@ impl Mempool {
                 .ok_or(MempoolError::MathOverflow)?;
             prev_heights.push(utxo.height);
             spent.push((utxo.amount, utxo.script_pubkey));
+        }
+        // CheckTxInputs `bad-txns-inputvalues-outofrange`.
+        if input_sum > MAX_MONEY {
+            return Err(MempoolError::ValueOutOfRange { what: "input total", amount: input_sum });
         }
 
         // BIP 68 relative lock-times for the next block, as Core's
@@ -662,7 +698,7 @@ impl Mempool {
         // correctness bug (lost data on a failed accept) and a free DoS
         // amplifier (one low-fee submission → up to MAX_DESCENDANTS
         // evicted innocents).
-        self.check_capacity_admission(size, fee, vsize, &ancestors)?;
+        self.check_capacity_admission(txid, size, fee, vsize, &ancestors, &to_evict)?;
 
         // ── Phase 7: mutate ─────────────────────────────────────────────
         //
@@ -749,156 +785,123 @@ impl Mempool {
     /// here so that no innocent mempool entries are destroyed by a doomed
     /// accept.
     ///
-    /// Algorithm:
+    /// It replays that loop exactly, on a lightweight copy of the graph as
+    /// it will be after Phase 7 (the conflict set `to_evict` gone, the new
+    /// tx inserted below `our_ancestors`): repeatedly pick the victim root
+    /// with `pick_eviction_victim`, the same deterministic rule
+    /// `evict_lowest_package` uses, and drop it with its descendants,
+    /// until the pool fits. Package sums are recomputed after every drop,
+    /// so a descendant shared by two roots is counted (and freed) once,
+    /// and a root that loses such a descendant is re-ranked, just as in
+    /// the real loop. If the victim's package contains the new tx, reject.
     ///
-    /// 1. Fast-path: if `total_size + new_size <= max_size`, no eviction
-    ///    is needed and the new tx is trivially safe.
-    /// 2. Identify the *root ancestors* of the new tx (entries with empty
-    ///    `ancestors` that the new tx descends from). These are the roots
-    ///    whose packages will fold the new tx in after insertion.
-    /// 3. Build a snapshot of every current root's package
-    ///    `(pkg_fee, pkg_vsize, pkg_size)`. For affected roots (containing
-    ///    the new tx after insertion), add the new tx's contribution.
-    /// 4. If the new tx has no ancestors at all, it forms its own root
-    ///    package containing only itself.
-    /// 5. Sort packages by ascending fee rate (sat/vB) and walk in order,
-    ///    simulating evictions until the projected total size is back
-    ///    under cap. If we hit a package that contains the new tx,
-    ///    reject — that's the runtime saying "the new tx is the next
-    ///    thing I'd evict". The conservative direction is correct:
-    ///    rejecting is always safe, accepting must be provably safe.
-    ///
-    /// Multi-root caveat: a tx whose parents live in two different roots
-    /// will, after insertion, *merge* those roots into one package
-    /// (because both can now reach the new tx as a common descendant).
-    /// This simulation treats them as separate packages and marks the
-    /// new tx as belonging to all of them. The result is conservative —
-    /// it can produce a spurious rejection in rare merge-shaped graphs
-    /// but cannot produce an incorrect acceptance.
+    /// Earlier versions sorted a one-off snapshot of root packages
+    /// instead: that counted a shared descendant once per root (over-
+    /// estimating the space freed) and broke fee-rate ties differently
+    /// from the real loop, so a tx could be accepted and then immediately
+    /// evicted by the loop it was certified against.
     fn check_capacity_admission(
         &self,
+        new_txid: Txid,
         new_size: usize,
         new_fee: u64,
         new_vsize: u64,
         our_ancestors: &HashSet<Txid>,
+        to_evict: &HashSet<Txid>,
     ) -> Result<(), MempoolError> {
+        let evicted_size: usize = to_evict.iter().filter_map(|t| self.txs.get(t)).map(|e| e.size).sum();
+        let mut total = self.total_size.saturating_sub(evicted_size).saturating_add(new_size);
         // Fast path: insertion fits without eviction.
-        if self.total_size.saturating_add(new_size) <= self.max_size {
+        if total <= self.max_size {
             return Ok(());
         }
 
-        // Roots that the new tx descends from. `our_ancestors` is the
-        // *transitive* closure (Phase 5), so the roots are the elements
-        // with empty `ancestors`.
-        let mut affected_roots: HashSet<Txid> = HashSet::new();
-        for ancestor_txid in our_ancestors {
-            if let Some(ancestor) = self.txs.get(ancestor_txid) {
-                if ancestor.ancestors.is_empty() {
-                    affected_roots.insert(*ancestor_txid);
-                }
+        struct Node {
+            fee: u64,
+            vsize: u64,
+            size: usize,
+            root: bool,
+            descendants: Vec<Txid>,
+        }
+        // Roots never change: removing a root also removes every tx that
+        // has it as an ancestor. Descendant lists may name removed txs;
+        // sums skip them, as `evict_lowest_package` skips missing entries.
+        let mut nodes: HashMap<Txid, Node> = self
+            .txs
+            .iter()
+            .filter(|(t, _)| !to_evict.contains(*t))
+            .map(|(t, e)| {
+                (
+                    *t,
+                    Node {
+                        fee: e.fee,
+                        vsize: e.vsize,
+                        size: e.size,
+                        root: e.ancestors.is_empty(),
+                        descendants: e.descendants.iter().copied().collect(),
+                    },
+                )
+            })
+            .collect();
+        for a in our_ancestors {
+            if let Some(n) = nodes.get_mut(a) {
+                n.descendants.push(new_txid);
             }
         }
+        nodes.insert(
+            new_txid,
+            Node {
+                fee: new_fee,
+                vsize: new_vsize,
+                size: new_size,
+                root: our_ancestors.is_empty(),
+                descendants: Vec::new(),
+            },
+        );
 
-        struct PkgSnapshot {
-            pkg_fee: u64,
-            pkg_vsize: u64,
-            pkg_size: usize,
-            contains_new: bool,
-        }
-
-        let mut packages: Vec<PkgSnapshot> = Vec::with_capacity(self.txs.len() / 4 + 1);
-        let mut new_tx_in_some_package = false;
-
-        for (txid, entry) in &self.txs {
-            if !entry.ancestors.is_empty() {
-                continue;
-            }
-            let mut pkg_fee = entry.fee;
-            let mut pkg_vsize = entry.vsize;
-            let mut pkg_size = entry.size;
-            for d in &entry.descendants {
-                if let Some(de) = self.txs.get(d) {
-                    pkg_fee = pkg_fee.saturating_add(de.fee);
-                    pkg_vsize = pkg_vsize.saturating_add(de.vsize);
-                    pkg_size = pkg_size.saturating_add(de.size);
-                }
-            }
-
-            let contains_new = affected_roots.contains(txid);
-            if contains_new {
-                pkg_fee = pkg_fee.saturating_add(new_fee);
-                pkg_vsize = pkg_vsize.saturating_add(new_vsize);
-                pkg_size = pkg_size.saturating_add(new_size);
-                new_tx_in_some_package = true;
-            }
-
-            packages.push(PkgSnapshot {
-                pkg_fee,
-                pkg_vsize,
-                pkg_size,
-                contains_new,
-            });
-        }
-
-        // No ancestors → the new tx becomes its own root package. (Or
-        // we somehow failed to attach it to any existing root, which
-        // shouldn't happen but is harmless to treat the same way.)
-        if !new_tx_in_some_package {
-            packages.push(PkgSnapshot {
-                pkg_fee: new_fee,
-                pkg_vsize: new_vsize,
-                pkg_size: new_size,
-                contains_new: true,
-            });
-        }
-
-        // Sort by ascending package rate (sat/vB). NaN is impossible
-        // because pkg_vsize is always > 0 for any non-empty tx.
-        packages.sort_by(|a, b| {
-            let ra = a.pkg_fee as f64 / a.pkg_vsize.max(1) as f64;
-            let rb = b.pkg_fee as f64 / b.pkg_vsize.max(1) as f64;
-            ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Walk packages worst-first, simulating evictions until we'd be
-        // under the cap. If we reach a package containing the new tx
-        // before that, reject.
-        let mut projected_total = self.total_size.saturating_add(new_size);
+        let package = |nodes: &HashMap<Txid, Node>, root: &Txid| -> (u64, u64) {
+            let n = &nodes[root];
+            n.descendants
+                .iter()
+                .filter_map(|d| nodes.get(d))
+                .fold((n.fee, n.vsize), |(f, v), d| (f.saturating_add(d.fee), v.saturating_add(d.vsize)))
+        };
         let new_fee_rate = new_fee as f64 / new_vsize.max(1) as f64;
-        for pkg in &packages {
-            if projected_total <= self.max_size {
-                return Ok(());
-            }
-            if pkg.contains_new {
-                // The eviction loop would target the new tx. Report the
-                // smallest *surviving* package rate so the caller knows
-                // what the new tx would have to beat to be admitted.
-                let min_surviving = packages
+        while total > self.max_size {
+            let roots: Vec<(Txid, u64, u64)> = nodes
+                .iter()
+                .filter(|(_, n)| n.root)
+                .map(|(t, _)| {
+                    let (fee, vsize) = package(&nodes, t);
+                    (*t, fee, vsize)
+                })
+                .collect();
+            let Some(victim) = pick_eviction_victim(roots.iter().copied()) else {
+                break;
+            };
+            let contains_new =
+                |root: &Txid| *root == new_txid || nodes[root].descendants.contains(&new_txid);
+            if contains_new(&victim) {
+                // The loop would evict the new tx. Report the lowest
+                // package rate it would have had to beat.
+                let min_pkg_fee_rate = roots
                     .iter()
-                    .filter(|p| !p.contains_new)
-                    .map(|p| p.pkg_fee as f64 / p.pkg_vsize.max(1) as f64)
+                    .filter(|(t, _, _)| !contains_new(t))
+                    .map(|(_, f, v)| *f as f64 / (*v).max(1) as f64)
                     .fold(f64::INFINITY, f64::min);
-                let min_pkg_fee_rate = if min_surviving.is_finite() {
-                    min_surviving
-                } else {
-                    0.0
-                };
                 return Err(MempoolError::MempoolFull {
                     new_fee_rate,
-                    min_pkg_fee_rate,
+                    min_pkg_fee_rate: if min_pkg_fee_rate.is_finite() { min_pkg_fee_rate } else { 0.0 },
                 });
             }
-            projected_total = projected_total.saturating_sub(pkg.pkg_size);
-        }
-
-        // Walked every package and still over cap (only possible if the
-        // new tx's package is the very last one, which the loop above
-        // would already have caught — but be defensive).
-        if projected_total > self.max_size {
-            return Err(MempoolError::MempoolFull {
-                new_fee_rate,
-                min_pkg_fee_rate: 0.0,
-            });
+            let members: Vec<Txid> = std::iter::once(victim)
+                .chain(nodes[&victim].descendants.iter().copied())
+                .collect();
+            for m in members {
+                if let Some(n) = nodes.remove(&m) {
+                    total -= n.size;
+                }
+            }
         }
         Ok(())
     }
@@ -1227,43 +1230,27 @@ impl Mempool {
     /// descendants while leaving the parent itself. Always evict at the
     /// root and the package leaves together.
     ///
+    /// The victim is chosen by `pick_eviction_victim`, which
+    /// `check_capacity_admission` replays exactly.
+    ///
     /// Returns true if a package was evicted (used by the capacity loop in
     /// `accept_tx_internal` to detect a stuck state).
     fn evict_lowest_package(&mut self) -> bool {
-        // A "root" is a tx with no ancestors in the mempool. Every
-        // package is rooted at one or more roots; an eviction starting at
-        // any root removes the smallest meaningful package.
-        let mut worst_root: Option<(Txid, f64)> = None;
-        for (txid, entry) in &self.txs {
-            if !entry.ancestors.is_empty() {
-                continue;
-            }
-            // Package = self + all descendants. Use vsize so the
-            // selection criterion matches the per-tx fee_rate (sat/vB)
-            // and CPFP packages with high-fee children outrank unrelated
-            // standalone txs at the same raw fee.
-            let mut pkg_fee = entry.fee;
-            let mut pkg_vsize = entry.vsize;
-            for d in &entry.descendants {
-                if let Some(de) = self.txs.get(d) {
-                    pkg_fee = pkg_fee.saturating_add(de.fee);
-                    pkg_vsize = pkg_vsize.saturating_add(de.vsize);
-                }
-            }
-            if pkg_vsize == 0 {
-                continue;
-            }
-            let pkg_rate = pkg_fee as f64 / pkg_vsize as f64;
-            match worst_root {
-                None => worst_root = Some((*txid, pkg_rate)),
-                Some((_, best_rate)) if pkg_rate < best_rate => {
-                    worst_root = Some((*txid, pkg_rate))
-                }
-                _ => {}
-            }
-        }
+        // A "root" is a tx with no ancestors in the mempool. Package =
+        // self + all descendants. Use vsize so the selection criterion
+        // matches the per-tx fee_rate (sat/vB) and CPFP packages with
+        // high-fee children outrank unrelated standalone txs at the same
+        // raw fee.
+        let roots = self.txs.iter().filter(|(_, e)| e.ancestors.is_empty()).map(|(txid, e)| {
+            let (fee, vsize) = e
+                .descendants
+                .iter()
+                .filter_map(|d| self.txs.get(d))
+                .fold((e.fee, e.vsize), |(f, v), d| (f.saturating_add(d.fee), v.saturating_add(d.vsize)));
+            (*txid, fee, vsize)
+        });
 
-        if let Some((txid, _)) = worst_root {
+        if let Some(txid) = pick_eviction_victim(roots) {
             debug!("Mempool: evicting lowest-package root {}", txid);
             self.evict_with_descendants(&txid);
             true
@@ -1361,6 +1348,29 @@ impl Mempool {
             one_forty_four_blocks: fee_at_block(144),
         }
     }
+}
+
+/// Which root package capacity eviction drops next, from `(root txid,
+/// package fee, package vsize)`: the lowest package fee rate, compared
+/// exactly (`fee_a * vsize_b` vs `fee_b * vsize_a`), ties broken by the
+/// smaller txid. Deterministic (not HashMap order), so the admission
+/// check's replay and the real eviction loop always pick the same root.
+fn pick_eviction_victim(roots: impl Iterator<Item = (Txid, u64, u64)>) -> Option<Txid> {
+    let mut worst: Option<(Txid, u64, u64)> = None;
+    for (txid, fee, vsize) in roots {
+        let is_worse = match worst {
+            None => true,
+            Some((w_txid, w_fee, w_vsize)) => {
+                let this = fee as u128 * w_vsize.max(1) as u128;
+                let that = w_fee as u128 * vsize.max(1) as u128;
+                this < that || (this == that && txid < w_txid)
+            }
+        };
+        if is_worse {
+            worst = Some((txid, fee, vsize));
+        }
+    }
+    worst.map(|(txid, _, _)| txid)
 }
 
 /// Mempool entry information exposed to the wallet RPC.
@@ -1471,6 +1481,13 @@ fn is_standard_bare_multisig(spk: &bitcoin::Script) -> bool {
 pub enum MempoolError {
     CoinbaseTx,
     MalformedTx,
+    /// Two inputs spend the same outpoint (CheckTransaction,
+    /// `bad-txns-inputs-duplicate`). Consensus-invalid.
+    DuplicateInput { input_index: usize },
+    /// An output, the output total or the input total exceeds MAX_MONEY
+    /// (`bad-txns-vout-toolarge`, `bad-txns-txouttotal-toolarge`,
+    /// `bad-txns-inputvalues-outofrange`). Consensus-invalid.
+    ValueOutOfRange { what: &'static str, amount: u64 },
     AlreadyInMempool,
     MissingInput { txid: Txid, vout: u32 },
     ImmatureCoinbase { input_index: usize, coinbase_height: u32 },
@@ -1551,6 +1568,12 @@ impl std::fmt::Display for MempoolError {
         match self {
             MempoolError::CoinbaseTx => write!(f, "coinbase transactions are not allowed in mempool"),
             MempoolError::MalformedTx => write!(f, "transaction has empty inputs or outputs"),
+            MempoolError::DuplicateInput { input_index } => {
+                write!(f, "input {} spends an outpoint an earlier input already spends", input_index)
+            }
+            MempoolError::ValueOutOfRange { what, amount } => {
+                write!(f, "{} of {} sats exceeds MAX_MONEY", what, amount)
+            }
             MempoolError::AlreadyInMempool => write!(f, "transaction already in mempool"),
             MempoolError::MissingInput { txid, vout } => {
                 write!(f, "input {}:{} not found in UTXO set", txid, vout)
@@ -2830,5 +2853,662 @@ mod tests {
                 e
             );
         }
+    }
+
+    // ── Data-path pass: CheckTransaction parity, exact policy boundaries,
+    //    capacity eviction and graph invariants ─────────────────────────
+
+    const ALL_MODES: [AcceptMode; 3] = [AcceptMode::Relay, AcceptMode::Own, AcceptMode::SkipConsensus];
+
+    fn accept_in(
+        pool: &mut Mempool,
+        tx: Transaction,
+        utxo: &UtxoSet,
+        height: u32,
+        mode: AcceptMode,
+    ) -> Result<Txid, MempoolError> {
+        pool.accept_tx_internal(tx, utxo, height, &synthetic_times, mode)
+    }
+
+    /// An `OP_TRUE` coin: spendable with an empty scriptSig, so the real
+    /// script check (`Relay` / `Own` modes) passes without signatures.
+    fn seed_op_true(utxo: &UtxoSet, id: u8, amount: u64, height: u32, coinbase: bool) -> OutPoint {
+        utxo.test_insert_utxo(
+            [id; 32],
+            0,
+            UtxoEntry { amount, script_pubkey: vec![0x51], height, is_coinbase: coinbase },
+        )
+        .unwrap();
+        OutPoint { txid: seed_txid(id), vout: 0 }
+    }
+
+    fn p2wpkh_out(value: u64) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20])),
+        }
+    }
+
+    fn spend_ops(inputs: &[OutPoint], outputs: Vec<TxOut>) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|op| TxIn {
+                    previous_output: *op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: outputs,
+        }
+    }
+
+    /// A spend of `input` paying `value`, padded with an OP_RETURN output
+    /// (4 WU per byte) and, for weights that aren't a multiple of 4, one
+    /// witness item (1 WU per byte), to a weight of exactly `target`.
+    fn tx_with_weight(input: (Txid, u32), value: u64, target: u64) -> Transaction {
+        let build = |pad: usize, witness: Option<usize>| {
+            let mut tx = make_tx(&[input], &[value]);
+            let mut script = vec![0x6a];
+            script.resize(1 + pad, 0);
+            tx.output.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(script) });
+            if let Some(len) = witness {
+                tx.input[0].witness = Witness::from_slice(&[vec![0u8; len]]);
+            }
+            tx
+        };
+        let w0 = |pad| build(pad, None).weight().to_wu();
+        let mut pad = (target.saturating_sub(w0(0)) / 4).saturating_sub(80) as usize;
+        loop {
+            let base = w0(pad);
+            assert!(base <= target, "overshot weight {}", target);
+            let tx = if (target - base) % 4 == 0 && target - base < 4 {
+                Some(build(pad, None))
+            } else if target - base >= 4 && target - base - 4 <= 252 {
+                // Marker + flag + item count + item length = 4 WU.
+                Some(build(pad, Some((target - base - 4) as usize)))
+            } else {
+                None
+            };
+            if let Some(tx) = tx {
+                assert_eq!(tx.weight().to_wu(), target);
+                return tx;
+            }
+            pad += 1;
+        }
+    }
+
+    /// Bitcoin Core's CheckTransaction `bad-txns-inputs-duplicate`: a tx
+    /// spending one coin twice is consensus-invalid. Accepting it would
+    /// count the coin's value twice and relay a tx Core peers punish us for.
+    #[test]
+    fn duplicate_input_is_rejected_in_every_mode() {
+        for mode in ALL_MODES {
+            let (utxo, _d) = fresh_utxo();
+            let coin = seed_op_true(&utxo, 1, 100_000, 1, false);
+            // Pays more than the coin is worth: only valid if counted twice.
+            let tx = spend_ops(&[coin, coin], vec![p2wpkh_out(150_000)]);
+            let err = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode).unwrap_err();
+            assert!(matches!(err, MempoolError::DuplicateInput { input_index: 1 }), "{:?}: {:?}", mode, err);
+        }
+    }
+
+    /// CheckTransaction's MoneyRange checks: each output and the output
+    /// total at most MAX_MONEY (`bad-txns-vout-toolarge`,
+    /// `bad-txns-txouttotal-toolarge`), and CheckTxInputs' input total
+    /// (`bad-txns-inputvalues-outofrange`).
+    #[test]
+    fn value_ranges_match_check_transaction() {
+        const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+        for mode in ALL_MODES {
+            let (utxo, _d) = fresh_utxo();
+            let a = seed_op_true(&utxo, 1, MAX_MONEY, 1, false);
+            let b = seed_op_true(&utxo, 2, MAX_MONEY, 1, false);
+            let c = seed_op_true(&utxo, 3, 1_000_000, 1, false);
+            let cases = [
+                ("one output above MAX_MONEY", vec![p2wpkh_out(MAX_MONEY + 1), p2wpkh_out(MAX_MONEY - 51_000)]),
+                ("outputs totalling above MAX_MONEY", vec![p2wpkh_out(MAX_MONEY), p2wpkh_out(MAX_MONEY - 50_000)]),
+            ];
+            for (what, outputs) in cases {
+                let tx = spend_ops(&[a, b], outputs);
+                let err = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode).unwrap_err();
+                assert!(matches!(err, MempoolError::ValueOutOfRange { .. }), "{:?} {}: {:?}", mode, what, err);
+            }
+            // Inputs above MAX_MONEY in total, outputs fine.
+            let tx = spend_ops(&[a, c], vec![p2wpkh_out(MAX_MONEY), p2wpkh_out(950_000)]);
+            let err = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode).unwrap_err();
+            assert!(matches!(err, MempoolError::ValueOutOfRange { .. }), "{:?} input total: {:?}", mode, err);
+            // Exactly MAX_MONEY in and out (less the fee) is fine.
+            let tx = spend_ops(&[a], vec![p2wpkh_out(MAX_MONEY - 50_000)]);
+            accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode).unwrap();
+        }
+    }
+
+    /// Core's mempool judges maturity for the next block (spend height =
+    /// tip + 1), exactly as block validation would: a coinbase from height
+    /// 100 can be mined at 200, so it is accepted with the tip at 199.
+    #[test]
+    fn coinbase_spend_is_judged_for_the_next_block() {
+        for mode in ALL_MODES {
+            let (utxo, _d) = fresh_utxo();
+            let coin = seed_op_true(&utxo, 1, 100_000, 100, true);
+            let tx = spend_ops(&[coin], vec![p2wpkh_out(90_000)]);
+            let err = accept_in(&mut Mempool::new(), tx.clone(), &utxo, 198, mode).unwrap_err();
+            assert!(
+                matches!(err, MempoolError::ImmatureCoinbase { coinbase_height: 100, .. }),
+                "{:?}: {:?}",
+                mode,
+                err
+            );
+            accept_in(&mut Mempool::new(), tx, &utxo, 199, mode)
+                .unwrap_or_else(|e| panic!("{:?}: mature in block 200, rejected at tip 199: {:?}", mode, e));
+        }
+    }
+
+    #[test]
+    fn min_relay_fee_boundary_is_one_sat_per_vbyte() {
+        let (utxo, _d) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+        let vsize = make_tx(&[(seed_txid(1), 0)], &[0]).vsize() as u64;
+        let short = make_tx(&[(seed_txid(1), 0)], &[1_000_000 - (vsize - 1)]);
+        assert!(matches!(
+            Mempool::new().accept_tx_test(short, &utxo, TEST_HEIGHT),
+            Err(MempoolError::InsufficientFee { .. })
+        ));
+        let exact = make_tx(&[(seed_txid(1), 0)], &[1_000_000 - vsize]);
+        Mempool::new().accept_tx_test(exact, &utxo, TEST_HEIGHT).unwrap();
+    }
+
+    #[test]
+    fn absurd_fee_boundary_is_inclusive() {
+        let (utxo, _d) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 100_000_000);
+        let at = make_tx(&[(seed_txid(1), 0)], &[100_000_000 - ABSURD_FEE_THRESHOLD]);
+        Mempool::new().accept_tx_test(at, &utxo, TEST_HEIGHT).unwrap();
+        let over = make_tx(&[(seed_txid(1), 0)], &[100_000_000 - ABSURD_FEE_THRESHOLD - 1]);
+        assert!(matches!(
+            Mempool::new().accept_tx_test(over, &utxo, TEST_HEIGHT),
+            Err(MempoolError::AbsurdFee { fee, .. }) if fee == ABSURD_FEE_THRESHOLD + 1
+        ));
+    }
+
+    /// The flat dust floor today: 546 sats for every output type, OP_RETURN
+    /// exempt.
+    #[test]
+    fn dust_floor_is_546_and_op_return_is_exempt() {
+        let (utxo, _d) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+        let at = make_tx(&[(seed_txid(1), 0)], &[DUST_THRESHOLD, 900_000]);
+        Mempool::new().accept_tx_test(at, &utxo, TEST_HEIGHT).unwrap();
+        let below = make_tx(&[(seed_txid(1), 0)], &[DUST_THRESHOLD - 1, 900_000]);
+        assert!(matches!(
+            Mempool::new().accept_tx_test(below, &utxo, TEST_HEIGHT),
+            Err(MempoolError::DustOutput { index: 0, amount: 545 })
+        ));
+        let mut op_return = make_tx(&[(seed_txid(1), 0)], &[0, 900_000]);
+        op_return.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]);
+        Mempool::new().accept_tx_test(op_return, &utxo, TEST_HEIGHT).unwrap();
+    }
+
+    /// Core's `GetDustThreshold` at the default 3 sat/vB dust relay fee is
+    /// per output type; a flat 546 refuses outputs the network relays
+    /// (e.g. a 330-sat P2TR output, common for Lightning anchors and
+    /// ordinals-free taproot change).
+    #[test]
+    #[ignore = "BUG (policy): dust threshold is a flat 546 sats; Core uses per-type thresholds (P2WPKH 294, P2TR/P2WSH 330, P2SH 540, P2PKH 546)"]
+    fn dust_threshold_is_per_output_type_like_core() {
+        use bitcoin::key::XOnlyPublicKey;
+        let xonly = XOnlyPublicKey::from_slice(&[
+            0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07,
+            0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ])
+        .unwrap();
+        let scripts: [(&str, ScriptBuf, u64); 5] = [
+            ("p2wpkh", ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([1; 20])), 294),
+            ("p2tr", ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly)), 330),
+            ("p2wsh", ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([1; 32])), 330),
+            ("p2sh", ScriptBuf::new_p2sh(&bitcoin::ScriptHash::from_byte_array([1; 20])), 540),
+            ("p2pkh", ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([1; 20])), 546),
+        ];
+        for (what, spk, threshold) in scripts {
+            for (value, ok) in [(threshold - 1, false), (threshold, true)] {
+                let (utxo, _d) = fresh_utxo();
+                seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+                let mut tx = make_tx(&[(seed_txid(1), 0)], &[value, 900_000]);
+                tx.output[0].script_pubkey = spk.clone();
+                let r = Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT);
+                assert_eq!(r.is_ok(), ok, "{} output of {} sats: {:?}", what, value, r);
+            }
+        }
+    }
+
+    /// MAX_TX_WEIGHT is inclusive, judged in weight units (not vbytes).
+    #[test]
+    fn weight_limit_is_exactly_400000_wu() {
+        let (utxo, _d) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 10_000_000);
+        let at = tx_with_weight((seed_txid(1), 0), 9_800_000, MAX_TX_WEIGHT);
+        Mempool::new().accept_tx_test(at, &utxo, TEST_HEIGHT).unwrap();
+        let over = tx_with_weight((seed_txid(1), 0), 9_800_000, MAX_TX_WEIGHT + 1);
+        assert!(matches!(
+            Mempool::new().accept_tx_test(over, &utxo, TEST_HEIGHT),
+            Err(MempoolError::OversizedTx { weight }) if weight == MAX_TX_WEIGHT + 1
+        ));
+    }
+
+    /// vsize is ceil(weight / 4): a child of weight 8,000 (2,000 vB) fits
+    /// a 99,000 vB parent's 101,000 vB package; 8,001 WU rounds up to
+    /// 2,001 vB and doesn't.
+    #[test]
+    fn ancestor_package_vsize_limit_is_exact_and_rounds_vsize_up() {
+        for (child_weight, ok) in [(8_000u64, true), (8_001, false)] {
+            let (utxo, _d) = fresh_utxo();
+            seed_utxo(&utxo, seed_txid(1), 0, 10_000_000);
+            let mut pool = Mempool::new();
+            let parent = tx_with_weight((seed_txid(1), 0), 9_800_000, 396_000);
+            assert_eq!(parent.vsize(), 99_000);
+            let parent_txid = pool.accept_tx_test(parent, &utxo, TEST_HEIGHT).unwrap();
+            let child = tx_with_weight((parent_txid, 0), 9_700_000, child_weight);
+            let r = pool.accept_tx_test(child, &utxo, TEST_HEIGHT);
+            if ok {
+                let txid = r.unwrap();
+                assert_eq!(pool.get_entry_info(&txid).unwrap().vsize, 2_000);
+                assert_eq!(pool.get_entry_info(&txid).unwrap().ancestor_vsize, 99_000);
+            } else {
+                assert!(
+                    matches!(r, Err(MempoolError::AncestorSetTooLarge { vbytes: 101_001, .. })),
+                    "{:?}",
+                    r
+                );
+            }
+        }
+    }
+
+    /// BIP 125 rule 3 at its exact boundary: the replacement must pay the
+    /// evicted fees plus its own vsize at the incremental relay fee.
+    #[test]
+    fn rbf_absolute_fee_boundary_is_exact() {
+        let r = seed_txid(1);
+        let setup = || {
+            let (utxo, d) = fresh_utxo();
+            seed_utxo(&utxo, r, 0, 1_000_000);
+            let mut pool = Mempool::new();
+            pool.accept_tx_test(make_tx_marked(&[(r, 0)], &[990_000], 0xa), &utxo, TEST_HEIGHT).unwrap();
+            (utxo, d, pool)
+        };
+        let vsize = make_tx_marked(&[(r, 0)], &[0], 0xb).vsize() as u64;
+        let required = 10_000 + vsize;
+
+        let (utxo, _d, mut pool) = setup();
+        let short = make_tx_marked(&[(r, 0)], &[1_000_000 - (required - 1)], 0xb);
+        assert!(matches!(
+            pool.accept_tx_test(short, &utxo, TEST_HEIGHT),
+            Err(MempoolError::ReplacementFeeInsufficient { provided, required: req, .. })
+                if provided == required - 1 && req == required
+        ));
+        assert_eq!(pool.count(), 1);
+
+        let (utxo, _d, mut pool) = setup();
+        let exact = make_tx_marked(&[(r, 0)], &[1_000_000 - required], 0xb);
+        let txid = pool.accept_tx_test(exact, &utxo, TEST_HEIGHT).unwrap();
+        assert_eq!(pool.get_all_txids(), vec![txid]);
+    }
+
+    /// BIP 125 rule 5 (Core's MAX_REPLACEMENT_CANDIDATES): a replacement
+    /// may evict 100 transactions, not 101.
+    #[test]
+    fn rbf_eviction_limit_is_exactly_100() {
+        for (extra_child, ok) in [(false, true), (true, false)] {
+            let (utxo, _d) = fresh_utxo();
+            let mut pool = Mempool::new();
+            let mut roots_inputs = vec![];
+            // 5 roots x (1 + 19 fan-out children) = 100 transactions.
+            for i in 0..5u8 {
+                let coin = seed_txid(10 + i);
+                seed_utxo(&utxo, coin, 0, 1_000_000);
+                roots_inputs.push((coin, 0));
+                let children = if extra_child && i == 0 { 20 } else { 19 };
+                let mut outs: Vec<u64> = vec![10_000; children];
+                outs.push(1_000_000 - children as u64 * 10_000 - 1_000);
+                let root = pool.accept_tx_test(make_tx(&[(coin, 0)], &outs), &utxo, TEST_HEIGHT).unwrap();
+                for v in 0..children as u32 {
+                    pool.accept_tx_test(make_tx(&[(root, v)], &[9_000]), &utxo, TEST_HEIGHT).unwrap();
+                }
+            }
+            let before = pool.count();
+            let replacement = make_tx_marked(&roots_inputs, &[4_700_000], 0xee);
+            let r = pool.accept_tx_test(replacement, &utxo, TEST_HEIGHT);
+            if ok {
+                assert_eq!(before, 100);
+                let txid = r.unwrap();
+                assert_eq!(pool.get_all_txids(), vec![txid]);
+            } else {
+                assert_eq!(before, 101);
+                assert!(
+                    matches!(r, Err(MempoolError::TooManyReplacements { evicted: 101, limit: 100 })),
+                    "{:?}",
+                    r
+                );
+                assert_eq!(pool.count(), 101, "a refused replacement evicts nothing");
+            }
+        }
+    }
+
+    /// Core (and Knots) refuse a replacement that spends an unconfirmed
+    /// output none of the originals spent (`replacement-adds-unconfirmed`,
+    /// BIP 125 rule 2). Hercules deliberately allows it (see
+    /// `rbf_allows_replacement_with_existing_mempool_parent`).
+    #[test]
+    #[ignore = "DIVERGENCE (policy, deliberate per rbf_allows_replacement_with_existing_mempool_parent): Core rejects replacement-adds-unconfirmed; owner to decide"]
+    fn rbf_replacement_adding_new_unconfirmed_input_is_rejected_like_core() {
+        let (utxo, _d) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+        seed_utxo(&utxo, seed_txid(2), 0, 1_000_000);
+        let mut pool = Mempool::new();
+        let a = pool.accept_tx_test(make_tx_marked(&[(seed_txid(1), 0)], &[990_000], 1), &utxo, TEST_HEIGHT).unwrap();
+        let p = pool.accept_tx_test(make_tx(&[(seed_txid(2), 0)], &[990_000]), &utxo, TEST_HEIGHT).unwrap();
+        let repl = make_tx_marked(&[(seed_txid(1), 0), (p, 0)], &[1_900_000], 2);
+        assert!(pool.accept_tx_test(repl, &utxo, TEST_HEIGHT).is_err());
+        assert!(pool.contains(&a));
+    }
+
+    /// A block confirming a tx that conflicts with a mempool tx evicts the
+    /// mempool tx and its whole package, and nothing else.
+    #[test]
+    fn confirmed_conflict_evicts_the_losing_package_only() {
+        let (utxo, _d) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+        seed_utxo(&utxo, seed_txid(2), 0, 1_000_000);
+        let mut pool = Mempool::new();
+        let a = pool.accept_tx_test(make_tx(&[(seed_txid(1), 0)], &[990_000]), &utxo, TEST_HEIGHT).unwrap();
+        let a_child = pool.accept_tx_test(make_tx(&[(a, 0)], &[980_000]), &utxo, TEST_HEIGHT).unwrap();
+        let other = pool.accept_tx_test(make_tx(&[(seed_txid(2), 0)], &[990_000]), &utxo, TEST_HEIGHT).unwrap();
+        let rival = make_tx_marked(&[(seed_txid(1), 0)], &[500_000], 0x77);
+        let block = Block {
+            header: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header,
+            txdata: vec![rival],
+        };
+        pool.remove_confirmed(&block);
+        assert!(!pool.contains(&a) && !pool.contains(&a_child));
+        assert_eq!(pool.get_all_txids(), vec![other]);
+        assert!(pool.spends.len() == 1 && pool.total_size == pool.txs[&other].size);
+    }
+
+    #[test]
+    fn entry_info_counts_include_self() {
+        let (utxo, _d) = fresh_utxo();
+        seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+        let mut pool = Mempool::new();
+        let a = pool.accept_tx_test(make_tx(&[(seed_txid(1), 0)], &[990_000]), &utxo, TEST_HEIGHT).unwrap();
+        let b = pool.accept_tx_test(make_tx(&[(a, 0)], &[980_000]), &utxo, TEST_HEIGHT).unwrap();
+        let ia = pool.get_entry_info(&a).unwrap();
+        let ib = pool.get_entry_info(&b).unwrap();
+        assert_eq!((ia.ancestor_count, ia.descendant_count), (1, 2));
+        assert_eq!((ib.ancestor_count, ib.descendant_count), (2, 1));
+        assert_eq!((ib.ancestor_fee, ib.ancestor_vsize), (ia.fee, ia.vsize));
+        assert_eq!(ia.fee, 10_000);
+        assert!(pool.get_entry_info(&seed_txid(9)).is_none());
+        assert_eq!(pool.min_fee_rate(), ia.fee_rate.min(ib.fee_rate));
+    }
+
+    #[test]
+    fn fee_estimates_are_floored_and_monotone_in_target() {
+        assert_eq!(Mempool::new().estimate_fee_rates().one_block, 1.0);
+        let (utxo, _d) = fresh_utxo();
+        let mut pool = Mempool::new();
+        // 40 txs of ~99 kvB each: ~1 block of weight per 10 txs, at fee
+        // rates 2..=41 sat/vB.
+        for i in 0..40u8 {
+            seed_utxo(&utxo, seed_txid(i), 0, 10_000_000);
+            let probe = tx_with_weight((seed_txid(i), 0), 0, 396_000);
+            let fee = probe.vsize() as u64 * (2 + i as u64);
+            pool.accept_tx_test(tx_with_weight((seed_txid(i), 0), 10_000_000 - fee, 396_000), &utxo, TEST_HEIGHT)
+                .unwrap();
+        }
+        let e = pool.estimate_fee_rates();
+        let all = [e.one_block, e.six_blocks, e.twelve_blocks, e.twenty_four_blocks, e.one_forty_four_blocks];
+        assert!(all.windows(2).all(|w| w[0] >= w[1]), "{:?}", all);
+        assert!(all.iter().all(|r| *r >= 1.0));
+        // The first block fills at the 11th-best rate (10 x 396k WU < 4M WU,
+        // 11 x 396k > 4M): rate 41 - 10 = 31.
+        assert!((e.one_block - 31.0).abs() < 0.01, "{}", e.one_block);
+        // Everything fits in 6 blocks: the floor of the cheapest tx's rate.
+        assert!((e.six_blocks - 2.0).abs() < 0.01, "{}", e.six_blocks);
+    }
+
+    /// Capacity eviction must never evict the transaction `accept_tx` just
+    /// accepted (the Phase 6.5 promise; only a `debug_assert` backs it).
+    /// Regression: with two packages at the same fee rate the admission
+    /// check assumed the incumbent goes, while the real loop took
+    /// whichever root HashMap iteration reached first.
+    #[test]
+    fn full_pool_fee_rate_tie_never_evicts_the_accepted_tx() {
+        for round in 0..64 {
+            let (utxo, _d) = fresh_utxo();
+            seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+            seed_utxo(&utxo, seed_txid(2), 0, 1_000_000);
+            let a = make_tx_marked(&[(seed_txid(1), 0)], &[990_000], 0xa);
+            let size = serialize(&a).len();
+            let mut pool = Mempool::with_max_size(size + size / 2);
+            pool.accept_tx_test(a, &utxo, TEST_HEIGHT).unwrap();
+            let b = make_tx_marked(&[(seed_txid(2), 0)], &[990_000], 0xb);
+            if let Ok(txid) = pool.accept_tx_test(b, &utxo, TEST_HEIGHT) {
+                assert!(pool.contains(&txid), "round {}: accepted then evicted", round);
+            }
+            assert!(pool.size() <= pool.max_size);
+        }
+    }
+
+    /// Same promise with a descendant shared by two roots. Regression: the
+    /// admission check counted the shared child once per root package, so
+    /// it thought two evictions freed more than they do (and never
+    /// re-ranked the second root after it lost the child).
+    #[test]
+    fn full_pool_shared_descendant_never_evicts_the_accepted_tx() {
+        for round in 0..16 {
+            let (utxo, _d) = fresh_utxo();
+            for i in 1..=3u8 {
+                seed_utxo(&utxo, seed_txid(i), 0, 10_000_000);
+            }
+            let vs = |t: &Transaction| t.vsize() as u64;
+            // R1 at 1 sat/vB, R2 at 10 sat/vB, D (spends both) at 1 sat/vB,
+            // N (unrelated, large) at 5 sat/vB.
+            let r1_v = vs(&make_tx(&[(seed_txid(1), 0)], &[0]));
+            let r1 = make_tx(&[(seed_txid(1), 0)], &[10_000_000 - r1_v]);
+            let r2 = make_tx(&[(seed_txid(2), 0)], &[10_000_000 - 10 * r1_v]);
+            let (r1_id, r2_id) = (r1.compute_txid(), r2.compute_txid());
+            let d_v = vs(&make_tx(&[(r1_id, 0), (r2_id, 0)], &[0]));
+            let d = make_tx(&[(r1_id, 0), (r2_id, 0)], &[20_000_000 - 11 * r1_v - d_v]);
+            let n_v = vs(&tx_with_weight((seed_txid(3), 0), 0, 1_400));
+            let n = tx_with_weight((seed_txid(3), 0), 10_000_000 - 5 * n_v, 1_400);
+            let sz = |t: &Transaction| serialize(t).len();
+            // Big enough for R1+R2+D; after N arrives, evicting R1's package
+            // (R1+D) is not enough, but the simulation subtracts D again
+            // with R2's package and concludes N fits.
+            let cap = sz(&n) - sz(&d) + 2;
+            assert!(cap >= sz(&r1) + sz(&r2) + sz(&d) && cap < sz(&r2) + sz(&n), "scenario setup");
+            let mut pool = Mempool::with_max_size(cap);
+            for tx in [r1.clone(), r2.clone(), d.clone()] {
+                pool.accept_tx_test(tx, &utxo, TEST_HEIGHT).unwrap();
+            }
+            // Package rates: R1+D < R2+D < N < R2 alone.
+            let pkg = |a: &Transaction, fee_a: u64| (fee_a + d_v) as f64 / (vs(a) + d_v) as f64;
+            assert!(pkg(&r1, r1_v) < pkg(&r2, 10 * r1_v) && pkg(&r2, 10 * r1_v) < 5.0);
+            assert!(pool.fee_rate(&r2_id).unwrap() > 5.0);
+            if let Ok(txid) = pool.accept_tx_test(n, &utxo, TEST_HEIGHT) {
+                assert!(pool.contains(&txid), "round {}: accepted then evicted", round);
+            }
+            assert!(pool.size() <= pool.max_size);
+        }
+    }
+
+    /// A coinbase whose txid is unique per height (scriptSig = height).
+    fn unique_coinbase(height: u32) -> Transaction {
+        let mut cb = make_tx(&[(seed_txid(0), 0)], &[1]);
+        cb.input[0].previous_output = OutPoint::null();
+        cb.input[0].script_sig = ScriptBuf::from_bytes(height.to_le_bytes().to_vec());
+        cb
+    }
+
+    /// Every graph field `accept_tx`, RBF, `remove_confirmed`, capacity
+    /// eviction and expiry maintain incrementally must equal what a full
+    /// recomputation from the pool's transactions gives, after every step
+    /// of random operation sequences.
+    fn assert_graph_invariants(pool: &Mempool, utxo: &UtxoSet) {
+        let total: usize = pool.txs.values().map(|e| e.size).sum();
+        assert_eq!(pool.total_size, total, "total_size");
+        assert!(pool.total_size <= pool.max_size, "over capacity");
+        let mut spends: HashMap<(Txid, u32), Txid> = HashMap::new();
+        for (txid, e) in &pool.txs {
+            assert_eq!(e.tx.compute_txid(), *txid);
+            assert_eq!(e.size, serialize(&e.tx).len());
+            assert_eq!(e.vsize, e.tx.vsize() as u64);
+            let parents: HashSet<Txid> = e
+                .tx
+                .input
+                .iter()
+                .map(|i| i.previous_output.txid)
+                .filter(|t| pool.txs.contains_key(t))
+                .collect();
+            assert_eq!(e.parents, parents, "parents of {}", txid);
+            for i in &e.tx.input {
+                let op = (i.previous_output.txid, i.previous_output.vout);
+                assert!(spends.insert(op, *txid).is_none(), "two pool txs spend {:?}", op);
+                let from_pool = pool
+                    .txs
+                    .get(&op.0)
+                    .is_some_and(|p| (op.1 as usize) < p.tx.output.len());
+                let confirmed = utxo.get(&op.0, op.1).unwrap().is_some();
+                assert!(from_pool || confirmed, "{} has an orphaned input {:?}", txid, op);
+            }
+            let mut ancestors = HashSet::new();
+            let mut stack: Vec<Txid> = parents.into_iter().collect();
+            while let Some(t) = stack.pop() {
+                if ancestors.insert(t) {
+                    stack.extend(pool.txs[&t].parents.iter().copied());
+                }
+            }
+            assert_eq!(e.ancestors, ancestors, "ancestors of {}", txid);
+            assert_eq!(e.ancestor_fee, ancestors.iter().map(|t| pool.txs[t].fee).sum::<u64>());
+            assert_eq!(e.ancestor_vsize, ancestors.iter().map(|t| pool.txs[t].vsize).sum::<u64>());
+            let descendants: HashSet<Txid> =
+                pool.txs.iter().filter(|(_, d)| d.ancestors.contains(txid)).map(|(t, _)| *t).collect();
+            assert_eq!(e.descendants, descendants, "descendants of {}", txid);
+            assert!(e.ancestors.len() < MAX_ANCESTORS && e.descendants.len() < MAX_DESCENDANTS);
+        }
+        assert_eq!(pool.spends, spends, "spends index");
+    }
+
+    #[test]
+    fn graph_state_matches_recomputation_after_random_operations() {
+        use proptest::test_runner::{Config, TestRunner};
+        let mut runner = TestRunner::new(Config { cases: 48, ..Config::default() });
+        runner
+            .run(&(proptest::prelude::any::<u64>(), 1500usize..6000), |(seed, cap)| {
+                let mut rng = seed;
+                let mut next = move |n: u64| {
+                    rng = rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    let mut z = rng;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    (z ^ (z >> 31)) % n.max(1)
+                };
+                let (utxo, _d) = fresh_utxo();
+                for i in 0..16u8 {
+                    seed_utxo(&utxo, seed_txid(i), 0, 1_000_000);
+                }
+                let mut pool = Mempool::with_max_size(cap);
+                let mut height = TEST_HEIGHT;
+                for step in 0..60 {
+                    // Candidate coins: confirmed seeds and every pool output.
+                    let mut coins: Vec<(Txid, u32, u64)> = (0..16u8)
+                        .filter_map(|i| utxo.get(&seed_txid(i), 0).unwrap().map(|u| (seed_txid(i), 0, u.amount)))
+                        .collect();
+                    let mut ids: Vec<Txid> = pool.txs.keys().copied().collect();
+                    ids.sort();
+                    for t in &ids {
+                        for (v, o) in pool.txs[t].tx.output.iter().enumerate() {
+                            coins.push((*t, v as u32, o.value.to_sat()));
+                        }
+                    }
+                    match next(10) {
+                        0..=6 if !coins.is_empty() => {
+                            // New tx (may double-spend: exercises RBF).
+                            let n_in = 1 + next(2) as usize;
+                            let mut ins = vec![];
+                            for _ in 0..n_in {
+                                let c = coins[next(coins.len() as u64) as usize];
+                                if !ins.iter().any(|x: &(Txid, u32, u64)| x.0 == c.0 && x.1 == c.1) {
+                                    ins.push(c);
+                                }
+                            }
+                            let value: u64 = ins.iter().map(|c| c.2).sum();
+                            let n_out = 1 + next(3);
+                            let fee = 200 + next(20_000);
+                            if value < fee + n_out * 1_000 {
+                                continue;
+                            }
+                            let each = (value - fee) / n_out;
+                            let outs: Vec<u64> = (0..n_out).map(|_| each).collect();
+                            let inputs: Vec<(Txid, u32)> = ins.iter().map(|c| (c.0, c.1)).collect();
+                            let tx = make_tx_marked(&inputs, &outs, step as u8);
+                            if let Ok(txid) = pool.accept_tx_test(tx, &utxo, height) {
+                                assert!(pool.contains(&txid));
+                            }
+                        }
+                        7 if !ids.is_empty() => {
+                            // Confirm a random root (block also lands in the UTXO set).
+                            let roots: Vec<Txid> =
+                                ids.iter().copied().filter(|t| pool.txs[t].ancestors.is_empty()).collect();
+                            let root = roots[next(roots.len() as u64) as usize];
+                            let tx = pool.txs[&root].tx.clone();
+                            height += 1;
+                            let block = Block {
+                                header: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header,
+                                txdata: vec![unique_coinbase(height), tx],
+                            };
+                            utxo.apply_block(&block, height).unwrap();
+                            pool.remove_confirmed(&block);
+                        }
+                        8 if !ids.is_empty() => {
+                            // A rival spend of a random pool tx's confirmed input confirms.
+                            let victim = &pool.txs[&ids[next(ids.len() as u64) as usize]].tx;
+                            let Some(confirmed) = victim
+                                .input
+                                .iter()
+                                .find(|i| utxo.get(&i.previous_output.txid, i.previous_output.vout).unwrap().is_some())
+                            else {
+                                continue;
+                            };
+                            let rival = make_tx_marked(
+                                &[(confirmed.previous_output.txid, confirmed.previous_output.vout)],
+                                &[1_000],
+                                0xfe,
+                            );
+                            height += 1;
+                            let block = Block {
+                                header: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header,
+                                txdata: vec![unique_coinbase(height), rival],
+                            };
+                            utxo.apply_block(&block, height).unwrap();
+                            pool.remove_confirmed(&block);
+                        }
+                        9 if !ids.is_empty() => {
+                            let t = ids[next(ids.len() as u64) as usize];
+                            pool.txs.get_mut(&t).unwrap().added_at = Instant::now()
+                                .checked_sub(MAX_TX_AGE + std::time::Duration::from_secs(1))
+                                .unwrap();
+                            pool.expire_old();
+                        }
+                        _ => {}
+                    }
+                    assert_graph_invariants(&pool, &utxo);
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }
