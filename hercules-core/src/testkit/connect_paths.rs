@@ -403,16 +403,22 @@ fn snapshot_node_synced_past_floor(chain: &FixtureChain, anchor: u32) -> (Node, 
     (node, a, b)
 }
 
-/// The ticket's interrupted reset: the header database is gone but the
-/// snapshot-loaded UTXO env, validated well past its floor with undo
-/// pruned, survived. Activation must not roll that set back to the floor
-/// (deleting outputs and restoring nothing, then condemning the honest
-/// block above the floor): it wipes the set and asks for a re-import.
+/// The ticket's interrupted reset, where the network no longer follows
+/// the set's chain: the header database is gone, and the snapshot-loaded
+/// UTXO env survived, validated past its floor (undo pruned) on a chain
+/// that forks from what our peers now serve above the floor. Activation
+/// must not roll that set back to the floor (deleting outputs and
+/// restoring nothing, then condemning the honest block above the floor):
+/// it wipes the set and asks for a re-import.
 #[test]
-fn interrupted_reset_with_snapshot_set_wipes_instead_of_corrupting() {
+fn interrupted_reset_with_snapshot_set_off_our_chain_is_wiped() {
     let chain = spending_chain(140);
     let (node, a, b) = snapshot_node_synced_past_floor(&chain, 110);
-    let mut node = node.restart_after(&[&a, &b], remove_headers);
+    drop((a, b));
+    let mut other = chain.fork_at(120);
+    other.mine(30);
+    let (c, d) = honest_pair(&other);
+    let mut node = node.restart_after(&[&c, &d], remove_headers);
     node.hs.prune_window = SMALL;
     assert_eq!(node.validated(), 0);
     assert!(!node.hs.needs_snapshot().unwrap(), "set still there before activation");
@@ -425,13 +431,37 @@ fn interrupted_reset_with_snapshot_set_wipes_instead_of_corrupting() {
     assert_eq!(node.hs.utxo.assume_valid_floor().unwrap(), 0);
     assert!(!node.hs.utxo.load_in_progress(), "wipe left its marker");
     assert!(node.hs.store.failed_hashes().unwrap().is_empty(), "honest block condemned");
-    for p in [&a, &b] {
+    for p in [&c, &d] {
         assert!(!node.is_banned(&p.addr()));
     }
 }
 
-/// The same reset in genesis mode: the set is wiped at open (it is far
-/// above `validated_height`), and the node re-syncs it from genesis.
+/// The same lost headers with the set on the chain our peers serve (an
+/// interrupted reset, or a power loss that dropped the header store's
+/// commits): once headers reach the set's block it is kept and activated
+/// at its own height, with nothing re-downloaded.
+#[test]
+fn snapshot_set_ahead_on_our_chain_is_kept_when_headers_are_lost() {
+    let chain = spending_chain(140);
+    let (node, a, b) = snapshot_node_synced_past_floor(&chain, 110);
+    drop((a, b));
+    let (c, d) = honest_pair(&chain);
+    let mut node = node.restart_after(&[&c, &d], remove_headers);
+    node.hs.prune_window = SMALL;
+    assert_eq!(node.validated(), 0);
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&chain));
+    assert!(ok, "{:?}, validated {}", res, node.validated());
+    node.assert_utxos_match(&chain);
+    assert_eq!(node.hs.utxo.assume_valid_floor().unwrap(), 110, "set was replaced");
+    for p in [&c, &d] {
+        assert!(p.block_requests().is_empty(), "re-downloaded blocks: {:?}", p.block_requests());
+    }
+}
+
+/// The same reset in genesis mode: the set is far above `validated_height`
+/// at open, its block isn't in our (now empty) header chain and its undo
+/// is pruned, so it is wiped there, and the node re-syncs from genesis.
 #[test]
 fn interrupted_reset_with_genesis_set_is_wiped_and_resynced() {
     let chain = spending_chain(130);
@@ -451,32 +481,131 @@ fn interrupted_reset_with_genesis_set_is_wiped_and_resynced() {
     assert!(node.hs.store.failed_hashes().unwrap().is_empty());
 }
 
-/// Activation requires the set to be exactly the snapshot: one with a
-/// block applied on top is wiped instead of activated.
+/// Apply `blocks` (heights from `from`) to the UTXO set without advancing
+/// `validated_height`: what survives a power loss that drops the header
+/// store's commits but keeps LMDB's.
+fn apply_only(node: &Node, chain: &FixtureChain, from: u32, to: u32) {
+    for h in from..=to {
+        node.hs.utxo.apply_block(chain.block(h), h).unwrap();
+    }
+}
+
+/// Review (PR #32): a set several blocks above `validated_height` on our
+/// own header chain is the truth, not a foreign set: `validated_height` is
+/// raised to it at open, nothing is wiped, and sync carries on from there.
 #[test]
-fn activation_wipes_a_set_that_is_not_at_the_snapshot() {
-    const ANCHOR: u32 = 110;
+fn set_ahead_on_our_chain_raises_validated_height_at_open() {
     let chain = spending_chain(120);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(110));
+    let headers: Vec<Header> = (111..=115).map(|h| chain.block(h).header).collect();
+    node.hs.store.store_headers(&headers, 111).unwrap();
+    apply_only(&node, &chain, 111, 115);
+    let (a, b) = honest_pair(&chain);
+    let node = node.restart(&[&a, &b]);
+    assert_eq!(node.validated(), 115, "validated_height not repaired");
+    assert_eq!(node.hs.utxo.best_block().unwrap(), Some((115, chain.hash_at(115).to_byte_array())));
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&chain));
+    assert!(ok, "{:?}", res);
+    node.assert_utxos_match(&chain);
+    for p in [&a, &b] {
+        for hash in p.block_requests() {
+            let h = node.hs.store.find_height_of_hash(hash).unwrap().unwrap();
+            assert!(h > 115, "re-fetched block {}", h);
+        }
+    }
+}
+
+/// A set several blocks ahead on a chain that isn't ours, with its undo
+/// still there, is not wiped at open: the next connect rolls it back to
+/// our chain and sync continues.
+#[test]
+fn set_ahead_on_another_chain_is_rolled_back_not_wiped() {
+    let chain = spending_chain(120);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &chain.prefix(110));
+    let mut other = chain.prefix(110).fork_at(110);
+    other.mine(5);
+    apply_only(&node, &other, 111, 115);
+    let count = node.hs.utxo.count().unwrap();
+    let (a, b) = honest_pair(&chain);
+    let node = node.restart(&[&a, &b]);
+    assert_eq!(node.validated(), 110);
+    assert_eq!(node.hs.utxo.count().unwrap(), count, "set wiped");
+    assert_eq!(node.hs.utxo.best_block().unwrap().map(|b| b.0), Some(115));
+
+    let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&chain));
+    assert!(ok, "{:?}", res);
+    node.assert_utxos_match(&chain);
+    assert!(node.hs.store.failed_hashes().unwrap().is_empty());
+}
+
+/// A node holding a snapshot of `chain` at `anchor`, pending (no headers).
+fn pending_snapshot_node(chain: &FixtureChain, anchor: u32) -> Node {
     let mut donor = Node::new(&[]);
-    presync(&mut donor, &chain.prefix(ANCHOR));
+    presync(&mut donor, &chain.prefix(anchor));
     let mut buf = Vec::new();
-    let block_hash = chain.hash_at(ANCHOR).to_byte_array();
-    let meta = donor.hs.utxo.write_snapshot(&mut buf, ANCHOR, &block_hash).unwrap();
+    let block_hash = chain.hash_at(anchor).to_byte_array();
+    let meta = donor.hs.utxo.write_snapshot(&mut buf, anchor, &block_hash).unwrap();
 
     let mut node = Node::new(&[]);
     let path = node.dir.path().join("snapshot.hutx");
     std::fs::write(&path, &buf).unwrap();
     node.hs.anchor = SnapshotAnchor {
-        height: ANCHOR,
+        height: anchor,
         block_hash,
         utxo_hash: meta.utxo_hash,
         utxo_count: meta.utxo_count,
     };
     node.hs.load_snapshot(path.to_str().unwrap(), |_, _| true).unwrap();
     assert!(!node.hs.activate_pending_snapshot().unwrap(), "pending without headers");
+    node
+}
 
-    // Something moved the set off the floor while it was pending.
-    node.hs.utxo.apply_block(chain.block(ANCHOR + 1), ANCHOR + 1).unwrap();
+fn store_chain_headers(node: &Node, chain: &FixtureChain) {
+    let headers: Vec<Header> = (1..=chain.tip_height()).map(|h| chain.block(h).header).collect();
+    node.hs.store.store_headers(&headers, 1).unwrap();
+}
+
+/// Activation of a pending snapshot whose set has moved off the floor:
+/// it waits until headers reach the set's block, then activates at that
+/// block when it is on our chain, activates at the floor (for the next
+/// connect to roll it back) when it isn't but its undo reaches the floor,
+/// and wipes it only when neither is possible.
+#[test]
+fn activation_of_a_set_off_the_floor_repairs_rolls_back_or_wipes() {
+    const ANCHOR: u32 = 110;
+    let chain = spending_chain(120);
+    let mut other = chain.prefix(ANCHOR).fork_at(ANCHOR);
+    other.mine(2);
+
+    // On our chain.
+    let node = pending_snapshot_node(&chain, ANCHOR);
+    apply_only(&node, &chain, ANCHOR + 1, ANCHOR + 3);
+    assert!(!node.hs.activate_pending_snapshot().unwrap(), "decided before headers reached the set");
+    assert_eq!(node.hs.utxo.best_block().unwrap().map(|b| b.0), Some(ANCHOR + 3));
+    store_chain_headers(&node, &chain);
+    assert!(node.hs.activate_pending_snapshot().unwrap());
+    assert_eq!(node.validated(), ANCHOR + 3);
+
+    // Another chain, undo intact: activated at the floor, then rolled back.
+    let mut node = pending_snapshot_node(&chain, ANCHOR);
+    apply_only(&node, &other, ANCHOR + 1, ANCHOR + 2);
+    store_chain_headers(&node, &chain);
+    assert!(node.hs.activate_pending_snapshot().unwrap());
+    assert_eq!(node.validated(), ANCHOR);
+    let (a, b) = honest_pair(&chain);
+    node.use_peers(&[&a, &b]);
+    let status = node.hs.catch_up_blocks(20, 30).unwrap();
+    assert!(status.caught_up, "{:?}", status);
+    node.assert_utxos_match(&chain);
+
+    // Another chain, undo pruned past the floor: wiped.
+    let node = pending_snapshot_node(&chain, ANCHOR);
+    apply_only(&node, &other, ANCHOR + 1, ANCHOR + 2);
+    node.hs.utxo.prune_undo_below(ANCHOR + 2).unwrap();
+    store_chain_headers(&node, &chain);
     let err = node.hs.activate_pending_snapshot().unwrap_err();
     assert!(format!("{}", err).contains("import the snapshot again"), "{}", err);
     assert_eq!(node.hs.utxo.count().unwrap(), 0);

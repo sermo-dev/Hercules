@@ -70,6 +70,25 @@ impl HeaderStore {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| StoreError(format!("set WAL: {}", e)))?;
 
+        // Durable commits, matching the UTXO env (ticket 050 review): LMDB
+        // commits with F_FULLFSYNC on Apple, and a plain fsync there only
+        // reaches the drive's cache, so without this a power loss could
+        // keep a block's UTXO apply and drop the `set_validated_height` (or
+        // headers) committed after it. `synchronous = FULL` syncs the WAL on
+        // every commit (NORMAL wouldn't in WAL mode), `fullfsync` makes
+        // that sync an F_FULLFSYNC, `checkpoint_fullfsync` the same for
+        // checkpoints. Cost: one F_FULLFSYNC per commit (a few ms to tens of
+        // ms on iOS flash), i.e. per header batch and per connected block,
+        // next to the one LMDB already pays. No-ops off Apple platforms.
+        for (pragma, value) in [
+            ("synchronous", "FULL"),
+            ("fullfsync", "ON"),
+            ("checkpoint_fullfsync", "ON"),
+        ] {
+            conn.pragma_update(None, pragma, value)
+                .map_err(|e| StoreError(format!("set {}: {}", pragma, e)))?;
+        }
+
         let version = check_schema_version(&conn, "header store", HEADERS_SCHEMA_VERSION)
             .map_err(StoreError)?;
 

@@ -935,13 +935,18 @@ impl HeaderSync {
         }
 
         // Ticket 050: a UTXO set more than one block above
-        // `validated_height` that isn't a snapshot still waiting for its
-        // headers (`activate_pending_snapshot` checks those) wasn't built
-        // from this header chain: nothing else leaves it there. A reset
-        // that lost the headers but kept the env (before resets wrote the
-        // marker first) did. Rolling it back to our chain would cross its
-        // pruned undo data, so wipe it instead.
-        if let Some((utxo_height, _)) =
+        // `validated_height` (a pending snapshot is `activate_pending_
+        // snapshot`'s to judge). The UTXO set is the truth when its block is
+        // on our header chain: LMDB commits are durable before the header
+        // store's, so a power loss can drop the last `set_validated_height`
+        // commits and keep the applies. Raise `validated_height` to it, as
+        // the repair below lowers it. A set whose block isn't on our chain
+        // is left for the normal rollback (`utxo_has_block`) while its undo
+        // reaches back to `validated_height`, and wiped only when it
+        // doesn't: rolling it back would then delete outputs and restore
+        // nothing. That is the interrupted reset (before resets wrote the
+        // marker first), which lost the headers but kept the env.
+        if let Some((utxo_height, utxo_hash)) =
             utxo.best_block().map_err(|e| SyncError::Store(format!("{}", e)))?
         {
             let validated = store
@@ -952,12 +957,37 @@ impl HeaderSync {
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
             let pending_snapshot = floor > 0 && validated < floor;
             if !pending_snapshot && utxo_height > validated.saturating_add(1) {
-                warn!(
-                    "UTXO set is at block {} but validated_height is {}: not built from these \
-                     headers (interrupted reset?); wiping it",
-                    utxo_height, validated
-                );
-                utxo.wipe().map_err(|e| SyncError::Store(format!("{}", e)))?;
+                let on_chain = store
+                    .get_hash_at_height(utxo_height)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?
+                    .map(|h| h.to_byte_array())
+                    == Some(utxo_hash);
+                let undo_from = utxo
+                    .undo_pruned_below()
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                if on_chain {
+                    warn!(
+                        "UTXO set is at block {} of our header chain but validated_height is {} \
+                         (lost header-store commits); raising it",
+                        utxo_height, validated
+                    );
+                    store
+                        .set_validated_height(utxo_height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                } else if validated.max(floor) + 1 < undo_from {
+                    warn!(
+                        "UTXO set is at block {} (not on our header chain), validated_height is \
+                         {} and undo below {} is pruned, so it can't be rolled back: wiping it",
+                        utxo_height, validated, undo_from
+                    );
+                    utxo.wipe().map_err(|e| SyncError::Store(format!("{}", e)))?;
+                } else {
+                    warn!(
+                        "UTXO set is at block {} (not on our header chain), validated_height is \
+                         {}: the next connect rolls it back",
+                        utxo_height, validated
+                    );
+                }
             }
         }
 
@@ -1187,12 +1217,16 @@ impl HeaderSync {
     /// activated) and `false` while headers haven't reached the snapshot,
     /// or while the UTXO env holds a partial load (`.loading` marker).
     ///
-    /// Ticket 050: the set must still be exactly the snapshot (best block
-    /// `(floor, snapshot hash)`). One that isn't, e.g. a set that kept
-    /// validating past the floor and then lost its headers in an
-    /// interrupted reset, is wiped (crash-safely) instead of activated, and
-    /// the snapshot has to be imported again. Activating it would roll it
-    /// back across pruned undo data to the floor.
+    /// Ticket 050: the set must be the snapshot (best block `(floor,
+    /// snapshot hash)`), or descend from it. A set ahead of the floor on our
+    /// header chain (validated from the snapshot, then the header store
+    /// lost its commits) is activated at its own height; one ahead on
+    /// another chain is activated at the floor and rolled back by the next
+    /// connect, if its undo reaches the floor. Otherwise, e.g. an
+    /// interrupted reset that kept a set validated past the floor on a
+    /// chain our headers no longer follow, it is wiped (crash-safely) and
+    /// the snapshot has to be imported again: rolling it back would cross
+    /// pruned undo data.
     fn activate_pending_snapshot(&self) -> Result<bool, SyncError> {
         // Partial, unverified rows: nothing may validate against them, in
         // genesis mode either (a failed load writes no floor).
@@ -1232,29 +1266,69 @@ impl HeaderSync {
             }
         };
 
-        // A set loaded before the best-block marker (ticket 024) has none;
-        // pending since then, nothing can have moved it off the floor.
+        // The set should be exactly the snapshot. A set loaded before the
+        // best-block marker (ticket 024) has none; pending since then,
+        // nothing can have moved it off the floor.
         let best = self
             .utxo
             .best_block()
             .map_err(|e| SyncError::Store(format!("{}", e)))?;
-        if best.is_some_and(|b| b != (floor, expected)) {
-            let (height, hash) = best.unwrap();
-            warn!(
-                "Pending snapshot at {} but the UTXO set is at block {} (height {}); wiping it",
-                floor,
-                BlockHash::from_byte_array(hash),
-                height
-            );
-            self.utxo
-                .wipe()
+        if let Some((height, hash)) = best.filter(|b| *b != (floor, expected)) {
+            let header_at = |h: u32| -> Result<Option<[u8; 32]>, SyncError> {
+                Ok(self
+                    .store
+                    .get_hash_at_height(h)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?
+                    .map(|b| b.to_byte_array()))
+            };
+            if height > floor {
+                // Ahead of the floor: validated from the snapshot, with
+                // the activation (or later `set_validated_height`) commits
+                // lost, or kept by an interrupted reset. Which chain it is
+                // on can't be told until our headers reach its height.
+                // Headers 0..count: they reach `height` iff count > height.
+                let count = self.store.count().map_err(|e| SyncError::Store(format!("{}", e)))?;
+                if count <= height {
+                    return Ok(false);
+                }
+                if header_at(height)? == Some(hash) && header_at(floor)? == Some(expected) {
+                    warn!(
+                        "Pending snapshot at {} but the UTXO set is at block {} of our header \
+                         chain (lost header-store commits); activating at {}",
+                        floor, height, height
+                    );
+                    self.store
+                        .set_validated_height(height)
+                        .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                    return Ok(true);
+                }
+            }
+            // Not on our chain. If its undo reaches back to the floor, the
+            // activation below lets the next connect roll it back there;
+            // otherwise (or below the floor, where nothing can be undone)
+            // it can never become the snapshot again.
+            let undo_from = self
+                .utxo
+                .undo_pruned_below()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
-            forget_utxo_verdicts(&self.store, self.peers_db_path.as_deref())?;
-            return Err(SyncError::Store(format!(
-                "the UTXO set was not the snapshot at height {} (it was at {}), so it was \
-                 wiped: import the snapshot again",
-                floor, height
-            )));
+            if height <= floor || floor + 1 < undo_from {
+                warn!(
+                    "Pending snapshot at {} but the UTXO set is at block {} (height {}), not on \
+                     our header chain and not rollable back to the floor; wiping it",
+                    floor,
+                    BlockHash::from_byte_array(hash),
+                    height
+                );
+                self.utxo
+                    .wipe()
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?;
+                forget_utxo_verdicts(&self.store, self.peers_db_path.as_deref())?;
+                return Err(SyncError::Store(format!(
+                    "the UTXO set was not the snapshot at height {} (it was at {}), so it was \
+                     wiped: import the snapshot again",
+                    floor, height
+                )));
+            }
         }
 
         match self
@@ -2071,9 +2145,11 @@ impl HeaderSync {
     /// path then can't roll back past. Blocks are also held back by the
     /// prune lock (`set_prune_floor`).
     ///
-    /// Once the block store is down to its window, a processing-length wake
+    /// Only in a call that found the block store already inside its window
+    /// (no block prune due), a processing-length wake
     /// (`ConnectCtx::has_maintenance_time`) migrates a pre-050 file to
-    /// incremental auto-vacuum, once per process.
+    /// incremental auto-vacuum, once per process and only with the disk
+    /// space for it (`BlockStore::migrate_auto_vacuum`).
     fn maybe_prune(&self, validated: u32, ctx: ConnectCtx) -> Result<(), SyncError> {
         let store_err = |e: &dyn std::fmt::Display| SyncError::Store(e.to_string());
         let PruneWindow { keep, slack, step, lock_max_hold } = self.prune_window;
@@ -2110,13 +2186,18 @@ impl HeaderSync {
                 .needs_auto_vacuum_migration()
                 .map_err(|e| store_err(&e))?
         {
+            // Once per process, done or not: a skip for disk space (or a
+            // failure) is retried by the next wake's process.
             self.vacuum_attempted.store(true, Ordering::Relaxed);
             info!("Block store: one-time migration to incremental auto-vacuum");
             let started = Instant::now();
-            self.block_store
+            if self
+                .block_store
                 .migrate_auto_vacuum()
-                .map_err(|e| store_err(&e))?;
-            info!("Block store migrated in {} ms", started.elapsed().as_millis());
+                .map_err(|e| store_err(&e))?
+            {
+                info!("Block store migrated in {} ms", started.elapsed().as_millis());
+            }
         }
         Ok(())
     }
