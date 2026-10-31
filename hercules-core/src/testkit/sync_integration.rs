@@ -135,15 +135,9 @@ impl Node {
     /// then stop it. Returns `body`'s result and `sync()`'s return value.
     pub(super) fn run_sync<R>(&self, body: impl FnOnce(&HeaderSync) -> R) -> (R, Result<(), SyncError>) {
         std::thread::scope(|s| {
-            let handle = s.spawn(|| self.hs.sync(|_| {}));
+            let sync = SyncThread::new(&self.hs, s.spawn(|| self.hs.sync(|_| {})));
             let r = body(&self.hs);
-            // `sync()` clears the stop flag on entry, so keep asking until
-            // it has actually returned.
-            while !handle.is_finished() {
-                self.hs.stop_sync();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            (r, handle.join().expect("sync thread panicked"))
+            (r, sync.stop())
         })
     }
 
@@ -152,22 +146,21 @@ impl Node {
     fn sync_errors_for(&self, window: Duration) -> (Vec<String>, Result<(), SyncError>) {
         let errors = Mutex::new(Vec::new());
         let res = std::thread::scope(|s| {
-            let handle = s.spawn(|| {
-                self.hs.sync(|st| {
-                    if let Some(e) = st.error {
-                        errors.lock().unwrap().push(e);
-                    }
-                })
-            });
+            let sync = SyncThread::new(
+                &self.hs,
+                s.spawn(|| {
+                    self.hs.sync(|st| {
+                        if let Some(e) = st.error {
+                            errors.lock().unwrap().push(e);
+                        }
+                    })
+                }),
+            );
             let start = Instant::now();
-            while start.elapsed() < window && !handle.is_finished() {
+            while start.elapsed() < window && !sync.is_finished() {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            while !handle.is_finished() {
-                self.hs.stop_sync();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            handle.join().expect("sync thread panicked")
+            sync.stop()
         });
         (errors.into_inner().unwrap(), res)
     }
@@ -183,13 +176,9 @@ impl Node {
         done: impl Fn(&HeaderSync) -> bool,
     ) -> (bool, Result<(), SyncError>) {
         std::thread::scope(|s| {
-            let handle = s.spawn(|| self.hs.sync(|_| {}));
-            let ok = wait_for(&self.hs, stall, &done, &|| handle.is_finished());
-            while !handle.is_finished() {
-                self.hs.stop_sync();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            (ok, handle.join().expect("sync thread panicked"))
+            let sync = SyncThread::new(&self.hs, s.spawn(|| self.hs.sync(|_| {})));
+            let ok = wait_for(&self.hs, stall, &done, &|| sync.is_finished());
+            (ok, sync.stop())
         })
     }
 
@@ -203,24 +192,61 @@ impl Node {
         event: impl Fn(&HeaderSync) -> bool,
     ) -> (bool, Result<(), SyncError>) {
         std::thread::scope(|s| {
-            let handle = s.spawn(|| self.hs.sync(|_| {}));
+            let sync = SyncThread::new(&self.hs, s.spawn(|| self.hs.sync(|_| {})));
             let start = Instant::now();
             let mut happened = event(&self.hs);
-            while !happened && start.elapsed() < window && !handle.is_finished() {
+            while !happened && start.elapsed() < window && !sync.is_finished() {
                 std::thread::sleep(Duration::from_millis(20));
                 happened = event(&self.hs);
             }
-            while !handle.is_finished() {
-                self.hs.stop_sync();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            (happened, handle.join().expect("sync thread panicked"))
+            (happened, sync.stop())
         })
     }
 
     /// `sync_window` with no event: just let the node run for `window`.
     pub(super) fn sync_for(&self, window: Duration) -> Result<(), SyncError> {
         self.sync_window(window, |_| false).1
+    }
+}
+
+/// A `sync()` running on a scoped thread, stopped when the test is done
+/// with it. Stopping on drop matters when the test body panics (a failed
+/// assertion or `unwrap` in a `done` check): the scope then waits for the
+/// sync thread, which nobody would otherwise stop, and the test hangs
+/// until CI cancels the run instead of failing with the panic.
+struct SyncThread<'scope, 'env> {
+    hs: &'env HeaderSync,
+    handle: Option<std::thread::ScopedJoinHandle<'scope, Result<(), SyncError>>>,
+}
+
+impl<'scope, 'env> SyncThread<'scope, 'env> {
+    fn new(hs: &'env HeaderSync, handle: std::thread::ScopedJoinHandle<'scope, Result<(), SyncError>>) -> Self {
+        SyncThread { hs, handle: Some(handle) }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.as_ref().map_or(true, |h| h.is_finished())
+    }
+
+    /// `sync()` clears the stop flag on entry, so keep asking until it
+    /// has actually returned.
+    fn stop_and_wait(&self) {
+        while !self.is_finished() {
+            self.hs.stop_sync();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Stop `sync()` and return its result.
+    fn stop(mut self) -> Result<(), SyncError> {
+        self.stop_and_wait();
+        self.handle.take().unwrap().join().expect("sync thread panicked")
+    }
+}
+
+impl Drop for SyncThread<'_, '_> {
+    fn drop(&mut self) {
+        self.stop_and_wait();
     }
 }
 
