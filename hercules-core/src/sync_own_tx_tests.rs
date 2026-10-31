@@ -399,7 +399,7 @@ fn confirmation_stops_tracking_and_conflict_drops() {
 
     // Block confirms tx, and a different spend of tx2's input.
     let double_spend = spend(tx2.input[0].previous_output, 80_000);
-    hs.on_block_connected(&block_with(vec![tx.clone(), double_spend.clone()]), VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block_with(vec![tx.clone(), double_spend.clone()]), VALIDATED + 1);
 
     assert!(!hs.mempool.lock().unwrap().contains(&txid));
     assert!(!hs.mempool.lock().unwrap().contains(&txid2));
@@ -625,7 +625,7 @@ fn replaced_original_confirming_conflicts_the_replacement() {
     let b = hs.submit_own_tx(&raw(&spend(prev, 90_000))).unwrap().txid;
     assert_eq!(hs.own_tx_status(&a).unwrap().unwrap().status, OwnTxStatus::Replaced { by: b });
 
-    hs.on_block_connected(&block_with(vec![a_tx]), VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block_with(vec![a_tx]), VALIDATED + 1);
     assert_eq!(
         hs.own_tx_status(&a).unwrap().unwrap().status,
         OwnTxStatus::Confirmed { height: VALIDATED + 1 }
@@ -644,7 +644,7 @@ fn open_undoes_settlements_above_validated_height() {
         let hs = fresh(&dir);
         let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
         hs.submit_own_tx(&raw(&tx)).unwrap();
-        hs.on_block_connected(&block_with(vec![tx.clone()]), VALIDATED + 1).unwrap();
+        hs.on_block_connected(&block_with(vec![tx.clone()]), VALIDATED + 1);
         // ...crash here, before set_validated_height(VALIDATED + 1).
         tx
     };
@@ -652,7 +652,7 @@ fn open_undoes_settlements_above_validated_height() {
     let hs = fresh(&dir);
     assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending);
     // Re-applying the block (crash-recovery path) settles it again.
-    hs.on_block_connected(&block_with(vec![tx]), VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block_with(vec![tx]), VALIDATED + 1);
     hs.store.set_validated_height(VALIDATED + 1).unwrap();
     drop(hs);
     // Opened with the validated height caught up: left alone.
@@ -676,7 +676,7 @@ fn reorg_path_unsettles_and_rebroadcasts_own_tx() {
     // takes (UTXO apply, block hook, validated height).
     let block = block_with(vec![tx]);
     hs.utxo.apply_block(&block, VALIDATED + 1).unwrap();
-    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block, VALIDATED + 1);
     hs.store.set_validated_height(VALIDATED + 1).unwrap();
     assert_eq!(
         hs.own_tx_status(&txid).unwrap().unwrap().status,
@@ -756,10 +756,10 @@ fn own_child_of_a_dead_foreign_parent_is_settled_end_to_end() {
     let d = hs.submit_own_tx(&raw(&spend(out0(&q), 90_000))).unwrap().txid;
     let rival = spend(coin, 70_000);
     let block = block_with(vec![rival.clone()]);
-    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block, VALIDATED + 1);
     assert_eq!(status(&hs, &d), OwnTxStatus::Conflicted { by: rival.compute_txid() });
     assert_stream_settled(&hs);
-    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block, VALIDATED + 1);
     assert_eq!(status(&hs, &d), OwnTxStatus::Conflicted { by: rival.compute_txid() });
     hs.own_txs.demote_confirmed_above(VALIDATED, unix_now_u32() as u64).unwrap();
     assert_eq!(status(&hs, &d), OwnTxStatus::Pending, "block conflicts are reorg-undoable");
@@ -814,7 +814,7 @@ fn reorg_readds_a_disconnected_own_tx_below_the_rolling_minimum() {
     let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
     let block = block_with(vec![tx]);
     hs.utxo.apply_block(&block, VALIDATED + 1).unwrap();
-    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block, VALIDATED + 1);
     hs.store.set_validated_height(VALIDATED + 1).unwrap();
     assert_eq!(status(&hs, &txid), OwnTxStatus::Confirmed { height: VALIDATED + 1 });
 
@@ -955,4 +955,46 @@ fn missing_input_with_the_utxo_set_caught_up_is_resolved_on_chain() {
     hs.own_txs.demote_confirmed_above(VALIDATED, unix_now_u32() as u64).unwrap();
     assert_eq!(status(&hs, &a), OwnTxStatus::Pending);
     assert_eq!(status(&hs, &b), OwnTxStatus::Pending);
+}
+
+/// PR #36 review: a broken own-tx tracker never stops the node. With the
+/// tracker failing, a block confirming an own tx still connects through
+/// `connect_block` and the validated height advances; the status says
+/// tracking is behind; the maintenance retry keeps trying, and once the
+/// fault clears the tx ends up confirmed at that block.
+#[test]
+fn own_tx_tracker_failure_never_stops_a_block_connect() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
+    // Block VALIDATED+1 with its header stored, already applied to the
+    // UTXO set, so `connect_block` takes its recovery branch (which
+    // doesn't re-run `check_block` on this synthetic block) and then runs
+    // the same store / hook / validated-height steps as any connect.
+    let mut block = block_with(vec![tx]);
+    block.header.prev_blockhash = hs.store.get_hash_at_height(VALIDATED).unwrap().unwrap();
+    hs.store.store_headers(&[block.header], VALIDATED + 1).unwrap();
+    hs.utxo.apply_block(&block, VALIDATED + 1).unwrap();
+
+    hs.own_txs.fail_hooks.store(true, Ordering::Relaxed);
+    assert!(
+        hs.connect_block(&block, VALIDATED + 1, ConnectCtx::foreground()).is_ok(),
+        "connect must not depend on the tracker"
+    );
+    assert_eq!(hs.store.validated_height().unwrap(), VALIDATED + 1);
+    assert!(!hs.mempool.lock().unwrap().contains(&txid));
+    assert_eq!(status(&hs, &txid), OwnTxStatus::Pending);
+    let err = hs.own_tx_tracking_error().expect("status reports tracking behind");
+    assert!(err.contains("transaction tracking is behind"), "{}", err);
+
+    hs.retry_own_tx_tracking();
+    assert_eq!(status(&hs, &txid), OwnTxStatus::Pending, "still failing");
+    assert!(hs.own_tx_tracking_error().is_some());
+
+    hs.own_txs.fail_hooks.store(false, Ordering::Relaxed);
+    hs.retry_own_tx_tracking();
+    assert_eq!(status(&hs, &txid), OwnTxStatus::Confirmed { height: VALIDATED + 1 });
+    assert!(hs.own_tx_tracking_error().is_none());
+    assert_stream_settled(&hs);
 }

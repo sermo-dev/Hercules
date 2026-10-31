@@ -47,6 +47,22 @@ compile_error!(
      `--features script-differential` (tests only)"
 );
 
+// Every build links the patched libbitcoinconsensus v26 for the policy-flag
+// pass (ticket 053). Next to libbitcoinkernel that is only safe where its
+// build seals it (Apple targets, `patches/bitcoinconsensus/build.rs`
+// `seal_archives`): both embed the same Core sources (SHA256, secp256k1,
+// SignatureHash, ...) under identical global names, and an unsealed static
+// link silently binds both libraries to one copy.
+#[cfg(all(feature = "script-kernel", not(target_vendor = "apple")))]
+compile_error!(
+    "the kernel backend links libbitcoinconsensus v26 beside libbitcoinkernel (the ticket 053 \
+     policy-flag pass), which is safe only on Apple targets, where build.rs seals the v26 \
+     archive; elsewhere ~300 duplicate Core/secp256k1 symbols would silently resolve to one \
+     library. Build with `--no-default-features --features script-consensus-legacy` here \
+     (e.g. for convert_snapshot on Linux), or teach patches/bitcoinconsensus/build.rs to seal \
+     ELF archives (objcopy --localize-hidden)"
+);
+
 #[cfg(all(feature = "script-differential", not(test), not(debug_assertions)))]
 compile_error!(
     "`script-differential` is a test-only mode (it aborts the process on any backend \

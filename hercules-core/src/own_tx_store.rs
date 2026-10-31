@@ -493,6 +493,10 @@ pub struct OwnTxStore {
     seen_peers: Mutex<HashMap<Txid, HashSet<String>>>,
     /// The same for `delivered_to_peers` (`own_tx_delivered`).
     delivered_peers: Mutex<HashMap<Txid, HashSet<String>>>,
+    /// Test fault: while set, the block and mempool hooks fail as a broken
+    /// database would.
+    #[cfg(test)]
+    pub(crate) fail_hooks: std::sync::atomic::AtomicBool,
 }
 
 /// Statuses `on_block` settles: active ones (confirm or conflict), and
@@ -587,9 +591,24 @@ impl OwnTxStore {
             watched: Mutex::new(HashSet::new()),
             seen_peers: Mutex::new(HashMap::new()),
             delivered_peers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_hooks: std::sync::atomic::AtomicBool::new(false),
         };
         store.refresh_active()?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    fn injected_fault(&self) -> Result<(), OwnTxStoreError> {
+        if self.fail_hooks.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(OwnTxStoreError("injected fault".into()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn injected_fault(&self) -> Result<(), OwnTxStoreError> {
+        Ok(())
     }
 
     fn refresh_active(&self) -> Result<(), OwnTxStoreError> {
@@ -951,6 +970,7 @@ impl OwnTxStore {
     /// Idempotent: re-running it for the same block (crash recovery)
     /// changes nothing more.
     pub fn on_block(&self, block: &Block, height: u32, now: u64) -> Result<usize, OwnTxStoreError> {
+        self.injected_fault()?;
         if self.watched.lock().unwrap().is_empty() {
             return Ok(0);
         }
@@ -1041,6 +1061,7 @@ impl OwnTxStore {
         height: u32,
         now: u64,
     ) -> Result<usize, OwnTxStoreError> {
+        self.injected_fault()?;
         let mut changed = 0;
         for removal in removals {
             if !self.is_active(&removal.txid) {

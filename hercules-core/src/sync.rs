@@ -7,7 +7,7 @@ use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use std::collections::{HashMap, HashSet};
 
@@ -994,6 +994,11 @@ pub struct HeaderSync {
     /// dropped those txs, so this is their only copy. Only events for
     /// active own txs are kept, so it is bounded by the tracker.
     unsettled_removals: Mutex<Vec<(Vec<crate::mempool::MempoolRemoval>, u32)>>,
+    /// Heights whose block `OwnTxStore::on_block` failed on (ticket 053);
+    /// the block connected anyway and `retry_own_tx_tracking` re-runs the
+    /// hook. In memory only: after a restart the chain-side resolution
+    /// (`resolve_missing_own_input`) settles what is left.
+    unsettled_blocks: Mutex<std::collections::BTreeSet<u32>>,
     /// Test kill point: `connect_block` stops after this step once, as if
     /// the process were killed there.
     #[cfg(test)]
@@ -1271,6 +1276,7 @@ impl HeaderSync {
             prune_floor: AtomicU32::new(NO_PRUNE_FLOOR),
             vacuum_attempted: AtomicBool::new(false),
             unsettled_removals: Mutex::new(Vec::new()),
+            unsettled_blocks: Mutex::new(std::collections::BTreeSet::new()),
             #[cfg(test)]
             connect_kill: Mutex::new(None),
             headers_stall_limit: (HEADERS_STALL_GRACE, MIN_HEADERS_RATE),
@@ -2063,10 +2069,9 @@ impl HeaderSync {
     /// the validated height.
     ///
     /// A batch the tracker fails to take is kept and retried first next
-    /// time (`unsettled_removals`); the error is returned so the block
-    /// path can fail the connect (the next connect at that height redoes
-    /// the hooks). Re-applying part of a batch is harmless: settled rows
-    /// are skipped.
+    /// time (`unsettled_removals`, also from the maintenance tick), and the
+    /// status reports tracking as behind until it is taken. Re-applying
+    /// part of a batch is harmless: settled rows are skipped.
     fn settle_mempool_removals(
         &self,
         removals: crate::mempool::MempoolRemovals,
@@ -2215,6 +2220,7 @@ impl HeaderSync {
         // (`MaybeUpdateMempoolForReorg`, `bypass_limits`), so a mined tx
         // isn't lost to a rolling minimum that rose since. Only own txs
         // for now; ticket 025 re-adds every disconnected transaction.
+        self.unsettled_blocks.lock().unwrap().retain(|h| *h <= fork_at);
         let disconnected = self.own_txs.confirmed_above(fork_at).unwrap_or_default();
         let _ = self
             .own_txs
@@ -2439,7 +2445,7 @@ impl HeaderSync {
 
         // The wallet hook (035) joins here and gets `spent`.
         debug!("Connecting block {} at {}: {} coins spent", hash, height, spent.len());
-        self.on_block_connected(block, height).map_err(BlockFailure::Local)?;
+        self.on_block_connected(block, height);
         self.kill_point(ConnectStep::Hooked)?;
 
         self.store
@@ -2990,23 +2996,81 @@ impl HeaderSync {
     /// `remove_confirmed` finds nothing to remove, and settled rows are
     /// skipped).
     ///
-    /// A tracker failure fails the hook, and with it the connect, before
-    /// `set_validated_height` (ticket 053): the next connect at this
-    /// height redoes the hooks, where a logged-and-ignored failure would
-    /// leave an own tx pending although the block confirmed or conflicted
-    /// it. The mempool part has run either way, and its events wait in
-    /// `unsettled_removals`.
-    fn on_block_connected(&self, block: &bitcoin::Block, height: u32) -> Result<(), SyncError> {
+    /// The node's progress never depends on the own-tx tracker, a wallet
+    /// bookkeeping file: a broken `own_txs.sqlite3` must not stop block
+    /// validation. A tracker failure is logged, the block's height kept in
+    /// `unsettled_blocks` (its removal events in `unsettled_removals`),
+    /// and the connect goes on. The maintenance tick retries both
+    /// (`retry_own_tx_tracking`), the status reports tracking as behind
+    /// meanwhile, and anything those retries can't reach (the process
+    /// restarted, the block was pruned) is still settled from the chain
+    /// when the tx's re-add finds its input gone
+    /// (`resolve_missing_own_input`).
+    fn on_block_connected(&self, block: &bitcoin::Block, height: u32) {
         let removals = {
             let mut pool = self.mempool.lock().unwrap();
             pool.remove_confirmed(block);
             pool.drain_removals()
         };
-        let settled = self.settle_mempool_removals(removals, height);
-        self.own_txs
-            .on_block(block, height, unix_now_u32() as u64)
-            .map_err(|e| SyncError::Store(format!("own tx tracker block hook at {}: {}", height, e)))?;
-        settled
+        let _ = self.settle_mempool_removals(removals, height);
+        if let Err(e) = self.own_txs.on_block(block, height, unix_now_u32() as u64) {
+            error!(
+                "Own tx tracker failed on block {} at {}: {}; the block is connected, own txs are \
+                 settled for it once the tracker recovers",
+                block.block_hash(),
+                height,
+                e
+            );
+            self.unsettled_blocks.lock().unwrap().insert(height);
+        }
+    }
+
+    /// Maintenance tick: retry what the own-tx tracker failed to take
+    /// (ticket 053): held removal batches, and `on_block` for each height
+    /// in `unsettled_blocks` whose block is still connected and stored (it
+    /// is idempotent). A height whose block is gone (pruned, or reorged
+    /// away and not yet replaced) is dropped: the chain-side resolution in
+    /// `resolve_missing_own_input` covers it.
+    fn retry_own_tx_tracking(&self) {
+        let _ = self.settle_mempool_removals(crate::mempool::MempoolRemovals::default(), 0);
+        let heights: Vec<u32> = self.unsettled_blocks.lock().unwrap().iter().copied().collect();
+        let validated = self.store.validated_height().unwrap_or(0);
+        for height in heights {
+            let block = (height <= validated)
+                .then(|| self.store.get_hash_at_height(height).ok().flatten())
+                .flatten()
+                .and_then(|h| self.block_store.get_block_by_hash(&h).ok().flatten());
+            let Some(block) = block else {
+                warn!("Own tx tracking: block {} is no longer stored; settling from the chain instead", height);
+                self.unsettled_blocks.lock().unwrap().remove(&height);
+                continue;
+            };
+            match self.own_txs.on_block(&block, height, unix_now_u32() as u64) {
+                Ok(_) => {
+                    info!("Own tx tracker caught up with block {}", height);
+                    self.unsettled_blocks.lock().unwrap().remove(&height);
+                }
+                Err(e) => {
+                    warn!("Own tx tracker still failing at block {}: {}", height, e);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The status error while own-tx tracking is behind the chain
+    /// (`retry_own_tx_tracking` has work left), so the wallet can say its
+    /// transaction statuses may be stale.
+    fn own_tx_tracking_error(&self) -> Option<String> {
+        let blocks = self.unsettled_blocks.lock().unwrap().len();
+        let batches = self.unsettled_removals.lock().unwrap().len();
+        (blocks + batches > 0).then(|| {
+            format!(
+                "transaction tracking is behind ({} blocks, {} mempool updates not yet applied); \
+                 retrying",
+                blocks, batches
+            )
+        })
     }
 
     /// Height of the last block whose scripts were fully validated.
@@ -3439,7 +3503,7 @@ impl HeaderSync {
             active_peer_addr: active_peer_addr.to_string(),
             is_syncing,
             validated_blocks,
-            error,
+            error: error.or_else(|| self.own_tx_tracking_error()),
         }
     }
 
@@ -4481,6 +4545,7 @@ impl HeaderSync {
         if timers.last_maintain.elapsed() >= MAINTENANCE_INTERVAL {
             pool.maintain();
             self.expire_mempool();
+            self.retry_own_tx_tracking();
             self.rebroadcast_due_own_txs(unix_now_u32() as u64);
             self.update_peer_counts(pool);
             // Clean up relay_state: remove entries for disconnected
