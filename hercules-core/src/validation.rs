@@ -7,6 +7,20 @@ use crate::chain_params::ChainParams;
 /// Target time for one difficulty epoch (2016 blocks): 2 weeks.
 const TARGET_TIMESPAN: i64 = 14 * 24 * 60 * 60;
 
+/// Core's `MAX_FUTURE_BLOCK_TIME`: a header may be at most 2 hours ahead
+/// of our clock.
+pub const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
+
+/// The latest header timestamp acceptable now (`MAX_FUTURE_BLOCK_TIME`
+/// past our clock). Later ones are not yet valid (`FutureTimestamp`).
+pub fn max_header_time_now() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+    now.saturating_add(MAX_FUTURE_BLOCK_TIME)
+}
+
 /// Validate a sequence of headers against a known previous header.
 /// Returns Ok(()) if all headers are valid, or an error describing the first invalid header.
 ///
@@ -42,18 +56,20 @@ pub fn validate_headers(
         if !params.no_retargeting && height % 2016 == 0 && height > 0 {
             // Retarget boundary: verify the new target is correctly calculated
             let epoch_start_height = height - 2016;
+            // Our own header store failing to produce the epoch start (a
+            // SQLite error, a missing row) says nothing about the peer's
+            // header: a local fault, never a difficulty verdict (ticket
+            // 052, 024's classes).
             let epoch_start_ts = epoch_start_time(epoch_start_height).map_err(|e| {
-                ValidationError::BadDifficulty {
+                ValidationError::MissingContext {
                     height,
-                    expected: format!("epoch start timestamp at height {}", epoch_start_height),
-                    got: e,
+                    what: format!("epoch start timestamp at height {}: {}", epoch_start_height, e),
                 }
             })?;
 
-            let prev_time = *timestamps.last().ok_or(ValidationError::BadDifficulty {
+            let prev_time = *timestamps.last().ok_or(ValidationError::MissingContext {
                 height,
-                expected: "previous block timestamp".into(),
-                got: "no timestamps available".into(),
+                what: "previous block timestamp".into(),
             })?;
 
             let actual_timespan = prev_time as i64 - epoch_start_ts as i64;
@@ -89,11 +105,19 @@ pub fn validate_headers(
             });
         }
 
-        // 4. Check timestamp is greater than median of last 11 blocks
-        if timestamps.len() >= 11 {
-            let mut recent: Vec<u32> = timestamps[timestamps.len() - 11..].to_vec();
+        // 4. Check timestamp is greater than the median of the previous
+        // 11 blocks, or of all of them below height 11: Core's
+        // GetMedianTimePast walks up to 11 ancestors and takes the middle
+        // of however many it found (`pbegin[(pend - pbegin) / 2]`), so
+        // block 1 must be later than genesis (ticket 052). A caller that
+        // passes fewer timestamps than that window (no history before a
+        // batch's start) gets no check, as before: the median of a partial
+        // window is not Core's median.
+        let window = (height as usize).min(11);
+        if window > 0 && timestamps.len() >= window {
+            let mut recent: Vec<u32> = timestamps[timestamps.len() - window..].to_vec();
             recent.sort();
-            let median = recent[5];
+            let median = recent[window / 2];
             if header.time <= median {
                 return Err(ValidationError::BadTimestamp {
                     height,
@@ -104,11 +128,7 @@ pub fn validate_headers(
         }
 
         // 5. Reject headers more than 2 hours in the future (MAX_FUTURE_BLOCK_TIME)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as u32;
-        let max_future = now.saturating_add(7200); // 2 hours
+        let max_future = max_header_time_now();
         if header.time > max_future {
             return Err(ValidationError::FutureTimestamp {
                 height,
@@ -266,6 +286,46 @@ pub enum ValidationError {
         height: u32,
         version: i32,
     },
+    /// Context we read from our own store to judge the header (the
+    /// retarget epoch's start) was unavailable: a local fault (ticket 052).
+    MissingContext {
+        height: u32,
+        what: String,
+    },
+}
+
+/// What a `ValidationError` says about the peer that sent the headers
+/// (ticket 052, applying 024's classes to headers). Matched exhaustively
+/// in `ValidationError::class`, so a new variant must be classified there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderErrorClass {
+    /// The header breaks a rule no clock or store can change: the sender
+    /// is penalized.
+    Invalid,
+    /// More than two hours ahead of our clock (Core's `time-too-new`,
+    /// `BLOCK_TIME_FUTURE`, which `MaybePunishNodeForBlock` doesn't
+    /// punish): it may become valid, and a phone whose clock runs slow sees
+    /// every honest tip this way. No penalty; the headers before it are
+    /// fine, and it is asked for again later.
+    NotYetValid,
+    /// Our own store failed: nobody else's fault, no penalty.
+    Local,
+}
+
+impl ValidationError {
+    /// Which of the classes above this error is.
+    pub fn class(&self) -> HeaderErrorClass {
+        match self {
+            ValidationError::FutureTimestamp { .. } => HeaderErrorClass::NotYetValid,
+            ValidationError::MissingContext { .. } => HeaderErrorClass::Local,
+            ValidationError::BadPrevHash { .. }
+            | ValidationError::InsufficientPow { .. }
+            | ValidationError::BadTimestamp { .. }
+            | ValidationError::BadDifficulty { .. }
+            | ValidationError::AnchorMismatch { .. }
+            | ValidationError::BadVersion { .. } => HeaderErrorClass::Invalid,
+        }
+    }
 }
 
 impl std::fmt::Display for ValidationError {
@@ -324,6 +384,9 @@ impl std::fmt::Display for ValidationError {
                 "block {} conflicts with the chain anchor: expected {}, got {}",
                 height, expected, got
             ),
+            ValidationError::MissingContext { height, what } => {
+                write!(f, "cannot check block {}: missing local {}", height, what)
+            }
         }
     }
 }
@@ -1163,7 +1226,8 @@ mod tests {
         );
         assert!(result.is_ok(), "{:?}", result);
 
-        // Same input under mainnet rules is a retarget and must be checked.
+        // Same input under mainnet rules is a retarget and must be checked:
+        // the lookup is consulted (and its failure is ours, ticket 052).
         let result = validate_headers(
             ChainParams::mainnet(),
             &[next],
@@ -1173,7 +1237,7 @@ mod tests {
             prev.bits,
             &|_| Err("no epoch start".into()),
         );
-        assert!(matches!(result, Err(ValidationError::BadDifficulty { .. })), "{:?}", result);
+        assert!(matches!(result, Err(ValidationError::MissingContext { height: 2016, .. })), "{:?}", result);
     }
 
     #[test]
@@ -1444,10 +1508,8 @@ mod tests {
     }
 
     /// Core's GetMedianTimePast uses every ancestor when there are fewer
-    /// than 11, so block 1 must be later than genesis. Here the check is
-    /// skipped below 11 ancestors (heights 1..=10).
+    /// than 11, so block 1 must be later than genesis.
     #[test]
-    #[ignore = "BUG (consensus, low severity): MTP rule skipped for headers at heights 1..=10 (fewer than 11 timestamps); Core uses all available ancestors"]
     fn mtp_applies_with_fewer_than_eleven_ancestors() {
         let params = ChainParams::regtest();
         let prev = params.genesis_header();
@@ -1459,7 +1521,6 @@ mod tests {
     /// A failure to read *our own* header store for the epoch start is a
     /// local fault, not evidence against the peer's header.
     #[test]
-    #[ignore = "BUG: a local epoch_start_time lookup failure is reported as BadDifficulty, indistinguishable from an invalid header (the sender can be penalized for our fault)"]
     fn epoch_start_lookup_failure_is_not_a_bad_difficulty_verdict() {
         let (h, _, last, new) = mainnet_retargets().remove(1);
         let r = validate_headers(ChainParams::mainnet(), &[new], last.block_hash(), h - 1, &[last.time], last.bits, &|_| {
@@ -1467,5 +1528,53 @@ mod tests {
         });
         assert!(r.is_err());
         assert!(!matches!(r, Err(ValidationError::BadDifficulty { .. })), "{:?}", r);
+        assert_eq!(r.unwrap_err().class(), HeaderErrorClass::Local);
+    }
+
+    /// The MTP window grows with the chain below height 11: at height 3
+    /// the median is the middle of genesis, 1 and 2 (Core's
+    /// `pbegin[(pend - pbegin) / 2]` of the sorted ancestors), and at
+    /// height 2 the later of the two (index 1 of 2).
+    #[test]
+    fn mtp_window_below_height_eleven_is_every_ancestor() {
+        let params = ChainParams::regtest();
+        let g = params.genesis_header();
+        // Ancestors' times: genesis, g+1000, g+10 (block 2 may be earlier
+        // than block 1 as long as it beats their median).
+        let b1 = regtest_header_at(&g, g.time + 1000);
+        let check_at_2 = |t: u32| {
+            validate_headers(params, &[regtest_header_at(&b1, t)], b1.block_hash(), 1, &[g.time, b1.time], g.bits, &|_| {
+                Err("unused".into())
+            })
+        };
+        // Window {g, g+1000}: index 1 is g+1000.
+        assert!(matches!(check_at_2(g.time + 1000), Err(ValidationError::BadTimestamp { median_past, .. }) if median_past == g.time + 1000));
+        check_at_2(g.time + 1001).expect("past the median of two");
+        let b2 = regtest_header_at(&b1, g.time + 1001);
+        // Window {g, g+1000, g+1001}: median g+1000.
+        let check_at_3 = |t: u32| {
+            validate_headers(params, &[regtest_header_at(&b2, t)], b2.block_hash(), 2, &[g.time, b1.time, b2.time], g.bits, &|_| {
+                Err("unused".into())
+            })
+        };
+        assert!(matches!(check_at_3(g.time + 1000), Err(ValidationError::BadTimestamp { .. })));
+        check_at_3(g.time + 1001).expect("one second past the median of three");
+    }
+
+    /// A header from more than two hours ahead is "not yet valid", not
+    /// invalid, and is past `max_header_time_now` (what sync cuts batches
+    /// at).
+    #[test]
+    fn future_timestamp_is_not_yet_valid() {
+        let params = ChainParams::regtest();
+        let g = params.genesis_header();
+        let a = mined_regtest_header(&g);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let b = regtest_header_at(&a, now + 3 * 3600);
+        let e = validate_headers(params, &[a, b], g.block_hash(), 0, &[g.time], g.bits, &|_| Err("unused".into()))
+            .unwrap_err();
+        assert!(matches!(e, ValidationError::FutureTimestamp { height: 2, .. }), "{:?}", e);
+        assert_eq!(e.class(), HeaderErrorClass::NotYetValid);
+        assert!(b.time > max_header_time_now() && a.time <= max_header_time_now());
     }
 }

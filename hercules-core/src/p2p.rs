@@ -91,14 +91,20 @@ const DNS_SEEDS: &[&str] = &[
     "seed.bitcoin.wiz.biz",
 ];
 
-/// Well-known Bitcoin v3 .onion seed nodes.
-/// These are 56-character base32-encoded v3 onion addresses.
-/// TODO: verify these against Bitcoin Core's current seed list.
+/// Bitcoin v3 .onion seed nodes: eight entries spread across Bitcoin
+/// Core's `contrib/seeds/nodes_main.txt` (master, 2026-10-31). Ticket 052:
+/// every earlier entry failed the v3 checksum, so none was ever dialed;
+/// `onion_seeds_are_valid_v3_addresses` now checks each one. Seeds go
+/// stale: refresh them from Core's list when it is regenerated.
 const ONION_SEEDS: &[&str] = &[
-    "bsqbtcparrfihlwolt4xgjbf4cgqckvrvsfyvy6etgfnhongzoqxziad.onion:8333",
-    "bnpczgbhoyoeg5nai4e4aw2kkxbda47gx2jrlansi6xxne5jrwxfauad.onion:8333",
-    "wizbit5555bsslwv4cqlcc7zsahelqeyaa5kauwcy2b4fhbzab5pwdqd.onion:8333",
-    "2dayzh7uruqtfflmhlt3r2pj2xygkdmcpbezfbml4nbnwrae7zn6eqd.onion:8333",
+    "24yjwaf2ni6wz44pmqpw3jyjhksoko7wxzelp6uyep2pdlgb5epbnoqd.onion:8333",
+    "5mbrhlddl2zgwbmgrtnz2uk6icrr7dtybagtz3afk7axszdssz2gdxad.onion:8333",
+    "czfu73oyemygxnooumke2wlajj52lphvpjwrnv6ys363lvitba7rmzqd.onion:8333",
+    "gh5nop77tdu72smpeswoayaesr7ghbesfg3jnxvneg76gwsxm7h5g7qd.onion:8333",
+    "k4vadrbdwgh5gbxqurkfhi5ab72xthkzkrz24xgbpk4ts3k4ybk4v3yd.onion:8333",
+    "n7ofwmu7rcqg55pxv6catz4ey4lzuxz5kofuu5yuomlr3fkxhbvadeid.onion:8333",
+    "qvl4hqoooka3jogtit34t7g6ru443xaf5g4ld47i6j3tc7nsomsu3fad.onion:8333",
+    "uvb7zm5buued5j4mn2fjwsjmnhyqwpultidczfvqq4laosojhytdiqqd.onion:8333",
 ];
 
 // ── PeerStream ────────────────────────────────────────────────────────
@@ -270,7 +276,22 @@ pub struct Peer {
     /// When the first byte in `partial` arrived: the message must be
     /// complete within `message_allowance` of it.
     partial_since: Option<Instant>,
+    /// When the last complete message arrived (or the connection opened):
+    /// inbound eviction drops the idlest peer (ticket 052).
+    last_recv: Instant,
+    /// Our outstanding `ping` (nonce, sent at), cleared by the matching
+    /// `pong` wherever it is read (`read_message`), and when we last sent
+    /// one: see `keep_alive` (ticket 052).
+    ping_sent: Option<(u64, Instant)>,
+    last_ping: Instant,
 }
+
+/// Core's keep-alive (net_processing `PING_INTERVAL`, net.h
+/// `TIMEOUT_INTERVAL`): a ping every 2 minutes, and a peer that hasn't
+/// answered one in 20 is dropped (ticket 052: a dead inbound connection
+/// otherwise holds its slot for good).
+pub const PING_INTERVAL: Duration = Duration::from_secs(2 * 60);
+pub const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// Source of inbound peers' pool addresses (`inbound#N`), unique for the
 /// process lifetime.
@@ -287,7 +308,45 @@ impl Peer {
             wants_addrv2: false,
             partial: Vec::new(),
             partial_since: None,
+            last_recv: Instant::now(),
+            ping_sent: None,
+            last_ping: Instant::now(),
         }
+    }
+
+    /// How long since this peer last sent us a complete message.
+    pub fn idle_for(&self) -> Duration {
+        self.last_recv.elapsed()
+    }
+
+    /// Core's keep-alive (ticket 052): send a `ping` once `interval` has
+    /// passed since the last one was answered (or sent), and fail once one
+    /// has gone unanswered for `timeout`; the caller drops the peer. The
+    /// `pong` is matched in `read_message`, so any reader clears it.
+    pub fn keep_alive(&mut self, interval: Duration, timeout: Duration) -> Result<(), PeerError> {
+        let now = Instant::now();
+        match self.ping_sent {
+            Some((_, sent)) if now.duration_since(sent) >= timeout => {
+                Err(PeerError::Receive(format!("ping timeout: no pong in {}s", timeout.as_secs())))
+            }
+            Some(_) => Ok(()),
+            None if now.duration_since(self.last_ping) >= interval => {
+                use std::collections::hash_map::RandomState;
+                use std::hash::{BuildHasher, Hasher};
+                let nonce = RandomState::new().build_hasher().finish();
+                self.send(NetworkMessage::Ping(nonce))?;
+                self.ping_sent = Some((nonce, now));
+                self.last_ping = now;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Pretend the last message arrived `ago` (eviction tests).
+    #[cfg(test)]
+    pub(crate) fn set_idle_for_test(&mut self, ago: Duration) {
+        self.last_recv = Instant::now() - ago;
     }
 
     /// Discover peer addresses from DNS seeds (clearnet).
@@ -734,6 +793,13 @@ impl Peer {
                 self.partial_since = None;
                 let raw = RawNetworkMessage::consensus_decode(&mut frame.as_slice())
                     .map_err(|e| PeerError::Receive(format!("{}", e)))?;
+                self.last_recv = Instant::now();
+                if let NetworkMessage::Pong(nonce) = raw.payload() {
+                    if self.ping_sent.is_some_and(|(n, _)| n == *nonce) {
+                        self.ping_sent = None;
+                        self.last_ping = self.last_recv;
+                    }
+                }
                 return Ok(Some(raw.payload().clone()));
             }
 
@@ -2509,13 +2575,42 @@ pub(crate) mod tests {
         }
     }
 
+    // ── Keep-alive (ticket 052) ──────────────────────────────────────
+
+    /// A ping once the interval has passed; the matching pong (read by any
+    /// receive path) clears it; one left unanswered past the timeout fails
+    /// the peer. A pong with the wrong nonce doesn't count.
+    #[test]
+    fn keep_alive_pings_and_times_out_a_silent_peer() {
+        let (mut peer, mut server) = loopback_peer_pair();
+        let long = Duration::from_secs(3600);
+        peer.keep_alive(long, long).unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut b = [0u8; 1];
+        assert!(server.peek(&mut b).is_err(), "pinged before the interval");
+        server.set_read_timeout(None).unwrap();
+
+        peer.keep_alive(Duration::ZERO, long).unwrap();
+        let NetworkMessage::Ping(nonce) = read_one_message(&mut server) else { panic!("no ping") };
+        write_message(&mut server, NetworkMessage::Pong(nonce.wrapping_add(1)));
+        assert!(matches!(peer.poll_message(Duration::from_secs(2)), Ok(Some(NetworkMessage::Pong(_)))));
+        assert!(peer.keep_alive(Duration::ZERO, Duration::ZERO).is_err(), "wrong nonce accepted");
+
+        let (mut peer, mut server) = loopback_peer_pair();
+        peer.keep_alive(Duration::ZERO, long).unwrap();
+        let NetworkMessage::Ping(nonce) = read_one_message(&mut server) else { panic!("no ping") };
+        write_message(&mut server, NetworkMessage::Pong(nonce));
+        assert!(matches!(peer.poll_message(Duration::from_secs(2)), Ok(Some(NetworkMessage::Pong(_)))));
+        assert!(peer.idle_for() < Duration::from_secs(2));
+        peer.keep_alive(long, Duration::ZERO).expect("answered: nothing outstanding");
+    }
+
     // ── Seeds and names ──────────────────────────────────────────────
 
     /// Every bundled onion seed must be a dialable v3 address: 56 base32
     /// chars whose embedded checksum and version byte verify
     /// (rend-spec-v3 §6, the same check `tor_v3` applies to gossip).
     #[test]
-    #[ignore = "BUG: ONION_SEEDS entries fail v3 validation (bad checksum; one is 55 chars), so Tor bootstrap can never dial them"]
     fn onion_seeds_are_valid_v3_addresses() {
         let invalid: Vec<&str> = ONION_SEEDS
             .iter()

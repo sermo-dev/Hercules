@@ -23,13 +23,14 @@ use crate::block_validation::{
 use crate::chain_params::ChainParams;
 use crate::mempool::Mempool;
 use crate::p2p::{msg_name, PeerError};
-use crate::peer_pool::{PeerInfo, PeerPool, PeerSource};
+use crate::peer_pool::{Offense, PeerInfo, PeerPool, PeerSource};
 use crate::store::{HeaderStore, NodeMode};
 use crate::tor::TorManager;
 use crate::utxo::{SnapshotLoadError, SnapshotMeta, UtxoSet};
 use crate::wake::{WakeBudget, WakePhase};
 use crate::validation::{
-    check_anchor, chainwork_for_headers, u256_add, u256_gt, validate_headers,
+    check_anchor, chainwork_for_headers, u256_add, u256_gt, validate_headers, HeaderErrorClass,
+    ValidationError,
 };
 
 /// How often to poll for new blocks after initial sync (seconds).
@@ -148,6 +149,15 @@ const INVALID_HEADERS_PENALTY: u32 = 50;
 /// `getheaders` with nothing beyond our tip. Small: its claimed height is
 /// also capped at our tip, which is what stops it being picked again.
 const EMPTY_HEADERS_PENALTY: u32 = 10;
+
+/// Core's `OUTBOUND_INVENTORY_BROADCAST_INTERVAL` (2 s): the mean Poisson
+/// delay before an own tx is announced (ticket 052).
+const OWN_TX_TRICKLE_MEAN_SECS: f64 = 2.0;
+
+/// Penalty for answering `getheaders` from below the best locator entry
+/// the peer shares with us (`skipped_locator_entry`, ticket 052): the same
+/// as an unconnectable batch.
+const LOCATOR_SKIP_PENALTY: u32 = 20;
 
 /// Pause before retrying a height at which every connected peer served a
 /// mutated block, so the loop waits for the pool to refill instead of
@@ -380,9 +390,10 @@ enum WitnessHeaders {
     /// Doesn't connect to the locator we sent: says nothing either way and
     /// costs the peer nothing.
     NoOpinion(String),
-    /// Invalid in itself (proof-of-work, linkage, timestamps, anchor):
-    /// costs the peer `INVALID_HEADERS_PENALTY`.
-    Invalid(String),
+    /// Invalid in itself (proof-of-work, linkage, timestamps, anchor), or
+    /// answered from below the best locator entry (ticket 052): costs the
+    /// peer `INVALID_HEADERS_PENALTY`, for the given offense.
+    Invalid(String, Offense),
 }
 
 /// How a wake's header phase ended (ticket 054).
@@ -596,6 +607,81 @@ fn header_source(sources: &[(u32, u32, String)], height: u32) -> Option<&str> {
         .map(|(_, _, addr)| addr.as_str())
 }
 
+/// Penalize `addr` for a header batch that failed `validate_headers`, by
+/// what the failure says about it (ticket 052, 024's classes): invalid
+/// headers cost `INVALID_HEADERS_PENALTY`; a header merely ahead of our
+/// clock (not yet valid) and our own store failing cost nothing. Returns
+/// the class so the caller can keep the valid prefix or stop on a local
+/// fault.
+fn punish_invalid_headers(pool: &mut PeerPool, addr: &str, e: &ValidationError) -> HeaderErrorClass {
+    let class = e.class();
+    match class {
+        HeaderErrorClass::Invalid => {
+            pool.misbehaving(addr, INVALID_HEADERS_PENALTY, Offense::Consensus)
+        }
+        HeaderErrorClass::NotYetValid => warn!(
+            "Headers from {} not yet valid: {} (is this device's clock behind?); no penalty, retrying later",
+            addr, e
+        ),
+        HeaderErrorClass::Local => warn!("Could not check headers from {}: {} (local fault, no penalty)", addr, e),
+    }
+    class
+}
+
+/// Whether a mempool rejection goes into the recently-rejected filter
+/// (ticket 052, Core's `m_lazy_recent_rejects`): `None` when it may pass
+/// before the next block or isn't the transaction's fault (missing inputs,
+/// which Core sends to the orphanage; already in the pool; our own store
+/// or verifier failing), else `Some(by_txid)`. By wtxid always; by txid
+/// too only for failures the witness can't cause, since only those prove
+/// every copy with that txid fails (Core: `TX_INPUTS_NOT_STANDARD`, or no
+/// witness, where the ids are equal). We announce and request by txid, so
+/// only those dedupe today; a witness-dependent rejection needs wtxid
+/// relay (BIP 339) to.
+fn reject_filter_keys(e: &crate::mempool::MempoolError) -> Option<bool> {
+    use crate::mempool::MempoolError as E;
+    use crate::relay_policy::PolicyRejection as P;
+    match e {
+        E::AlreadyInMempool
+        | E::MissingInput { .. }
+        | E::UtxoLookup(_)
+        | E::ChainContext(_)
+        | E::ScriptVerifierError { .. } => None,
+        // Committed to by the txid: inputs, outputs, amounts, version,
+        // locktime, sequences, scriptSigs.
+        E::CoinbaseTx
+        | E::DuplicateInput { .. }
+        | E::ValueOutOfRange { .. }
+        | E::ImmatureCoinbase { .. }
+        | E::Inflation
+        | E::MathOverflow
+        | E::AbsurdFee { .. }
+        | E::DustOutput { .. }
+        | E::NonStandardScript { .. }
+        | E::NonStandardVersion { .. }
+        | E::NonStandardScriptSig { .. }
+        | E::NonFinal { .. }
+        | E::NonBip68Final { .. }
+        | E::PolicyRejection(P::Cat21 | P::Runes { .. }) => Some(true),
+        // Anything that weight, sigops or witness content decide.
+        _ => Some(false),
+    }
+}
+
+/// Core answers `getheaders` from the first locator entry on its active
+/// chain (`FindForkInGlobalIndex`), so an honest batch never contains a
+/// locator entry listed before the one it builds on. One that does
+/// answered from a lower entry than the best it shares with us: it is
+/// replaying old headers, as a witness outvoting an honest peer or a peer
+/// holding us in the fork-follow loop would (ticket 052). Returns the
+/// offending hash. A batch not building on a locator entry isn't judged.
+fn skipped_locator_entry(headers: &[Header], locator: &[BlockHash]) -> Option<BlockHash> {
+    let start = headers.first()?.prev_blockhash;
+    let i = locator.iter().position(|h| *h == start)?;
+    let earlier: HashSet<&BlockHash> = locator[..i].iter().collect();
+    headers.iter().map(|h| h.block_hash()).find(|h| earlier.contains(h))
+}
+
 /// Format a legacy v1 `Address` from `addr` gossip into the `host:port`
 /// string our AddrManager keys on. Returns `None` for unroutable entries
 /// (Tor addresses encoded in the legacy form, port 0, etc.).
@@ -706,18 +792,49 @@ fn unix_now_u32() -> u32 {
         .min(u32::MAX as u64) as u32
 }
 
-/// Reject obvious junk before we put an address into the AddrManager:
-/// loopback, link-local, multicast, unspecified. We deliberately do NOT
-/// filter RFC1918 here — a node operator with a self-hosted peer on the
-/// LAN should still be able to talk to it.
+/// Whether a gossiped address is publicly routable, as Core's
+/// `CNetAddr::IsRoutable` (netaddress.cpp) decides, before it goes into
+/// the AddrManager (ticket 052). Before 052 private ranges were accepted,
+/// so in clearnet mode any peer could make us dial hosts on the user's LAN.
+/// Rejected, as in Core: invalid (unspecified, 255.255.255.255, IPv6
+/// documentation 2001:db8::/32 and 3fff::/20), RFC1918, RFC2544
+/// (198.18/15), RFC3927 (169.254/16), RFC4862 (fe80::/64), RFC6598 (CGNAT
+/// 100.64/10), RFC5737 (documentation), RFC4193 (ULA fc00::/7), RFC4843
+/// (ORCHID 2001:10::/28), RFC7343 (ORCHIDv2 2001:20::/28) and local
+/// (0/8, 127/8, ::1). Also multicast: Core can't connect to it, and never
+/// sees it here as a peer. An IPv4-mapped IPv6 address is refused: Core
+/// parses legacy `addr` entries as IPv4 first (as `format_v1_address`
+/// does), and for addrv2 makes mapped ones invalid (BIP 155).
 fn is_routable(sock: &std::net::SocketAddr) -> bool {
-    let ip = sock.ip();
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return false;
-    }
-    match ip {
-        std::net::IpAddr::V4(v4) => !v4.is_link_local() && !v4.is_broadcast(),
-        std::net::IpAddr::V6(_) => true,
+    match sock.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || o[0] == 0
+                || o[0] == 127
+                || v4.is_private()
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0], o[1], o[2]) == (192, 0, 2)
+                || (o[0], o[1], o[2]) == (198, 51, 100)
+                || (o[0], o[1], o[2]) == (203, 0, 113))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !(v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || v6.to_ipv4_mapped().is_some()
+                || (s[0], s[1]) == (0x2001, 0x0db8)
+                || (s[0] == 0x3fff && s[1] & 0xf000 == 0)
+                || (s[0], s[1], s[2], s[3]) == (0xfe80, 0, 0, 0)
+                || s[0] & 0xfe00 == 0xfc00
+                || (s[0] == 0x2001 && s[1] & 0xfff0 == 0x0010)
+                || (s[0] == 0x2001 && s[1] & 0xfff0 == 0x0020))
+        }
     }
 }
 
@@ -928,14 +1045,14 @@ fn fetch_requested_block(
                     block.block_hash(),
                     block_hash
                 );
-                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY, Offense::Delivery);
             }
             Err(e @ PeerError::BlockNotReceived { .. }) => {
                 info!(
                     "validate_latest_block: {} from {}, trying another peer",
                     e, block_peer_addr
                 );
-                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY, Offense::Delivery);
             }
             Err(e) => {
                 info!(
@@ -957,8 +1074,8 @@ struct RelayQueueEntry {
     txid: Txid,
     relay_at: Instant,
     /// Peer we got it from, so we don't relay it back. `None` for the
-    /// user's own transactions (ticket 033), which are announced to every
-    /// peer immediately and never attributed to a peer.
+    /// user's own transactions (ticket 033), which go only to outbound
+    /// peers that never got our onion (ticket 052), never attributed to a peer.
     from_peer: Option<String>,
 }
 
@@ -1006,12 +1123,24 @@ pub struct HeaderSync {
     /// Ticket 029 private-broadcast transport. When set, own transactions
     /// go through it instead of being announced on our regular peers.
     private_broadcast: Mutex<Option<Arc<dyn crate::own_tx_store::PrivateBroadcast>>>,
-    /// Addresses queued by `handle_peer_message` from inbound `addr` /
-    /// `addrv2` gossip. Drained into the PeerPool's AddrManager after
+    /// Mean of the Poisson delay before an own tx is announced (ticket
+    /// 052): Core's `OUTBOUND_INVENTORY_BROADCAST_INTERVAL`, 2 s. Tests set
+    /// it to 0 so an announcement is due at once.
+    own_tx_trickle_mean_secs: f64,
+    /// Peers we announced each own tx to, for the process (ticket 052):
+    /// one of them announcing it back is an echo, not propagation, so a
+    /// censoring peer can't fake delivery. Only active own txids; pruned
+    /// with the maintenance tick.
+    own_tx_sent_to: Mutex<HashMap<Txid, HashSet<String>>>,
+    /// Ticket 052's recently-rejected filter and in-flight tx requests.
+    tx_download: Mutex<crate::tx_download::TxDownload>,
+    /// Addresses queued by `handle_peer_message` from `addr` / `addrv2`
+    /// gossip, with the peer that sent them (ticket 052: rate limit and
+    /// source bucket). Drained into the PeerPool's AddrManager after
     /// `service_peer_messages` returns, since the message handlers run
     /// inside `for_each_peer` (which already holds the slot Mutex) and
     /// can't safely take a `&mut PeerPool`.
-    pending_gossip_addrs: Mutex<Vec<String>>,
+    pending_gossip_addrs: Mutex<Vec<(String, Vec<String>)>>,
     /// Cumulative serving counters.
     pub stats: Mutex<NodeStats>,
     /// Last-known peer counts (updated from monitor loop for UI access).
@@ -1324,6 +1453,9 @@ impl HeaderSync {
             relay_queue: Mutex::new(Vec::new()),
             own_txs,
             private_broadcast: Mutex::new(None),
+            own_tx_trickle_mean_secs: OWN_TX_TRICKLE_MEAN_SECS,
+            own_tx_sent_to: Mutex::new(HashMap::new()),
+            tx_download: Mutex::new(crate::tx_download::TxDownload::new()),
             pending_gossip_addrs: Mutex::new(Vec::new()),
             stats: Mutex::new(NodeStats {
                 blocks_served: 0,
@@ -2007,8 +2139,8 @@ impl HeaderSync {
     }
 
     /// Send an own transaction out now: via the 029 private-broadcast
-    /// transport if installed, else an immediate `inv` to every peer on
-    /// the next monitor-loop tick (`from_peer: None`, no Poisson delay).
+    /// transport if installed, else an `inv` on the next monitor-loop tick
+    /// after a Poisson delay, to eligible outbound peers only (ticket 052).
     ///
     /// Without the transport and without Tor, our regular peers are
     /// clearnet: a pending tx is not announced on them (it would tie the
@@ -2032,11 +2164,17 @@ impl HeaderSync {
                 txid
             );
         } else {
+            // Ticket 052's stopgap: after a Poisson delay (Core's trickle,
+            // `OUTBOUND_INVENTORY_BROADCAST_INTERVAL`), and only to
+            // outbound peers that never got our onion
+            // (`PeerPool::may_carry_own_txs`, enforced in
+            // `drain_relay_queue`).
+            let delay = poisson_delay_secs(self.own_tx_trickle_mean_secs);
             let mut queue = self.relay_queue.lock().unwrap();
             if !queue.iter().any(|e| e.txid == txid && e.from_peer.is_none()) {
                 queue.push(RelayQueueEntry {
                     txid,
-                    relay_at: Instant::now(),
+                    relay_at: Instant::now() + Duration::from_secs_f64(delay),
                     from_peer: None,
                 });
             }
@@ -2697,7 +2835,7 @@ impl HeaderSync {
             }
             if let Err(e) = self.check_batch_anchor(&batch, prev_height + 1) {
                 warn!("Fork from {} conflicts with anchor: {}", addr, e);
-                pool.misbehaving(addr, ANCHOR_CONFLICT_PENALTY);
+                pool.misbehaving(addr, ANCHOR_CONFLICT_PENALTY, Offense::Consensus);
                 return Ok(false);
             }
             let validated = {
@@ -2727,8 +2865,11 @@ impl HeaderSync {
                 )
             };
             if let Err(e) = validated {
-                warn!("Fork from {} has invalid headers: {}", addr, e);
-                pool.misbehaving(addr, INVALID_HEADERS_PENALTY);
+                warn!("Fork from {} failed header validation: {}", addr, e);
+                // Not yet valid: not followed now, asked again later.
+                if punish_invalid_headers(pool, addr, &e) == HeaderErrorClass::Local {
+                    return Err(SyncError::Store(format!("{}", e)));
+                }
                 return Ok(false);
             }
             for (i, h) in batch.iter().enumerate() {
@@ -3287,23 +3428,20 @@ impl HeaderSync {
                     Ok(None) => {}
                     Err(e) => warn!("cross-check: failed-block lookup: {}", e),
                 }
-                let Some(first) = headers.first() else {
+                if headers.is_empty() {
                     return FirstHeader::Failed;
-                };
+                }
                 match self.check_witness_headers(&headers, locator) {
-                    Ok(()) => FirstHeader::Hash(
-                        first.block_hash(),
-                        headers.iter().map(|h| h.block_hash()).collect(),
-                    ),
+                    Ok(new) => FirstHeader::Hash(new[0], new),
                     Err(WitnessHeaders::NoOpinion(e)) => {
                         // A peer that lacks our locator's blocks answers
                         // from elsewhere (genesis): not misbehavior.
                         debug!("cross-check: peer {}'s headers are no opinion: {}", addr, e);
                         FirstHeader::Failed
                     }
-                    Err(WitnessHeaders::Invalid(e)) => {
+                    Err(WitnessHeaders::Invalid(e, offense)) => {
                         warn!("cross-check: peer {} sent invalid headers: {}", addr, e);
-                        pool.misbehaving(addr, INVALID_HEADERS_PENALTY);
+                        pool.misbehaving(addr, INVALID_HEADERS_PENALTY, offense);
                         FirstHeader::Failed
                     }
                 }
@@ -3335,16 +3473,31 @@ impl HeaderSync {
     /// Not connecting to our locator is `NoOpinion`, never proof: an honest
     /// peer that has none of the hashes we sent answers from genesis (and
     /// in an eclipse recovery our stored chain may well be fake). Only
-    /// headers that are invalid in themselves are `Invalid`.
+    /// headers that are invalid in themselves are `Invalid`, and so is a
+    /// batch answered from a lower locator entry than the best it shares
+    /// with us (`skipped_locator_entry`).
+    ///
+    /// Returns the batch's hashes past the headers we already have (ticket
+    /// 052): real old headers of our own chain are no opinion on what comes
+    /// next, so a witness and tiebreaker replaying them can't outvote an
+    /// honest peer. A batch of nothing but our own headers is `NoOpinion`.
+    /// A header ahead of our clock, or our store failing, is no opinion
+    /// either (never the peer's fault).
     fn check_witness_headers(
         &self,
         headers: &[Header],
         locator: &[BlockHash],
-    ) -> Result<(), WitnessHeaders> {
+    ) -> Result<Vec<BlockHash>, WitnessHeaders> {
         let local = |e: String| WitnessHeaders::NoOpinion(e);
         let prev = headers[0].prev_blockhash;
         if !locator.contains(&prev) {
             return Err(local(format!("first header builds on {}, not on our locator", prev)));
+        }
+        if let Some(skipped) = skipped_locator_entry(headers, locator) {
+            return Err(WitnessHeaders::Invalid(
+                format!("answered from below locator entry {} it has", skipped),
+                Offense::Delivery,
+            ));
         }
         let height = self
             .store
@@ -3361,7 +3514,7 @@ impl HeaderSync {
             .timestamps_up_to(height, 11)
             .map_err(|e| local(format!("{}", e)))?;
         self.check_batch_anchor(headers, height + 1)
-            .map_err(WitnessHeaders::Invalid)?;
+            .map_err(|e| WitnessHeaders::Invalid(e, Offense::Consensus))?;
         let store = &self.store;
         let epoch_lookup = |h: u32| -> Result<u32, String> {
             store
@@ -3378,7 +3531,37 @@ impl HeaderSync {
             prev_header.bits,
             &epoch_lookup,
         )
-        .map_err(|e| WitnessHeaders::Invalid(format!("{}", e)))
+        .map_err(|e| match e.class() {
+            HeaderErrorClass::Invalid => WitnessHeaders::Invalid(format!("{}", e), Offense::Consensus),
+            HeaderErrorClass::NotYetValid | HeaderErrorClass::Local => local(format!("{}", e)),
+        })?;
+        let new: Vec<BlockHash> = headers
+            .iter()
+            .map(|h| h.block_hash())
+            .skip_while(|h| matches!(self.store.find_height_of_hash(*h), Ok(Some(_))))
+            .collect();
+        if new.is_empty() {
+            return Err(local("only headers we already have".into()));
+        }
+        Ok(new)
+    }
+
+    /// The first header of `headers` not already in our store: what a
+    /// batch says about the chain past ours (ticket 052). `None` if every
+    /// one is ours.
+    fn first_new_header(&self, headers: &[Header]) -> Result<Option<BlockHash>, SyncError> {
+        for h in headers {
+            let hash = h.block_hash();
+            if self
+                .store
+                .find_height_of_hash(hash)
+                .map_err(|e| SyncError::Store(format!("{}", e)))?
+                .is_none()
+            {
+                return Ok(Some(hash));
+            }
+        }
+        Ok(None)
     }
 
     /// Build a SyncStatus snapshot from the pool and current state.
@@ -3399,7 +3582,9 @@ impl HeaderSync {
             active_peer_addr: active_peer_addr.to_string(),
             is_syncing,
             validated_blocks,
-            error,
+            // A session that can't remember bans says so (ticket 052),
+            // unless there is a more pressing error to show.
+            error: error.or_else(|| pool.persistence_warning()),
         }
     }
 
@@ -3533,7 +3718,7 @@ impl HeaderSync {
             // Request headers from best peer. `get_headers` has its own
             // deadline (ticket 049), so a trickling peer can't hold us.
             let asked_at = Instant::now();
-            let mut headers = match peer.get_headers(locator, BlockHash::all_zeros()) {
+            let mut headers = match peer.get_headers(locator.clone(), BlockHash::all_zeros()) {
                 Ok(h) => {
                     let waited = asked_at.elapsed();
                     pool.return_peer(peer);
@@ -3578,15 +3763,39 @@ impl HeaderSync {
                 }
             };
 
+            // Not yet valid (ticket 052): headers more than
+            // MAX_FUTURE_BLOCK_TIME past our clock are cut off with no
+            // penalty (Core's `time-too-new` isn't punished; a phone whose
+            // clock is behind sees every honest tip this way). The valid
+            // prefix goes on as a batch of its own; the rest is asked for
+            // again next round, after the monitor interval or the next
+            // announcement, by when the clock may have caught up.
+            let mut deferred_future = false;
+            if headers.len() <= 2000 {
+                let limit = crate::validation::max_header_time_now();
+                if let Some(cut) = headers.iter().position(|h| h.time > limit) {
+                    warn!(
+                        "Peer {} sent a header {}s past our clock's limit; keeping the {} before it \
+                         and asking again later (is this device's clock behind?)",
+                        active_addr,
+                        headers[cut].time - limit,
+                        cut
+                    );
+                    headers.truncate(cut);
+                    deferred_future = true;
+                }
+            }
+
             if headers.is_empty() {
                 // It announced a block, then had nothing past our tip.
-                if let Some(hash) = asked_announcer {
+                // Not if we cut the batch ourselves: it had more.
+                if let Some(hash) = asked_announcer.filter(|_| !deferred_future) {
                     if self.store.find_height_of_hash(hash).ok().flatten().is_none() {
                         warn!("Peer {} announced block {} it can't serve headers for", active_addr, hash);
-                        pool.misbehaving(&active_addr, UNFULFILLED_ANNOUNCEMENT_PENALTY);
+                        pool.misbehaving(&active_addr, UNFULFILLED_ANNOUNCEMENT_PENALTY, Offense::Delivery);
                     }
                 }
-                if self.claimed_more_than(&mut pool, &active_addr, tip_height) {
+                if !deferred_future && self.claimed_more_than(&mut pool, &active_addr, tip_height) {
                     pool.maintain();
                     continue;
                 }
@@ -3765,7 +3974,7 @@ impl HeaderSync {
                             block_hash,
                             block.block_hash()
                         );
-                        pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+                        pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY, Offense::Delivery);
                         record_bad_delivery(&mut bad_deliveries, next_height, block_peer_addr);
                         continue;
                     }
@@ -3783,7 +3992,7 @@ impl HeaderSync {
                                     "Mutated block {} from {}: {}; fetching it elsewhere",
                                     next_height, block_peer_addr, reason
                                 );
-                                pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY);
+                                pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY, Offense::Delivery);
                                 record_bad_delivery(&mut bad_deliveries, next_height, block_peer_addr);
                                 continue;
                             }
@@ -3910,7 +4119,20 @@ impl HeaderSync {
                     "Peer sent {} headers (max 2000), disconnecting",
                     headers.len()
                 );
-                pool.misbehaving(&active_addr, 100);
+                pool.misbehaving(&active_addr, 100, Offense::Delivery);
+                pool.maintain();
+                continue;
+            }
+
+            // Answered from below the best locator entry it shares with
+            // us: replaying our own old headers (ticket 052), never what an
+            // honest peer sends.
+            if let Some(skipped) = skipped_locator_entry(&headers, &locator) {
+                warn!(
+                    "Peer {} answered getheaders from below locator entry {} it has",
+                    active_addr, skipped
+                );
+                pool.misbehaving(&active_addr, LOCATOR_SKIP_PENALTY, Offense::Delivery);
                 pool.maintain();
                 continue;
             }
@@ -3939,16 +4161,24 @@ impl HeaderSync {
                 .store
                 .get_locator_hashes()
                 .map_err(|e| SyncError::Store(format!("{}", e)))?;
-            let active_first_hash = headers[0].block_hash();
+            // Compared with the witness's first header past ours (ticket
+            // 052): headers we already have say nothing. A batch of only
+            // those stores nothing by itself (the fork path below rechecks
+            // whatever it follows to), so there is nothing to check yet.
+            let active_first_new = self.first_new_header(&headers)?;
             let strict = !self.has_min_chain_work()?;
-            match self.cross_check_headers(
-                &mut pool,
-                &cross_check_locator,
-                &active_addr,
-                active_first_hash,
-                strict,
-                None,
-            ) {
+            let verdict = match active_first_new {
+                Some(active_first_hash) => self.cross_check_headers(
+                    &mut pool,
+                    &cross_check_locator,
+                    &active_addr,
+                    active_first_hash,
+                    strict,
+                    None,
+                ),
+                None => HeaderCrossCheck::Accept,
+            };
+            match verdict {
                 HeaderCrossCheck::Accept => {}
                 // Inconclusive needs a budget; the main loop has none.
                 HeaderCrossCheck::Reject | HeaderCrossCheck::Inconclusive => {
@@ -3990,7 +4220,7 @@ impl HeaderSync {
                     None => {
                         // Headers don't connect to any known block
                         warn!("Peer {} sent unconnectable headers", active_addr);
-                        pool.misbehaving(&active_addr, 20);
+                        pool.misbehaving(&active_addr, 20, Offense::Delivery);
                         continue;
                     }
                     Some(mut base_height) => {
@@ -4003,9 +4233,19 @@ impl HeaderSync {
                         // (entries are far apart low in the chain). Ask for
                         // what follows until its chain diverges from ours,
                         // within FORK_FOLLOW_BUDGET.
+                        //
+                        // Only below minimum work (ticket 052): an honest
+                        // peer answers from the best locator entry it shares
+                        // (`skipped_locator_entry`), and our locator is dense
+                        // near the tip, so a whole batch of our own headers
+                        // means a fork far below it — which, with minimum
+                        // work, is refused as deeper than MAX_REORG_DEPTH
+                        // anyway. Following it then only let a peer hold the
+                        // loop for the whole budget with old headers.
                         let mut skipped = false;
                         let skip_deadline = Instant::now() + FORK_FOLLOW_BUDGET;
-                        while fork_at == base_height + headers.len() as u32
+                        while strict
+                            && fork_at == base_height + headers.len() as u32
                             && headers.len() == 2000
                             && fork_at < tip_height
                         {
@@ -4051,6 +4291,14 @@ impl HeaderSync {
                                 active_addr, fork_at, tip_height
                             );
                             pool.lower_peer_height(&active_addr, fork_at);
+                            // Nothing new for a block it announced: the
+                            // same as answering empty (ticket 052).
+                            if let Some(hash) = asked_announcer {
+                                if self.store.find_height_of_hash(hash).ok().flatten().is_none() {
+                                    warn!("Peer {} announced block {} it can't serve headers for", active_addr, hash);
+                                    pool.misbehaving(&active_addr, UNFULFILLED_ANNOUNCEMENT_PENALTY, Offense::Delivery);
+                                }
+                            }
                             continue;
                         }
                         if skipped && fork_at < tip_height {
@@ -4072,11 +4320,14 @@ impl HeaderSync {
                                     .get_locator_hashes()
                                     .map_err(|e| SyncError::Store(format!("{}", e)))?,
                             );
+                            // Its first header past ours (`check_witness_headers`
+                            // drops a witness's shared prefix the same way).
+                            let first_divergent = headers[(fork_at - base_height) as usize].block_hash();
                             match self.cross_check_headers(
                                 &mut pool,
                                 &recheck_locator,
                                 &active_addr,
-                                headers[0].block_hash(),
+                                first_divergent,
                                 strict,
                                 None,
                             ) {
@@ -4200,7 +4451,7 @@ impl HeaderSync {
                             if strict {
                                 pool.lower_peer_height(&active_addr, 0);
                             } else {
-                                pool.misbehaving(&active_addr, 20);
+                                pool.misbehaving(&active_addr, 20, Offense::Delivery);
                             }
                             continue;
                         }
@@ -4212,7 +4463,7 @@ impl HeaderSync {
                                 "Peer {} suggests reorg from fork point {} at or below anchor {}, refusing",
                                 active_addr, fork_at, self.anchor.height
                             );
-                            pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY);
+                            pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY, Offense::Consensus);
                             continue;
                         }
 
@@ -4253,7 +4504,7 @@ impl HeaderSync {
                         let new_headers = &headers[new_chain_offset..];
                         if let Err(e) = self.check_batch_anchor(new_headers, fork_at + 1) {
                             warn!("Reorg rejected: {}", e);
-                            pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY);
+                            pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY, Offense::Consensus);
                             continue;
                         }
                         if let Err(e) = validate_headers(
@@ -4269,7 +4520,9 @@ impl HeaderSync {
                                 "Reorg rejected: new chain failed validation: {}",
                                 e
                             );
-                            pool.misbehaving(&active_addr, INVALID_HEADERS_PENALTY);
+                            if punish_invalid_headers(&mut pool, &active_addr, &e) == HeaderErrorClass::Local {
+                                return Err(SyncError::Store(format!("{}", e)));
+                            }
                             continue;
                         }
 
@@ -4318,7 +4571,7 @@ impl HeaderSync {
             // fake no matter how valid its PoW looks — ban the peer.
             if let Err(e) = self.check_batch_anchor(&headers, tip_height + 1) {
                 warn!("Peer {} sent headers conflicting with anchor: {}", active_addr, e);
-                pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY);
+                pool.misbehaving(&active_addr, ANCHOR_CONFLICT_PENALTY, Offense::Consensus);
                 pool.maintain();
                 continue;
             }
@@ -4336,7 +4589,9 @@ impl HeaderSync {
                 &epoch_lookup,
             ) {
                 warn!("Peer {} sent invalid headers: {}", active_addr, e);
-                pool.misbehaving(&active_addr, INVALID_HEADERS_PENALTY);
+                if punish_invalid_headers(&mut pool, &active_addr, &e) == HeaderErrorClass::Local {
+                    return Err(SyncError::Store(format!("{}", e)));
+                }
                 pool.maintain();
                 continue;
             }
@@ -4411,7 +4666,9 @@ impl HeaderSync {
         // mutex and can't take a `&mut PeerPool`.
         let gossip = std::mem::take(&mut *self.pending_gossip_addrs.lock().unwrap());
         if !gossip.is_empty() {
-            pool.ingest_gossip_addrs(gossip);
+            for (from, batch) in gossip {
+                pool.ingest_gossip_addrs(&from, batch);
+            }
         }
 
         // Opportunistic refill: if the outbound pool has shrunk
@@ -4437,8 +4694,19 @@ impl HeaderSync {
             }
         }
 
+        // Tx requests that timed out (or got `notfound`) go to the next
+        // announcer (ticket 052).
+        self.retry_tx_requests(pool);
+
         // Periodic maintenance
         if timers.last_maintain.elapsed() >= MAINTENANCE_INTERVAL {
+            // Pings, and a peer that hasn't answered one in PING_TIMEOUT is
+            // dropped (ticket 052): a dead inbound connection otherwise
+            // holds its slot for good.
+            pool.for_each_peer(|_addr, _, peer| {
+                peer.keep_alive(crate::p2p::PING_INTERVAL, crate::p2p::PING_TIMEOUT)
+                    .map_err(|e| format!("{}", e))
+            });
             pool.maintain();
             self.mempool.lock().unwrap().expire_old();
             self.rebroadcast_due_own_txs(unix_now_u32() as u64);
@@ -4452,6 +4720,18 @@ impl HeaderSync {
                     pool.peer_info().iter().map(|p| p.addr.clone()).collect();
                 let mut state = self.relay_state.lock().unwrap();
                 state.retain(|addr, _| connected.contains(addr));
+                drop(state);
+                let mut dl = self.tx_download.lock().unwrap();
+                let now = Instant::now();
+                let gone: HashSet<String> = dl.peers().filter(|p| !connected.contains(*p)).map(|p| p.to_string()).collect();
+                for p in &gone {
+                    dl.forget_peer(p, now);
+                }
+                drop(dl);
+                self.own_tx_sent_to
+                    .lock()
+                    .unwrap()
+                    .retain(|txid, _| self.own_txs.is_active(txid));
             }
             timers.last_maintain = Instant::now();
         }
@@ -4524,6 +4804,18 @@ impl HeaderSync {
                 self.handle_tx(addr, tx)?;
             }
 
+            NetworkMessage::NotFound(items) => {
+                // Ticket 052: a tx it can't serve is asked of the next
+                // announcer now, not at the timeout (Core does the same).
+                let now = Instant::now();
+                let mut dl = self.tx_download.lock().unwrap();
+                for item in items.iter().take(MAX_INV_SZ) {
+                    if let Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) = item {
+                        dl.not_found(txid, addr, now);
+                    }
+                }
+            }
+
             NetworkMessage::SendHeaders => {
                 let mut state = self.relay_state.lock().unwrap();
                 state
@@ -4570,7 +4862,12 @@ impl HeaderSync {
                 // Sample up to 999 addresses from the AddrManager, leaving one
                 // slot in the 1000-entry budget for our own self-advertisement.
                 let sample = pool.sample_addresses(999);
-                let our_pubkey = self.tor().and_then(|t| t.our_onion_pubkey());
+                // Never to an outbound connection kept clean for own
+                // transactions (ticket 052).
+                let our_pubkey = self
+                    .tor()
+                    .and_then(|t| t.our_onion_pubkey())
+                    .filter(|_| pool.may_self_advertise(addr));
 
                 if peer.wants_addrv2() {
                     let mut entries: Vec<bitcoin::p2p::address::AddrV2Message> = sample
@@ -4625,7 +4922,7 @@ impl HeaderSync {
                     self.pending_gossip_addrs
                         .lock()
                         .unwrap()
-                        .extend(batch);
+                        .push((addr.to_string(), batch));
                     debug!("Queued {} v1 gossip addresses from {}", queued, addr);
                 }
             }
@@ -4646,7 +4943,7 @@ impl HeaderSync {
                     self.pending_gossip_addrs
                         .lock()
                         .unwrap()
-                        .extend(batch);
+                        .push((addr.to_string(), batch));
                     debug!("Queued {} v2 gossip addresses from {}", queued, addr);
                 }
             }
@@ -4784,7 +5081,8 @@ impl HeaderSync {
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     // An own tx is served only to a peer we announced it
-                    // to or that announced it to us; anyone else asking
+                    // to or that announced it to us (and only an outbound one
+                    // never told our onion, ticket 052); anyone else asking
                     // is probing whether we have it (i.e. are its source).
                     if self.own_txs.is_active(&txid) && !self.peer_knows_own_tx(addr, &txid) {
                         not_found.push(item);
@@ -4861,6 +5159,11 @@ impl HeaderSync {
 
         let mut request = Vec::new();
         let mut block_lookups = 0;
+        let now = Instant::now();
+        if inv_list.iter().any(|i| matches!(i, Inventory::Transaction(_) | Inventory::WitnessTransaction(_))) {
+            let validated = self.store.validated_height().unwrap_or(0);
+            self.tx_download.lock().unwrap().on_tip(validated);
+        }
 
         for item in inv_list {
             match item {
@@ -4880,7 +5183,7 @@ impl HeaderSync {
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     let own = self.own_txs.is_active(txid);
-                    if own {
+                    if own && self.counts_as_propagation(txid, addr, pool) {
                         // A peer announcing our own tx back: it propagated.
                         // Deduped per (peer, txid) in the store.
                         let _ = self.own_txs.record_seen(txid, addr, unix_now_u32() as u64);
@@ -4896,11 +5199,23 @@ impl HeaderSync {
                         let mut state = self.relay_state.lock().unwrap();
                         let entry = state.entry(addr.to_string()).or_default();
                         record_known_txid(entry, *txid);
-                        if own {
+                        // Only a peer own txs may go to is then allowed to
+                        // fetch it: an inbound or self-advertised one never
+                        // gets it from us (ticket 052), even after
+                        // announcing it.
+                        if own && pool.may_carry_own_txs(addr) {
                             entry.own_txids.insert(*txid);
                         }
                     }
-                    if request.len() < MAX_GETDATA_SZ && !self.mempool.lock().unwrap().contains(txid) {
+                    // Not one we rejected since the last block, nor one
+                    // already asked of another announcer (ticket 052).
+                    if request.len() < MAX_GETDATA_SZ
+                        && !self.mempool.lock().unwrap().contains(txid)
+                        && {
+                            let mut dl = self.tx_download.lock().unwrap();
+                            !dl.recently_rejected(txid) && dl.should_request(*txid, addr, now)
+                        }
+                    {
                         // Request with witness data for segwit transactions
                         request.push(Inventory::WitnessTransaction(*txid));
                     }
@@ -4963,7 +5278,7 @@ impl HeaderSync {
                 "Peer {} claims height {} but has no headers above {}, banning",
                 addr, claimed, tip_height
             );
-            pool.misbehaving(addr, 100);
+            pool.misbehaving(addr, 100, Offense::Delivery);
             return true;
         }
         // A smaller gap is no proof of lying (it may have
@@ -4977,7 +5292,7 @@ impl HeaderSync {
                 addr, claimed, tip_height
             );
             pool.lower_peer_height(addr, tip_height);
-            pool.misbehaving(addr, EMPTY_HEADERS_PENALTY);
+            pool.misbehaving(addr, EMPTY_HEADERS_PENALTY, Offense::Delivery);
             return true;
         }
         false
@@ -4996,11 +5311,25 @@ impl HeaderSync {
     // path lands and we have a clearer picture of locking ordering.
     fn handle_tx(&self, addr: &str, tx: bitcoin::Transaction) -> Result<(), String> {
         let validated_height = self.store.validated_height().unwrap_or(0);
+        let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
 
         let result = {
             let mut mempool = self.mempool.lock().unwrap();
             mempool.accept_tx(tx, &self.utxo, validated_height, &self.store)
         }; // mempool lock released before acquiring relay_queue lock
+
+        // Ticket 052: nothing in flight for it now; a rejection is kept
+        // until the next block so other announcers aren't asked for it.
+        {
+            let mut dl = self.tx_download.lock().unwrap();
+            dl.received(&txid);
+            if let Err(e) = &result {
+                if let Some(by_txid) = reject_filter_keys(e) {
+                    dl.on_tip(validated_height);
+                    dl.reject(txid, wtxid, by_txid);
+                }
+            }
+        }
 
         match result {
             Ok(txid) => {
@@ -5029,7 +5358,12 @@ impl HeaderSync {
             return;
         };
         let mut sent = 0usize;
-        pool.for_each_peer(|_addr, _is_inbound, peer| {
+        pool.for_each_peer(|addr, _is_inbound, peer| {
+            // Not to the connections kept clean for own transactions
+            // (ticket 052): only peers that already know our onion.
+            if !pool.may_self_advertise(addr) {
+                return Ok(());
+            }
             // send_self_advertisement silently no-ops on peers that didn't
             // negotiate addrv2, so we don't need to filter here. Errors are
             // surfaced as Err to let `for_each_peer` drop dead connections.
@@ -5104,9 +5438,17 @@ impl HeaderSync {
         for ((txid, from_peer), (_, fee_rate_satkvb)) in ready.iter().zip(fee_rates.iter()) {
             let inv = vec![Inventory::Transaction(*txid)];
 
+            let is_own = own.contains(txid);
             pool.for_each_peer(|addr, _, peer| {
                 // Don't relay back to sender
                 if from_peer.as_deref() == Some(addr) {
+                    return Ok(());
+                }
+                // Own transactions only to outbound peers that never got
+                // our onion (ticket 052): an inbound peer dialed it, and a
+                // self-advertised one was told it, so either could tie the
+                // tx to that long-lived identity.
+                if is_own && !pool.may_carry_own_txs(addr) {
                     return Ok(());
                 }
                 if let Some((known, own_known, feefilter)) = relay_snapshot.get(addr) {
@@ -5132,7 +5474,11 @@ impl HeaderSync {
         // (rebroadcasts), and allow them to fetch our own ones.
         if !sent.is_empty() {
             let mut state = self.relay_state.lock().unwrap();
+            let mut sent_to = self.own_tx_sent_to.lock().unwrap();
             for (addr, txid) in sent {
+                if own.contains(&txid) {
+                    sent_to.entry(txid).or_default().insert(addr.clone());
+                }
                 let entry = state.entry(addr).or_default();
                 record_known_txid(entry, txid);
                 if own.contains(&txid) {
@@ -5140,6 +5486,47 @@ impl HeaderSync {
                 }
             }
         }
+    }
+
+    /// Ask the next announcer for each tx whose request timed out or was
+    /// answered `notfound` (ticket 052). A peer that is gone or busy is
+    /// skipped; its turn has passed.
+    fn retry_tx_requests(&self, pool: &PeerPool) {
+        let retries = self.tx_download.lock().unwrap().retries(Instant::now());
+        if retries.is_empty() {
+            return;
+        }
+        let mut by_peer: HashMap<String, Vec<Inventory>> = HashMap::new();
+        for (peer, txid) in retries {
+            by_peer.entry(peer).or_default().push(Inventory::WitnessTransaction(txid));
+        }
+        for (addr, items) in by_peer {
+            let Some(mut peer) = pool.checkout_peer_by_addr(&addr) else { continue };
+            match peer.send(NetworkMessage::GetData(items)) {
+                Ok(()) => pool.return_peer(peer),
+                Err(e) => {
+                    warn!("getdata retry to {} failed: {}", addr, e);
+                    pool.remove_peer(&addr);
+                }
+            }
+        }
+    }
+
+    /// Whether `addr` announcing own tx `txid` to us shows it propagated
+    /// (ticket 052): only from an outbound peer we never sent it to. One we
+    /// sent it to is echoing it back (a censoring peer would, to fake
+    /// delivery), and an inbound peer chose to connect to us: two inbound
+    /// connections from someone holding the tx back must not count either.
+    fn counts_as_propagation(&self, txid: &Txid, addr: &str, pool: &PeerPool) -> bool {
+        if pool.is_inbound(addr) {
+            return false;
+        }
+        !self
+            .own_tx_sent_to
+            .lock()
+            .unwrap()
+            .get(txid)
+            .is_some_and(|peers| peers.contains(addr))
     }
 
     /// True if `addr` is known to have own tx `txid` (we announced it to
@@ -5219,7 +5606,7 @@ impl HeaderSync {
 
         // Enforce 2000-header limit (same as main sync loop)
         if headers.len() > 2000 {
-            pool.misbehaving(&peer_addr, 100);
+            pool.misbehaving(&peer_addr, 100, Offense::Delivery);
             return Err(SyncError::Validation(format!(
                 "peer sent {} headers (max 2000)", headers.len()
             )));
@@ -5260,7 +5647,7 @@ impl HeaderSync {
         };
 
         if let Err(e) = self.check_batch_anchor(&headers, tip_height + 1) {
-            pool.misbehaving(&peer_addr, ANCHOR_CONFLICT_PENALTY);
+            pool.misbehaving(&peer_addr, ANCHOR_CONFLICT_PENALTY, Offense::Consensus);
             return Err(SyncError::Validation(e));
         }
 
@@ -5273,7 +5660,9 @@ impl HeaderSync {
             tip_header.bits,
             &epoch_lookup,
         ) {
-            pool.misbehaving(&peer_addr, INVALID_HEADERS_PENALTY);
+            if e.class() == HeaderErrorClass::Invalid {
+                pool.misbehaving(&peer_addr, INVALID_HEADERS_PENALTY, Offense::Consensus);
+            }
             return Err(SyncError::Validation(format!("{}", e)));
         }
 
@@ -5357,7 +5746,7 @@ impl HeaderSync {
                 Ok(_) => {}
                 Err(BlockFailure::Delivery(reason)) => {
                     warn!("validate_latest_block: mutated block from {}: {}", from, reason);
-                    pool.misbehaving(&from, MUTATED_BLOCK_PENALTY);
+                    pool.misbehaving(&from, MUTATED_BLOCK_PENALTY, Offense::Delivery);
                     notification.validation_error =
                         Some(format!("peer served a corrupted block: {}", reason));
                     bad_peers.push(from);
@@ -5609,7 +5998,7 @@ impl HeaderSync {
                     next_height,
                     block_hash
                 );
-                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY);
+                pool.misbehaving(&block_peer_addr, BLOCK_NOT_RECEIVED_PENALTY, Offense::Delivery);
                 bad_peers.push(block_peer_addr);
                 continue;
             }
@@ -5623,7 +6012,7 @@ impl HeaderSync {
                         "catch_up_blocks: mutated block {} from {}: {}",
                         next_height, block_peer_addr, reason
                     );
-                    pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY);
+                    pool.misbehaving(&block_peer_addr, MUTATED_BLOCK_PENALTY, Offense::Delivery);
                     bad_peers.push(block_peer_addr);
                     continue;
                 }
@@ -5881,7 +6270,7 @@ impl HeaderSync {
         budget: &WakeBudget,
     ) -> Result<WakeBatch, SyncError> {
         if headers.len() > MAX_HEADERS_PER_MSG {
-            pool.misbehaving(peer_addr, 100);
+            pool.misbehaving(peer_addr, 100, Offense::Delivery);
             return Ok(WakeBatch::Refused(format!(
                 "peer sent {} headers (max 2000)",
                 headers.len()
@@ -5948,7 +6337,7 @@ impl HeaderSync {
         };
 
         if let Err(e) = self.check_batch_anchor(headers, tip_height + 1) {
-            pool.misbehaving(peer_addr, ANCHOR_CONFLICT_PENALTY);
+            pool.misbehaving(peer_addr, ANCHOR_CONFLICT_PENALTY, Offense::Consensus);
             return Ok(WakeBatch::Refused(e));
         }
 
@@ -5962,7 +6351,9 @@ impl HeaderSync {
             &epoch_lookup,
         ) {
             warn!("catch_up_blocks: invalid headers from {}: {}", peer_addr, e);
-            pool.misbehaving(peer_addr, INVALID_HEADERS_PENALTY);
+            if e.class() == HeaderErrorClass::Invalid {
+                pool.misbehaving(peer_addr, INVALID_HEADERS_PENALTY, Offense::Consensus);
+            }
             return Ok(WakeBatch::Refused(format!("invalid headers from peer: {}", e)));
         }
 
@@ -6395,7 +6786,7 @@ mod tests {
         assert_eq!(pool.get_score(&active), Some(100), "divergence touched the ban score");
         assert!(pool.get_demerit(&active).unwrap() > 0, "outvoted peer not deprioritized");
         // A later routine penalty can't combine with it into a ban.
-        pool.misbehaving(&active, BLOCK_NOT_RECEIVED_PENALTY);
+        pool.misbehaving(&active, BLOCK_NOT_RECEIVED_PENALTY, Offense::Delivery);
         assert!(!pool.is_banned(&active));
     }
 
@@ -6522,12 +6913,90 @@ mod tests {
         assert!(is_routable(&sock));
     }
 
+    /// Ticket 052: an honest `headers` reply builds on the first locator
+    /// entry the peer has, so it never contains an entry listed before
+    /// that one; a reply that does replayed from lower down. Entries after
+    /// the one it builds on (a locator not sorted by height, as the fork
+    /// recheck sends) may appear.
     #[test]
-    fn is_routable_accepts_rfc1918() {
-        // We deliberately allow RFC1918 so node operators can talk to a
-        // self-hosted peer on the LAN. This pins down that decision.
-        let sock = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 8333);
-        assert!(is_routable(&sock));
+    fn skipped_locator_entry_flags_answers_from_below_the_best_shared_entry() {
+        let chain = cheap_chain(12, 0);
+        let hash = |h: usize| chain[h - 1].block_hash();
+        let genesis = genesis_header().block_hash();
+        // Our locator: 12, 11, 10, 8, genesis.
+        let locator = vec![hash(12), hash(11), hash(10), hash(8), genesis];
+        // From genesis, through 8 and 10: skipped them.
+        assert_eq!(skipped_locator_entry(&chain[..10], &locator), Some(hash(8)));
+        // From 8, up to 9: fine. From 8 past 10: skipped 10.
+        assert_eq!(skipped_locator_entry(&chain[8..9], &locator), None);
+        assert_eq!(skipped_locator_entry(&chain[8..11], &locator), Some(hash(10)));
+        // Builds on our tip: nothing before it.
+        assert_eq!(skipped_locator_entry(&[], &locator), None);
+        // Not building on a locator entry: not judged here.
+        assert_eq!(skipped_locator_entry(&chain[3..6], &locator), None);
+        // The recheck locator leads with the hash the batch builds on.
+        let recheck = vec![hash(8), hash(12), hash(11), hash(10), genesis];
+        assert_eq!(skipped_locator_entry(&chain[8..11], &recheck), None);
+    }
+
+    /// Ticket 052: Core's `IsRoutable`, class by class. Gossip can no
+    /// longer point us at the user's LAN.
+    #[test]
+    fn is_routable_matches_cores_address_classes() {
+        let v4 = |a: [u8; 4]| SocketAddr::new(IpAddr::V4(Ipv4Addr::from(a)), 8333);
+        let v6 = |s: &str| SocketAddr::new(IpAddr::V6(s.parse::<Ipv6Addr>().unwrap()), 8333);
+        let unroutable = [
+            ("RFC1918 10/8", v4([10, 1, 2, 3])),
+            ("RFC1918 172.16/12", v4([172, 16, 0, 1])),
+            ("RFC1918 172.31", v4([172, 31, 255, 1])),
+            ("RFC1918 192.168/16", v4([192, 168, 1, 100])),
+            ("RFC2544", v4([198, 18, 0, 1])),
+            ("RFC2544 .19", v4([198, 19, 0, 1])),
+            ("RFC3927", v4([169, 254, 1, 1])),
+            ("RFC6598 CGNAT low", v4([100, 64, 0, 1])),
+            ("RFC6598 CGNAT high", v4([100, 127, 255, 1])),
+            ("RFC5737 TEST-NET-1", v4([192, 0, 2, 1])),
+            ("RFC5737 TEST-NET-2", v4([198, 51, 100, 1])),
+            ("RFC5737 TEST-NET-3", v4([203, 0, 113, 1])),
+            ("0/8", v4([0, 1, 2, 3])),
+            ("loopback", v4([127, 0, 0, 2])),
+            ("INADDR_NONE", v4([255, 255, 255, 255])),
+            ("multicast", v4([224, 0, 0, 1])),
+            ("::", v6("::")),
+            ("::1", v6("::1")),
+            ("IPv4-mapped", v6("::ffff:8.8.8.8")),
+            ("RFC3849", v6("2001:db8::1")),
+            ("RFC9637", v6("3fff:0fff::1")),
+            ("RFC4862", v6("fe80::1")),
+            ("RFC4193", v6("fd12:3456::1")),
+            ("RFC4193 fc", v6("fc00::1")),
+            ("RFC4843", v6("2001:10::1")),
+            ("RFC7343", v6("2001:2f::1")),
+            ("multicast v6", v6("ff02::1")),
+        ];
+        for (what, sock) in unroutable {
+            assert!(!is_routable(&sock), "{} ({}) accepted", what, sock);
+        }
+        let routable = [
+            v4([8, 8, 8, 8]),
+            v4([100, 63, 255, 1]),
+            v4([100, 128, 0, 1]),
+            v4([172, 15, 0, 1]),
+            v4([172, 32, 0, 1]),
+            v4([198, 17, 0, 1]),
+            v4([198, 20, 0, 1]),
+            v4([192, 0, 3, 1]),
+            v6("2001:4860::8888"),
+            v6("2002::1"),              // RFC3964 6to4: routable in Core
+            v6("2001::1"),              // RFC4380 Teredo: routable in Core
+            v6("64:ff9b::808:808"),     // RFC6052 NAT64: routable in Core
+            v6("3fff:1000::1"),         // just past RFC9637's /20
+            v6("2001:30::1"),           // past ORCHIDv2
+            v6("fe80:0:0:1::1"),        // outside RFC4862's fe80::/64
+        ];
+        for sock in routable {
+            assert!(is_routable(&sock), "{} rejected", sock);
+        }
     }
 
     // ── unix_now_u32 ───────────────────────────────────────────────────
@@ -6558,12 +7027,12 @@ mod tests {
         let msg = AddrV2Message {
             time: 0,
             services: ServiceFlags::NETWORK,
-            addr: AddrV2::Ipv6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            addr: AddrV2::Ipv6(Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, 0x8888)),
             port: 8333,
         };
         let formatted = format_v2_address(&msg).unwrap();
         // SocketAddr's IPv6 Display wraps the address in brackets.
-        assert!(formatted.contains("2001:db8"));
+        assert!(formatted.contains("2001:4860"));
         assert!(formatted.ends_with(":8333"));
     }
 

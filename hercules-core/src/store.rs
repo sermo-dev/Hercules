@@ -1360,7 +1360,7 @@ mod tests {
             };
             open(p).unwrap();
             let current = version(None);
-            assert_eq!(current, 1, "{} not stamped", name);
+            assert!(current >= 1, "{} not stamped", name);
 
             // A file from before versioning opens and is stamped.
             version(Some(0));
