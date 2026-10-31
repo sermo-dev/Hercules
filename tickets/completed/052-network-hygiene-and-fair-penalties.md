@@ -140,3 +140,11 @@ The real fix is ticket 029's private broadcast (short-lived isolated Tor connect
 ## Roadmap position
 
 Fifth in the pre-wallet hardening block: **049 → 050 → 053 → 054 → 052 → 025**. The own-tx stopgap can land early if Tor-mode sends happen before 029.
+
+## Status (2026-10-31)
+
+Merged in PR #35 (`002beec`). Offense classes (`Offense::Consensus` / `Delivery`) with `ValidationError::class()`, so not-yet-valid and local errors never cost a peer score; the `skipped_locator_entry` penalty only on proof inside the batch; `tx_download` (one request per tx, recent-rejects filter, bounded in-flight and alternates); addrman source buckets, per-source caps on outbound slots, slots reserved for protected (seed/proven) addresses, inbound gossip accepted at Core's slow rate into the unverified bucket; the first `OWN_TX_OUTBOUND` connections kept clean (never told our onion) for own transactions, and own txs never sent to inbound or self-advertised peers; propagation counted only from an outbound peer we never sent the tx to; `peer_store` v2 with a one-time ban amnesty. Owner decisions taken as recommended: lift old bans once, keep inbound in Tor mode, inbound gossip at the slow rate, 4 clean slots.
+
+**At merge with 054:** wake parallel dials keep the gossip limits (a batch counts its own gossip addresses; test `wake_parallel_dials_keep_the_gossip_limits`), and wake agreement uses the proven-aware groups (unproven onions are one opinion).
+
+**Follow-ups:** wtxid relay (BIP 339), not yet ticketed; surfacing the no-persistence fallback beyond the status warning.
