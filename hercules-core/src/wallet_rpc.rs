@@ -659,6 +659,8 @@ fn own_tx_json(rec: &crate::own_tx_store::OwnTxRecord) -> serde_json::Value {
         "last_sent_at": rec.last_sent_at,
         "attempts": rec.attempts,
         "seen_from_peers": rec.seen_from_peers,
+        "delivered_to_peers": rec.delivered_to_peers,
+        "delivery": rec.delivery().name(),
     })
 }
 

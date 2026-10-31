@@ -1,8 +1,10 @@
 //! Ticket 033: own-transaction submission, tracking, rebroadcast and relay.
 //!
-//! Transactions here spend `OP_TRUE` outputs seeded straight into the UTXO
-//! set, so they pass real (`script_verify`) script verification without
-//! signatures, and pay to P2WPKH so they are network-standard.
+//! Transactions here spend P2WSH(`OP_TRUE`) outputs seeded straight into
+//! the UTXO set, with the witness script as the only witness item, so they
+//! pass real (`script_verify`) script verification, policy flags included,
+//! without signatures; a bare `OP_TRUE` coin would be a non-standard input
+//! (ticket 053). They pay to P2WPKH so they are network-standard.
 
 use super::*;
 use crate::own_tx_store::{OwnTxStatus, SubmitError};
@@ -16,6 +18,12 @@ use tempfile::TempDir;
 
 const OP_TRUE: u8 = 0x51;
 const VALIDATED: u32 = 200;
+
+/// P2WSH of the one-opcode witness script `script`. `spend` always offers
+/// `OP_TRUE` as the witness script, so only an `OP_TRUE` coin is spendable.
+fn p2wsh_of(script: u8) -> Vec<u8> {
+    ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(vec![script]).wscript_hash()).into_bytes()
+}
 
 /// A node in Tor mode (regular peers over Tor), without a real TorManager.
 fn fresh(dir: &TempDir) -> HeaderSync {
@@ -46,7 +54,7 @@ fn seed(hs: &HeaderSync, id: u8, script: u8, height: u32, coinbase: bool) -> Out
             0,
             UtxoEntry {
                 amount: 100_000,
-                script_pubkey: vec![script],
+                script_pubkey: p2wsh_of(script),
                 height,
                 is_coinbase: coinbase,
             },
@@ -63,7 +71,7 @@ fn spend(prev: OutPoint, out_value: u64) -> Transaction {
             previous_output: prev,
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
-            witness: Witness::new(),
+            witness: Witness::from_slice(&[[OP_TRUE]]),
         }],
         output: vec![TxOut {
             value: Amount::from_sat(out_value),
@@ -139,7 +147,8 @@ fn consensus_rejects_are_classified() {
     let dir = TempDir::new().unwrap();
     let hs = fresh(&dir);
 
-    // OP_FALSE output: script verification fails.
+    // P2WSH(OP_FALSE) coin spent with OP_TRUE: script verification fails
+    // under the consensus flags, not only the policy ones.
     let bad_script = spend(seed(&hs, 1, 0x00, 1, false), 90_000);
     assert!(matches!(
         hs.submit_own_tx(&raw(&bad_script)),
@@ -244,7 +253,9 @@ fn duplicate_input_tx_is_refused_from_user_and_peers() {
         Err(SubmitError::Consensus(msg)) => assert!(msg.contains("already spends"), "{}", msg),
         other => panic!("expected a consensus reject, got {:?}", other),
     }
-    hs.handle_tx("1.2.3.4:8333", tx.clone()).unwrap();
+    // From a peer it is invalid on its face: the peer is disconnected.
+    let err = hs.handle_tx("1.2.3.4:8333", tx.clone()).unwrap_err();
+    assert!(err.contains("consensus-invalid"), "{}", err);
     assert!(!hs.mempool.lock().unwrap().contains(&tx.compute_txid()));
     assert!(hs.list_own_txs().unwrap().is_empty());
     assert!(hs.relay_queue.lock().unwrap().is_empty());
@@ -388,7 +399,7 @@ fn confirmation_stops_tracking_and_conflict_drops() {
 
     // Block confirms tx, and a different spend of tx2's input.
     let double_spend = spend(tx2.input[0].previous_output, 80_000);
-    hs.on_block_connected(&block_with(vec![tx.clone(), double_spend.clone()]), VALIDATED + 1);
+    hs.on_block_connected(&block_with(vec![tx.clone(), double_spend.clone()]), VALIDATED + 1).unwrap();
 
     assert!(!hs.mempool.lock().unwrap().contains(&txid));
     assert!(!hs.mempool.lock().unwrap().contains(&txid2));
@@ -614,7 +625,7 @@ fn replaced_original_confirming_conflicts_the_replacement() {
     let b = hs.submit_own_tx(&raw(&spend(prev, 90_000))).unwrap().txid;
     assert_eq!(hs.own_tx_status(&a).unwrap().unwrap().status, OwnTxStatus::Replaced { by: b });
 
-    hs.on_block_connected(&block_with(vec![a_tx]), VALIDATED + 1);
+    hs.on_block_connected(&block_with(vec![a_tx]), VALIDATED + 1).unwrap();
     assert_eq!(
         hs.own_tx_status(&a).unwrap().unwrap().status,
         OwnTxStatus::Confirmed { height: VALIDATED + 1 }
@@ -633,7 +644,7 @@ fn open_undoes_settlements_above_validated_height() {
         let hs = fresh(&dir);
         let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
         hs.submit_own_tx(&raw(&tx)).unwrap();
-        hs.on_block_connected(&block_with(vec![tx.clone()]), VALIDATED + 1);
+        hs.on_block_connected(&block_with(vec![tx.clone()]), VALIDATED + 1).unwrap();
         // ...crash here, before set_validated_height(VALIDATED + 1).
         tx
     };
@@ -641,7 +652,7 @@ fn open_undoes_settlements_above_validated_height() {
     let hs = fresh(&dir);
     assert_eq!(hs.own_tx_status(&txid).unwrap().unwrap().status, OwnTxStatus::Pending);
     // Re-applying the block (crash-recovery path) settles it again.
-    hs.on_block_connected(&block_with(vec![tx]), VALIDATED + 1);
+    hs.on_block_connected(&block_with(vec![tx]), VALIDATED + 1).unwrap();
     hs.store.set_validated_height(VALIDATED + 1).unwrap();
     drop(hs);
     // Opened with the validated height caught up: left alone.
@@ -665,7 +676,7 @@ fn reorg_path_unsettles_and_rebroadcasts_own_tx() {
     // takes (UTXO apply, block hook, validated height).
     let block = block_with(vec![tx]);
     hs.utxo.apply_block(&block, VALIDATED + 1).unwrap();
-    hs.on_block_connected(&block, VALIDATED + 1);
+    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
     hs.store.set_validated_height(VALIDATED + 1).unwrap();
     assert_eq!(
         hs.own_tx_status(&txid).unwrap().unwrap().status,
@@ -686,4 +697,262 @@ fn reorg_path_unsettles_and_rebroadcasts_own_tx() {
     hs.rebroadcast_due_own_txs(unix_now_u32() as u64);
     assert!(hs.mempool.lock().unwrap().contains(&txid));
     assert_eq!(queued_own(&hs), vec![txid]);
+}
+
+// ── Ticket 053 part 2 ────────────────────────────────────────────────
+
+/// A spend of `prev` paying `out_value` to a P2WSH(`OP_TRUE`) output, so a
+/// child can spend it in turn.
+fn spend_to_op_true(prev: OutPoint, out_value: u64) -> Transaction {
+    let mut tx = spend(prev, out_value);
+    tx.output[0].script_pubkey = ScriptBuf::from_bytes(p2wsh_of(OP_TRUE));
+    tx
+}
+
+fn out0(tx: &Transaction) -> OutPoint {
+    OutPoint { txid: tx.compute_txid(), vout: 0 }
+}
+
+fn status(hs: &HeaderSync, txid: &Txid) -> OwnTxStatus {
+    hs.own_tx_status(txid).unwrap().unwrap().status
+}
+
+/// Nothing drained is left behind or held for a retry.
+fn assert_stream_settled(hs: &HeaderSync) {
+    assert!(hs.mempool.lock().unwrap().drain_removals().removals.is_empty(), "undrained events");
+    assert!(hs.unsettled_removals.lock().unwrap().is_empty(), "events held for retry");
+}
+
+/// Ticket 053 item 1, through the real paths: an own tx C spending
+/// someone else's unconfirmed P is settled when P dies, which `on_block`
+/// alone can't see (C's own input is never spent by the block).
+/// - P replaced through relay (`handle_tx`): C conflicted by the
+///   replacement, with no height.
+/// - P double-spent by a block (`on_block_connected`): C conflicted at
+///   that height, and a reorg below it makes C pending again.
+///
+/// Replaying the block hook (crash recovery) changes nothing more.
+#[test]
+fn own_child_of_a_dead_foreign_parent_is_settled_end_to_end() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+
+    // Replaced through relay.
+    let coin = seed(&hs, 1, OP_TRUE, 1, false);
+    let p = spend_to_op_true(coin, 95_000);
+    hs.handle_tx("1.2.3.4:8333", p.clone()).unwrap();
+    let c = hs.submit_own_tx(&raw(&spend(out0(&p), 90_000))).unwrap().txid;
+    let p2 = spend_to_op_true(coin, 80_000);
+    hs.handle_tx("5.6.7.8:8333", p2.clone()).unwrap();
+    assert!(!hs.mempool.lock().unwrap().contains(&c));
+    assert_eq!(status(&hs, &c), OwnTxStatus::Conflicted { by: p2.compute_txid() });
+    assert!(!hs.own_txs.is_active(&c));
+    assert_stream_settled(&hs);
+
+    // Double-spent by a block.
+    let coin = seed(&hs, 2, OP_TRUE, 1, false);
+    let q = spend_to_op_true(coin, 95_000);
+    hs.handle_tx("1.2.3.4:8333", q.clone()).unwrap();
+    let d = hs.submit_own_tx(&raw(&spend(out0(&q), 90_000))).unwrap().txid;
+    let rival = spend(coin, 70_000);
+    let block = block_with(vec![rival.clone()]);
+    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
+    assert_eq!(status(&hs, &d), OwnTxStatus::Conflicted { by: rival.compute_txid() });
+    assert_stream_settled(&hs);
+    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
+    assert_eq!(status(&hs, &d), OwnTxStatus::Conflicted { by: rival.compute_txid() });
+    hs.own_txs.demote_confirmed_above(VALIDATED, unix_now_u32() as u64).unwrap();
+    assert_eq!(status(&hs, &d), OwnTxStatus::Pending, "block conflicts are reorg-undoable");
+}
+
+/// The removal reasons that don't settle anything leave an own tx active
+/// and the stream drained: capacity eviction (`handle_tx`), expiry (the
+/// maintenance tick's `expire_mempool`) and the reorg wipe (`apply_reorg`).
+/// Confirmation is `on_block`'s.
+#[test]
+fn evicted_expired_and_reorged_own_txs_stay_active() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    store_headers_to(&hs, VALIDATED + 1);
+
+    // Evicted: a pool with room for one tx, then a richer one arrives.
+    *hs.mempool.lock().unwrap() = Mempool::with_max_size(150);
+    let own = hs.submit_own_tx(&raw(&spend(seed(&hs, 1, OP_TRUE, 1, false), 99_000))).unwrap().txid;
+    hs.handle_tx("1.2.3.4:8333", spend(seed(&hs, 2, OP_TRUE, 1, false), 50_000)).unwrap();
+    assert!(!hs.mempool.lock().unwrap().contains(&own), "evicted");
+    assert_eq!(status(&hs, &own), OwnTxStatus::Pending);
+    assert_stream_settled(&hs);
+
+    // Expired.
+    *hs.mempool.lock().unwrap() = Mempool::new();
+    let own2 = hs.submit_own_tx(&raw(&spend(seed(&hs, 3, OP_TRUE, 1, false), 90_000))).unwrap().txid;
+    hs.mempool.lock().unwrap().expire_for_test(&own2);
+    hs.expire_mempool();
+    assert!(!hs.mempool.lock().unwrap().contains(&own2));
+    assert_eq!(status(&hs, &own2), OwnTxStatus::Pending);
+    assert_stream_settled(&hs);
+
+    // Reorg wipe.
+    let own3 = hs.submit_own_tx(&raw(&spend(seed(&hs, 4, OP_TRUE, 1, false), 90_000))).unwrap().txid;
+    let fork_hash = hs.store.get_hash_at_height(VALIDATED).unwrap().unwrap();
+    hs.apply_reorg(VALIDATED, &headers_on(fork_hash, VALIDATED + 1, VALIDATED + 2, 7)).unwrap();
+    assert!(!hs.mempool.lock().unwrap().contains(&own3));
+    assert_eq!(status(&hs, &own3), OwnTxStatus::Pending);
+    assert_stream_settled(&hs);
+}
+
+/// Ticket 053 item 6: an own tx that a reorg disconnects goes straight
+/// back into the mempool even below the rolling minimum fee, as Core
+/// re-adds disconnected block transactions (`bypass_limits`). A fresh
+/// submission at the same rate is refused.
+#[test]
+fn reorg_readds_a_disconnected_own_tx_below_the_rolling_minimum() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    store_headers_to(&hs, VALIDATED + 1);
+    let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 99_000);
+    let txid = hs.submit_own_tx(&raw(&tx)).unwrap().txid;
+    let block = block_with(vec![tx]);
+    hs.utxo.apply_block(&block, VALIDATED + 1).unwrap();
+    hs.on_block_connected(&block, VALIDATED + 1).unwrap();
+    hs.store.set_validated_height(VALIDATED + 1).unwrap();
+    assert_eq!(status(&hs, &txid), OwnTxStatus::Confirmed { height: VALIDATED + 1 });
+
+    // The pool has since been full: 50 sat/vB to get in.
+    hs.mempool.lock().unwrap().set_rolling_min_fee_for_test(50_000.0);
+    let other = spend(seed(&hs, 2, OP_TRUE, 1, false), 99_000);
+    assert!(matches!(hs.submit_own_tx(&raw(&other)), Err(SubmitError::FeeTooLow { .. })));
+
+    let fork_hash = hs.store.get_hash_at_height(VALIDATED).unwrap().unwrap();
+    hs.apply_reorg(VALIDATED, &headers_on(fork_hash, VALIDATED + 1, VALIDATED + 2, 7)).unwrap();
+    assert!(hs.mempool.lock().unwrap().contains(&txid), "re-added despite the rolling minimum");
+    assert_eq!(status(&hs, &txid), OwnTxStatus::Pending);
+}
+
+/// Ticket 053 item 2: an own tx whose fee is below every connected
+/// peer's feefilter is refused with `FeeBelowNetworkMinimum`, not kept,
+/// not tracked; one peer without a filter is enough to send it.
+#[test]
+fn submit_below_every_peer_feefilter_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    for (addr, rate) in [("1.1.1.1:8333", 5_000), ("2.2.2.2:8333", 3_000)] {
+        hs.relay_state.lock().unwrap().entry(addr.into()).or_default().feefilter_rate = rate;
+    }
+    // 200 sats on 84 vB: ~2.4 sat/vB, under both filters (3 and 5).
+    let tx = spend(seed(&hs, 1, OP_TRUE, 1, false), 100_000 - 200);
+    assert_eq!(tx.vsize(), 84);
+    match hs.submit_own_tx(&raw(&tx)) {
+        Err(e @ SubmitError::FeeBelowNetworkMinimum { .. }) => {
+            assert_eq!(e.kind(), "fee_below_network_minimum");
+            assert!(matches!(e, SubmitError::FeeBelowNetworkMinimum { min, .. } if min == 3.0), "{:?}", e);
+        }
+        other => panic!("expected FeeBelowNetworkMinimum, got {:?}", other),
+    }
+    assert!(!hs.mempool.lock().unwrap().contains(&tx.compute_txid()));
+    assert!(hs.list_own_txs().unwrap().is_empty());
+    assert!(queued_own(&hs).is_empty());
+
+    hs.relay_state.lock().unwrap().entry("3.3.3.3:8333".into()).or_default();
+    hs.submit_own_tx(&raw(&tx)).unwrap();
+}
+
+/// Ticket 053 items 3 and 4: a peer we sent an own child to may fetch its
+/// own unconfirmed parent (it needs it to accept the child); a peer that
+/// knows neither may not. Serving an own tx records the delivery.
+#[test]
+fn own_parent_is_served_to_a_peer_sent_its_child_and_delivery_is_recorded() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let mut pool = PeerPool::new_for_test();
+    let (peer, mut server) = loopback_peer_pair();
+    let addr = peer.addr().to_string();
+    assert!(pool.add_inbound_peer(peer));
+    let (stranger, mut stranger_server) = loopback_peer_pair();
+    assert!(pool.add_inbound_peer(stranger));
+
+    let parent = spend_to_op_true(seed(&hs, 1, OP_TRUE, 1, false), 95_000);
+    let p = hs.submit_own_tx(&raw(&parent)).unwrap().txid;
+    hs.relay_queue.lock().unwrap().clear(); // only the child is announced
+    let c = hs.submit_own_tx(&raw(&spend(out0(&parent), 90_000))).unwrap().txid;
+    let rec = hs.own_tx_status(&p).unwrap().unwrap();
+    assert_eq!((rec.delivered_to_peers, rec.delivery()), (0, crate::own_tx_store::Delivery::NotSeen));
+
+    hs.drain_relay_queue(&pool);
+    for s in [&mut server, &mut stranger_server] {
+        assert!(matches!(read_one_message(s), NetworkMessage::Inv(inv) if inv == vec![Inventory::Transaction(c)]));
+    }
+    // Both were sent the child; make the second a peer that knows of
+    // neither by dropping its relay state.
+    let stranger_addr = pool.peer_info().iter().map(|p| p.addr.clone()).find(|a| *a != addr).unwrap();
+    hs.relay_state.lock().unwrap().remove(&stranger_addr);
+
+    let getdata = |txid| NetworkMessage::GetData(vec![Inventory::WitnessTransaction(txid)]);
+    write_message(&mut stranger_server, getdata(p));
+    hs.service_peer_messages(&mut pool);
+    assert!(matches!(read_one_message(&mut stranger_server), NetworkMessage::NotFound(_)));
+
+    write_message(&mut server, getdata(c));
+    write_message(&mut server, getdata(p));
+    hs.service_peer_messages(&mut pool);
+    hs.service_peer_messages(&mut pool);
+    let served: Vec<Txid> = (0..2)
+        .map(|_| match read_one_message(&mut server) {
+            NetworkMessage::Tx(t) => t.compute_txid(),
+            other => panic!("expected tx, got {}", msg_name(&other)),
+        })
+        .collect();
+    assert_eq!(served, vec![c, p]);
+
+    for txid in [p, c] {
+        let rec = hs.own_tx_status(&txid).unwrap().unwrap();
+        assert_eq!(rec.delivered_to_peers, 1);
+        assert_eq!(rec.delivery(), crate::own_tx_store::Delivery::Delivered);
+        assert!(hs.own_txs.was_delivered_to(&txid, &addr));
+        assert_eq!(rec.status, OwnTxStatus::Pending, "a fetch is not propagation");
+    }
+}
+
+/// Store `block` as the block at `height` (header included), and apply it
+/// to the UTXO set, without the connect hooks: a block the hooks missed.
+fn connect_without_hooks(hs: &HeaderSync, block: &mut bitcoin::Block, height: u32) {
+    let prev = hs.store.get_hash_at_height(height - 1).unwrap().unwrap();
+    block.header.prev_blockhash = prev;
+    hs.store.store_headers(&[block.header], height).unwrap();
+    hs.utxo.apply_block(block, height).unwrap();
+    hs.block_store.store_block(block, height).unwrap();
+    hs.store.set_validated_height(height).unwrap();
+}
+
+/// Reviewer item (C): an own tx whose block the hooks missed (here: no
+/// hooks at all) is found on the chain when its re-add reports a missing
+/// input with the UTXO set caught up: mined itself (its outputs are
+/// coins), or its input spent by another tx (undo data + stored block).
+/// An input that is simply unknown leaves it pending.
+#[test]
+fn missing_input_with_the_utxo_set_caught_up_is_resolved_on_chain() {
+    let dir = TempDir::new().unwrap();
+    let hs = fresh(&dir);
+    let mined = spend(seed(&hs, 1, OP_TRUE, 1, false), 90_000);
+    let a = hs.submit_own_tx(&raw(&mined)).unwrap().txid;
+    let coin = seed(&hs, 2, OP_TRUE, 1, false);
+    let b = hs.submit_own_tx(&raw(&spend(coin, 90_000))).unwrap().txid;
+    let rival = spend(coin, 80_000);
+    let orphan = spend(OutPoint { txid: Txid::from_byte_array([9; 32]), vout: 0 }, 1_000);
+    hs.own_txs.track(orphan.compute_txid(), &raw(&orphan), unix_now_u32() as u64).unwrap();
+
+    let mut block = block_with(vec![mined.clone(), rival.clone()]);
+    connect_without_hooks(&hs, &mut block, VALIDATED + 1);
+    // The app restarts: the mempool is gone, the tracker still pending.
+    *hs.mempool.lock().unwrap() = Mempool::new();
+    assert_eq!(status(&hs, &a), OwnTxStatus::Pending);
+
+    hs.rebroadcast_due_own_txs(unix_now_u32() as u64 + 100_000);
+    assert_eq!(status(&hs, &a), OwnTxStatus::Confirmed { height: VALIDATED + 1 });
+    assert_eq!(status(&hs, &b), OwnTxStatus::Conflicted { by: rival.compute_txid() });
+    assert_eq!(status(&hs, &orphan.compute_txid()), OwnTxStatus::Pending, "parent may still turn up");
+    // Both reorg-undoable.
+    hs.own_txs.demote_confirmed_above(VALIDATED, unix_now_u32() as u64).unwrap();
+    assert_eq!(status(&hs, &a), OwnTxStatus::Pending);
+    assert_eq!(status(&hs, &b), OwnTxStatus::Pending);
 }

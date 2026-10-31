@@ -988,6 +988,12 @@ pub struct HeaderSync {
     /// The block store's one-time `VACUUM` migration was tried in this
     /// process (it is not retried per block if it fails).
     vacuum_attempted: AtomicBool,
+    /// Mempool removal events the own-tx tracker failed to take (a SQLite
+    /// error), with the height they were drained at, retried first on the
+    /// next `settle_mempool_removals` (ticket 053). The mempool has already
+    /// dropped those txs, so this is their only copy. Only events for
+    /// active own txs are kept, so it is bounded by the tracker.
+    unsettled_removals: Mutex<Vec<(Vec<crate::mempool::MempoolRemoval>, u32)>>,
     /// Test kill point: `connect_block` stops after this step once, as if
     /// the process were killed there.
     #[cfg(test)]
@@ -1264,6 +1270,7 @@ impl HeaderSync {
             prune_window: DEFAULT_PRUNE_WINDOW,
             prune_floor: AtomicU32::new(NO_PRUNE_FLOOR),
             vacuum_attempted: AtomicBool::new(false),
+            unsettled_removals: Mutex::new(Vec::new()),
             #[cfg(test)]
             connect_kill: Mutex::new(None),
             headers_stall_limit: (HEADERS_STALL_GRACE, MIN_HEADERS_RATE),
@@ -1746,6 +1753,9 @@ impl HeaderSync {
     /// - Consensus validity and network standardness are required; our
     ///   local Knots-style relay policy (018) is not applied — it is
     ///   reported as a warning on the receipt instead.
+    /// - Refused with `FeeBelowNetworkMinimum` if its fee is below every
+    ///   connected peer's `feefilter` (ticket 053): no peer would be sent
+    ///   it. Nothing is kept or tracked then.
     /// - Persisted in the own-tx tracker, then announced immediately (no
     ///   Poisson trickle) to every connected peer, or handed to the 029
     ///   private-broadcast transport when one is installed. Rebroadcast
@@ -1788,14 +1798,38 @@ impl HeaderSync {
             ));
         }
 
-        let (accepted, conflicts) = {
+        let network_floor = self.network_fee_floor_per_kvb();
+        let now = unix_now_u32() as u64;
+        // The tx is tracked, and the accept's removals drained, under the
+        // same mempool lock as the accept (ticket 053). A block connecting
+        // right after it then finds the tx tracked (its `remove_confirmed`
+        // waits for this lock, and `on_block` runs after that), rather than
+        // settling an untracked tx that `track` would then insert as
+        // pending forever. And an own replacement is known as own when its
+        // original's `ReplacedBy` event is settled below, or it would read
+        // as a conflict.
+        let (accepted, conflicts, removals, tracked) = {
             let mut pool = self.mempool.lock().unwrap();
             let conflicts = pool.conflicting_txids(&tx);
-            (
-                pool.accept_own_tx(tx.clone(), &self.utxo, validated_height, &self.store),
-                conflicts,
-            )
+            let accepted = pool.accept_own_tx_for_network(
+                tx.clone(),
+                &self.utxo,
+                validated_height,
+                &self.store,
+                network_floor,
+            );
+            let tracked = match accepted {
+                Ok(_) | Err(crate::mempool::MempoolError::AlreadyInMempool) => {
+                    Some(self.own_txs.track(txid, raw, now))
+                }
+                Err(_) => None,
+            };
+            (accepted, conflicts, pool.drain_removals(), tracked)
         };
+        // Settle what the accept removed (an own original it replaced is
+        // `Replaced`, own descendants of it `Conflicted`) even if tracking
+        // failed: those removals happened.
+        let _ = self.settle_mempool_removals(removals, validated_height);
         let already_known = match accepted {
             Ok(_) => false,
             Err(crate::mempool::MempoolError::AlreadyInMempool) => true,
@@ -1809,16 +1843,8 @@ impl HeaderSync {
                 ))
             }
         };
-
-        let now = unix_now_u32() as u64;
-        self.own_txs
-            .track(txid, raw, now)
-            .map_err(|e| SubmitError::Internal(format!("{}", e)))?;
-        if !already_known {
-            // Accepted with conflicts == it replaced them (RBF).
-            for c in &conflicts {
-                let _ = self.own_txs.mark_replaced(c, txid, now);
-            }
+        if let Some(Err(e)) = tracked {
+            return Err(SubmitError::Internal(format!("{}", e)));
         }
         info!(
             "Own tx {} submitted (validated_height {}{})",
@@ -1908,7 +1934,7 @@ impl HeaderSync {
         if let Ok(active) = self.own_txs.active_records() {
             let validated_height = self.store.validated_height().unwrap_or(0);
             for rec in active {
-                self.readd_own_tx(&rec, validated_height, now);
+                self.readd_own_tx(&rec, validated_height, false);
             }
         }
         self.rebroadcast_due_own_txs(now);
@@ -1916,36 +1942,180 @@ impl HeaderSync {
 
     /// Ensure an own tx is in the mempool, re-adding it if needed (app
     /// restart, eviction, reorg). An accepted re-add that evicts other own
-    /// txs settles them as replaced, as `submit_own_tx` would: after a
-    /// reorg demotes both an RBF original and its replacement, the second
-    /// re-add wins the RBF race again. Returns whether it is in the pool.
+    /// txs settles them as replaced through the removal events, as
+    /// `submit_own_tx` does: after a reorg demotes both an RBF original
+    /// and its replacement, the second re-add wins the RBF race again.
+    /// `disconnected` re-adds one a reorg took out of a block, with no fee
+    /// floor (`Mempool::accept_disconnected_own_tx`). Returns whether it
+    /// is in the pool.
     fn readd_own_tx(
         &self,
         rec: &crate::own_tx_store::OwnTxRecord,
         validated_height: u32,
-        now: u64,
+        disconnected: bool,
     ) -> bool {
         let Some(tx) = rec.tx() else { return false };
-        let replaced = {
+        let (accepted, removals) = {
             let mut pool = self.mempool.lock().unwrap();
             if pool.contains(&rec.txid) {
                 return true;
             }
-            let conflicts = pool.conflicting_txids(&tx);
-            match pool.accept_own_tx(tx, &self.utxo, validated_height, &self.store) {
-                Ok(_) => conflicts,
-                Err(e) => {
-                    // Inputs not validated yet, or a conflict that a block
-                    // will settle: retry on schedule.
-                    debug!("own tx {} not re-added to mempool: {}", rec.txid, e);
-                    return false;
-                }
-            }
+            let accepted = if disconnected {
+                pool.accept_disconnected_own_tx(tx, &self.utxo, validated_height, &self.store)
+            } else {
+                pool.accept_own_tx(tx, &self.utxo, validated_height, &self.store)
+            };
+            (accepted, pool.drain_removals())
         };
-        for c in &replaced {
-            let _ = self.own_txs.mark_replaced(c, rec.txid, now);
+        let _ = self.settle_mempool_removals(removals, validated_height);
+        match accepted {
+            Ok(_) => true,
+            Err(crate::mempool::MempoolError::MissingInput { txid, vout }) => {
+                debug!("own tx {} not re-added to mempool: input {}:{} missing", rec.txid, txid, vout);
+                self.resolve_missing_own_input(rec, bitcoin::OutPoint { txid, vout }, validated_height);
+                false
+            }
+            Err(e) => {
+                // Inputs not validated yet, or a conflict that a block
+                // will settle: retry on schedule.
+                debug!("own tx {} not re-added to mempool: {}", rec.txid, e);
+                false
+            }
         }
-        true
+    }
+
+    /// An own tx's re-add found input `missing` in neither the UTXO set nor
+    /// the mempool (ticket 053). With the UTXO set caught up to the headers
+    /// that means one of: the tx itself was mined, the input was spent by
+    /// another tx that was, or it spends an unconfirmed parent we don't
+    /// have (an app restart empties the mempool). The block hooks normally
+    /// settle the first two, but can miss them (a block connecting between
+    /// a submit's accept and its tracking, a hook interrupted by a crash),
+    /// and then the tx would stay pending for its whole expiry.
+    ///
+    /// So look on the chain: the tx's own outputs in the UTXO set (it was
+    /// mined at that coin's height), else the undo data of the blocks we
+    /// keep for the block that spent `missing`, and in that block the
+    /// spender (`settle_from_chain`). Found nowhere, it stays pending: an
+    /// unconfirmed parent may still turn up, and a spend older than the
+    /// undo window is not ours to guess at.
+    fn resolve_missing_own_input(
+        &self,
+        rec: &crate::own_tx_store::OwnTxRecord,
+        missing: bitcoin::OutPoint,
+        validated_height: u32,
+    ) {
+        let tip = self.store.tip().ok().flatten().map(|(h, _, _)| h).unwrap_or(0);
+        if validated_height < tip {
+            return; // the input may be in a block we haven't validated yet
+        }
+        let Some(tx) = rec.tx() else { return };
+        let now = unix_now_u32() as u64;
+        for vout in 0..tx.output.len() as u32 {
+            if let Ok(Some(coin)) = self.utxo.get(&rec.txid, vout) {
+                let _ = self.own_txs.settle_from_chain(&rec.txid, rec.txid, coin.height, now);
+                return;
+            }
+        }
+        let mut height = validated_height;
+        while height > 0 {
+            let spent = match self.utxo.spent_coins_at(height) {
+                Ok(Some(spent)) => spent,
+                _ => return, // past the undo window (or a read error)
+            };
+            if spent.iter().any(|c| c.outpoint == missing) {
+                let block = self
+                    .store
+                    .get_hash_at_height(height)
+                    .ok()
+                    .flatten()
+                    .and_then(|h| self.block_store.get_block_by_hash(&h).ok().flatten());
+                let spender = block.and_then(|b| {
+                    b.txdata
+                        .iter()
+                        .find(|t| t.input.iter().any(|i| i.previous_output == missing))
+                        .map(|t| t.compute_txid())
+                });
+                match spender {
+                    Some(by) => {
+                        let _ = self.own_txs.settle_from_chain(&rec.txid, by, height, now);
+                    }
+                    None => warn!(
+                        "own tx {}: input {} spent at height {} by a tx we no longer have",
+                        rec.txid, missing, height
+                    ),
+                }
+                return;
+            }
+            height -= 1;
+        }
+    }
+
+    /// Hand mempool removals to the own-tx tracker (ticket 053's event
+    /// stream): an own tx replaced, or conflicted out by a block, directly
+    /// or through a parent that isn't ours, is settled. Every call that
+    /// can remove transactions drains under the same lock and comes here:
+    /// `on_block_connected` (`remove_confirmed`), `submit_own_tx`,
+    /// `readd_own_tx` and `handle_tx` (replacements, capacity eviction),
+    /// the monitor loop (`expire_old`) and `apply_reorg` (`remove_tx`).
+    /// Draining hands each event over once, so none is applied twice.
+    /// `height` is the block just connected (for `ConflictedByBlock`), or
+    /// the validated height.
+    ///
+    /// A batch the tracker fails to take is kept and retried first next
+    /// time (`unsettled_removals`); the error is returned so the block
+    /// path can fail the connect (the next connect at that height redoes
+    /// the hooks). Re-applying part of a batch is harmless: settled rows
+    /// are skipped.
+    fn settle_mempool_removals(
+        &self,
+        removals: crate::mempool::MempoolRemovals,
+        height: u32,
+    ) -> Result<(), SyncError> {
+        if removals.dropped > 0 {
+            // Only non-final events are ever dropped (see
+            // MAX_QUEUED_REMOVALS), and the tracker ignores those.
+            warn!("{} mempool removal events were dropped undrained", removals.dropped);
+        }
+        let mut pending = self.unsettled_removals.lock().unwrap();
+        let ours: Vec<_> = removals.removals.into_iter().filter(|r| self.own_txs.is_active(&r.txid)).collect();
+        if !ours.is_empty() {
+            pending.push((ours, height));
+        }
+        while let Some((batch, h)) = pending.first() {
+            if let Err(e) = self.own_txs.on_mempool_removals(batch, *h, unix_now_u32() as u64) {
+                warn!("own tx tracker mempool hook: {} ({} batches kept for retry)", e, pending.len());
+                return Err(SyncError::Store(e.to_string()));
+            }
+            pending.remove(0);
+        }
+        Ok(())
+    }
+
+    /// Drop mempool txs older than 14 days (maintenance tick), and settle
+    /// the removals like every other mempool call (ticket 053).
+    fn expire_mempool(&self) {
+        let removals = {
+            let mut mempool = self.mempool.lock().unwrap();
+            mempool.expire_old();
+            mempool.drain_removals()
+        };
+        let _ = self.settle_mempool_removals(removals, self.store.validated_height().unwrap_or(0));
+    }
+
+    /// The lowest `feefilter` (BIP 133, sat/kvB) among the peers we hold
+    /// relay state for; 0 if any of them set none, or we know of none.
+    /// An own tx paying less would be announced to no peer (ticket 053).
+    /// Entries of peers that disconnected linger until the next
+    /// maintenance tick drops them, so this can be a tick stale.
+    fn network_fee_floor_per_kvb(&self) -> u64 {
+        self.relay_state
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.feefilter_rate)
+            .min()
+            .unwrap_or(0)
     }
 
     /// Re-announce own transactions whose rebroadcast is due, re-adding
@@ -1972,7 +2142,7 @@ impl HeaderSync {
                 continue;
             }
             let Some(tx) = rec.tx() else { continue };
-            if self.readd_own_tx(&rec, validated_height, now) {
+            if self.readd_own_tx(&rec, validated_height, false) {
                 self.announce_own_tx(rec.txid, &tx, now);
             } else {
                 // Push the schedule back so we don't retry every tick.
@@ -2022,8 +2192,9 @@ impl HeaderSync {
         let new_tip = fork_at + new_headers.len() as u32;
 
         // Clear the mempool — transactions may reference UTXOs that no
-        // longer exist on the new chain.
-        {
+        // longer exist on the new chain. (Ticket 025 keeps them and
+        // re-checks them instead.)
+        let removals = {
             let mut mempool = self.mempool.lock().unwrap();
             let count = mempool.count();
             if count > 0 {
@@ -2034,14 +2205,38 @@ impl HeaderSync {
                 }
                 info!("Reorg: cleared {} transactions from mempool", count);
             }
-        }
+            mempool.drain_removals()
+        };
+        let _ = self.settle_mempool_removals(removals, new_validated);
         // Own txs confirmed or conflicted above the fork are unsettled
-        // again; rebroadcast re-adds them.
+        // again; rebroadcast re-adds them. The confirmed ones were in the
+        // disconnected blocks: they go back into the mempool now, with no
+        // fee floor, as Core re-adds disconnected block transactions
+        // (`MaybeUpdateMempoolForReorg`, `bypass_limits`), so a mined tx
+        // isn't lost to a rolling minimum that rose since. Only own txs
+        // for now; ticket 025 re-adds every disconnected transaction.
+        let disconnected = self.own_txs.confirmed_above(fork_at).unwrap_or_default();
         let _ = self
             .own_txs
             .demote_confirmed_above(fork_at, unix_now_u32() as u64);
+        self.readd_disconnected_own_txs(&disconnected, new_validated);
 
         Ok((new_tip, new_validated))
+    }
+
+    /// Re-add own txs a reorg disconnected (see `apply_reorg`), oldest block
+    /// first. A child whose parent comes later in the list (same block,
+    /// sent in the same second) is retried after it, until a pass adds
+    /// nothing.
+    fn readd_disconnected_own_txs(&self, recs: &[crate::own_tx_store::OwnTxRecord], validated_height: u32) {
+        let mut left: Vec<&crate::own_tx_store::OwnTxRecord> = recs.iter().collect();
+        loop {
+            let before = left.len();
+            left.retain(|rec| !self.readd_own_tx(rec, validated_height, true));
+            if left.is_empty() || left.len() == before {
+                break;
+            }
+        }
     }
 
     /// Height of the block the UTXO set is at. From the best-block marker
@@ -2244,7 +2439,7 @@ impl HeaderSync {
 
         // The wallet hook (035) joins here and gets `spent`.
         debug!("Connecting block {} at {}: {} coins spent", hash, height, spent.len());
-        self.on_block_connected(block, height);
+        self.on_block_connected(block, height).map_err(BlockFailure::Local)?;
         self.kill_point(ConnectStep::Hooked)?;
 
         self.store
@@ -2787,14 +2982,31 @@ impl HeaderSync {
 
     /// Block-connect hook, run by `connect_block` for every block on every
     /// path: drop its transactions (and their conflicts) from the mempool
-    /// and settle any own transactions it confirms or conflicts. Delivered
-    /// at least once: crash recovery runs it again, so everything here must
-    /// be idempotent.
-    fn on_block_connected(&self, block: &bitcoin::Block, height: u32) {
-        self.mempool.lock().unwrap().remove_confirmed(block);
-        if let Err(e) = self.own_txs.on_block(block, height, unix_now_u32() as u64) {
-            warn!("own tx tracker block hook at {}: {}", height, e);
-        }
+    /// and settle any own transactions it confirms or conflicts: directly
+    /// (`on_block`), and through the mempool's removal events, which also
+    /// catch an own tx whose parent someone else's tx double-spent
+    /// (ticket 053). Delivered at least once: crash recovery runs it
+    /// again, so everything here must be idempotent (a second
+    /// `remove_confirmed` finds nothing to remove, and settled rows are
+    /// skipped).
+    ///
+    /// A tracker failure fails the hook, and with it the connect, before
+    /// `set_validated_height` (ticket 053): the next connect at this
+    /// height redoes the hooks, where a logged-and-ignored failure would
+    /// leave an own tx pending although the block confirmed or conflicted
+    /// it. The mempool part has run either way, and its events wait in
+    /// `unsettled_removals`.
+    fn on_block_connected(&self, block: &bitcoin::Block, height: u32) -> Result<(), SyncError> {
+        let removals = {
+            let mut pool = self.mempool.lock().unwrap();
+            pool.remove_confirmed(block);
+            pool.drain_removals()
+        };
+        let settled = self.settle_mempool_removals(removals, height);
+        self.own_txs
+            .on_block(block, height, unix_now_u32() as u64)
+            .map_err(|e| SyncError::Store(format!("own tx tracker block hook at {}: {}", height, e)))?;
+        settled
     }
 
     /// Height of the last block whose scripts were fully validated.
@@ -4268,7 +4480,7 @@ impl HeaderSync {
         // Periodic maintenance
         if timers.last_maintain.elapsed() >= MAINTENANCE_INTERVAL {
             pool.maintain();
-            self.mempool.lock().unwrap().expire_old();
+            self.expire_mempool();
             self.rebroadcast_due_own_txs(unix_now_u32() as u64);
             self.update_peer_counts(pool);
             // Clean up relay_state: remove entries for disconnected
@@ -4612,9 +4824,17 @@ impl HeaderSync {
                 }
                 Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                     // An own tx is served only to a peer we announced it
-                    // to or that announced it to us; anyone else asking
-                    // is probing whether we have it (i.e. are its source).
-                    if self.own_txs.is_active(&txid) && !self.peer_knows_own_tx(addr, &txid) {
+                    // to or that announced it to us, or one that knows an
+                    // own descendant of it (ticket 053): that peer asks
+                    // for the parent to accept the child, and the child
+                    // already showed it the parent exists. Anyone else
+                    // asking is probing whether we have it (i.e. are its
+                    // source).
+                    let own = self.own_txs.is_active(&txid);
+                    if own
+                        && !self.peer_knows_own_tx(addr, &txid)
+                        && !self.peer_knows_own_descendant(addr, &txid)
+                    {
                         not_found.push(item);
                         continue;
                     }
@@ -4624,6 +4844,10 @@ impl HeaderSync {
                         drop(mempool);
                         peer.send_tx(tx_clone)
                             .map_err(|e| format!("send tx: {}", e))?;
+                        if own {
+                            // It reached this peer: the delivery signal.
+                            let _ = self.own_txs.record_delivered(&txid, addr, unix_now_u32() as u64);
+                        }
                     } else {
                         not_found.push(item);
                     }
@@ -4825,10 +5049,14 @@ impl HeaderSync {
     fn handle_tx(&self, addr: &str, tx: bitcoin::Transaction) -> Result<(), String> {
         let validated_height = self.store.validated_height().unwrap_or(0);
 
-        let result = {
+        let (result, removals) = {
             let mut mempool = self.mempool.lock().unwrap();
-            mempool.accept_tx(tx, &self.utxo, validated_height, &self.store)
+            let result = mempool.accept_tx(tx, &self.utxo, validated_height, &self.store);
+            (result, mempool.drain_removals())
         }; // mempool lock released before acquiring relay_queue lock
+        // A relayed replacement can evict an own tx, or the parent an own
+        // tx spends (ticket 053).
+        let _ = self.settle_mempool_removals(removals, validated_height);
 
         match result {
             Ok(txid) => {
@@ -4839,6 +5067,15 @@ impl HeaderSync {
                     relay_at: Instant::now() + Duration::from_secs_f64(delay),
                     from_peer: Some(addr.to_string()),
                 });
+            }
+            // Invalid on its face (a CheckTransaction failure): no honest
+            // node relays it, so the sender is disconnected, as ticket 053
+            // asks. Not scored: scores and discouragement are ticket 052's
+            // penalty classes. Everything else costs the sender nothing,
+            // as in Core 30+, which punishes no tx rejection at all.
+            Err(e) if e.is_invalid_on_its_face() => {
+                warn!("Consensus-invalid tx from {}: {}", addr, e);
+                return Err(format!("sent a consensus-invalid transaction: {}", e));
             }
             Err(e) => {
                 debug!("Rejected tx from {}: {}", addr, e);
@@ -4968,6 +5205,21 @@ impl HeaderSync {
                 }
             }
         }
+    }
+
+    /// True if `addr` is known to have an own tx that descends from
+    /// mempool tx `txid` (in `own_txids`: we announced it, or it announced
+    /// it to us). Such a peer has, or is asking for, `txid` to accept it.
+    fn peer_knows_own_descendant(&self, addr: &str, txid: &Txid) -> bool {
+        let descendants = self.mempool.lock().unwrap().descendants(txid);
+        if descendants.is_empty() {
+            return false;
+        }
+        self.relay_state
+            .lock()
+            .unwrap()
+            .get(addr)
+            .is_some_and(|s| descendants.iter().any(|d| s.own_txids.contains(d)))
     }
 
     /// True if `addr` is known to have own tx `txid` (we announced it to

@@ -144,6 +144,8 @@ dictionary OwnTxInfo {
     u64 next_attempt_at;
     u32 attempts;
     u32 seen_from_peers;
+    u32 delivered_to_peers;
+    string delivery;
     u64 updated_at;
 };
 
@@ -246,6 +248,7 @@ interface BroadcastError {
     NotYetFinal(string msg);
     NonStandard(string msg);
     FeeTooLow(string msg);
+    FeeBelowNetworkMinimum(string msg);
     AbsurdFee(string msg);
     Conflict(string msg);
     AlreadyKnown(string txid);
