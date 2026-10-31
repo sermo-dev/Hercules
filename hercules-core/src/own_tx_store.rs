@@ -449,7 +449,7 @@ impl OwnTxStore {
         let conn = Connection::open(path).map_err(db_err)?;
         conn.busy_timeout(crate::store::SQLITE_BUSY_TIMEOUT).map_err(db_err)?;
         if path != ":memory:" {
-            conn.pragma_update(None, "journal_mode", "WAL").map_err(db_err)?;
+            crate::store::set_wal(&conn).map_err(db_err)?;
         }
         let version = crate::store::check_schema_version(&conn, "own tx store", SCHEMA_VERSION)
             .map_err(OwnTxStoreError)?;

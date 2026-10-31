@@ -18,6 +18,38 @@ pub struct HeaderStore {
 /// there is normally no other connection; this is defense in depth.
 pub(crate) const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Put `conn` in WAL mode. Two connections switching a new file to WAL at
+/// once both hold a shared lock and want it exclusive, and SQLite refuses
+/// one of them "database is locked" at once (deadlock avoidance, so the
+/// busy handler is never called and `busy_timeout` doesn't cover it): a
+/// `PeerPool` that lost that race ran its whole session without saving
+/// bans or scores. The mode is stored in the file, so one already in WAL
+/// mode is left alone; otherwise retry for as long as the busy timeout
+/// would have waited.
+pub(crate) fn set_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let res = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .and_then(|mode| {
+                if mode.eq_ignore_ascii_case("wal") {
+                    Ok(())
+                } else {
+                    conn.pragma_update(None, "journal_mode", "WAL")
+                }
+            });
+        match res {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                    && start.elapsed() < SQLITE_BUSY_TIMEOUT =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// `headers.sqlite3` layout version (`PRAGMA user_version`, ticket 050).
 ///
 /// History:
@@ -67,8 +99,7 @@ impl HeaderStore {
 
         // Set WAL journal mode before any writes so that table creation
         // also benefits from WAL's crash-recovery semantics.
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| StoreError(format!("set WAL: {}", e)))?;
+        set_wal(&conn).map_err(|e| StoreError(format!("set WAL: {}", e)))?;
 
         // Durable commits, matching the UTXO env (ticket 050 review): LMDB
         // commits with F_FULLFSYNC on Apple, and a plain fsync there only

@@ -65,8 +65,7 @@ impl BlockStore {
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
             .map_err(|e| BlockStoreError(format!("set auto_vacuum: {}", e)))?;
 
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| BlockStoreError(format!("set WAL: {}", e)))?;
+        crate::store::set_wal(&conn).map_err(|e| BlockStoreError(format!("set WAL: {}", e)))?;
 
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| BlockStoreError(format!("set synchronous: {}", e)))?;
