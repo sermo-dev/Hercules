@@ -82,11 +82,29 @@ const MAX_DESCENDANTS: usize = 25;
 /// decision to perform.
 const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 
-/// Anti-foot-shoot fee ceiling. A transaction whose absolute fee exceeds
-/// this is rejected outright. Matches Bitcoin Core's `-maxtxfee` default
-/// (0.1 BTC). The intent is to catch wallet bugs and crafted txs that
-/// would burn the entire input value as fees, not to enforce policy.
+/// Anti-foot-shoot fee ceiling for the user's **own** transactions: one
+/// whose absolute fee exceeds this is refused. Matches Bitcoin Core's
+/// `-maxtxfee` default (0.1 BTC). The intent is to catch wallet bugs that
+/// would burn the input value as fees. Core applies its cap only where the
+/// local user broadcasts (`BroadcastTransaction`'s `max_tx_fee`), never to
+/// relayed transactions, and neither do we: a high-fee exchange batch is
+/// not ours to second-guess.
 const ABSURD_FEE_THRESHOLD: u64 = 10_000_000;
+
+/// Highest standard transaction version (`TX_MAX_STANDARD_VERSION` before
+/// Core 28). Core 28+ and Knots also accept version 3 under the TRUC
+/// rules (BIP 431); we don't implement TRUC, so a v3 tx is refused rather
+/// than relayed without them. Stricter than Core 28+, deliberately.
+const TX_MAX_STANDARD_VERSION: i32 = 2;
+
+/// Largest standard scriptSig (`MAX_STANDARD_SCRIPTSIG_SIZE`): enough for
+/// a 15-of-15 P2SH multisig spend.
+const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
+
+/// Largest standard sigop cost per transaction (`MAX_STANDARD_TX_SIGOPS_COST`
+/// = `MAX_BLOCK_SIGOPS_COST / 5`), so one transaction can't fill a block's
+/// sigop budget.
+const MAX_STANDARD_TX_SIGOPS_COST: u64 = crate::contextual_checks::MAX_BLOCK_SIGOPS_COST / 5;
 
 /// A transaction in the mempool with fee metadata and CPFP graph state.
 ///
@@ -403,6 +421,22 @@ impl Mempool {
         if weight > MAX_TX_WEIGHT {
             return Err(MempoolError::OversizedTx { weight });
         }
+        // The rest of Core's `IsStandardTx` that doesn't depend on output
+        // types: version, and scriptSigs that are small and push-only
+        // (anything else in a scriptSig is malleable by third parties).
+        let version = tx.version.0;
+        if !(1..=TX_MAX_STANDARD_VERSION).contains(&version) {
+            return Err(MempoolError::NonStandardVersion { version });
+        }
+        for (input_index, input) in tx.input.iter().enumerate() {
+            if input.script_sig.len() > MAX_STANDARD_SCRIPTSIG_SIZE {
+                return Err(MempoolError::NonStandardScriptSig { input_index, reason: "scriptsig-size" });
+            }
+            if !is_push_only(&input.script_sig) {
+                return Err(MempoolError::NonStandardScriptSig { input_index, reason: "scriptsig-not-pushonly" });
+            }
+        }
+
         // Virtual size = ceil(weight / 4). All policy decisions (fee rate,
         // ancestor / descendant limits, package rate) use this — never the
         // raw serialized byte length. The bitcoin crate's `Transaction::vsize`
@@ -576,6 +610,20 @@ impl Mempool {
             });
         }
 
+        // Standard sigop cost (MemPoolAccept::PreChecks,
+        // `bad-txns-too-many-sigops`): legacy + P2SH + witness sigops,
+        // counted as `GetTransactionSigOpCost` does with the standard
+        // flags, before any script runs.
+        let spent_spks: Vec<&[u8]> = spent.iter().map(|(_, spk)| spk.as_slice()).collect();
+        let sigop_cost = crate::contextual_checks::transaction_sigop_cost(
+            &tx,
+            &spent_spks,
+            crate::chain_params::SCRIPT_VERIFY_P2SH | crate::chain_params::SCRIPT_VERIFY_WITNESS,
+        );
+        if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
+            return Err(MempoolError::TooManySigops { cost: sigop_cost, limit: MAX_STANDARD_TX_SIGOPS_COST });
+        }
+
         if !skip_consensus {
             script_verify::verify_transaction(&tx, &spent, flags)
                 .map_err(MempoolError::from_script_verify)?;
@@ -595,10 +643,9 @@ impl Mempool {
 
         let fee = input_sum - output_sum;
 
-        // Absurd-fee guardrail. Catches wallet bugs and crafted txs that
-        // would burn the entire input value as fees. Bitcoin Core uses
-        // the same default (`-maxtxfee=0.1 BTC`).
-        if fee > ABSURD_FEE_THRESHOLD {
+        // Absurd-fee guardrail, own transactions only (see
+        // ABSURD_FEE_THRESHOLD).
+        if mode == AcceptMode::Own && fee > ABSURD_FEE_THRESHOLD {
             return Err(MempoolError::AbsurdFee {
                 fee,
                 limit: ABSURD_FEE_THRESHOLD,
@@ -617,7 +664,7 @@ impl Mempool {
 
         // ── Phase 4: BIP 125 RBF enforcement ────────────────────────────
         if !direct_conflicts.is_empty() {
-            self.check_bip125(fee, vsize, &direct_conflicts, &to_evict)?;
+            self.check_bip125(&tx, fee, vsize, &direct_conflicts, &to_evict)?;
         }
 
         // ── Phase 5: ancestor closure + limit enforcement ───────────────
@@ -948,30 +995,47 @@ impl Mempool {
         out
     }
 
-    /// BIP 125 rules 2, 3, 5. Rule 1 (signaling) is intentionally omitted —
-    /// we follow Bitcoin Core v28+ full RBF semantics. Rule 4 (eviction
-    /// count) is enforced before this is called. Rule 5 (no new unconfirmed
-    /// parents) is intentionally **not** enforced here: it would have been
-    /// vacuous given how `parents` is constructed (every entry comes from
-    /// a successful mempool lookup in Phase 2), and it has been removed
-    /// from the loop instead. Phase 2 already rejects replacements that
-    /// try to spend an output of one of the txs they're replacing
-    /// (`to_evict.contains(prev_txid)` → `MissingInput`), which is the
-    /// only legitimate concern rule 5 was guarding against.
+    /// Core's `MemPoolAccept::ReplacementChecks`, in its order. Signaling
+    /// (BIP 125 rule 1) is intentionally omitted — we follow Bitcoin Core
+    /// v28+ full RBF semantics. The eviction count (rule 5) is enforced
+    /// before this is called, and Phase 2 rejects a replacement spending
+    /// an output of a tx it replaces (`MissingInput`).
     ///
-    /// * Rule 2 — replacement fee_rate (sat/vB) must be strictly higher
-    ///   than every directly-conflicting tx's fee_rate. Both sides use
-    ///   *vsize* (virtual bytes), never raw serialized bytes — mixing
-    ///   the two ranks SegWit txs incorrectly.
-    /// * Rule 3 — replacement absolute fee must cover the originals' fees
-    ///   *plus* a relay-cost surcharge: `replacement_vsize * incremental_relay_fee`.
+    /// * No new unconfirmed inputs (BIP 125 rule 2, Core ≤ 30's
+    ///   `HasNoNewUnconfirmed`, `replacement-adds-unconfirmed`; Knots
+    ///   keeps it): every input that spends a mempool tx must spend one
+    ///   the directly-conflicting txs already spent from. Otherwise a fee
+    ///   bump could hang on low-fee junk that has to be mined first, and
+    ///   Knots / older Core peers drop it while we keep it.
+    /// * Fee rate (Core's `PaysMoreThanConflicts`) — replacement fee_rate
+    ///   (sat/vB) must be strictly higher than every directly-conflicting
+    ///   tx's fee_rate. Both sides use *vsize* (virtual bytes), never raw
+    ///   serialized bytes — mixing the two ranks SegWit txs incorrectly.
+    /// * Rule 3/4 (`PaysForRBF`) — replacement absolute fee must cover the
+    ///   originals' fees *plus* a relay-cost surcharge:
+    ///   `replacement_vsize * incremental_relay_fee`.
     fn check_bip125(
         &self,
+        tx: &Transaction,
         replacement_fee: u64,
         replacement_vsize: u64,
         direct_conflicts: &HashSet<Txid>,
         to_evict: &HashSet<Txid>,
     ) -> Result<(), MempoolError> {
+        // Txids the conflicts spend from, confirmed or not, as Core
+        // collects them (`parents_of_conflicts`).
+        let parents_of_conflicts: HashSet<Txid> = direct_conflicts
+            .iter()
+            .filter_map(|t| self.txs.get(t))
+            .flat_map(|e| e.tx.input.iter().map(|i| i.previous_output.txid))
+            .collect();
+        for (input_index, input) in tx.input.iter().enumerate() {
+            let parent = input.previous_output.txid;
+            if !parents_of_conflicts.contains(&parent) && self.txs.contains_key(&parent) {
+                return Err(MempoolError::ReplacementAddsUnconfirmed { input_index, parent });
+            }
+        }
+
         // Rule 2 — replacement fee_rate strictly greater than each direct
         // conflict's individual fee_rate. Both sides use sat/vB so SegWit
         // discount is applied symmetrically.
@@ -1508,6 +1572,19 @@ fn is_standard_bare_multisig(spk: &bitcoin::Script) -> bool {
     m <= n && keys.len() == n && keys.iter().all(valid_key)
 }
 
+/// Core's `CScript::IsPushOnly`: the script parses, and every opcode is a
+/// push or a small-number opcode up to OP_16 (which counts OP_1NEGATE and
+/// OP_RESERVED, as Core does).
+fn is_push_only(script: &bitcoin::Script) -> bool {
+    use bitcoin::opcodes::all::OP_PUSHNUM_16;
+    use bitcoin::script::Instruction;
+    script.instructions().all(|ins| match ins {
+        Ok(Instruction::PushBytes(_)) => true,
+        Ok(Instruction::Op(op)) => op.to_u8() <= OP_PUSHNUM_16.to_u8(),
+        Err(_) => false,
+    })
+}
+
 /// Errors from mempool transaction validation.
 #[derive(Debug)]
 pub enum MempoolError {
@@ -1543,6 +1620,14 @@ pub enum MempoolError {
     /// An output worth less than its type's `dust_threshold`.
     DustOutput { index: usize, amount: u64, threshold: u64 },
     NonStandardScript { index: usize },
+    /// Version outside 1..=`TX_MAX_STANDARD_VERSION` (IsStandardTx, `version`).
+    NonStandardVersion { version: i32 },
+    /// A scriptSig over `MAX_STANDARD_SCRIPTSIG_SIZE` (`scriptsig-size`) or
+    /// with non-push opcodes (`scriptsig-not-pushonly`); `reason` is
+    /// Core's reject string.
+    NonStandardScriptSig { input_index: usize, reason: &'static str },
+    /// Sigop cost over `MAX_STANDARD_TX_SIGOPS_COST` (`bad-txns-too-many-sigops`).
+    TooManySigops { cost: u64, limit: u64 },
     /// Transaction rejected by Knots-aligned relay policy (spam filters).
     PolicyRejection(crate::relay_policy::PolicyRejection),
     NonFinal { lock_time: u32, current_height: u32 },
@@ -1562,6 +1647,9 @@ pub enum MempoolError {
     TooManyDescendants { ancestor: Txid, count: usize, limit: usize },
     // BIP 125 RBF (ticket 009)
     TooManyReplacements { evicted: usize, limit: usize },
+    /// A replacement spends from unconfirmed `parent`, which none of the
+    /// txs it replaces spent from (`replacement-adds-unconfirmed`).
+    ReplacementAddsUnconfirmed { input_index: usize, parent: Txid },
     ReplacementFeeTooLow { replacement: f64, conflict: f64 },
     ReplacementFeeInsufficient {
         provided: u64,
@@ -1662,6 +1750,15 @@ impl std::fmt::Display for MempoolError {
             MempoolError::NonStandardScript { index } => {
                 write!(f, "output {} has non-standard script type", index)
             }
+            MempoolError::NonStandardVersion { version } => {
+                write!(f, "transaction version {} is non-standard", version)
+            }
+            MempoolError::NonStandardScriptSig { input_index, reason } => {
+                write!(f, "input {} scriptSig is non-standard ({})", input_index, reason)
+            }
+            MempoolError::TooManySigops { cost, limit } => {
+                write!(f, "sigop cost {} exceeds standard limit {}", cost, limit)
+            }
             MempoolError::PolicyRejection(ref r) => {
                 write!(f, "relay policy: {:?}", r)
             }
@@ -1706,6 +1803,13 @@ impl std::fmt::Display for MempoolError {
                     f,
                     "replacement would evict {} txs (limit {})",
                     evicted, limit
+                )
+            }
+            MempoolError::ReplacementAddsUnconfirmed { input_index, parent } => {
+                write!(
+                    f,
+                    "replacement input {} spends unconfirmed {}, which no replaced tx spent from",
+                    input_index, parent
                 )
             }
             MempoolError::ReplacementFeeTooLow { replacement, conflict } => {
@@ -2401,18 +2505,16 @@ mod tests {
 
     #[test]
     fn rbf_allows_replacement_with_existing_mempool_parent() {
-        // The original BIP 125 "rule 5" forbade a replacement from adding
-        // any new unconfirmed parent that wasn't already a parent of one
-        // of the directly-conflicting txs. We've intentionally relaxed
-        // that: as long as every parent already exists in the mempool,
-        // the replacement doesn't introduce *new* unconfirmed dependency
-        // — only rearranges who depends on whom. The legitimate concern
-        // (replacement spending an output of the tx it's replacing) is
-        // caught earlier in Phase 2.
+        // BIP 125 rule 2 as Knots and Core ≤ 30 enforce it
+        // (`replacement-adds-unconfirmed`, owner decision on ticket 053):
+        // a replacement may spend unconfirmed outputs only of txs the
+        // conflicts already spent from. It used to be relaxed here, so a
+        // fee bump accepted locally died on Knots peers.
         //
         // Setup: P1, P2 both in mempool. A spends P1.0 only. A' spends
-        // P1.0 (the conflict) and P2.0 (a parent that already exists in
-        // the mempool but wasn't a parent of A). Expected: A' is accepted.
+        // P1.0 (the conflict) and P2.0 (in the mempool, but not a parent
+        // of A): rejected. A'' spends P1.0 and P1.1 (P1 already a parent
+        // of A): accepted.
         let (utxo, _dir) = fresh_utxo();
         let r1 = seed_txid(1);
         let r2 = seed_txid(2);
@@ -2431,19 +2533,24 @@ mod tests {
         let a = make_tx_marked(&[(p1_txid, 0)], &[390_000], 0xa);
         let a_txid = pool.accept_tx_test(a, &utxo, TEST_HEIGHT).unwrap();
 
-        // A' spends P1.0 (RBF conflict with A) AND P2.0 (parent already
-        // in mempool). It pays a much higher absolute fee.
+        // A' spends P1.0 (RBF conflict with A) AND P2.0 (a mempool tx A
+        // didn't spend from). It pays a much higher absolute fee, but
+        // that doesn't matter.
         let a_prime = make_tx_marked(&[(p1_txid, 0), (p2_txid, 0)], &[1_300_000], 0xb);
-        let a_prime_txid = pool
-            .accept_tx_test(a_prime, &utxo, TEST_HEIGHT)
-            .expect("loosened BIP 125 should accept replacement with existing-mempool parent");
+        let err = pool.accept_tx_test(a_prime, &utxo, TEST_HEIGHT).unwrap_err();
+        assert!(
+            matches!(err, MempoolError::ReplacementAddsUnconfirmed { input_index: 1, parent } if parent == p2_txid),
+            "{:?}",
+            err
+        );
+        assert!(pool.contains(&a_txid));
 
-        assert!(pool.contains(&a_prime_txid));
+        // A'' adds P1.1: P1 is already a parent of A, so nothing new.
+        let a_second = make_tx_marked(&[(p1_txid, 0), (p1_txid, 1)], &[700_000], 0xc);
+        let a_second_txid = pool.accept_tx_test(a_second, &utxo, TEST_HEIGHT).unwrap();
+        assert!(pool.contains(&a_second_txid));
         assert!(!pool.contains(&a_txid));
-        // P2 is now a parent of A'.
-        let a_prime_entry = pool.txs.get(&a_prime_txid).unwrap();
-        assert!(a_prime_entry.parents.contains(&p2_txid));
-        assert!(a_prime_entry.parents.contains(&p1_txid));
+        assert!(pool.txs[&a_second_txid].parents.contains(&p1_txid));
     }
 
     #[test]
@@ -2526,23 +2633,25 @@ mod tests {
     // ── Code-review fixes (Phase 6.5 admission, absurd fee, expire cascade) ──
 
     #[test]
-    fn absurd_fee_rejected() {
+    fn absurd_fee_rejected_for_own_txs_only() {
         // Burning the entire input as fees should trip the anti-foot-shoot
-        // ceiling. The threshold is 10 BTC; we make the input bigger than
-        // that and the output negligible to push fee well over the cap.
+        // ceiling (0.1 BTC) on the user's own send; a relayed tx paying
+        // that much is someone else's business, as in Core.
         let (utxo, _dir) = fresh_utxo();
-        let parent = seed_txid(1);
-        seed_utxo(&utxo, parent, 0, 20 * 100_000_000); // 20 BTC
+        let coin = seed_op_true(&utxo, 1, 20 * 100_000_000, 1, false); // 20 BTC
 
-        let mut pool = Mempool::new();
-        // Output of 1000 sats; fee = 20 BTC - 1000 sats > 10 BTC ceiling.
-        let tx = make_tx(&[(parent, 0)], &[1000]);
-        let err = pool.accept_tx_test(tx, &utxo, TEST_HEIGHT).unwrap_err();
+        // Output of 1000 sats; fee = 20 BTC - 1000 sats.
+        let tx = spend_ops(&[coin], vec![p2wpkh_out(1000)]);
+        let err = accept_in(&mut Mempool::new(), tx.clone(), &utxo, TEST_HEIGHT, AcceptMode::Own).unwrap_err();
         assert!(matches!(
             err,
             MempoolError::AbsurdFee { fee, limit }
                 if fee > limit && limit == 10_000_000
         ));
+        for mode in [AcceptMode::Relay, AcceptMode::SkipConsensus] {
+            accept_in(&mut Mempool::new(), tx.clone(), &utxo, TEST_HEIGHT, mode)
+                .unwrap_or_else(|e| panic!("{:?}: {:?}", mode, e));
+        }
     }
 
     #[test]
@@ -3058,13 +3167,130 @@ mod tests {
     #[test]
     fn absurd_fee_boundary_is_inclusive() {
         let (utxo, _d) = fresh_utxo();
-        seed_utxo(&utxo, seed_txid(1), 0, 100_000_000);
-        let at = make_tx(&[(seed_txid(1), 0)], &[100_000_000 - ABSURD_FEE_THRESHOLD]);
-        Mempool::new().accept_tx_test(at, &utxo, TEST_HEIGHT).unwrap();
-        let over = make_tx(&[(seed_txid(1), 0)], &[100_000_000 - ABSURD_FEE_THRESHOLD - 1]);
+        let coin = seed_op_true(&utxo, 1, 100_000_000, 1, false);
+        let at = spend_ops(&[coin], vec![p2wpkh_out(100_000_000 - ABSURD_FEE_THRESHOLD)]);
+        accept_in(&mut Mempool::new(), at, &utxo, TEST_HEIGHT, AcceptMode::Own).unwrap();
+        let over = spend_ops(&[coin], vec![p2wpkh_out(100_000_000 - ABSURD_FEE_THRESHOLD - 1)]);
         assert!(matches!(
-            Mempool::new().accept_tx_test(over, &utxo, TEST_HEIGHT),
+            accept_in(&mut Mempool::new(), over, &utxo, TEST_HEIGHT, AcceptMode::Own),
             Err(MempoolError::AbsurdFee { fee, .. }) if fee == ABSURD_FEE_THRESHOLD + 1
+        ));
+    }
+
+    /// IsStandardTx's version rule: 1 and 2 are standard, 0, 3 (TRUC,
+    /// which we don't implement) and above are not, in every mode.
+    #[test]
+    fn version_standardness_both_sides() {
+        for mode in ALL_MODES {
+            for (version, ok) in [(0, false), (1, true), (2, true), (3, false), (-1, false), (i32::MAX, false)] {
+                let (utxo, _d) = fresh_utxo();
+                let coin = seed_op_true(&utxo, 1, 1_000_000, 1, false);
+                let mut tx = spend_ops(&[coin], vec![p2wpkh_out(900_000)]);
+                tx.version = Version(version);
+                let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode);
+                if ok {
+                    r.unwrap_or_else(|e| panic!("{:?} v{}: {:?}", mode, version, e));
+                } else {
+                    assert!(matches!(r, Err(MempoolError::NonStandardVersion { version: v }) if v == version), "{:?} v{}: {:?}", mode, version, r);
+                }
+            }
+        }
+    }
+
+    /// IsStandardTx's scriptSig rules: push-only (`scriptsig-not-pushonly`,
+    /// where OP_1NEGATE..OP_16 and OP_RESERVED count as pushes) and at most
+    /// 1,650 bytes (`scriptsig-size`).
+    #[test]
+    fn scriptsig_standardness_both_sides() {
+        let push = |len: usize| {
+            let mut b = bitcoin::script::Builder::new();
+            b = b.push_slice(<&bitcoin::script::PushBytes>::try_from(&vec![0x11u8; len][..]).unwrap());
+            b.into_script()
+        };
+        // A pushdata2 of n bytes is n + 3 bytes of script.
+        let cases: Vec<(ScriptBuf, Option<&str>)> = vec![
+            (ScriptBuf::from_bytes(vec![0x00, 0x4f, 0x50, 0x51, 0x60]), None), // OP_0 OP_1NEGATE OP_RESERVED OP_1 OP_16
+            (push(1_647), None),                                               // exactly 1,650 bytes
+            (push(1_648), Some("scriptsig-size")),
+            (ScriptBuf::from_bytes(vec![0x51, 0x61]), Some("scriptsig-not-pushonly")), // OP_NOP
+            (ScriptBuf::from_bytes(vec![0x51, 0x75]), Some("scriptsig-not-pushonly")), // OP_DROP
+            (ScriptBuf::from_bytes(vec![0x4c]), Some("scriptsig-not-pushonly")),       // truncated push
+        ];
+        assert_eq!(push(1_647).len(), MAX_STANDARD_SCRIPTSIG_SIZE);
+        for (script_sig, expected) in cases {
+            // SkipConsensus: a scriptSig in front of OP_TRUE would leave
+            // extra stack items; the standardness rule is what's tested.
+            let (utxo, _d) = fresh_utxo();
+            seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+            let mut tx = make_tx(&[(seed_txid(1), 0)], &[900_000]);
+            tx.input[0].script_sig = script_sig.clone();
+            let r = Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT);
+            match expected {
+                None => {
+                    r.unwrap_or_else(|e| panic!("{:?}: {:?}", script_sig, e));
+                }
+                Some(reason) => assert!(
+                    matches!(r, Err(MempoolError::NonStandardScriptSig { input_index: 0, reason: got }) if got == reason),
+                    "{:?}: {:?}",
+                    script_sig,
+                    r
+                ),
+            }
+        }
+    }
+
+    /// The standard sigop cost limit (16,000) counts legacy sigops in
+    /// outputs (x4) and P2SH redeem-script sigops (x4) as
+    /// `GetTransactionSigOpCost` does.
+    #[test]
+    fn sigop_cost_limit_both_sides() {
+        // Each 0xac (OP_CHECKSIG) output script costs 4; 0xae
+        // (OP_CHECKMULTISIG, inaccurate count) costs 20 * 4 = 80.
+        let with_outputs = |checksigs: usize| {
+            let mut spk = vec![0xae; checksigs / 20];
+            spk.extend(vec![0xac; checksigs % 20]);
+            spk
+        };
+        for (sigops, ok) in [(4_000usize, true), (4_001, false)] {
+            let (utxo, _d) = fresh_utxo();
+            seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
+            let mut tx = make_tx(&[(seed_txid(1), 0)], &[900_000]);
+            tx.output[0].script_pubkey = ScriptBuf::from_bytes(with_outputs(sigops));
+            let r = Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT);
+            if ok {
+                r.unwrap();
+            } else {
+                assert!(matches!(r, Err(MempoolError::TooManySigops { cost: 16_004, limit: 16_000 })), "{:?}", r);
+            }
+        }
+
+        // P2SH: the redeem script's sigops count (accurately) against the
+        // spending tx: 16 x OP_CHECKSIG is 16 sigops.
+        let redeem = ScriptBuf::from_bytes(vec![0xac; 16]);
+        let (utxo, _d) = fresh_utxo();
+        utxo.test_insert_utxo(
+            [2; 32],
+            0,
+            UtxoEntry {
+                amount: 1_000_000,
+                script_pubkey: ScriptBuf::new_p2sh(&redeem.script_hash()).into_bytes(),
+                height: 1,
+                is_coinbase: false,
+            },
+        )
+        .unwrap();
+        let mut tx = make_tx(&[(seed_txid(2), 0)], &[900_000]);
+        tx.input[0].script_sig = bitcoin::script::Builder::new()
+            .push_slice(<&bitcoin::script::PushBytes>::try_from(redeem.as_bytes()).unwrap())
+            .into_script();
+        // Outputs: 3,980 legacy sigops + 16 P2SH = 3,996 x 4 = 15,984: ok.
+        tx.output[0].script_pubkey = ScriptBuf::from_bytes(with_outputs(3_980));
+        Mempool::new().accept_tx_test(tx.clone(), &utxo, TEST_HEIGHT).unwrap();
+        // 3,985 + 16 = 4,001: over.
+        tx.output[0].script_pubkey = ScriptBuf::from_bytes(with_outputs(3_985));
+        assert!(matches!(
+            Mempool::new().accept_tx_test(tx, &utxo, TEST_HEIGHT),
+            Err(MempoolError::TooManySigops { cost: 16_004, .. })
         ));
     }
 
@@ -3286,10 +3512,8 @@ mod tests {
 
     /// Core (and Knots) refuse a replacement that spends an unconfirmed
     /// output none of the originals spent (`replacement-adds-unconfirmed`,
-    /// BIP 125 rule 2). Hercules deliberately allows it (see
-    /// `rbf_allows_replacement_with_existing_mempool_parent`).
+    /// BIP 125 rule 2), and so do we (owner decision, ticket 053).
     #[test]
-    #[ignore = "DIVERGENCE (policy, deliberate per rbf_allows_replacement_with_existing_mempool_parent): Core rejects replacement-adds-unconfirmed; owner to decide"]
     fn rbf_replacement_adding_new_unconfirmed_input_is_rejected_like_core() {
         let (utxo, _d) = fresh_utxo();
         seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);

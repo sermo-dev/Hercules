@@ -177,6 +177,9 @@ impl SubmitError {
             M::OversizedTx { .. }
             | M::DustOutput { .. }
             | M::NonStandardScript { .. }
+            | M::NonStandardVersion { .. }
+            | M::NonStandardScriptSig { .. }
+            | M::TooManySigops { .. }
             | M::PolicyRejection(_)
             | M::TooManyAncestors { .. }
             | M::AncestorSetTooLarge { .. }
@@ -194,6 +197,7 @@ impl SubmitError {
             },
             M::AbsurdFee { fee, limit } => SubmitError::AbsurdFee { fee, limit },
             M::TooManyReplacements { .. }
+            | M::ReplacementAddsUnconfirmed { .. }
             | M::ReplacementFeeTooLow { .. }
             | M::ReplacementFeeInsufficient { .. } => SubmitError::Conflict {
                 conflicts,
