@@ -5692,8 +5692,10 @@ impl HeaderSync {
     ///   anchor, validation) and are stored. Peers that said there was
     ///   nothing new before them lose a little score
     ///   (`WITHHELD_HEADERS_PENALTY`).
-    /// - A second opinion whose chain doesn't hold our tip (it may not
-    ///   have our newest block yet) is no opinion.
+    /// - A second opinion whose chain doesn't hold our tip is no opinion
+    ///   if it is behind us (it may not have our newest block yet). If it
+    ///   claims our height or more, or its headers reach past our tip, it
+    ///   is likely on another branch: the tip stays unconfirmed.
     ///
     /// `confirmed` follows `wake_tip_confirmed`; a full batch (more to
     /// fetch) or headers a peer offered but we couldn't check are never
@@ -5765,10 +5767,31 @@ impl HeaderSync {
 
             let first_answer = sources.is_empty() && agreeing.is_empty();
             if headers[0].prev_blockhash != tip_hash && !first_answer {
-                info!(
-                    "catch_up_blocks: {}'s headers don't build on our tip {}; no opinion",
-                    addr, tip_hash
-                );
+                // A peer that doesn't know our tip. Behind us (it claims
+                // less, and its chain stops short), it is no opinion: it
+                // may just not have our newest block yet. At or past our
+                // height, it is most likely on another branch, and we may
+                // need a reorg (ticket 025's): the tip can't be confirmed
+                // this wake, however many peers agree with it. Nothing is
+                // stored and nobody is penalized.
+                let claimed = pool.get_peer_height(&addr).unwrap_or(0);
+                let reaches = self
+                    .store
+                    .find_height_of_hash(headers[0].prev_blockhash)
+                    .map_err(|e| SyncError::Store(format!("{}", e)))?
+                    .map(|h| h + headers.len() as u32);
+                if claimed >= tip_height || reaches.is_some_and(|h| h > tip_height) {
+                    info!(
+                        "catch_up_blocks: {} (claims {}) is on another branch than our tip {}; tip unconfirmed",
+                        addr, claimed, tip_hash
+                    );
+                    contested = true;
+                } else {
+                    info!(
+                        "catch_up_blocks: {}'s headers don't build on our tip {}; no opinion",
+                        addr, tip_hash
+                    );
+                }
                 continue;
             }
             match self.wake_store_batch(pool, &addr, &headers, tip_height, tip_hash, &tip_header, budget)? {

@@ -153,6 +153,60 @@ fn two_peers_agreeing_on_no_news_is_caught_up() {
     assert_eq!(status.blocks_validated, 0);
 }
 
+/// PR #34 review: our tip is on a stale one-block branch. An honest peer
+/// on a longer competing branch doesn't know our tip; two stale peers
+/// agree with it. That is no confirmation: the honest peer is evidence we
+/// may need a reorg (ticket 025), so the tip stays unconfirmed. Nothing
+/// is stored from it and nobody is penalized.
+#[test]
+fn a_taller_peer_on_another_branch_leaves_the_tip_unconfirmed() {
+    let base = chain(10);
+    let mut honest_chain = base.clone();
+    honest_chain.mine(3);
+    let mut stale_chain = base.fork_at(10);
+    stale_chain.mine(1);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &stale_chain);
+    let (s1, s2) = (MockPeer::spawn(&stale_chain, vec![]), MockPeer::spawn(&stale_chain, vec![]));
+    let honest = MockPeer::spawn(&honest_chain, vec![]);
+    // Asked after a stale peer, as a second opinion.
+    demote(&node, &honest.addr(), 80);
+    node.use_peers(&[&s1, &s2, &honest]);
+
+    let status = node.hs.catch_up_blocks(10, 15).unwrap();
+    assert!(!status.caught_up && !status.tip_confirmed, "{:?}", status);
+    assert!(status.error.is_none() && !status.tip_disagreement, "{:?}", status);
+    assert_eq!(node.tip(), (11, stale_chain.tip_hash()), "nothing stored from the other branch");
+    assert!(honest.log().iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))), "honest peer never asked");
+    for (p, floor) in [(&s1, FRESH_SCORE), (&s2, FRESH_SCORE), (&honest, 80)] {
+        assert!(!node.is_banned(&p.addr()));
+        assert!(node.score(&p.addr()).unwrap_or(floor) >= floor, "{} penalized", p.addr());
+    }
+}
+
+/// The other side of that rule: a peer that is behind us (claims less
+/// and its chain stops short of our tip) is no opinion, and two peers
+/// agreeing still confirm the tip.
+#[test]
+fn a_peer_behind_us_is_no_opinion() {
+    let c = chain(12);
+    let mut node = Node::new(&[]);
+    presync(&mut node, &c);
+    let (a, b) = (MockPeer::spawn(&c, vec![]), MockPeer::spawn(&c, vec![]));
+    // On a branch that forked at 5 and only reached 9: behind us.
+    let mut short = c.fork_at(5);
+    short.mine(4);
+    let behind = MockPeer::spawn(&short, vec![]);
+    // `a` first, then `behind` as the second opinion, then `b`.
+    demote(&node, &behind.addr(), 90);
+    demote(&node, &b.addr(), 80);
+    node.use_peers(&[&behind, &a, &b]);
+
+    let status = node.hs.catch_up_blocks(10, 15).unwrap();
+    assert!(status.caught_up && status.tip_confirmed, "{:?}", status);
+    assert!(behind.log().iter().any(|m| matches!(m, NetworkMessage::GetHeaders(_))));
+}
+
 // ── Retry ────────────────────────────────────────────────────────────
 
 /// Verification: the first peer asked fails; the wake carries on with the

@@ -141,9 +141,16 @@ impl Node {
         })
     }
 
-    /// Run `sync()` for a fixed `window` (or until it returns), collecting
-    /// every status error message.
-    fn sync_errors_for(&self, window: Duration) -> (Vec<String>, Result<(), SyncError>) {
+    /// Run `sync()` until `ready` holds (a progress-based wait, like
+    /// `sync_until`, so a loaded machine can't fail it), then for a fixed
+    /// `window` more (or until it returns), collecting every status error
+    /// message. False if `ready` never held.
+    fn sync_errors_after(
+        &self,
+        stall: Duration,
+        ready: impl Fn(&HeaderSync) -> bool,
+        window: Duration,
+    ) -> (bool, Vec<String>, Result<(), SyncError>) {
         let errors = Mutex::new(Vec::new());
         let res = std::thread::scope(|s| {
             let sync = SyncThread::new(
@@ -156,13 +163,15 @@ impl Node {
                     })
                 }),
             );
+            let ok = wait_for(&self.hs, stall, &ready, &|| sync.is_finished());
             let start = Instant::now();
-            while start.elapsed() < window && !sync.is_finished() {
+            while ok && start.elapsed() < window && !sync.is_finished() {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            sync.stop()
+            (ok, sync.stop())
         });
-        (errors.into_inner().unwrap(), res)
+        let (ok, res) = res;
+        (ok, errors.into_inner().unwrap(), res)
     }
 
     /// Run `sync()` until `done` holds (true), or the node goes `stall`
@@ -1313,7 +1322,14 @@ fn corrupted_blocks_from_every_peer_are_reported_without_spinning() {
     let m2 = MockPeer::spawn(&chain, vec![Behavior::ServeWitnessless(102)]);
     let node = Node::new(&[&m1, &m2]);
 
-    let (errors, res) = node.sync_errors_for(Duration::from_secs(6));
+    // Reaching 101 is a progress-based wait (a loaded runner validated only
+    // 26 blocks in a fixed 6 s); the 6 s window for block 102 starts there.
+    let (ready, errors, res) = node.sync_errors_after(
+        SYNC_TIMEOUT,
+        |hs| hs.store.validated_height().unwrap_or(0) >= 101,
+        Duration::from_secs(6),
+    );
+    assert!(ready, "never validated up to 101: {}", node.validated());
     assert!(res.is_ok(), "{:?}", res);
     assert_eq!(node.validated(), 101);
     assert!(!node.is_failed(&chain.hash_at(102)));
