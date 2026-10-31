@@ -55,8 +55,19 @@ impl Node {
     /// Simulate an app restart: close every store and reopen the same
     /// directory, pointed at `peers`.
     pub(super) fn restart(self, peers: &[&MockPeer]) -> Node {
+        self.restart_after(peers, |_| {})
+    }
+
+    /// `restart`, running `while_down` on the data directory while every
+    /// store is closed (to delete or tamper with files, as a crash would).
+    pub(super) fn restart_after(
+        self,
+        peers: &[&MockPeer],
+        while_down: impl FnOnce(&std::path::Path),
+    ) -> Node {
         let Node { hs, dir, _slot } = self;
         drop(hs);
+        while_down(dir.path());
         let hs = Node::open(&dir, peers);
         Node { hs, dir, _slot }
     }
@@ -271,7 +282,7 @@ fn wait_until(hs: &HeaderSync, stall: Duration, done: &dyn Fn(&HeaderSync) -> bo
 }
 
 /// Header tip is `chain`'s tip and every block up to it is validated.
-fn synced_to(chain: &FixtureChain) -> impl Fn(&HeaderSync) -> bool + '_ {
+pub(super) fn synced_to(chain: &FixtureChain) -> impl Fn(&HeaderSync) -> bool + '_ {
     move |hs| {
         let tip_ok = hs
             .store
