@@ -16,6 +16,9 @@ enum NotificationSource: String, Codable {
     case wakeBusy           // Node busy (e.g. snapshot import) for the whole budget
     case wakeCancelled      // BG task expired or the push watchdog fired
     case nodeReset          // Wake skipped or cancelled: the node is being reset
+    // Ticket 054
+    case unconfirmed        // Headers checked, but no second peer confirmed the tip
+    case awaitingSetup      // AssumeUTXO without its snapshot: headers only
     /// A source written by a newer version of the app. Decoding never fails
     /// on one, so a downgrade keeps the history.
     case unknown
@@ -23,6 +26,63 @@ enum NotificationSource: String, Codable {
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
         self = NotificationSource(rawValue: raw) ?? .unknown
+    }
+}
+
+extension NotificationSource {
+    /// A wake's catch-up status as a record source. Ticket 054: never
+    /// "validated" (caught up) on a tip the peers didn't confirm, and never
+    /// a block height for a node still waiting for its snapshot.
+    static func catchUp(
+        caughtUp: Bool,
+        blocksValidated: UInt32,
+        behind: Bool,
+        tipConfirmed: Bool,
+        awaitingSnapshot: Bool,
+        tipDisagreement: Bool,
+        invalidChain: Bool
+    ) -> NotificationSource {
+        if invalidChain { return .invalidChain }
+        if tipDisagreement { return .tipDisagreement }
+        if awaitingSnapshot { return .awaitingSetup }
+        if caughtUp { return .fullValidation }
+        if blocksValidated > 0 && behind { return .catchUpProgress }
+        if !tipConfirmed { return .unconfirmed }
+        if blocksValidated > 0 { return .catchUpProgress }
+        return .headerOnly
+    }
+
+    /// How a local notification for this source is delivered (ticket 054).
+    struct NotificationStyle: Equatable {
+        /// Sound and an active interruption level; otherwise passive and
+        /// silent.
+        let alerts: Bool
+        /// One identifier shared by every routine block notification, so
+        /// each replaces the last instead of stacking ~144 a day.
+        static let routineIdentifier = "block-latest"
+        static let finishSetupIdentifier = "finish-setup"
+
+        let kind: Kind
+        enum Kind: Equatable { case perBlock, routine, finishSetup }
+
+        func identifier(height: UInt32, blockHash: String) -> String {
+            switch kind {
+            case .perBlock: return height > 0 ? "block-\(height)" : "block-\(blockHash)"
+            case .routine: return Self.routineIdentifier
+            case .finishSetup: return Self.finishSetupIdentifier
+            }
+        }
+    }
+
+    var notificationStyle: NotificationStyle {
+        switch self {
+        case .tipDisagreement, .invalidChain:
+            return NotificationStyle(alerts: true, kind: .perBlock)
+        case .awaitingSetup:
+            return NotificationStyle(alerts: false, kind: .finishSetup)
+        default:
+            return NotificationStyle(alerts: false, kind: .routine)
+        }
     }
 }
 

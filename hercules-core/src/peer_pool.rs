@@ -165,6 +165,14 @@ const MAX_KNOWN_ADDRS: usize = 10_000;
 /// it stall the loop for tens of seconds chasing a long tail of dead peers.
 const REFILL_BUDGET: Duration = Duration::from_secs(2);
 
+/// A wake's connect pass (ticket 054, 028's fanout): connections dialed
+/// at once, the fewest it settles for while time allows (two peers can
+/// confirm a tip between them), and how long it keeps dialing to get
+/// them. The pass also stops at the wake's own connect deadline.
+const WAKE_CONNECT_PARALLEL: usize = 3;
+const WAKE_MIN_PEERS: usize = 2;
+const WAKE_CONNECT_BUDGET: Duration = Duration::from_secs(8);
+
 /// Minimum number of viable candidates before we'll re-query DNS seeds. The
 /// AddrManager is the primary source of peer addresses; DNS is only consulted
 /// as a fallback when the manager has been depleted (initial bootstrap or
@@ -804,6 +812,16 @@ fn cross_check_group(addr: &str, enforce_diversity: bool, proven: bool) -> Strin
     })
 }
 
+/// `cross_check_group` for a wake's agreement count (ticket 054): an
+/// onion's group follows its slot's `proven`. A peer that has left the
+/// pool counts as unproven (one group with every other unproven onion):
+/// its address book entry is proven by the connect itself, and taking
+/// that would count it as an independent opinion.
+fn wake_group(slots: &[PeerSlot], addr: &str, enforce_diversity: bool) -> String {
+    let proven = slots.iter().find(|s| s.addr == addr).is_some_and(|s| s.proven);
+    cross_check_group(addr, enforce_diversity, proven)
+}
+
 /// Why a peer is penalized: the two of ticket 024's three failure
 /// classes that are the peer's fault (ticket 052's audit). The third,
 /// a local fault (our store, our clock, our deadline), has no variant on
@@ -1195,15 +1213,27 @@ impl PeerPool {
         let our_onion_pubkey: Option<[u8; 32]> =
             self.tor.as_ref().and_then(|t| t.our_onion_pubkey());
 
-        for addr in candidates {
-            if connected >= needed {
+        // A wake (it has a connect deadline) dials in parallel, and keeps
+        // dialing past `REFILL_BUDGET` until it has `WAKE_MIN_PEERS` (ticket
+        // 054): one sequential attempt per round trip, checked against the
+        // budget only between attempts, left a Tor wake with one peer, and
+        // one peer's word for the tip.
+        let wake = connect_deadline.is_some();
+        let parallel = if wake { WAKE_CONNECT_PARALLEL } else { 1 };
+        let mut pending: std::collections::VecDeque<String> = candidates.into();
+
+        loop {
+            if connected >= needed || pending.is_empty() {
                 break;
             }
             if connect_deadline.is_some_and(|d| Instant::now() >= d) {
                 info!("PeerPool: connect deadline reached after {} new connections", connected);
                 break;
             }
-            if refill_started.elapsed() >= REFILL_BUDGET {
+            let short_of_wake_minimum = wake
+                && current + connected < WAKE_MIN_PEERS
+                && refill_started.elapsed() < WAKE_CONNECT_BUDGET;
+            if refill_started.elapsed() >= REFILL_BUDGET && !short_of_wake_minimum {
                 info!(
                     "PeerPool: refill budget ({}s) exhausted after {} new connections",
                     REFILL_BUDGET.as_secs(),
@@ -1212,105 +1242,167 @@ impl PeerPool {
                 break;
             }
 
-            // Decided before connecting: the connect itself would make the
-            // address "proven" and "protected".
-            let proven = self.addrs.is_proven(&addr);
-            let gossip_source = self.addrs.gossip_source(&addr);
-
-            // Re-check the bucket against this pass's claims (the snapshot
-            // above only reflects buckets occupied at the start of refill).
-            let bucket = netgroup(&addr, diversity, proven);
-            if bucket.as_ref().is_some_and(|b| claimed_buckets.contains(b)) {
-                continue;
-            }
-            // Ticket 052: gossip addresses fill at most
-            // MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND slots, and at most
-            // MAX_OUTBOUND_PER_SOURCE of them from any one source.
-            if let Some(src) = &gossip_source {
-                if unprotected_slots >= MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND
-                    || per_source.get(src).copied().unwrap_or(0) >= MAX_OUTBOUND_PER_SOURCE
-                {
+            // The next batch: candidates from distinct buckets that this
+            // pass hasn't claimed (the snapshot above only reflects buckets
+            // occupied at the start of refill), within ticket 052's gossip
+            // limits counting the batch as if every dial succeeds. One that
+            // shares a bucket or source with another in the batch waits for
+            // a later one. Proven and the gossip source are decided before
+            // connecting: the connect itself would make the address
+            // "proven" and "protected".
+            let want = parallel.min(needed - connected);
+            let mut batch: Vec<(String, bool, Option<String>, Option<String>)> = Vec::with_capacity(want);
+            let mut batch_buckets: HashSet<String> = HashSet::new();
+            let mut batch_sources: HashMap<String, usize> = HashMap::new();
+            let mut batch_unprotected = 0;
+            let mut i = 0;
+            while batch.len() < want && i < pending.len() {
+                let addr = &pending[i];
+                let proven = self.addrs.is_proven(addr);
+                let gossip_source = self.addrs.gossip_source(addr);
+                let bucket = netgroup(addr, diversity, proven);
+                if bucket.as_ref().is_some_and(|b| claimed_buckets.contains(b)) {
+                    pending.remove(i);
                     continue;
                 }
+                // Ticket 052: gossip addresses fill at most
+                // MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND slots, and at
+                // most MAX_OUTBOUND_PER_SOURCE of them from any one source.
+                if let Some(src) = &gossip_source {
+                    let from_src = per_source.get(src).copied().unwrap_or(0);
+                    if unprotected_slots >= MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND
+                        || from_src >= MAX_OUTBOUND_PER_SOURCE
+                    {
+                        pending.remove(i);
+                        continue;
+                    }
+                    if unprotected_slots + batch_unprotected >= MAX_OUTBOUND - RESERVED_PROTECTED_OUTBOUND
+                        || from_src + batch_sources.get(src).copied().unwrap_or(0) >= MAX_OUTBOUND_PER_SOURCE
+                    {
+                        i += 1;
+                        continue;
+                    }
+                }
+                if bucket.as_ref().is_some_and(|b| batch_buckets.contains(b)) {
+                    i += 1;
+                    continue;
+                }
+                batch_buckets.extend(bucket.clone());
+                if let Some(src) = &gossip_source {
+                    *batch_sources.entry(src.clone()).or_default() += 1;
+                    batch_unprotected += 1;
+                }
+                if let Some(addr) = pending.remove(i) {
+                    batch.push((addr, proven, gossip_source, bucket));
+                }
+            }
+            if batch.is_empty() {
+                break;
             }
 
             let magic = self.params.magic;
-            let result = if let Some(ref tor) = self.tor {
-                Peer::connect_tor(tor, &addr, self.our_height as i32, magic)
+            let our_height = self.our_height as i32;
+            let tor = self.tor.clone();
+            let dial = |addr: &str| match tor {
+                Some(ref tor) => Peer::connect_tor(tor, addr, our_height, magic),
+                None => Peer::connect(addr, our_height, magic),
+            };
+            type Dialed = (String, bool, Option<String>, Option<String>, Result<Peer, PeerError>);
+            let results: Vec<Dialed> = if batch.len() == 1 {
+                batch.into_iter().map(|(addr, proven, src, bucket)| {
+                    let r = dial(&addr);
+                    (addr, proven, src, bucket, r)
+                }).collect()
             } else {
-                Peer::connect(&addr, self.our_height as i32, magic)
+                std::thread::scope(|s| {
+                    let dials: Vec<_> = batch
+                        .into_iter()
+                        .map(|(addr, proven, src, bucket)| {
+                            let dial = &dial;
+                            s.spawn(move || {
+                                let r = dial(&addr);
+                                (addr, proven, src, bucket, r)
+                            })
+                        })
+                        .collect();
+                    dials
+                        .into_iter()
+                        .filter_map(|h| h.join().ok())
+                        .collect()
+                })
             };
 
-            match result {
-                Ok(mut peer) => {
-                    let user_agent = peer.peer_user_agent().unwrap_or_default();
-                    let height = peer.peer_height().unwrap_or(0).max(0) as u32;
-                    info!(
-                        "PeerPool: connected to {} ({}) at height {}",
-                        addr, user_agent, height
-                    );
-                    self.addrs.record_success(&addr);
+            for (addr, proven, gossip_source, bucket, result) in results {
+                match result {
+                    Ok(mut peer) => {
+                        let user_agent = peer.peer_user_agent().unwrap_or_default();
+                        let height = peer.peer_height().unwrap_or(0).max(0) as u32;
+                        info!(
+                            "PeerPool: connected to {} ({}) at height {}",
+                            addr, user_agent, height
+                        );
+                        self.addrs.record_success(&addr);
 
-                    // Self-advertise unsolicited so this peer learns our
-                    // onion address immediately and can start gossiping it
-                    // onward — except on the first `OWN_TX_OUTBOUND`
-                    // connections, kept clean so own transactions have
-                    // peers that can't tie them to the onion (ticket 052).
-                    // `send_self_advertisement` no-ops if the peer didn't
-                    // negotiate addrv2 (it then never learns the onion). A
-                    // failure on the self-ad is non-fatal — the peer is
-                    // still usable for header sync, we just won't get
-                    // inbound discovery via this particular path.
-                    let mut self_advertised = false;
-                    if let Some(pubkey) = our_onion_pubkey.filter(|_| clean_slots >= OWN_TX_OUTBOUND) {
-                        self_advertised = peer.wants_addrv2();
-                        if let Err(e) = peer.send_self_advertisement(pubkey, 8333) {
-                            warn!("PeerPool: self-ad to {} failed: {}", addr, e);
+                        // Self-advertise unsolicited so this peer learns our
+                        // onion address immediately and can start gossiping
+                        // it onward — except on the first `OWN_TX_OUTBOUND`
+                        // connections, kept clean so own transactions have
+                        // peers that can't tie them to the onion (ticket
+                        // 052). `send_self_advertisement` no-ops if the peer
+                        // didn't negotiate addrv2 (it then never learns the
+                        // onion). A failure on the self-ad is non-fatal — the
+                        // peer is still usable for header sync, we just won't
+                        // get inbound discovery via this particular path.
+                        let mut self_advertised = false;
+                        if let Some(pubkey) = our_onion_pubkey.filter(|_| clean_slots >= OWN_TX_OUTBOUND) {
+                            self_advertised = peer.wants_addrv2();
+                            if let Err(e) = peer.send_self_advertisement(pubkey, 8333) {
+                                warn!("PeerPool: self-ad to {} failed: {}", addr, e);
+                            }
                         }
-                    }
-                    if !self_advertised {
-                        clean_slots += 1;
-                    }
+                        if !self_advertised {
+                            clean_slots += 1;
+                        }
 
-                    // Restore any persisted score so a known-good peer comes
-                    // back at its earned reputation, not as a stranger.
-                    let score = self
-                        .store
-                        .as_ref()
-                        .and_then(|s| s.load_score(&addr).ok().flatten())
-                        .unwrap_or(SCORE_DEFAULT);
+                        // Restore any persisted score so a known-good peer comes
+                        // back at its earned reputation, not as a stranger.
+                        let score = self
+                            .store
+                            .as_ref()
+                            .and_then(|s| s.load_score(&addr).ok().flatten())
+                            .unwrap_or(SCORE_DEFAULT);
 
-                    if let Some(bucket) = bucket {
-                        claimed_buckets.insert(bucket);
+                        if let Some(bucket) = bucket {
+                            claimed_buckets.insert(bucket);
+                        }
+                        if let Some(src) = &gossip_source {
+                            *per_source.entry(src.clone()).or_default() += 1;
+                            unprotected_slots += 1;
+                        }
+
+                        let slot = PeerSlot {
+                            user_agent,
+                            height,
+                            score,
+                            proven,
+                            self_advertised,
+                            gossip_source,
+                            // `connect` asked for its address book: take the
+                            // reply whole, as Core does after a `getaddr`.
+                            addr_tokens: 1.0 + ADDR_TOKEN_BURST,
+                            ..PeerSlot::base(Some(peer), addr, false)
+                        };
+
+                        self.slots.lock().unwrap().push(slot);
+                        connected += 1;
                     }
-                    if let Some(src) = &gossip_source {
-                        *per_source.entry(src.clone()).or_default() += 1;
-                        unprotected_slots += 1;
+                    Err(e) => {
+                        warn!("PeerPool: failed to connect to {}: {}", addr, e);
+                        self.addrs.record_failure(&addr);
                     }
-
-                    let slot = PeerSlot {
-                        user_agent,
-                        height,
-                        score,
-                        proven,
-                        self_advertised,
-                        gossip_source,
-                        // `connect` asked for its address book: take the
-                        // reply whole, as Core does after a `getaddr`.
-                        addr_tokens: 1.0 + ADDR_TOKEN_BURST,
-                        ..PeerSlot::base(Some(peer), addr, false)
-                    };
-
-                    self.slots.lock().unwrap().push(slot);
-                    connected += 1;
-                }
-                Err(e) => {
-                    warn!("PeerPool: failed to connect to {}: {}", addr, e);
-                    self.addrs.record_failure(&addr);
                 }
             }
         }
-
         if connected > 0 {
             let total = self.slots.lock().unwrap().len();
             info!(
@@ -1861,6 +1953,67 @@ impl PeerPool {
             }
         }
         best.map(|s| s.addr.clone())
+    }
+
+    /// The next peer a wake asks for headers (ticket 054): an available
+    /// outbound peer not in `asked`. The first is the highest-weighted
+    /// (reputation, never a claimed height). After that a second opinion
+    /// is wanted, so a peer claiming more than `tip_height` goes first (it
+    /// may have what the others withheld), then one independent
+    /// (`cross_check_group`) of every peer in `agreeing`, then weight;
+    /// the earliest slot on a tie.
+    pub fn wake_header_peer(
+        &self,
+        asked: &[String],
+        agreeing: &[String],
+        tip_height: u32,
+    ) -> Option<String> {
+        let diversity = self.params.enforce_netgroup_diversity;
+        let slots = self.slots.lock().unwrap();
+        let taken: HashSet<String> =
+            agreeing.iter().map(|a| wake_group(&slots, a, diversity)).collect();
+        let second_opinion = !asked.is_empty();
+        let rank = |s: &PeerSlot| {
+            let taller = second_opinion && s.height > tip_height;
+            let independent = !taken.contains(&cross_check_group(&s.addr, diversity, s.proven));
+            (taller, independent, s.weight())
+        };
+        let mut best: Option<&PeerSlot> = None;
+        for s in slots.iter() {
+            if s.inbound || s.peer.is_none() || asked.iter().any(|a| a == &s.addr) {
+                continue;
+            }
+            if best.map_or(true, |b| rank(s) > rank(b)) {
+                best = Some(s);
+            }
+        }
+        best.map(|s| s.addr.clone())
+    }
+
+    /// How many of `addrs` are independent of each other: the number of
+    /// distinct `cross_check_group`s among them (ticket 054: two peers in
+    /// one /16 agreeing is one opinion).
+    pub fn independent_count(&self, addrs: &[String]) -> usize {
+        let diversity = self.params.enforce_netgroup_diversity;
+        let slots = self.slots.lock().unwrap();
+        addrs
+            .iter()
+            .map(|a| wake_group(&slots, a, diversity))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Every available outbound peer not in `excluded`, highest weight
+    /// first (earliest slot on a tie): a wake spreads its block requests
+    /// over them (ticket 054).
+    pub fn available_outbound_excluding(&self, excluded: &[String]) -> Vec<String> {
+        let slots = self.slots.lock().unwrap();
+        let mut found: Vec<&PeerSlot> = slots
+            .iter()
+            .filter(|s| !s.inbound && s.peer.is_some() && !excluded.iter().any(|e| e == &s.addr))
+            .collect();
+        found.sort_by_key(|s| std::cmp::Reverse(s.weight()));
+        found.into_iter().map(|s| s.addr.clone()).collect()
     }
 
     /// Pick an available outbound peer not in `excluded`, highest score
@@ -3541,5 +3694,23 @@ mod tests {
         // The first OWN_TX_OUTBOUND connections (all, without an onion) are
         // clean for own transactions.
         assert!(slots.iter().all(|s| !s.self_advertised));
+    }
+
+    /// The same limits for a wake, which dials `WAKE_CONNECT_PARALLEL` at
+    /// once (ticket 054): a batch counts its own gossip addresses, so it
+    /// can't take three from one source because none had connected yet.
+    #[test]
+    fn wake_parallel_dials_keep_the_gossip_limits() {
+        let mut chain = crate::testkit::FixtureChain::new();
+        chain.mine(1);
+        let peers: Vec<crate::testkit::MockPeer> =
+            (0..12).map(|_| crate::testkit::MockPeer::spawn(&chain, vec![])).collect();
+        let mut pool = PeerPool::new_for_test_with(ChainParams::regtest());
+        for p in &peers {
+            pool.addrs.insert(p.addr(), AddrSource::Gossip, "gossip:A");
+        }
+        pool.maintain_until(Some(Instant::now() + Duration::from_secs(10)));
+        let slots = pool.slots.lock().unwrap();
+        assert_eq!(slots.len(), MAX_OUTBOUND_PER_SOURCE, "{} slots from one source", slots.len());
     }
 }

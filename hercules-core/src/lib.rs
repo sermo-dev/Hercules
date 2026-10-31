@@ -280,6 +280,8 @@ pub struct CatchUpStatus {
     pub error: Option<String>,
     pub tip_disagreement: bool,
     pub invalid_chain_detected: bool,
+    pub tip_confirmed: bool,
+    pub awaiting_snapshot: bool,
 }
 
 impl From<sync::CatchUpStatus> for CatchUpStatus {
@@ -294,6 +296,34 @@ impl From<sync::CatchUpStatus> for CatchUpStatus {
             error: s.error,
             tip_disagreement: s.tip_disagreement,
             invalid_chain_detected: s.invalid_chain_detected,
+            tip_confirmed: s.tip_confirmed,
+            awaiting_snapshot: s.awaiting_snapshot,
+        }
+    }
+}
+
+/// How the node gets its UTXO set (ticket 054). Recorded in the node at
+/// first open; the node's copy is the one that counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeValidationMode {
+    AssumeUtxo,
+    Genesis,
+}
+
+impl From<NodeValidationMode> for store::NodeMode {
+    fn from(m: NodeValidationMode) -> Self {
+        match m {
+            NodeValidationMode::AssumeUtxo => store::NodeMode::AssumeUtxo,
+            NodeValidationMode::Genesis => store::NodeMode::Genesis,
+        }
+    }
+}
+
+impl From<store::NodeMode> for NodeValidationMode {
+    fn from(m: store::NodeMode) -> Self {
+        match m {
+            store::NodeMode::AssumeUtxo => NodeValidationMode::AssumeUtxo,
+            store::NodeMode::Genesis => NodeValidationMode::Genesis,
         }
     }
 }
@@ -305,6 +335,10 @@ impl From<sync::CatchUpStatus> for CatchUpStatus {
 pub enum WakeOutcome {
     /// Catch-up ran; `status` says how far it got.
     Completed,
+    /// Catch-up ran, but no second peer confirmed there is nothing past
+    /// `status.target_height` (ticket 054): blocks it validated count,
+    /// but the node may not be at the network's tip.
+    Unconfirmed,
     /// The transport wasn't up with enough budget left for one block, so
     /// no network work was attempted.
     TransportSlow,
@@ -798,6 +832,49 @@ impl HerculesNode {
         })
     }
 
+    /// `open`, then record `mode` as the node's validation mode if none is
+    /// recorded yet (ticket 054). The app passes the user's choice (or
+    /// `None` before there is one) and reads `validation_mode` back: the
+    /// node's mode is the one that counts.
+    pub fn open_in_mode(
+        db_path: String,
+        tor_data_dir: Option<String>,
+        mode: Option<NodeValidationMode>,
+    ) -> Result<Self, HerculesError> {
+        let node = HerculesNode::open(db_path, tor_data_dir)?;
+        if let Some(mode) = mode {
+            node.set_validation_mode(mode)?;
+        }
+        Ok(node)
+    }
+
+    /// Record the user's validation mode if none is recorded yet (ticket
+    /// 054), e.g. when they pick one after a wake already opened the node.
+    /// Returns the node's mode, which may differ from `mode`
+    /// (`HeaderSync::set_validation_mode`). In AssumeUTXO mode no block is
+    /// validated until a snapshot is loaded.
+    pub fn set_validation_mode(
+        &self,
+        mode: NodeValidationMode,
+    ) -> Result<NodeValidationMode, HerculesError> {
+        self.syncer
+            .set_validation_mode(mode.into())
+            .map(Into::into)
+            .map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })
+    }
+
+    /// The node's recorded validation mode; `None` until one is set.
+    pub fn validation_mode(&self) -> Result<Option<NodeValidationMode>, HerculesError> {
+        self.syncer
+            .mode()
+            .map(|m| m.map(Into::into))
+            .map_err(|e| HerculesError::StorageError {
+                msg: format!("{}", e),
+            })
+    }
+
     /// Shut the node down for good, e.g. before a reset (ticket 028).
     /// Stops the sync loop, cancels running wakes, ends transport waits,
     /// stops the wallet API, and refuses every later session. Waits up to
@@ -1010,6 +1087,22 @@ impl HerculesNode {
                 preempted,
                 Some("budget spent before headers were checked".into()),
             ),
+            // Headers checked, but one peer's word for the tip (ticket
+            // 054). Peer disagreement, an invalid block or a refused batch
+            // say more, and stay `Completed` with their own fields.
+            Ok(status)
+                if !status.tip_confirmed
+                    && !status.tip_disagreement
+                    && !status.invalid_chain_detected
+                    && status.error.is_none() =>
+            {
+                report(
+                    cancelled_or(WakeOutcome::Unconfirmed),
+                    Some(status.into()),
+                    preempted,
+                    None,
+                )
+            }
             Ok(status) => report(
                 cancelled_or(WakeOutcome::Completed),
                 Some(status.into()),

@@ -8,6 +8,32 @@ use rusqlite::{params, Connection};
 
 use log::info;
 
+/// How a node gets its UTXO set (ticket 054): from the AssumeUTXO
+/// snapshot, or by validating every block from genesis. Part of the node's
+/// identity for one database, recorded in the header store's metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeMode {
+    AssumeUtxo,
+    Genesis,
+}
+
+impl NodeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            NodeMode::AssumeUtxo => "assumeutxo",
+            NodeMode::Genesis => "genesis",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<NodeMode> {
+        match s {
+            "assumeutxo" => Some(NodeMode::AssumeUtxo),
+            "genesis" => Some(NodeMode::Genesis),
+            _ => None,
+        }
+    }
+}
+
 /// Persistent storage for block headers using SQLite.
 pub struct HeaderStore {
     conn: Mutex<Connection>,
@@ -386,6 +412,45 @@ impl HeaderStore {
         Ok(())
     }
 
+    /// The validation mode this node was set up in (ticket 054), or `None`
+    /// before one was recorded. Written once, at the first open that knows
+    /// it; a mode switch goes through `reset_database`, which deletes this
+    /// file, so the row never changes under a live chain.
+    pub fn validation_mode(&self) -> Result<Option<NodeMode>, StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        let value = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'validation_mode'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| StoreError(format!("get validation_mode: {}", e)))?;
+        match value {
+            None => Ok(None),
+            Some(s) => NodeMode::from_str(&s)
+                .map(Some)
+                .ok_or_else(|| StoreError(format!("unknown validation_mode {:?}", s))),
+        }
+    }
+
+    /// Record the validation mode (see `validation_mode`).
+    pub fn set_validation_mode(&self, mode: NodeMode) -> Result<(), StoreError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError(format!("lock: {}", e)))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('validation_mode', ?1)",
+            params![mode.as_str()],
+        )
+        .map_err(|e| StoreError(format!("set validation_mode: {}", e)))?;
+        Ok(())
+    }
+
     /// Find the height of a block by its hash. Returns None if not found.
     pub fn find_height_of_hash(&self, hash: BlockHash) -> Result<Option<u32>, StoreError> {
         let conn = self
@@ -732,6 +797,33 @@ mod tests {
         )
         .unwrap();
         deserialize(&raw).unwrap()
+    }
+
+    #[test]
+    fn validation_mode_is_unset_until_recorded_and_survives_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("headers.sqlite3");
+        let path = path.to_str().unwrap();
+        {
+            let store = HeaderStore::open(path).unwrap();
+            assert_eq!(store.validation_mode().unwrap(), None);
+            store.set_validation_mode(NodeMode::AssumeUtxo).unwrap();
+            assert_eq!(store.validation_mode().unwrap(), Some(NodeMode::AssumeUtxo));
+        }
+        let store = HeaderStore::open(path).unwrap();
+        assert_eq!(store.validation_mode().unwrap(), Some(NodeMode::AssumeUtxo));
+    }
+
+    #[test]
+    fn unknown_validation_mode_is_an_error_not_a_guess() {
+        let store = HeaderStore::open(":memory:").unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("INSERT INTO metadata (key, value) VALUES ('validation_mode', 'turbo')", [])
+            .unwrap();
+        assert!(store.validation_mode().is_err());
     }
 
     #[test]

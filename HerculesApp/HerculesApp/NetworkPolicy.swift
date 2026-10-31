@@ -46,7 +46,8 @@ final class NetworkPolicy: ObservableObject {
     @Published private(set) var isExpensive: Bool = false
     @Published private(set) var isConstrained: Bool = false
 
-    private struct PathState {
+    /// One path update, as the policy reads it.
+    struct PathState: Equatable {
         var status: NWPath.Status
         var isExpensive: Bool
         var isConstrained: Bool
@@ -84,7 +85,7 @@ final class NetworkPolicy: ObservableObject {
     /// metered? Read-through to UserDefaults so a Settings toggle takes
     /// effect on the next access without a republish.
     var cellularAllowed: Bool {
-        UserDefaults.standard.bool(forKey: Self.useCellularDataKey)
+        defaults.bool(forKey: Self.useCellularDataKey)
     }
 
     /// The single decision callers should consult before opening any
@@ -123,13 +124,18 @@ final class NetworkPolicy: ObservableObject {
         return cellularAllowed ? .meteredAllowed : .meteredBlocked
     }
 
-    private let monitor: NWPathMonitor
+    private let source: NetworkPathSource
+    private let defaults: UserDefaults
     private let queue = DispatchQueue(label: "io.hercules.networkpolicy", qos: .utility)
 
-    private init() {
-        monitor = NWPathMonitor()
+    /// `source` and `defaults` are injectable so the unit tests can drive
+    /// the first-path wait with a fake monitor (ticket 054). The app uses
+    /// `shared`: the system monitor and standard defaults.
+    init(source: NetworkPathSource = SystemPathSource(), defaults: UserDefaults = .standard) {
+        self.source = source
+        self.defaults = defaults
         firstPath.enter()
-        monitor.pathUpdateHandler = { [weak self] path in
+        source.start(queue: queue) { [weak self] path in
             guard let self = self else { return }
             // Decisions first, on this queue, so a wake that is waiting
             // for the first path sees it now rather than after a hop to
@@ -137,11 +143,7 @@ final class NetworkPolicy: ObservableObject {
             self.stateLock.lock()
             let isFirst = self._state == nil
             let wasMetered = self._state.map { $0.isExpensive || $0.isConstrained }
-            self._state = PathState(
-                status: path.status,
-                isExpensive: path.isExpensive,
-                isConstrained: path.isConstrained
-            )
+            self._state = path
             let metered = path.isExpensive || path.isConstrained
             let onMeteredChange = wasMetered == metered ? nil : self._onMeteredChange
             self.stateLock.unlock()
@@ -156,7 +158,6 @@ final class NetworkPolicy: ObservableObject {
                 self.isConstrained = path.isConstrained
             }
         }
-        monitor.start(queue: queue)
     }
 
     /// Block until the monitor has reported its first path, or `timeout`
@@ -189,6 +190,33 @@ final class NetworkPolicy: ObservableObject {
     }
 
     deinit {
+        source.cancel()
+    }
+}
+
+/// Where `NetworkPolicy` gets path updates: `NWPathMonitor` in the app, a
+/// fake in the unit tests (ticket 054).
+protocol NetworkPathSource: AnyObject {
+    /// Start delivering updates to `onUpdate` on `queue`.
+    func start(queue: DispatchQueue, onUpdate: @escaping (NetworkPolicy.PathState) -> Void)
+    func cancel()
+}
+
+final class SystemPathSource: NetworkPathSource {
+    private let monitor = NWPathMonitor()
+
+    func start(queue: DispatchQueue, onUpdate: @escaping (NetworkPolicy.PathState) -> Void) {
+        monitor.pathUpdateHandler = { path in
+            onUpdate(NetworkPolicy.PathState(
+                status: path.status,
+                isExpensive: path.isExpensive,
+                isConstrained: path.isConstrained
+            ))
+        }
+        monitor.start(queue: queue)
+    }
+
+    func cancel() {
         monitor.cancel()
     }
 }

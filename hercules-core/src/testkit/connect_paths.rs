@@ -302,7 +302,9 @@ fn killed_connect_is_finished(path: Path, step: ConnectStep) {
         "block not applied before the kill"
     );
 
-    let node = node.restart(&[&peer]);
+    // A second peer, so the wake paths can confirm the tip (ticket 054).
+    let witness = MockPeer::spawn(&chain, vec![]);
+    let node = node.restart(&[&peer, &witness]);
     match path {
         Path::Sync => {
             let (ok, res) = node.sync_until(SYNC_TIMEOUT, synced_to(&chain));
