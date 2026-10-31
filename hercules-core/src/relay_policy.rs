@@ -136,7 +136,7 @@ fn witness_script<'a>(input: &'a bitcoin::TxIn, spent_spk: Option<&[u8]>) -> Opt
 /// BIP 341 control block: 33 + 32m bytes (m <= 128), and a tapscript leaf
 /// version (0xc0, low bit the output key's parity).
 fn is_control_block_shaped(item: &[u8]) -> bool {
-    item.len() >= 33 && (item.len() - 33) % 32 == 0 && (item.len() - 33) / 32 <= 128 && item[0] & 0xfe == 0xc0
+    item.len() >= 33 && (item.len() - 33).is_multiple_of(32) && (item.len() - 33) / 32 <= 128 && item[0] & 0xfe == 0xc0
 }
 
 // ── Individual checks ─────────────────────────────────────────────────

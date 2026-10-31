@@ -859,6 +859,7 @@ impl OwnTxStore {
     ///
     /// Own descendants that weren't in the mempool are cascaded too (see
     /// `cascade_conflict`). Returns the number of rows changed.
+    #[cfg_attr(not(test), allow(dead_code))] // wired into sync.rs with ticket 049's handlers
     pub fn on_mempool_removals(
         &self,
         removals: &[MempoolRemoval],
