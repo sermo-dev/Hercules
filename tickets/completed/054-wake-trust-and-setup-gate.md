@@ -143,3 +143,11 @@ Move the NodeHostScenarios checks into it over time.
 ## Roadmap position
 
 Fourth in the pre-wallet hardening block: **049 → 050 → 053 → 054 → 052 → 025**. It must land before 035/040 show confirmations or "payment received" from wake results.
+
+## Status (2026-10-31)
+
+Merged in PR #34 (`60afe18`). A wake needs two independent agreeing peers, or one when the chain has minimum work and the tip is at most an hour old (`WakeOutcome::Unconfirmed`, `CatchUpStatus.tip_confirmed`); a second opinion on another branch leaves the tip unconfirmed; wakes dial 3 peers in parallel within an 8 s budget; `NodeMode` is stored, so AssumeUTXO mode never validates without the snapshot (`awaiting_snapshot`); one Swift `WakeGate`, auto-start sync, the snapshot moved to Application Support, and the `HerculesAppTests` XCTest target.
+
+Owner decisions taken as recommended: withholding during a wake is a selection demerit only (`PeerPool::deprioritize`, not persisted, never toward a ban; test `a_peer_with_no_new_headers_during_a_wake_keeps_its_score`); the one-hour single-peer rule stays; installs the old bug converted are recorded as genesis (Settings shows the mode); background catch-up keeps running with notifications off; header-only pushes while the snapshot is pending.
+
+**Follow-ups (059):** Switch & Wipe deleting pending own txs; a one-time in-app notice for installs recorded as genesis because the old bug converted them (decided, not yet built).
