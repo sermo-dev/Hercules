@@ -16,7 +16,7 @@ use bitcoin::{OutPoint, Transaction, Txid};
 use log::{info, warn};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::mempool::MempoolError;
+use crate::mempool::{MempoolError, MempoolRemoval, RemovalReason};
 
 /// How long an unconfirmed own transaction is rebroadcast before we give
 /// up and mark it `Expired`. Matches the mempool's 14-day expiry, which is
@@ -177,11 +177,15 @@ impl SubmitError {
             M::OversizedTx { .. }
             | M::DustOutput { .. }
             | M::NonStandardScript { .. }
+            | M::NonStandardVersion { .. }
+            | M::NonStandardScriptSig { .. }
+            | M::TooManySigops { .. }
             | M::PolicyRejection(_)
             | M::TooManyAncestors { .. }
             | M::AncestorSetTooLarge { .. }
             | M::TooManyDescendants { .. } => SubmitError::NonStandard(msg),
-            M::InsufficientFee { fee_rate, min_rate } => SubmitError::FeeTooLow {
+            M::InsufficientFee { fee_rate, min_rate }
+            | M::MempoolMinFeeNotMet { fee_rate, min_rate } => SubmitError::FeeTooLow {
                 fee_rate,
                 min: min_rate,
             },
@@ -194,6 +198,7 @@ impl SubmitError {
             },
             M::AbsurdFee { fee, limit } => SubmitError::AbsurdFee { fee, limit },
             M::TooManyReplacements { .. }
+            | M::ReplacementAddsUnconfirmed { .. }
             | M::ReplacementFeeTooLow { .. }
             | M::ReplacementFeeInsufficient { .. } => SubmitError::Conflict {
                 conflicts,
@@ -833,6 +838,73 @@ impl OwnTxStore {
         Ok(changed)
     }
 
+    /// Mempool event hook (ticket 053): settle own transactions the
+    /// mempool dropped because they can no longer confirm, including ones
+    /// that only spend from someone else's transaction that died (which
+    /// `on_block` can't see: their own inputs are never spent by the
+    /// block). `removals` come from `Mempool::drain_removals`; `height` is
+    /// the tip they were drained at (the block just connected, for
+    /// `ConflictedByBlock`).
+    ///
+    /// * `ConflictedByBlock { by }` — `Conflicted { by }` at `height`, so a
+    ///   reorg below it demotes the tx back to pending.
+    /// * `ReplacedBy(by)` — `Replaced { by }` if `by` is an own tx spending
+    ///   one of its inputs (as `mark_replaced`); otherwise, replaced by
+    ///   someone else's tx or evicted as a descendant of a replaced one,
+    ///   `Conflicted { by }` with no height, as `mark_replaced` settles own
+    ///   descendants: no block caused it.
+    /// * `Confirmed` is `on_block`'s. `Evicted`, `Expired` and `Reorg`
+    ///   don't make a tx invalid: it stays active and the rebroadcast path
+    ///   re-adds it.
+    ///
+    /// Own descendants that weren't in the mempool are cascaded too (see
+    /// `cascade_conflict`). Returns the number of rows changed.
+    #[cfg_attr(not(test), allow(dead_code))] // wired into sync.rs with ticket 049's handlers
+    pub fn on_mempool_removals(
+        &self,
+        removals: &[MempoolRemoval],
+        height: u32,
+        now: u64,
+    ) -> Result<usize, OwnTxStoreError> {
+        let mut changed = 0;
+        for removal in removals {
+            if !self.is_active(&removal.txid) {
+                continue;
+            }
+            let (status, status_height, by) = match removal.reason {
+                RemovalReason::ConflictedByBlock { by } => (OwnTxStatus::Conflicted { by }, Some(height), by),
+                RemovalReason::ReplacedBy(by) => {
+                    let replaced_directly = match (self.get(&removal.txid)?, self.get(&by)?) {
+                        (Some(old), Some(new)) => match (old.tx(), new.tx()) {
+                            (Some(old), Some(new)) => new
+                                .input
+                                .iter()
+                                .any(|n| old.input.iter().any(|o| o.previous_output == n.previous_output)),
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    let status = if replaced_directly {
+                        OwnTxStatus::Replaced { by }
+                    } else {
+                        OwnTxStatus::Conflicted { by }
+                    };
+                    (status, None, by)
+                }
+                RemovalReason::Confirmed
+                | RemovalReason::Evicted
+                | RemovalReason::Expired
+                | RemovalReason::Reorg => continue,
+            };
+            warn!("Own tx {} left the mempool as {} by {}", removal.txid, status.name(), by);
+            self.write_status(&removal.txid, &status, status_height, now)?;
+            changed += 1 + self.cascade_conflict(vec![removal.txid], by, status_height, now)?;
+            // Later events in this batch see the new state.
+            self.refresh_active()?;
+        }
+        Ok(changed)
+    }
+
     /// Reorg hook: confirmations and conflicts recorded above `fork_height`
     /// are undone, so those transactions go back to pending and are due for
     /// rebroadcast (a re-add that still conflicts is settled again by the
@@ -1196,7 +1268,7 @@ mod tests {
             SubmitError::Internal(_)
         ));
         assert!(matches!(
-            c(MempoolError::DustOutput { index: 0, amount: 1 }),
+            c(MempoolError::DustOutput { index: 0, amount: 1, threshold: 294 }),
             SubmitError::NonStandard(_)
         ));
         assert!(matches!(
@@ -1455,16 +1527,129 @@ mod tests {
     /// parent's input confirms, the parent can never confirm, so neither
     /// can ours. It should be settled as conflicted, not rebroadcast for
     /// 14 days spending an output that will never exist.
+    ///
+    /// Only the mempool knows the parent died (the block never touches our
+    /// tx's own input), so the block is applied to a real mempool and its
+    /// removal events are handed over with the block, as the sync loop
+    /// does (ticket 053).
     #[test]
-    #[ignore = "BUG: an own tx whose (non-own) mempool parent is conflicted out by a block stays pending until the 14-day expiry; on_block only sees own txs' direct inputs"]
     fn own_child_of_a_conflicted_foreign_parent_is_settled() {
         let s = OwnTxStore::open(":memory:").unwrap();
-        let theirs = tx_spending(OutPoint { txid: txid(90), vout: 0 }, 1);
-        let mine = tx_spending(out(&theirs), 2);
+        let (utxo, _d, mut pool) = pool_with_coins(&[90]);
+        let theirs = pool_tx(OutPoint { txid: txid(90), vout: 0 }, 99_000, 1);
+        let mine = pool_tx(out(&theirs), 98_000, 2);
         let tm = track_tx(&s, &mine);
+        pool.accept_tx_test(theirs, &utxo, POOL_HEIGHT).unwrap();
+        pool.accept_tx_test(mine, &utxo, POOL_HEIGHT).unwrap();
         // The parent's input is spent by a different tx that confirms.
-        let rival = tx_spending(OutPoint { txid: txid(90), vout: 0 }, 3);
-        s.on_block(&block_of(vec![rival]), 400, 1).unwrap();
+        let rival = pool_tx(OutPoint { txid: txid(90), vout: 0 }, 90_000, 3);
+        let by = rival.compute_txid();
+        let block = block_of(vec![rival]);
+        pool.remove_confirmed(&block);
+        s.on_block(&block, 400, 1).unwrap();
+        assert_eq!(s.on_mempool_removals(&pool.drain_removals().removals, 400, 1).unwrap(), 1);
         assert!(matches!(status(&s, &tm), OwnTxStatus::Conflicted { .. }), "{:?}", status(&s, &tm));
+        assert_eq!(status(&s, &tm), OwnTxStatus::Conflicted { by });
+        assert!(!s.is_active(&tm));
+        // Block-caused, so a reorg below the block undoes it.
+        assert_eq!(s.demote_confirmed_above(399, 2).unwrap(), 1);
+        assert_eq!(status(&s, &tm), OwnTxStatus::Pending);
+    }
+
+    const POOL_HEIGHT: u32 = 200;
+
+    /// A UTXO set holding a 100,000-sat coin at `[id; 32]:0` for each id,
+    /// and an empty mainnet mempool.
+    fn pool_with_coins(ids: &[u8]) -> (crate::utxo::UtxoSet, TempDir, crate::mempool::Mempool) {
+        let dir = TempDir::new().unwrap();
+        let utxo = crate::utxo::UtxoSet::open(dir.path().to_str().unwrap()).unwrap();
+        for id in ids {
+            utxo.test_insert_utxo(
+                [*id; 32],
+                0,
+                crate::utxo::UtxoEntry { amount: 100_000, script_pubkey: vec![0xac], height: 1, is_coinbase: false },
+            )
+            .unwrap();
+        }
+        (utxo, dir, crate::mempool::Mempool::new())
+    }
+
+    /// One-in, one-out tx spending `prev` and paying `value`, accepted by
+    /// the mempool's test entry point; `tag` makes it distinct.
+    fn pool_tx(prev: OutPoint, value: u64, tag: u8) -> Transaction {
+        let mut tx = tx_spending(prev, tag);
+        tx.output[0].value = bitcoin::Amount::from_sat(value);
+        tx.output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0xac, tag]);
+        tx
+    }
+
+    /// Our child of someone else's tx that a relayed replacement evicts:
+    /// conflicted by the replacement right away, with no height (no block
+    /// caused it), and the replacement later confirming changes nothing.
+    #[test]
+    fn own_child_of_a_foreign_parent_replaced_through_relay_is_conflicted() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let (utxo, _d, mut pool) = pool_with_coins(&[91]);
+        let theirs = pool_tx(OutPoint { txid: txid(91), vout: 0 }, 99_000, 1);
+        let mine = pool_tx(out(&theirs), 98_000, 2);
+        let tm = track_tx(&s, &mine);
+        pool.accept_tx_test(theirs, &utxo, POOL_HEIGHT).unwrap();
+        pool.accept_tx_test(mine, &utxo, POOL_HEIGHT).unwrap();
+        let bump = pool_tx(OutPoint { txid: txid(91), vout: 0 }, 80_000, 3);
+        let by = pool.accept_tx_test(bump.clone(), &utxo, POOL_HEIGHT).unwrap();
+        assert_eq!(s.on_mempool_removals(&pool.drain_removals().removals, 300, 5).unwrap(), 1);
+        assert_eq!(status(&s, &tm), OwnTxStatus::Conflicted { by });
+        assert_eq!(s.on_block(&block_of(vec![bump]), 301, 6).unwrap(), 0);
+        assert_eq!(status(&s, &tm), OwnTxStatus::Conflicted { by });
+        assert_eq!(s.demote_confirmed_above(0, 7).unwrap(), 0, "no block caused it");
+    }
+
+    /// An own replacement seen through the event stream: the original is
+    /// `Replaced`, its own child in the pool and its own grandchild that
+    /// isn't (never re-added) are `Conflicted`. Idempotent with
+    /// `mark_replaced`, which the submit path also calls.
+    #[test]
+    fn own_replacement_events_settle_original_and_descendants() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let (utxo, _d, mut pool) = pool_with_coins(&[92, 93]);
+        let a = pool_tx(OutPoint { txid: txid(92), vout: 0 }, 99_000, 1);
+        let child = pool_tx(out(&a), 98_000, 2);
+        let grandchild = pool_tx(out(&child), 97_000, 3);
+        let unrelated = pool_tx(OutPoint { txid: txid(93), vout: 0 }, 99_000, 4);
+        let ids: Vec<Txid> = [&a, &child, &grandchild, &unrelated].iter().map(|t| track_tx(&s, t)).collect();
+        for t in [&a, &child, &unrelated] {
+            pool.accept_tx_test((*t).clone(), &utxo, POOL_HEIGHT).unwrap();
+        }
+        let bump = pool_tx(OutPoint { txid: txid(92), vout: 0 }, 90_000, 5);
+        let tb = track_tx(&s, &bump);
+        pool.accept_tx_test(bump, &utxo, POOL_HEIGHT).unwrap();
+        let removals = pool.drain_removals().removals;
+        assert_eq!(removals.len(), 2);
+        assert_eq!(s.on_mempool_removals(&removals, 300, 5).unwrap(), 3);
+        assert_eq!(status(&s, &ids[0]), OwnTxStatus::Replaced { by: tb });
+        assert_eq!(status(&s, &ids[1]), OwnTxStatus::Conflicted { by: tb });
+        assert_eq!(status(&s, &ids[2]), OwnTxStatus::Conflicted { by: tb });
+        assert!(s.is_active(&ids[3]) && s.is_active(&tb));
+        // Replaying the batch, or the submit path's mark_replaced, is a no-op.
+        assert_eq!(s.on_mempool_removals(&removals, 300, 6).unwrap(), 0);
+        s.mark_replaced(&ids[0], tb, 6).unwrap();
+        assert_eq!(status(&s, &ids[0]), OwnTxStatus::Replaced { by: tb });
+    }
+
+    /// Eviction for space, expiry and a reorg clear don't make an own tx
+    /// invalid: it stays active for the rebroadcast path to re-add.
+    #[test]
+    fn evicted_expired_and_reorged_own_txs_stay_active() {
+        let s = OwnTxStore::open(":memory:").unwrap();
+        let tm = track_tx(&s, &tx_spending(OutPoint { txid: txid(94), vout: 0 }, 1));
+        for reason in [RemovalReason::Evicted, RemovalReason::Expired, RemovalReason::Reorg, RemovalReason::Confirmed] {
+            let r = vec![MempoolRemoval { txid: tm, reason: reason.clone() }];
+            assert_eq!(s.on_mempool_removals(&r, 300, 5).unwrap(), 0, "{:?}", reason);
+            assert_eq!(status(&s, &tm), OwnTxStatus::Pending, "{:?}", reason);
+        }
+        // Untracked txids are ignored whatever the reason.
+        let r = vec![MempoolRemoval { txid: txid(95), reason: RemovalReason::ConflictedByBlock { by: txid(96) } }];
+        assert_eq!(s.on_mempool_removals(&r, 300, 5).unwrap(), 0);
+        assert!(s.get(&txid(95)).unwrap().is_none());
     }
 }
