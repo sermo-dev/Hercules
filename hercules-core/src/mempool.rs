@@ -52,8 +52,13 @@ const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
 /// Maximum transaction expiry time (14 days).
 const MAX_TX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
 
-/// Dust threshold in satoshis (Bitcoin Core default for P2PKH).
-const DUST_THRESHOLD: u64 = 546;
+/// Dust relay fee in sat/kvB: Bitcoin Core's and Knots' `DUST_RELAY_TX_FEE`
+/// (`-dustrelayfee` default). See [`dust_threshold`].
+const DUST_RELAY_FEE_PER_KVB: u64 = 3_000;
+
+/// Scripts longer than this are unspendable (`MAX_SCRIPT_SIZE`), so
+/// `CScript::IsUnspendable` exempts them from the dust rule like OP_RETURN.
+const MAX_SCRIPT_SIZE: usize = 10_000;
 
 /// Maximum OP_RETURN output size (matches Bitcoin Core MAX_OP_RETURN_RELAY).
 const MAX_OP_RETURN_SIZE: usize = 83;
@@ -404,14 +409,18 @@ impl Mempool {
         // already does the round-up correctly.
         let vsize: u64 = tx.vsize() as u64;
 
+        // Core's `IsDust` per output (IsStandardTx, `dust`). Core 29+
+        // allows one dust output in a zero-fee tx (ephemeral dust), which
+        // only package relay can get mined; without package relay a
+        // zero-fee tx fails the minimum relay fee anyway, so any dust
+        // output is a rejection here.
         for (i, output) in tx.output.iter().enumerate() {
-            if output.script_pubkey.is_op_return() {
-                continue;
-            }
-            if output.value.to_sat() < DUST_THRESHOLD {
+            let threshold = dust_threshold(output);
+            if output.value.to_sat() < threshold {
                 return Err(MempoolError::DustOutput {
                     index: i,
                     amount: output.value.to_sat(),
+                    threshold,
                 });
             }
         }
@@ -1373,6 +1382,29 @@ fn pick_eviction_victim(roots: impl Iterator<Item = (Txid, u64, u64)>) -> Option
     worst.map(|(txid, _, _)| txid)
 }
 
+/// Bitcoin Core's `GetDustThreshold` at `DUST_RELAY_FEE_PER_KVB`: an
+/// output is dust if it is worth less than the fee to create *and later
+/// spend* it. The spend is costed at a typical input for the output's
+/// type: 32 + 4 + 1 + 107 + 4 = 148 bytes for a legacy (P2PKH-sized)
+/// input, or 32 + 4 + 1 + 107 / 4 + 4 = 67 vbytes for a witness program,
+/// whose signature and key sit in the discounted witness. Unspendable
+/// outputs (`CScript::IsUnspendable`: OP_RETURN, or over
+/// `MAX_SCRIPT_SIZE`) are never dust.
+///
+/// At 3,000 sat/kvB that gives P2WPKH 294, P2TR and P2WSH 330, P2SH 540
+/// and P2PKH 546 sats. Core's fee is `ceil(rate * bytes / 1000)`
+/// (`CFeeRate::GetFee`).
+pub(crate) fn dust_threshold(output: &bitcoin::TxOut) -> u64 {
+    let spk = &output.script_pubkey;
+    if spk.is_op_return() || spk.len() > MAX_SCRIPT_SIZE {
+        return 0;
+    }
+    // Serialized txout: 8-byte value, compact-size script length, script.
+    let txout_size = 8 + bitcoin::VarInt(spk.len() as u64).size() as u64 + spk.len() as u64;
+    let spend_size = if spk.is_witness_program() { 32 + 4 + 1 + 107 / 4 + 4 } else { 32 + 4 + 1 + 107 + 4 };
+    (DUST_RELAY_FEE_PER_KVB * (txout_size + spend_size)).div_ceil(1000)
+}
+
 /// Mempool entry information exposed to the wallet RPC.
 #[derive(Debug, Clone)]
 pub struct MempoolEntryInfo {
@@ -1508,7 +1540,8 @@ pub enum MempoolError {
     /// would have to beat to displace something else.
     MempoolFull { new_fee_rate: f64, min_pkg_fee_rate: f64 },
     OversizedTx { weight: u64 },
-    DustOutput { index: usize, amount: u64 },
+    /// An output worth less than its type's `dust_threshold`.
+    DustOutput { index: usize, amount: u64, threshold: u64 },
     NonStandardScript { index: usize },
     /// Transaction rejected by Knots-aligned relay policy (spam filters).
     PolicyRejection(crate::relay_policy::PolicyRejection),
@@ -1619,11 +1652,11 @@ impl std::fmt::Display for MempoolError {
             MempoolError::OversizedTx { weight } => {
                 write!(f, "transaction weight {} exceeds limit {}", weight, MAX_TX_WEIGHT)
             }
-            MempoolError::DustOutput { index, amount } => {
+            MempoolError::DustOutput { index, amount, threshold } => {
                 write!(
                     f,
-                    "output {} is dust ({} sats, min {})",
-                    index, amount, DUST_THRESHOLD
+                    "output {} is dust ({} sats, min {} for its type)",
+                    index, amount, threshold
                 )
             }
             MempoolError::NonStandardScript { index } => {
@@ -3035,22 +3068,77 @@ mod tests {
         ));
     }
 
-    /// The flat dust floor today: 546 sats for every output type, OP_RETURN
-    /// exempt.
+    /// `GetDustThreshold` for scripts that aren't one of the standard
+    /// types follows the same formula (legacy-spend sized); OP_RETURN and
+    /// over-long (unspendable) scripts are exempt.
     #[test]
-    fn dust_floor_is_546_and_op_return_is_exempt() {
+    fn dust_threshold_formula_covers_other_scripts_and_exempts_unspendable() {
+        let out = |spk: Vec<u8>| TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(spk) };
+        // 0xac: (8 + 1 + 1 + 148) * 3 = 474.
+        assert_eq!(dust_threshold(&out(vec![0xac])), 474);
+        // A 2-of-3 bare multisig (105-byte script): (8 + 1 + 105 + 148) * 3.
+        assert_eq!(dust_threshold(&out(vec![0x51; 105])), 786);
+        // Unknown witness version 2, 32-byte program: witness-sized spend.
+        let mut v2 = vec![0x52, 0x20];
+        v2.extend([7u8; 32]);
+        assert_eq!(dust_threshold(&out(v2)), 330);
+        assert_eq!(dust_threshold(&out(vec![0x6a, 0x01, 0x00])), 0);
+        assert_eq!(dust_threshold(&out(vec![0x51; MAX_SCRIPT_SIZE])), (8 + 3 + 10_000 + 148) * 3);
+        assert_eq!(dust_threshold(&out(vec![0x51; MAX_SCRIPT_SIZE + 1])), 0);
+
         let (utxo, _d) = fresh_utxo();
         seed_utxo(&utxo, seed_txid(1), 0, 1_000_000);
-        let at = make_tx(&[(seed_txid(1), 0)], &[DUST_THRESHOLD, 900_000]);
+        let at = make_tx(&[(seed_txid(1), 0)], &[474, 900_000]);
         Mempool::new().accept_tx_test(at, &utxo, TEST_HEIGHT).unwrap();
-        let below = make_tx(&[(seed_txid(1), 0)], &[DUST_THRESHOLD - 1, 900_000]);
+        let below = make_tx(&[(seed_txid(1), 0)], &[473, 900_000]);
         assert!(matches!(
             Mempool::new().accept_tx_test(below, &utxo, TEST_HEIGHT),
-            Err(MempoolError::DustOutput { index: 0, amount: 545 })
+            Err(MempoolError::DustOutput { index: 0, amount: 473, threshold: 474 })
         ));
         let mut op_return = make_tx(&[(seed_txid(1), 0)], &[0, 900_000]);
         op_return.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]);
         Mempool::new().accept_tx_test(op_return, &utxo, TEST_HEIGHT).unwrap();
+    }
+
+    /// The boundaries the ticket names, in every accept mode: P2WPKH
+    /// 293/294, P2TR and P2WSH 329/330, P2SH 539/540, P2PKH 545/546.
+    #[test]
+    fn dust_boundaries_per_output_type_in_every_mode() {
+        let xonly = bitcoin::key::XOnlyPublicKey::from_slice(&[
+            0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07,
+            0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ])
+        .unwrap();
+        let p2tr = ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(xonly));
+        let cases = [
+            (ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([1; 20])), 293u64),
+            (p2tr, 329),
+            (ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([1; 32])), 329),
+            (ScriptBuf::new_p2sh(&bitcoin::ScriptHash::from_byte_array([1; 20])), 539),
+            (ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array([1; 20])), 545),
+        ];
+        for mode in ALL_MODES {
+            for (spk, below) in &cases {
+                for (value, ok) in [(*below, false), (below + 1, true)] {
+                    let (utxo, _d) = fresh_utxo();
+                    let coin = seed_op_true(&utxo, 1, 1_000_000, 1, false);
+                    let tx = spend_ops(&[coin], vec![TxOut { value: Amount::from_sat(value), script_pubkey: spk.clone() }, p2wpkh_out(900_000)]);
+                    let r = accept_in(&mut Mempool::new(), tx, &utxo, TEST_HEIGHT, mode);
+                    if ok {
+                        r.unwrap_or_else(|e| panic!("{:?} {} sats to {}: {:?}", mode, value, spk, e));
+                    } else {
+                        assert!(
+                            matches!(r, Err(MempoolError::DustOutput { index: 0, amount, threshold }) if amount == value && threshold == value + 1),
+                            "{:?} {} sats to {}: {:?}",
+                            mode,
+                            value,
+                            spk,
+                            r
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Core's `GetDustThreshold` at the default 3 sat/vB dust relay fee is
@@ -3058,7 +3146,6 @@ mod tests {
     /// (e.g. a 330-sat P2TR output, common for Lightning anchors and
     /// ordinals-free taproot change).
     #[test]
-    #[ignore = "BUG (policy): dust threshold is a flat 546 sats; Core uses per-type thresholds (P2WPKH 294, P2TR/P2WSH 330, P2SH 540, P2PKH 546)"]
     fn dust_threshold_is_per_output_type_like_core() {
         use bitcoin::key::XOnlyPublicKey;
         let xonly = XOnlyPublicKey::from_slice(&[

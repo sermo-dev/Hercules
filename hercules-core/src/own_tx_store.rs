@@ -1196,7 +1196,7 @@ mod tests {
             SubmitError::Internal(_)
         ));
         assert!(matches!(
-            c(MempoolError::DustOutput { index: 0, amount: 1 }),
+            c(MempoolError::DustOutput { index: 0, amount: 1, threshold: 294 }),
             SubmitError::NonStandard(_)
         ));
         assert!(matches!(
