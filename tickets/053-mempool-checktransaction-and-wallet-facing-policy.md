@@ -1,5 +1,12 @@
 # Ticket 053: Mempool — Context-Free Transaction Checks and Wallet-Facing Policy
 
+## Decisions (2026-10-30, owner)
+
+- **Principle:** every policy change matches Bitcoin Core / Knots behavior (ticket 018); we don't invent policy.
+- **Replacements that add a new unconfirmed input are rejected**, matching Knots (`replacement-adds-unconfirmed`). The existing test `rbf_allows_replacement_with_existing_mempool_parent` and the PR #29 divergence test are updated to match.
+- **Minimum relay fee and incremental relay fee stay at 1 sat/vB.** No change. 041's estimator floors at 1 sat/vB.
+- **Duplicate inputs / MoneyRange:** already shipped in PR #29.
+
 ## Summary
 
 The mempool never runs Core's `CheckTransaction`, so it accepts and relays a transaction that spends the same coin twice. Core and Knots peers reject such a transaction as consensus-invalid and disconnect us, so an attacker holding one coin can keep knocking us off our peers for free. Under ticket 040 it would also show the user a fake, inflated "pending" payment.
@@ -114,7 +121,7 @@ C stays active until its 14-day expiry and is never marked Conflicted. Confirmed
 
 ### Owner decision
 
-**Minimum relay fee and incremental relay fee.** Today both are 1 sat/vB. Core 29.1/30 reportedly lowered both defaults to 0.1 sat/vB, and Knots has its own defaults; verify both. If we stay at 1 sat/vB, sub-1 sat/vB incoming payments and small RBF bumps won't appear in 040, and 041's estimator must floor at our minimum.
+Decided: stay at 1 sat/vB (see Decisions).
 
 ## Files touched
 

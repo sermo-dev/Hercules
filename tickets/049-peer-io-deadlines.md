@@ -1,5 +1,10 @@
 # Ticket 049: Peer I/O Deadlines — No Single Peer Can Stall the Node
 
+## Decisions (2026-10-30, owner)
+
+- **BIP35 `mempool`:** don't serve it. Handle it as a default Core node does: we don't advertise `NODE_BLOOM`, so a `mempool` message gets the same treatment Core gives it (verify Core's current `ProcessMessage` handling and match it).
+- **Serving blocks on cellular: allowed, with a daily upload cap on metered networks** (default 100 MB/day, reset daily or on joining an unmetered network). This is on top of the per-peer limits below, and applies only when the user has enabled cellular data at all. It needs a Swift → Rust signal from `NetworkPolicy` (metered or not), e.g. `set_network_metered(bool)`.
+
 ## Summary
 
 Every peer read and write runs on the one sync thread. Reads only have a per-`read()` timeout, and writes have no timeout at all. A single peer, including an anonymous inbound peer on the onion address we advertise ourselves, can therefore stall syncing indefinitely. While the sync thread is stuck it holds the node session, so every background wake reports `Busy` and `NodeHost.reset` times out.
@@ -122,8 +127,7 @@ All through the 027 harness:
 
 ## Open questions
 
-- **Serve BIP35 `mempool` at all?** Recommendation: no. Nothing in our product needs it, and it reveals our mempool.
-- **Upload budget on cellular.** Should serving blocks be off entirely on metered networks? Recommendation: yes, gate serving on `NetworkPolicy`'s unmetered state (needs a Swift → Rust signal).
+Both were decided (see Decisions).
 
 ## Roadmap position
 
