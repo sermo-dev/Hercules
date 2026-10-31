@@ -362,7 +362,10 @@ fn handle_get_block_header(
 ) -> RpcResponse {
     // Accept either {"height": N} or {"hash": "hex"}.
     if let Some(height) = params.get("height").and_then(|v| v.as_u64()) {
-        match syncer.rpc_get_header_at_height(height as u32) {
+        let Ok(height) = u32::try_from(height) else {
+            return RpcResponse::err(id, INVALID_PARAMS, format!("height {} out of range", height));
+        };
+        match syncer.rpc_get_header_at_height(height) {
             Ok(Some((hash, header))) => RpcResponse::ok(
                 id,
                 serde_json::json!({
@@ -404,7 +407,10 @@ fn handle_get_block_hash(
     id: serde_json::Value,
 ) -> RpcResponse {
     let height = match params.get("height").and_then(|v| v.as_u64()) {
-        Some(h) => h as u32,
+        Some(h) => match u32::try_from(h) {
+            Ok(h) => h,
+            Err(_) => return RpcResponse::err(id, INVALID_PARAMS, format!("height {} out of range", h)),
+        },
         None => return RpcResponse::err(id, INVALID_PARAMS, "expected {\"height\": N}".into()),
     };
     match syncer.rpc_get_block_hash(height) {
@@ -452,7 +458,10 @@ fn handle_get_utxo(
         }
     };
     let vout = match params.get("vout").and_then(|v| v.as_u64()) {
-        Some(v) => v as u32,
+        Some(v) => match u32::try_from(v) {
+            Ok(v) => v,
+            Err(_) => return RpcResponse::err(id, INVALID_PARAMS, format!("vout {} out of range", v)),
+        },
         None => {
             return RpcResponse::err(
                 id,
@@ -1048,5 +1057,455 @@ mod tests {
         assert_eq!(p2, "/2");
         assert_eq!(h2.get("connection").unwrap(), "close");
         assert_eq!(&b2, b"test");
+    }
+
+    // ══ Request validation and parsing (tests/network-app) ═══════════
+
+    use crate::testkit::{lmdb_slot, FixtureChain, LmdbSlot};
+    use proptest::prelude::*;
+    use std::io::Cursor;
+
+    /// A regtest node with a 12-block chain's headers, blocks 10..=12 in
+    /// the block store, and one UTXO at `UTXO_TXID:0`.
+    struct Rpc {
+        hs: HeaderSync,
+        chain: FixtureChain,
+        _dir: tempfile::TempDir,
+        _slot: LmdbSlot,
+    }
+
+    const UTXO_TXID: [u8; 32] = [0x77; 32];
+
+    fn rpc_node() -> Rpc {
+        let slot = lmdb_slot();
+        let dir = tempfile::TempDir::new().unwrap();
+        let hs = HeaderSync::with_config(crate::sync::SyncConfig {
+            db_path: dir.path().join("headers.sqlite3").to_str().unwrap().to_string(),
+            tor: None,
+            params: crate::chain_params::ChainParams::regtest(),
+            peers: crate::peer_pool::PeerSource::Static(vec![]),
+        })
+        .unwrap();
+        let mut chain = FixtureChain::new();
+        chain.mine(12);
+        let headers: Vec<bitcoin::block::Header> = (1..=12).map(|h| chain.block(h).header).collect();
+        hs.header_store_for_test().store_headers(&headers, 1).unwrap();
+        for h in 10..=12 {
+            hs.block_store_for_test().store_block(chain.block(h), h).unwrap();
+        }
+        hs.utxo_for_test()
+            .test_insert_utxo(
+                UTXO_TXID,
+                0,
+                crate::utxo::UtxoEntry { amount: 4242, script_pubkey: vec![0x51], height: 3, is_coinbase: false },
+            )
+            .unwrap();
+        Rpc { hs, chain, _dir: dir, _slot: slot }
+    }
+
+    impl Rpc {
+        /// Dispatch `method` with `params`; the response as JSON.
+        fn call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            let req = RpcRequest { jsonrpc: Some("2.0".into()), method: method.into(), params, id: serde_json::json!(7) };
+            let v = serde_json::to_value(dispatch(&self.hs, &req)).unwrap();
+            assert_eq!(v["id"], 7, "id not echoed: {}", v);
+            v
+        }
+    }
+
+    fn code(v: &serde_json::Value) -> Option<i64> {
+        v["error"]["code"].as_i64()
+    }
+
+    fn utxo_txid_hex() -> String {
+        bitcoin::Txid::from_byte_array(UTXO_TXID).to_string()
+    }
+
+    use bitcoin::hashes::Hash;
+
+    /// Heights and vouts arrive as JSON u64 and used to be cast with `as
+    /// u32`, so 2^32 + n silently became n: `get_block_hash {"height":
+    /// 4294967296}` answered with genesis, `get_utxo` with `vout`
+    /// 4294967296 returned output 0's coin.
+    #[test]
+    fn out_of_range_heights_and_vouts_are_invalid_params_not_wrapped() {
+        let r = rpc_node();
+        let big = 1u64 << 32;
+        let genesis = r.chain.hash_at(0).to_string();
+        let v = r.call("get_block_hash", serde_json::json!({ "height": big }));
+        assert_eq!(code(&v), Some(INVALID_PARAMS as i64), "{}", v);
+        assert_ne!(v["result"], serde_json::json!(genesis));
+        let v = r.call("get_block_header", serde_json::json!({ "height": big + 5 }));
+        assert_eq!(code(&v), Some(INVALID_PARAMS as i64), "{}", v);
+        let v = r.call("get_utxo", serde_json::json!({ "txid": utxo_txid_hex(), "vout": big }));
+        assert_eq!(code(&v), Some(INVALID_PARAMS as i64), "{}", v);
+        // In range, the same calls answer normally.
+        assert_eq!(r.call("get_block_hash", serde_json::json!({ "height": 0 }))["result"], serde_json::json!(genesis));
+        assert_eq!(r.call("get_utxo", serde_json::json!({ "txid": utxo_txid_hex(), "vout": 0 }))["result"]["value"], 4242);
+        assert!(r.call("get_utxo", serde_json::json!({ "txid": utxo_txid_hex(), "vout": u32::MAX }))["result"].is_null());
+    }
+
+    #[test]
+    fn every_method_answers_valid_requests() {
+        let r = rpc_node();
+        let tip = r.call("get_tip", serde_json::Value::Null);
+        assert_eq!(tip["result"]["height"], 12);
+        assert_eq!(tip["result"]["hash"], r.chain.hash_at(12).to_string());
+        // Fixture timestamps are years old.
+        assert_eq!(tip["result"]["is_stale"], true);
+
+        let by_height = r.call("get_block_header", serde_json::json!({ "height": 5 }));
+        assert_eq!(by_height["result"]["hash"], r.chain.hash_at(5).to_string());
+        assert_eq!(by_height["result"]["prev_block_hash"], r.chain.hash_at(4).to_string());
+        let by_hash = r.call("get_block_header", serde_json::json!({ "hash": r.chain.hash_at(5).to_string() }));
+        assert_eq!(by_hash["result"], by_height["result"]);
+        assert!(r.call("get_block_header", serde_json::json!({ "height": 99 }))["result"].is_null());
+        assert!(r.call("get_block_header", serde_json::json!({ "hash": "00".repeat(32) }))["result"].is_null());
+
+        let block = r.call("get_block", serde_json::json!({ "hash": r.chain.hash_at(11).to_string() }));
+        let hex = block["result"]["hex"].as_str().unwrap();
+        let decoded: bitcoin::Block = bitcoin::consensus::encode::deserialize_hex(hex).unwrap();
+        assert_eq!(decoded.block_hash(), r.chain.hash_at(11));
+        let pruned = r.call("get_block", serde_json::json!({ "hash": r.chain.hash_at(2).to_string() }));
+        assert_eq!(code(&pruned), Some(BLOCK_PRUNED as i64));
+
+        assert!(r.call("get_mempool_entry", serde_json::json!({ "txid": utxo_txid_hex() }))["result"].is_null());
+        assert!(r.call("get_fee_estimates", serde_json::Value::Null)["result"].is_object());
+        assert!(r.call("get_broadcast_status", serde_json::json!({ "txid": utxo_txid_hex() }))["result"].is_null());
+        let info = r.call("get_node_info", serde_json::Value::Null);
+        assert_eq!(info["result"]["tip_height"], 12);
+        assert_eq!(code(&r.call("get_compact_filter", serde_json::Value::Null)), Some(METHOD_NOT_FOUND as i64));
+    }
+
+    #[test]
+    fn malformed_params_are_invalid_params_for_every_method() {
+        let r = rpc_node();
+        let bad_params = [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!([5]),
+            serde_json::json!("x"),
+            serde_json::json!({}),
+            serde_json::json!({ "height": -1 }),
+            serde_json::json!({ "height": 1.5 }),
+            serde_json::json!({ "height": "5" }),
+            serde_json::json!({ "hash": 5 }),
+            serde_json::json!({ "hash": "zz" }),
+            serde_json::json!({ "hash": "00" }),
+            serde_json::json!({ "txid": "not hex" }),
+            serde_json::json!({ "txid": "ab".repeat(33) }),
+            serde_json::json!({ "txid": utxo_txid_hex() }),          // no vout
+            serde_json::json!({ "txid": utxo_txid_hex(), "vout": -1 }),
+            serde_json::json!({ "hex": "zz" }),
+            serde_json::json!({ "hex": 12 }),
+        ];
+        for method in [
+            "get_block_header",
+            "get_block_hash",
+            "get_block",
+            "get_utxo",
+            "get_mempool_entry",
+            "broadcast_transaction",
+            "get_broadcast_status",
+        ] {
+            for p in &bad_params {
+                let v = r.call(method, p.clone());
+                if v.get("error").is_some() {
+                    let c = code(&v).unwrap();
+                    assert!(
+                        c == INVALID_PARAMS as i64 || c == TX_REJECTED as i64,
+                        "{} {} -> unexpected error {}",
+                        method,
+                        p,
+                        v
+                    );
+                }
+            }
+        }
+        // The specific shapes that must be refused, not answered.
+        for (method, p) in [
+            ("get_block_hash", serde_json::json!({ "height": -1 })),
+            ("get_block_hash", serde_json::json!({ "height": "5" })),
+            ("get_block", serde_json::json!({ "hash": "zz" })),
+            ("get_utxo", serde_json::json!({ "txid": utxo_txid_hex() })),
+            ("get_mempool_entry", serde_json::json!({ "txid": "not hex" })),
+            ("broadcast_transaction", serde_json::json!({ "hex": "zz" })),
+            ("get_broadcast_status", serde_json::json!({})),
+        ] {
+            assert_eq!(code(&r.call(method, p.clone())), Some(INVALID_PARAMS as i64), "{} {}", method, p);
+        }
+        assert_eq!(code(&r.call("getblockcount", serde_json::Value::Null)), Some(METHOD_NOT_FOUND as i64));
+        assert_eq!(code(&r.call("", serde_json::Value::Null)), Some(METHOD_NOT_FOUND as i64));
+    }
+
+    #[test]
+    fn broadcast_of_non_transaction_bytes_is_rejected_not_internal() {
+        let r = rpc_node();
+        for hex in ["", "00", "deadbeef", &"ff".repeat(100)] {
+            let v = r.call("broadcast_transaction", serde_json::json!({ "hex": hex }));
+            assert_eq!(code(&v), Some(TX_REJECTED as i64), "{:?} -> {}", hex, v);
+        }
+    }
+
+    // ── HTTP parsing bounds ──────────────────────────────────────────
+
+    /// A reader that counts what is consumed from it.
+    struct Counting<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n);
+            Ok(n)
+        }
+    }
+
+    /// Reviewer finding: `read_line` reads the whole line before the
+    /// MAX_LINE_LENGTH check, so a client (before authenticating) can make
+    /// the server buffer an arbitrarily long request line or header.
+    #[test]
+    #[ignore = "BUG: read_http_request buffers a whole line before checking MAX_LINE_LENGTH (unbounded pre-auth memory)"]
+    fn oversized_lines_are_refused_without_buffering_them() {
+        for prefix in [&b""[..], &b"POST / HTTP/1.1\r\n"[..]] {
+            let mut data = prefix.to_vec();
+            data.extend(std::iter::repeat(b'A').take(16 * 1024 * 1024));
+            let read = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut reader = BufReader::new(Counting { inner: Cursor::new(data), read: read.clone() });
+            assert!(read_http_request(&mut reader).is_err());
+            assert!(
+                read.get() < 4 * MAX_LINE_LENGTH + prefix.len(),
+                "consumed {} bytes of one line (limit {})",
+                read.get(),
+                MAX_LINE_LENGTH
+            );
+        }
+    }
+
+    #[test]
+    fn line_and_body_limits_are_enforced() {
+        let long = format!("POST /{} HTTP/1.1\r\n\r\n", "a".repeat(MAX_LINE_LENGTH));
+        assert!(read_http_request(&mut BufReader::new(long.as_bytes())).is_err());
+        let long_header = format!("POST / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_LINE_LENGTH));
+        assert!(read_http_request(&mut BufReader::new(long_header.as_bytes())).is_err());
+        let too_big = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_SIZE + 1);
+        let err = read_http_request(&mut BufReader::new(too_big.as_bytes())).unwrap_err();
+        assert!(err.contains("too large"), "{}", err);
+        // At the limit: accepted (body truncated here, so read fails, but
+        // not for size).
+        let at_limit = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_SIZE);
+        let err = read_http_request(&mut BufReader::new(at_limit.as_bytes())).unwrap_err();
+        assert!(err.contains("read body"), "{}", err);
+    }
+
+    #[test]
+    fn malformed_requests_are_errors_or_parse_safely() {
+        for raw in [
+            &b"\r\n"[..],
+            b"POST\r\n\r\n",
+            b"GARBAGE",
+            b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nshort",
+        ] {
+            assert!(read_http_request(&mut BufReader::new(raw)).is_err(), "{:?}", String::from_utf8_lossy(raw));
+        }
+        // Lenient on what doesn't matter: lowercase method, odd headers,
+        // a non-numeric length (read as 0).
+        let raw = b"post /x HTTP/1.0\r\nNoColonHere\r\nContent-Length: abc\r\nX-Y:  spaced  \r\n\r\n";
+        let (m, p, h, b) = read_http_request(&mut BufReader::new(&raw[..])).unwrap();
+        assert_eq!((m.as_str(), p.as_str(), b.len()), ("POST", "/x", 0));
+        assert_eq!(h.get("x-y").map(String::as_str), Some("spaced"));
+    }
+
+    #[test]
+    fn auth_parsing_edge_cases() {
+        let with = |v: &str| {
+            let mut h = HashMap::new();
+            h.insert("authorization".to_string(), v.to_string());
+            h
+        };
+        let b64 = |s: &str| base64_encode(s.as_bytes());
+        // Username ignored; password may itself contain ':'.
+        assert!(verify_auth(&with(&format!("Basic {}", b64("anyone:tok:en"))), "tok:en"));
+        assert!(verify_auth(&with(&format!("Basic {}", b64(":tok"))), "tok"));
+        assert!(verify_auth(&with(&format!("Basic   {}  ", b64("u:tok"))), "tok"));
+        for bad in [
+            "Basic".to_string(),
+            "Basic ".to_string(),
+            format!("basic {}", b64("u:tok")),
+            format!("Basic {}", b64("tok")),            // no colon
+            format!("Basic {}", b64("u:tok ")),         // trailing space
+            format!("Basic {}", b64("u:TOK")),
+            "Basic !!!!".to_string(),
+            "Basic /w==".to_string(),                    // decodes to non-UTF-8
+            format!("Basic {}=", b64("u:tok")),          // extra padding is tolerated? must not panic
+        ] {
+            let _ = verify_auth(&with(&bad), "tok");
+            if !bad.ends_with("==") && !bad.ends_with('=') {
+                assert!(!verify_auth(&with(&bad), "tok"), "{:?} accepted", bad);
+            }
+        }
+        // An empty expected token never matches a real request by accident.
+        assert!(!verify_auth(&with(&format!("Basic {}", b64("u:x"))), ""));
+    }
+
+    // ── Keep-alive connection behavior ───────────────────────────────
+
+    fn request(body: &str, auth: Option<&str>, extra: &str) -> String {
+        let auth = auth.map(|t| format!("Authorization: Basic {}\r\n", base64_encode(format!("w:{}", t).as_bytes()))).unwrap_or_default();
+        format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n{}{}\r\n{}", body.len(), auth, extra, body)
+    }
+
+    /// Read one HTTP response (status code, body) off `reader`.
+    fn read_response(reader: &mut BufReader<std::net::TcpStream>) -> (u16, String) {
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let code: u16 = status.split(' ').nth(1).unwrap_or("0").parse().unwrap_or(0);
+        let mut len = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; len];
+        reader.read_exact(&mut body).unwrap();
+        (code, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[test]
+    fn connection_recovers_from_bad_json_and_checks_auth_on_every_request() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (client, handle, _dir) = served_connection(shutdown.clone());
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client);
+
+        // Bad JSON: an error response, connection kept.
+        writer.write_all(request("{nope", Some("token"), "").as_bytes()).unwrap();
+        let (status, body) = read_response(&mut reader);
+        assert_eq!(status, 200);
+        assert!(body.contains(&PARSE_ERROR.to_string()), "{}", body);
+
+        // Wrong protocol version: an error response, connection kept.
+        writer.write_all(request(r#"{"jsonrpc":"1.0","method":"get_tip","id":1}"#, Some("token"), "").as_bytes()).unwrap();
+        let (_, body) = read_response(&mut reader);
+        assert!(body.contains(&INVALID_REQUEST.to_string()), "{}", body);
+
+        // Two pipelined requests in one write: two answers, in order.
+        let one = request(r#"{"jsonrpc":"2.0","method":"get_tip","id":"a"}"#, Some("token"), "");
+        let two = request(r#"{"jsonrpc":"2.0","method":"nope","id":"b"}"#, Some("token"), "");
+        writer.write_all(format!("{}{}", one, two).as_bytes()).unwrap();
+        let (_, a) = read_response(&mut reader);
+        let (_, b) = read_response(&mut reader);
+        assert!(a.contains("\"id\":\"a\"") && b.contains("\"id\":\"b\""), "{} / {}", a, b);
+        assert!(b.contains(&METHOD_NOT_FOUND.to_string()));
+
+        // An authorized connection is not a session: an unauthenticated
+        // request on it is refused and the connection closed.
+        writer.write_all(request(r#"{"jsonrpc":"2.0","method":"get_tip","id":2}"#, None, "").as_bytes()).unwrap();
+        let (status, _) = read_response(&mut reader);
+        assert_eq!(status, 401);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn non_post_and_oversized_bodies_close_the_connection() {
+        for raw in [
+            "GET / HTTP/1.1\r\n\r\n".to_string(),
+            format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY_SIZE + 1),
+        ] {
+            let (client, handle, _dir) = served_connection(Arc::new(AtomicBool::new(false)));
+            let mut writer = client.try_clone().unwrap();
+            writer.write_all(raw.as_bytes()).unwrap();
+            let mut response = String::new();
+            BufReader::new(client).read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 405") || response.starts_with("HTTP/1.1 400"), "{}", response);
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn connection_close_is_honored_after_the_response() {
+        let (client, handle, _dir) = served_connection(Arc::new(AtomicBool::new(false)));
+        let mut writer = client.try_clone().unwrap();
+        writer
+            .write_all(request(r#"{"jsonrpc":"2.0","method":"get_tip","id":1}"#, Some("token"), "Connection: close\r\n").as_bytes())
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(client).read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200") && response.contains("Connection: close"), "{}", response);
+        handle.join().unwrap();
+    }
+
+    // ── Properties ───────────────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_read_http_request_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
+            let mut reader = BufReader::new(&bytes[..]);
+            for _ in 0..4 {
+                if read_http_request(&mut reader).is_err() {
+                    break;
+                }
+            }
+        }
+
+        #[test]
+        fn prop_base64_round_trips_and_decode_never_panics(s in ".{0,64}", junk in ".{0,64}") {
+            prop_assert_eq!(base64_decode(&base64_encode(s.as_bytes())), Some(s));
+            let _ = base64_decode(&junk);
+        }
+
+        /// The right token always authenticates, whatever the username
+        /// (without ':'); any other token never does.
+        #[test]
+        fn prop_auth_accepts_exactly_the_token(user in "[^:]{0,16}", token in "[ -~]{1,64}", other in "[ -~]{1,64}") {
+            let mut h = HashMap::new();
+            h.insert("authorization".to_string(), format!("Basic {}", base64_encode(format!("{}:{}", user, token).as_bytes())));
+            prop_assert!(verify_auth(&h, &token));
+            prop_assume!(other != token);
+            prop_assert!(!verify_auth(&h, &other));
+        }
+    }
+
+    #[test]
+    fn prop_dispatch_never_panics_on_arbitrary_params() {
+        let r = rpc_node();
+        let methods = [
+            "get_tip", "get_block_header", "get_block_hash", "get_block", "get_utxo", "get_mempool_entry",
+            "get_fee_estimates", "broadcast_transaction", "get_broadcast_status", "get_compact_filter",
+            "get_node_info", "unknown",
+        ];
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::from),
+            any::<i64>().prop_map(serde_json::Value::from),
+            any::<u64>().prop_map(serde_json::Value::from),
+            any::<f64>().prop_map(serde_json::Value::from),
+            "[0-9a-f]{0,80}".prop_map(serde_json::Value::from),
+            ".{0,20}".prop_map(serde_json::Value::from),
+        ];
+        let params = prop::collection::btree_map(
+            prop::sample::select(vec!["height", "hash", "txid", "vout", "hex", "x"]),
+            leaf,
+            0..4,
+        )
+        .prop_map(|m| serde_json::Value::Object(m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()));
+        let mut runner = proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
+            cases: std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(256),
+            ..Default::default()
+        });
+        runner
+            .run(&(prop::sample::select(methods.to_vec()), params), |(method, params)| {
+                let v = r.call(method, params);
+                prop_assert!(v.get("result").is_some() || v.get("error").is_some());
+                Ok(())
+            })
+            .unwrap();
     }
 }

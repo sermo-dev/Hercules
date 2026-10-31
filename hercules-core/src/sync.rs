@@ -2244,6 +2244,25 @@ impl HeaderSync {
             .store(pool.outbound_count() as u32, Ordering::Relaxed);
     }
 
+    /// The header store, for tests outside this module (wallet RPC, FFI)
+    /// that seed a chain directly.
+    #[cfg(test)]
+    pub(crate) fn header_store_for_test(&self) -> &HeaderStore {
+        &self.store
+    }
+
+    /// The block store, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn block_store_for_test(&self) -> &BlockStore {
+        &self.block_store
+    }
+
+    /// The UTXO set, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn utxo_for_test(&self) -> &UtxoSet {
+        &self.utxo
+    }
+
     /// Request the sync loop to stop. The loop will exit cleanly on its
     /// next iteration, returning Ok(()) from `sync()`.
     #[cfg(test)]
@@ -5996,3 +6015,13 @@ mod tests {
 #[cfg(test)]
 #[path = "testkit/sync_integration.rs"]
 mod integration_tests;
+
+// Inbound message handling against hostile input (tests/network-app).
+#[cfg(test)]
+#[path = "sync_inbound_tests.rs"]
+mod inbound_tests;
+
+// Adversarial peers against the real sync paths (tests/network-app).
+#[cfg(test)]
+#[path = "testkit/adversarial_sync.rs"]
+mod adversarial_tests;

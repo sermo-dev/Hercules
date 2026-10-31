@@ -389,14 +389,16 @@ mod tests {
 
     #[test]
     fn acquire_within_gives_up_at_floor_and_on_cancel() {
-        // 300 ms budget, 200 ms floor: gives up after ~100 ms.
-        let b = WakeBudget::new(300);
+        // 2 s budget, 1 s floor: gives up once ~1 s has passed, long
+        // before the budget ends. Sized so a loaded CI runner's sleep
+        // overshoot (seen: +150 ms on a 300 ms version) can't fail it.
+        let b = WakeBudget::new(2_000);
         let start = Instant::now();
-        let got: Option<()> = acquire_within(&b, Duration::from_millis(200), || None, || true);
+        let got: Option<()> = acquire_within(&b, Duration::from_millis(1_000), || None, || true);
         assert!(got.is_none());
         let waited = start.elapsed();
-        assert!(waited >= Duration::from_millis(90), "{:?}", waited);
-        assert!(waited < Duration::from_millis(250), "{:?}", waited);
+        assert!(waited >= Duration::from_millis(990), "{:?}", waited);
+        assert!(waited < Duration::from_millis(1_900), "{:?}", waited);
 
         let b = Arc::new(WakeBudget::new(60_000));
         let b2 = Arc::clone(&b);
@@ -440,15 +442,16 @@ mod tests {
 
     #[test]
     fn slow_transport_gives_up_at_floor_but_keeps_bootstrapping() {
-        // Bootstrap needs 400 ms; the wake has 500 ms with a 300 ms floor,
-        // so it must give up after ~200 ms rather than wait it out.
-        let gate = gate_after(Duration::from_millis(400), Ok(1));
-        let b = WakeBudget::new(500);
+        // Bootstrap needs 3 s; the wake has 2 s with a 1 s floor, so it
+        // must give up after ~1 s rather than wait it out. (Seconds, not
+        // hundreds of ms, so CI sleep overshoot can't fail it.)
+        let gate = gate_after(Duration::from_millis(3_000), Ok(1));
+        let b = WakeBudget::new(2_000);
         let start = Instant::now();
-        assert_eq!(gate.wait_within(&b, Duration::from_millis(300)), Err(TransportWait::Slow));
+        assert_eq!(gate.wait_within(&b, Duration::from_millis(1_000)), Err(TransportWait::Slow));
         let waited = start.elapsed();
-        assert!(waited >= Duration::from_millis(180), "{:?}", waited);
-        assert!(waited < Duration::from_millis(350), "{:?}", waited);
+        assert!(waited >= Duration::from_millis(990), "{:?}", waited);
+        assert!(waited < Duration::from_millis(1_900), "{:?}", waited);
         assert!(gate.is_bootstrapping());
         // The bootstrap carries on in the background for the next wake.
         assert_eq!(gate.wait_within(&WakeBudget::new(5_000), Duration::ZERO), Ok(1));

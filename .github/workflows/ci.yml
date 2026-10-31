@@ -1,0 +1,271 @@
+# Continuous checks for hercules-core and the iOS app.
+#
+# Every push and pull request:
+#   rust       cargo test (libbitcoinkernel backend), cargo test with the
+#              script-differential feature (kernel vs legacy library on
+#              every script check), and clippy (reported, not yet gating).
+#   ios        build-ios.sh (device + simulator static libs, UniFFI Swift
+#              bindings, XCFramework), then an unsigned simulator build of
+#              the app and widget.
+#   scenarios  HerculesApp/Tools/NodeHostScenarios (Swift wake/foreground
+#              coordination checks).
+#
+# Nightly (and on demand from the Actions tab):
+#   nightly    #[ignore]d heavy tests (`heavy_` prefix), property tests
+#              with many more cases (`prop_` prefix, see PROPTEST_CASES),
+#              the suite at high parallelism, and the known-bug tests
+#              (#[ignore = "BUG: ..."] / ticket 025) for information only.
+#
+# Builds compile Bitcoin Core's libbitcoinkernel from source
+# (hercules-core/kernel-sys/build.rs): cmake + Boost headers, and the
+# pinned Core checkout is cached by the build script's hash (it pins
+# CORE_COMMIT). Caches are saved from main only, once per key (lockfile,
+# kernel build script, toolchain), so pull requests reuse them without
+# growing them; hercules-core itself recompiles each run.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Rust tests (kernel, differential, clippy)
+    if: github.event_name != 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: hercules-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain and build dependencies
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          brew install cmake boost
+          rustc --version && cmake --version | head -1
+
+      - name: Restore cargo registry
+        id: registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('hercules-core/Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: Restore Bitcoin Core source
+        id: core-src
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/kernel-sys/bitcoin-core-*
+          key: core-src-${{ hashFiles('hercules-core/kernel-sys/build.rs') }}
+
+      - name: Restore target dir
+        id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/target
+          key: target-debug-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('hercules-core/Cargo.lock', 'hercules-core/kernel-sys/build.rs', 'hercules-core/kernel-sys/src/**') }}
+
+      - name: Build tests
+        run: cargo test --locked --no-run
+
+      - name: cargo test (libbitcoinkernel)
+        run: cargo test --locked
+
+      - name: cargo test --features script-differential
+        run: cargo test --locked --features script-differential
+
+      - name: cargo clippy (not yet gating)
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets
+
+      - name: Save cargo registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('hercules-core/Cargo.lock') }}
+
+      - name: Save Bitcoin Core source
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.core-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/kernel-sys/bitcoin-core-*
+          key: core-src-${{ hashFiles('hercules-core/kernel-sys/build.rs') }}
+
+      - name: Save target dir
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/target
+          key: target-debug-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('hercules-core/Cargo.lock', 'hercules-core/kernel-sys/build.rs', 'hercules-core/kernel-sys/src/**') }}
+
+  ios:
+    name: iOS libraries and simulator build
+    if: github.event_name != 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain and build dependencies
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --target aarch64-apple-ios --target aarch64-apple-ios-sim
+          rustup default "$RUST_TOOLCHAIN"
+          brew install cmake boost
+          xcodebuild -version
+
+      - name: Restore cargo registry
+        id: registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('hercules-core/Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: Restore Bitcoin Core source
+        id: core-src
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/kernel-sys/bitcoin-core-*
+          key: core-src-${{ hashFiles('hercules-core/kernel-sys/build.rs') }}
+
+      - name: Restore target dir
+        id: target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/target
+          key: target-ios-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('hercules-core/Cargo.lock', 'hercules-core/kernel-sys/build.rs', 'hercules-core/kernel-sys/src/**') }}
+
+      - name: Check the lockfile is current
+        working-directory: hercules-core
+        run: cargo fetch --locked
+
+      - name: build-ios.sh (device + simulator libraries, Swift bindings)
+        run: ./build-ios.sh
+
+      - name: Simulator build (unsigned)
+        run: |
+          xcodebuild build \
+            -project HerculesApp/HerculesApp.xcodeproj \
+            -target HerculesApp \
+            -sdk iphonesimulator \
+            -arch arm64 \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Save target dir
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/target
+          key: target-ios-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('hercules-core/Cargo.lock', 'hercules-core/kernel-sys/build.rs', 'hercules-core/kernel-sys/src/**') }}
+
+  scenarios:
+    name: NodeHost Swift scenarios
+    if: github.event_name != 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run scenarios
+        run: ./HerculesApp/Tools/NodeHostScenarios/run.sh
+
+  nightly:
+    name: Nightly (heavy, extended property tests, high parallelism)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: hercules-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain and build dependencies
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          brew install cmake boost
+
+      - name: Restore cargo registry
+        id: registry
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ hashFiles('hercules-core/Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: Restore Bitcoin Core source
+        id: core-src
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/kernel-sys/bitcoin-core-*
+          key: core-src-${{ hashFiles('hercules-core/kernel-sys/build.rs') }}
+
+      - name: Restore target dir (from the main-branch rust job)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hercules-core/target
+          key: target-debug-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('hercules-core/Cargo.lock', 'hercules-core/kernel-sys/build.rs', 'hercules-core/kernel-sys/src/**') }}
+
+      - name: Heavy ignored tests
+        run: cargo test --locked --lib -- --ignored heavy_
+
+      - name: Property tests, many cases (time-boxed fuzzing)
+        env:
+          PROPTEST_CASES: "20000"
+        timeout-minutes: 60
+        run: cargo test --locked --lib prop_
+
+      - name: Full suite at high parallelism (flake canary)
+        run: cargo test --locked -- --test-threads=16
+
+      - name: Known-bug tests (informational; a pass means it was fixed)
+        continue-on-error: true
+        run: |
+          cargo test --locked --lib -- --ignored \
+            --skip heavy_ --skip bench_ --skip mainnet

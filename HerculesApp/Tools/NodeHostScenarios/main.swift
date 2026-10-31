@@ -198,5 +198,78 @@ DispatchQueue.concurrentPerform(iterations: pushes.count) { i in
 }
 check(waitDone.wait(timeout: .now() + 5) == .success, "s14 processing wait ends when pushes finish (no deadlock)")
 
+// 15. wake budget arithmetic (ticket 028): Rust's budget ends before the
+//     watchdog fires, the watchdog fires before iOS's ~30 s kill, and a
+//     wake leaves room for at least one block
+check(Double(WakeConfig.budgetMs) / 1000 < WakeConfig.watchdogSeconds, "s15 Rust budget ends before the watchdog")
+check(WakeConfig.watchdogSeconds < 28, "s15 watchdog fires before iOS's ~30 s limit")
+check(WakeConfig.minBlockMs < WakeConfig.budgetMs && WakeConfig.maxBlocks >= 1, "s15 a wake can fit at least one block")
+check(WakeConfig.processingRoundMs > WakeConfig.budgetMs && WakeConfig.processingMaxBlocks >= WakeConfig.maxBlocks,
+      "s15 processing rounds are longer than short wakes")
+check(WakeConfig.processingMaxRounds > 0 && WakeConfig.processingMaxYields > 0, "s15 processing loop is bounded")
+
+// 16. the whole restart table: only a wake-stopped session restarts, never
+//     after a user Stop, now if on screen else when active
+for preempted in [false, true] {
+    for userStopped in [false, true] {
+        for foreground in [false, true] {
+            let got = ForegroundRestart.decide(preempted: preempted, userStopped: userStopped, appInForeground: foreground)
+            let want: ForegroundRestart = (!preempted || userStopped) ? .none : (foreground ? .now : .whenActive)
+            if got != want { check(false, "s16 decide(\(preempted), \(userStopped), \(foreground)) = \(got)") }
+        }
+    }
+}
+check(true, "s16 restart decision table (8 cases)")
+
+// 17. a processing round admitted while sync runs in the background
+//     preempts it like a push does; on screen it defers to foreground
+s = NodeSessionState(); s.beginForeground()
+let bgRound = Token()
+check(s.admitWake(bgRound, appInForeground: false, kind: .processing) == .run(preemptsForeground: true), "s17 background round preempts sync")
+check(s.endForeground() == true, "s17 the stopped sync is told to restart")
+s.finishWake(bgRound, stoppedForegroundSync: true)
+s = NodeSessionState(); s.beginForeground()
+check(s.admitWake(Token(), appInForeground: true, kind: .processing) == .foregroundActive, "s17 on-screen round defers to foreground")
+check(s.inFlightWakes == 0, "s17 deferred round not registered")
+
+// 18. the first cancel reason sticks: a wake cancelled by a reset is
+//     still attributed to the reset when foreground starts afterwards
+s = NodeSessionState()
+let r18 = Token()
+_ = s.admitWake(r18, appInForeground: false)
+s.cancelAllWakes()
+s.beginForeground()
+check(r18.cancels == 2, "s18 both cancels reach the wake (cancel is idempotent in Rust)")
+check(s.finishWake(r18, stoppedForegroundSync: false) == .reset, "s18 reset stays the reason")
+_ = s.endForeground()
+
+// 19. finishing twice, or a wake never admitted, is harmless
+s = NodeSessionState()
+let r19 = Token()
+_ = s.admitWake(r19, appInForeground: false)
+check(s.finishWake(r19, stoppedForegroundSync: false) == .none, "s19 first finish")
+check(s.finishWake(r19, stoppedForegroundSync: false) == .none && s.inFlightWakes == 0, "s19 second finish is a no-op")
+check(s.finishWake(Token(), stoppedForegroundSync: true) == .none && s.inFlightWakes == 0, "s19 unknown token is a no-op")
+check(s.endForeground() == false && !s.isForegroundActive, "s19 no foreground state invented")
+
+// 20. OnceGate used in sequence: the second body never runs
+let g20 = OnceGate()
+var ran20 = 0
+check(g20.fire { ran20 += 1 } && !g20.fire { ran20 += 1 } && ran20 == 1, "s20 OnceGate runs exactly one body")
+
+// 21. a token that ended without a stop or retire is not "over" (a later
+//     restart must still be able to tell a crash-free end from a Stop)
+let t21 = SyncSessionToken(generation: 9)
+t21.markEnded()
+check(t21.ended && !t21.isOver && !t21.stopped && !t21.retired && t21.generation == 9, "s21 ended is independent of stop/retire")
+
+// 22. history decoding edges: an empty list is an empty history (not
+//     "unreadable"), and non-array JSON is unreadable (never overwritten)
+check(NotificationHistory.decode(Data("[]".utf8))?.isEmpty == true, "s22 [] decodes to an empty history")
+check(NotificationHistory.decode(Data("{}".utf8)) == nil, "s22 an object is not a history")
+check(NotificationHistory.decode(Data("null".utf8)) == nil, "s22 null is not a history")
+check(NotificationHistory.decode(Data()) == nil, "s22 an empty file is not a history")
+check(NotificationHistory.decode(Data("[1, \"x\", null, \(good)]".utf8))?.count == 1, "s22 junk entries dropped, the good one kept")
+
 print(fails == 0 ? "ALL PASS" : "\(fails) FAILED")
 exit(fails == 0 ? 0 : 1)

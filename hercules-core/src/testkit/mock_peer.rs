@@ -24,6 +24,7 @@ use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
+use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 
 use super::fixture_chain::FixtureChain;
@@ -56,6 +57,24 @@ pub enum Behavior {
     Disconnect,
     /// Answer every `getheaders` with an empty `headers` message.
     WithholdHeaders,
+    /// Claim this start height in our `version` (a tip we may not have).
+    InflatedHeight(i32),
+    /// Answer `getheaders` with at most one header (a peer dribbling the
+    /// chain one round trip per header).
+    OneHeaderPerBatch,
+    /// Right after the handshake, ask for the block at this height
+    /// `count` times in one `getdata`, then never read from the socket
+    /// again (the node's writes fill the buffers and block).
+    FloodGetDataNeverRead { height: u32, count: usize },
+    /// Write every post-handshake reply one byte at a time, this long
+    /// apart (each byte well inside the node's per-read timeout).
+    TrickleResponses(Duration),
+    /// Answer `getheaders` with a frame header claiming a 4 MB `headers`
+    /// payload, then send one byte per interval, forever.
+    EndlessHeadersTrickle(Duration),
+    /// After the handshake, announce a new random block hash every
+    /// interval, forever (none of them exists).
+    SpamBlockInv(Duration),
 }
 
 /// The chain a mock serves, indexed by hash.
@@ -212,7 +231,7 @@ impl Drop for MockPeer {
 
 // ── Session ──────────────────────────────────────────────────────────
 
-fn run_session(stream: TcpStream, shared: &Shared) -> io::Result<()> {
+fn run_session(stream: TcpStream, shared: &Arc<Shared>) -> io::Result<()> {
     let mut reader = stream.try_clone()?;
     let writer = Arc::new(Mutex::new(stream));
     shared.sessions.lock().unwrap().push(writer.clone());
@@ -225,14 +244,49 @@ fn run_session(stream: TcpStream, shared: &Shared) -> io::Result<()> {
             break;
         }
     }
-    let start_height = shared.chain.lock().unwrap().tip_height() as i32;
+    let behaviors = shared.behaviors.lock().unwrap().clone();
+    let start_height = behaviors
+        .iter()
+        .find_map(|b| match b {
+            Behavior::InflatedHeight(h) => Some(*h),
+            _ => None,
+        })
+        .unwrap_or_else(|| shared.chain.lock().unwrap().tip_height() as i32);
     send(&writer, magic, NetworkMessage::Version(version_message(start_height)))?;
     send(&writer, magic, NetworkMessage::Verack)?;
 
-    let behaviors = shared.behaviors.lock().unwrap().clone();
     if behaviors.iter().any(|b| matches!(b, Behavior::Disconnect)) {
         let _ = writer.lock().unwrap().shutdown(Shutdown::Both);
         return Ok(());
+    }
+    for b in &behaviors {
+        match b {
+            Behavior::FloodGetDataNeverRead { height, count } => {
+                let hash = shared.chain.lock().unwrap().blocks[*height as usize].block_hash();
+                let items = vec![Inventory::WitnessBlock(hash); *count];
+                send(&writer, magic, NetworkMessage::GetData(items))?;
+                while !shared.shutdown.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                return Ok(());
+            }
+            Behavior::SpamBlockInv(every) => {
+                let (w, every) = (writer.clone(), *every);
+                let shared = Arc::clone(shared);
+                std::thread::spawn(move || {
+                    let mut n: u64 = 0;
+                    while !shared.shutdown.load(Ordering::SeqCst) {
+                        n += 1;
+                        let hash = BlockHash::hash(&n.to_le_bytes());
+                        if send(&w, magic, NetworkMessage::Inv(vec![Inventory::Block(hash)])).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(every);
+                    }
+                });
+            }
+            _ => {}
+        }
     }
 
     loop {
@@ -265,10 +319,22 @@ fn run_session(stream: TcpStream, shared: &Shared) -> io::Result<()> {
         } else {
             magic
         };
+        let trickle = behaviors.iter().find_map(|b| match b {
+            Behavior::TrickleResponses(d) => Some(*d),
+            _ => None,
+        });
+        let endless = behaviors.iter().find_map(|b| match b {
+            Behavior::EndlessHeadersTrickle(d) => Some(*d),
+            _ => None,
+        });
         match msg {
-            NetworkMessage::Ping(nonce) => send(&writer, magic, NetworkMessage::Pong(nonce))?,
+            NetworkMessage::Ping(nonce) => send_t(&writer, magic, NetworkMessage::Pong(nonce), trickle)?,
+            NetworkMessage::GetHeaders(_) if endless.is_some() => {
+                endless_headers(&writer, magic, endless.unwrap(), shared);
+                return Ok(());
+            }
             NetworkMessage::GetHeaders(gh) => {
-                let headers = if behaviors.iter().any(|b| matches!(b, Behavior::WithholdHeaders)) {
+                let mut headers = if behaviors.iter().any(|b| matches!(b, Behavior::WithholdHeaders)) {
                     Vec::new()
                 } else {
                     shared
@@ -277,11 +343,14 @@ fn run_session(stream: TcpStream, shared: &Shared) -> io::Result<()> {
                         .unwrap()
                         .headers_after(&gh.locator_hashes, gh.stop_hash)
                 };
-                send(&writer, magic, NetworkMessage::Headers(headers))?;
+                if behaviors.iter().any(|b| matches!(b, Behavior::OneHeaderPerBatch)) {
+                    headers.truncate(1);
+                }
+                send_t(&writer, magic, NetworkMessage::Headers(headers), trickle)?;
             }
             NetworkMessage::GetData(items) => {
                 for item in items {
-                    serve_item(&writer, shared, &behaviors, item)?;
+                    serve_item(&writer, shared, &behaviors, item, trickle)?;
                 }
             }
             _ => {}
@@ -294,11 +363,12 @@ fn serve_item(
     shared: &Shared,
     behaviors: &[Behavior],
     item: Inventory,
+    trickle: Option<Duration>,
 ) -> io::Result<()> {
     let magic = shared.magic;
     let hash = match item {
         Inventory::Block(h) | Inventory::WitnessBlock(h) => h,
-        other => return send(writer, magic, NetworkMessage::NotFound(vec![other])),
+        other => return send_t(writer, magic, NetworkMessage::NotFound(vec![other]), trickle),
     };
     let found = {
         let chain = shared.chain.lock().unwrap();
@@ -308,7 +378,7 @@ fn serve_item(
             .map(|h| (*h, chain.blocks[*h as usize].clone()))
     };
     let Some((height, block)) = found else {
-        return send(writer, magic, NetworkMessage::NotFound(vec![item]));
+        return send_t(writer, magic, NetworkMessage::NotFound(vec![item]), trickle);
     };
 
     let mut reply = block;
@@ -316,10 +386,10 @@ fn serve_item(
         match b {
             Behavior::WithholdBlock(h) if *h == height => return Ok(()),
             Behavior::WrongBlockAt(h, other) if *h == height => {
-                return send(writer, magic, NetworkMessage::Block(other.clone()));
+                return send_t(writer, magic, NetworkMessage::Block(other.clone()), trickle);
             }
             Behavior::UnsolicitedBlockBefore(h, other) if *h == height => {
-                send(writer, magic, NetworkMessage::Block(other.clone()))?;
+                send_t(writer, magic, NetworkMessage::Block(other.clone()), trickle)?;
             }
             Behavior::ServeMutated(h) if *h == height => {
                 reply = FixtureChain::strip_witness(&reply);
@@ -330,7 +400,7 @@ fn serve_item(
             _ => {}
         }
     }
-    send(writer, magic, NetworkMessage::Block(reply))
+    send_t(writer, magic, NetworkMessage::Block(reply), trickle)
 }
 
 fn version_message(start_height: i32) -> VersionMessage {
@@ -358,6 +428,49 @@ fn send(writer: &Arc<Mutex<TcpStream>>, magic: Magic, msg: NetworkMessage) -> io
     let mut w = writer.lock().unwrap();
     w.write_all(&bytes)?;
     w.flush()
+}
+
+/// `send`, or one byte per `trickle` interval when set.
+fn send_t(
+    writer: &Arc<Mutex<TcpStream>>,
+    magic: Magic,
+    msg: NetworkMessage,
+    trickle: Option<Duration>,
+) -> io::Result<()> {
+    let Some(every) = trickle else {
+        return send(writer, magic, msg);
+    };
+    let bytes = serialize(&RawNetworkMessage::new(magic, msg));
+    for b in bytes {
+        {
+            let mut w = writer.lock().unwrap();
+            w.write_all(&[b])?;
+            w.flush()?;
+        }
+        std::thread::sleep(every);
+    }
+    Ok(())
+}
+
+/// A `headers` frame header claiming the 4 MB maximum, then one zero
+/// byte per `every` until the node hangs up or the mock shuts down.
+fn endless_headers(writer: &Arc<Mutex<TcpStream>>, magic: Magic, every: Duration, shared: &Shared) {
+    let mut header = Vec::with_capacity(24);
+    header.extend_from_slice(&magic.to_bytes());
+    let mut cmd = [0u8; 12];
+    cmd[..7].copy_from_slice(b"headers");
+    header.extend_from_slice(&cmd);
+    header.extend_from_slice(&4_000_000u32.to_le_bytes());
+    header.extend_from_slice(&[0u8; 4]);
+    if writer.lock().unwrap().write_all(&header).is_err() {
+        return;
+    }
+    while !shared.shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(every);
+        if writer.lock().unwrap().write_all(&[0]).is_err() {
+            return;
+        }
+    }
 }
 
 fn recv(reader: &mut TcpStream, shared: &Shared) -> io::Result<NetworkMessage> {

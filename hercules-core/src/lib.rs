@@ -1764,4 +1764,299 @@ mod tests {
         assert!(external.is_syncing);
         assert_eq!(external.validated_blocks, 50);
     }
+
+    // ══ FFI surface (tests/network-app) ══════════════════════════════
+    //
+    // Every exported function: error mapping, no panic on bad input, and
+    // behavior on a closed node. Nodes here are mainnet `open` nodes in a
+    // temp dir; nothing below reaches the network (sessions are refused
+    // on a closed node, and bad inputs fail before any I/O).
+
+    use crate::testkit::{lmdb_slot, LmdbSlot};
+    use proptest::prelude::*;
+
+    struct Ffi {
+        node: HerculesNode,
+        dir: tempfile::TempDir,
+        _slot: LmdbSlot,
+    }
+
+    fn ffi_node() -> Ffi {
+        let slot = lmdb_slot();
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("headers.sqlite3").to_string_lossy().into_owned();
+        let node = HerculesNode::open(db, None).unwrap();
+        Ffi { node, dir, _slot: slot }
+    }
+
+    impl Ffi {
+        fn db(&self) -> String {
+            self.dir.path().join("headers.sqlite3").to_string_lossy().into_owned()
+        }
+    }
+
+    struct Quiet;
+    impl SyncCallback for Quiet {
+        fn on_progress(&self, _status: SyncStatus) {}
+    }
+    struct Accept(bool);
+    impl SnapshotCallback for Accept {
+        fn on_progress(&self, _loaded: u64, _total: u64) -> bool {
+            self.0
+        }
+    }
+
+    fn is_node_open(e: &HerculesError) -> bool {
+        matches!(e, HerculesError::NodeOpen { .. })
+    }
+
+    #[test]
+    fn closed_node_refuses_every_session_and_keeps_answering_getters() {
+        let f = ffi_node();
+        assert!(f.node.close(1_000), "idle node didn't close");
+        // Sessions: refused at once, before any network or disk work.
+        let start = Instant::now();
+        assert!(is_node_open(&f.node.wait_for_transport(10_000).unwrap_err()));
+        assert!(is_node_open(&f.node.start_header_sync(Box::new(Quiet)).unwrap_err()));
+        assert!(is_node_open(&f.node.validate_latest_block(25).unwrap_err()));
+        assert!(is_node_open(&f.node.catch_up_blocks(10, 25).unwrap_err()));
+        assert!(is_node_open(&f.node.load_snapshot("/nonexistent".into(), Box::new(Accept(true))).unwrap_err()));
+        assert!(is_node_open(&f.node.start_wallet_api().unwrap_err()));
+        let report = f.node.wake_catch_up(Arc::new(WakeBudget::new(20_000)), 10, 1_000);
+        assert!(matches!(report.outcome, WakeOutcome::Cancelled), "{:?}", report.outcome);
+        assert!(report.status.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2), "closed-node calls took {:?}", start.elapsed());
+
+        // Read-only getters and controls still answer (the UI polls them
+        // while a reset is in progress).
+        assert_eq!(f.node.get_status().unwrap().synced_headers, 0);
+        assert!(f.node.needs_snapshot().unwrap());
+        assert_eq!(f.node.get_trust_info().unwrap().validated_height, 0);
+        assert_eq!(f.node.get_mempool_status().tx_count, 0);
+        let _ = f.node.get_node_status();
+        assert!(f.node.get_tor_status().is_none(), "clearnet node reports a Tor status");
+        f.node.set_validation_paused(true);
+        assert!(f.node.is_validation_paused());
+        f.node.stop_sync();
+        f.node.stop_wallet_api();
+        assert!(f.node.list_own_txs().unwrap().is_empty());
+        assert_eq!(f.node.reconsider_invalid_blocks().unwrap(), 0);
+        // Closing twice is fine.
+        assert!(f.node.close(0));
+    }
+
+    #[test]
+    fn reset_waits_for_the_last_node_reference_then_starts_fresh() {
+        let f = ffi_node();
+        let db = f.db();
+        // Live node: refused, files untouched.
+        assert!(is_node_open(&reset_database(db.clone()).unwrap_err()));
+        assert!(f.node.close(1_000));
+        assert!(is_node_open(&reset_database(db.clone()).unwrap_err()), "reset while the stores are still open");
+        let Ffi { node, dir, _slot } = f;
+        drop(node);
+        reset_database(db.clone()).unwrap();
+        // Idempotent on an already-clean directory.
+        reset_database(db.clone()).unwrap();
+        let again = HerculesNode::open(db, None).unwrap();
+        assert_eq!(again.get_status().unwrap().synced_headers, 0);
+        drop(again);
+        drop(dir);
+    }
+
+    #[test]
+    fn one_node_per_database_whatever_the_path_spelling() {
+        let f = ffi_node();
+        let dir = f.dir.path();
+        for spelling in [
+            dir.join("headers.sqlite3"),
+            dir.join(".").join("headers.sqlite3"),
+            dir.join("sub").join("..").join("headers.sqlite3"),
+        ] {
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            match HerculesNode::open(spelling.to_string_lossy().into_owned(), None) {
+                Err(e) => assert!(is_node_open(&e), "{:?}: {}", spelling, e),
+                Ok(_) => panic!("second node opened on {:?}", spelling),
+            }
+        }
+    }
+
+    #[test]
+    fn open_reports_storage_errors_for_unusable_paths() {
+        let _slot = lmdb_slot();
+        let dir = tempfile::TempDir::new().unwrap();
+        // A regular file where the database's directory should be.
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        for db in [file.join("headers.sqlite3"), dir.path().join("missing").join("deeper").join("h.sqlite3")] {
+            match HerculesNode::open(db.to_string_lossy().into_owned(), None) {
+                Err(HerculesError::StorageError { .. }) => {}
+                Err(e) => panic!("{:?}: wrong error {}", db, e),
+                Ok(_) => panic!("{:?}: opened", db),
+            }
+        }
+        // A failed open releases its claim: the path can be used later.
+        let good = dir.path().join("h.sqlite3").to_string_lossy().into_owned();
+        drop(HerculesNode::open(good.clone(), None).unwrap());
+        drop(HerculesNode::open(good, None).unwrap());
+    }
+
+    #[test]
+    fn string_inputs_are_validated_before_any_work() {
+        let f = ffi_node();
+        assert!(matches!(f.node.own_tx_status("zz".into()), Err(HerculesError::SyncFailed { .. })));
+        assert!(matches!(f.node.own_tx_status(String::new()), Err(HerculesError::SyncFailed { .. })));
+        assert!(f.node.own_tx_status("ab".repeat(32)).unwrap().is_none());
+        for bad in ["zz", "0", "", "00", "deadbeef", " 0100 "] {
+            match f.node.submit_own_tx(bad.into()) {
+                Err(BroadcastError::Invalid { .. }) => {}
+                other => panic!("{:?}: {:?}", bad, other.map(|r| r.txid)),
+            }
+        }
+        // A well-formed tx on an unsynced node: NotSynced, not a crash or
+        // a network attempt.
+        let tx = "02000000000101".to_string()
+            + &"11".repeat(32)
+            + "00000000"
+            + "00"
+            + "ffffffff"
+            + "01"
+            + "e803000000000000"
+            + "160014"
+            + &"22".repeat(20)
+            + "0100"
+            + "00000000";
+        match f.node.submit_own_tx(tx) {
+            Err(BroadcastError::NotSynced { .. }) | Err(BroadcastError::Invalid { .. }) => {}
+            other => panic!("{:?}", other.map(|r| r.txid)),
+        }
+    }
+
+    #[test]
+    fn snapshot_load_failures_are_typed_and_leave_the_node_usable() {
+        let f = ffi_node();
+        let garbage = f.dir.path().join("garbage.hutx");
+        std::fs::write(&garbage, vec![0x5a; 4096]).unwrap();
+        match f.node.load_snapshot(garbage.to_string_lossy().into_owned(), Box::new(Accept(true))) {
+            Err(HerculesError::SnapshotInvalid { .. }) => {}
+            other => panic!("garbage snapshot: {:?}", other.map(|i| i.height)),
+        }
+        match f.node.load_snapshot(f.dir.path().join("missing.hutx").to_string_lossy().into_owned(), Box::new(Accept(true))) {
+            Err(HerculesError::SnapshotInvalid { .. }) | Err(HerculesError::StorageError { .. }) => {}
+            other => panic!("missing snapshot: {:?}", other.map(|i| i.height)),
+        }
+        // Still a fresh, usable node.
+        assert!(f.node.needs_snapshot().unwrap());
+        assert_eq!(f.node.get_status().unwrap().validated_blocks, 0);
+        assert!(f.node.close(1_000));
+    }
+
+    #[test]
+    fn wallet_api_without_tor_errors_cleanly_and_rotation_persists_a_private_token() {
+        let f = ffi_node();
+        match f.node.start_wallet_api() {
+            Err(HerculesError::TorError { msg }) => assert!(msg.contains("not enabled"), "{}", msg),
+            other => panic!("{:?}", other),
+        }
+        assert!(matches!(f.node.get_wallet_api_connection_string(), Err(HerculesError::NetworkError { .. })));
+        f.node.stop_wallet_api();
+        let t1 = f.node.rotate_wallet_auth_token().unwrap();
+        let t2 = f.node.rotate_wallet_auth_token().unwrap();
+        for t in [&t1, &t2] {
+            assert_eq!(t.len(), 64);
+            assert!(t.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert_ne!(t1, t2, "rotation returned the same token");
+        let path = f.dir.path().join("wallet_auth_token");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), t2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "auth token readable by others: {:o}", mode);
+        }
+    }
+
+    #[test]
+    fn sync_errors_map_to_the_documented_ffi_errors() {
+        use sync::SyncError as S;
+        assert!(matches!(map_sync_error(S::NoPeers), HerculesError::NetworkError { .. }));
+        assert!(matches!(map_sync_error(S::Peer("x".into())), HerculesError::NetworkError { msg } if msg == "x"));
+        assert!(matches!(map_sync_error(S::Validation("x".into())), HerculesError::SyncFailed { .. }));
+        assert!(matches!(map_sync_error(S::Store("x".into())), HerculesError::StorageError { .. }));
+        assert!(matches!(map_sync_error(S::SnapshotInvalid("x".into())), HerculesError::SnapshotInvalid { .. }));
+    }
+
+    #[test]
+    fn wake_error_outcome_distinguishes_cancel_timeout_and_failure() {
+        let live = WakeBudget::new(60_000);
+        assert!(matches!(wake_error_outcome(&live), WakeOutcome::Failed));
+        let spent = WakeBudget::new(0);
+        assert!(matches!(wake_error_outcome(&spent), WakeOutcome::TimedOut));
+        spent.cancel();
+        assert!(matches!(wake_error_outcome(&spent), WakeOutcome::Cancelled), "cancel outranks timeout");
+    }
+
+    #[test]
+    fn dates_match_an_independent_calendar() {
+        // Reference values from Python's datetime (proleptic Gregorian):
+        // leap days in 1972 and 2000, 2100 not a leap year, u32 max.
+        for (t, s) in [
+            (68_169_600u32, "1972-02-29 00:00:00 UTC"),
+            (946_684_799, "1999-12-31 23:59:59 UTC"),
+            (951_782_400, "2000-02-29 00:00:00 UTC"),
+            (1_231_006_505, "2009-01-03 18:15:05 UTC"),
+            (4_107_542_400, "2100-03-01 00:00:00 UTC"),
+            (u32::MAX, "2106-02-07 06:28:15 UTC"),
+        ] {
+            assert_eq!(chrono_format(t), s, "{}", t);
+        }
+    }
+
+    #[test]
+    fn parse_block_header_requires_exactly_80_bytes() {
+        let genesis = GENESIS_HEX.to_string();
+        assert!(parse_block_header(genesis.clone()).is_ok());
+        assert!(parse_block_header(genesis.to_uppercase()).is_ok(), "hex case should not matter");
+        for bad in [String::new(), genesis[..158].to_string(), genesis.clone() + "00", genesis[..159].to_string(), " ".to_string() + &genesis] {
+            assert!(matches!(parse_block_header(bad.clone()), Err(HerculesError::SyncFailed { .. })), "{:?}", bad.len());
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_parse_block_header_never_panics(s in ".{0,200}", bytes in prop::collection::vec(any::<u8>(), 0..120)) {
+            let _ = parse_block_header(s);
+            let r = parse_block_header(hex::encode(&bytes));
+            prop_assert_eq!(r.is_ok(), bytes.len() == 80);
+        }
+
+        #[test]
+        fn prop_chrono_format_is_well_formed(t in any::<u32>()) {
+            let s = chrono_format(t);
+            prop_assert_eq!(s.len(), "YYYY-MM-DD HH:MM:SS UTC".len());
+            let month: u32 = s[5..7].parse().unwrap();
+            let day: u32 = s[8..10].parse().unwrap();
+            prop_assert!((1..=12).contains(&month) && (1..=31).contains(&day), "{}", s);
+        }
+    }
+
+    #[test]
+    fn prop_string_ffi_inputs_never_panic() {
+        let f = ffi_node();
+        let mut runner = proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
+            cases: std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(128),
+            ..Default::default()
+        });
+        runner
+            .run(&(".{0,100}", prop::collection::vec(any::<u8>(), 0..300)), |(s, bytes)| {
+                let _ = f.node.own_tx_status(s.clone());
+                let _ = f.node.submit_own_tx(s);
+                let _ = f.node.submit_own_tx(hex::encode(&bytes));
+                Ok(())
+            })
+            .unwrap();
+        // Nothing was tracked by any of it (nothing synced to validate).
+        assert!(f.node.list_own_txs().unwrap().is_empty());
+    }
 }
